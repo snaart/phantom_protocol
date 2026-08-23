@@ -14,6 +14,7 @@
 //! `migration`, `streams`, `negative`, `liveness_soak`) hold the concrete
 //! session, and the reference leg records a [`skipped`] note saying why.
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -29,11 +30,13 @@ use crate::probe::conn::{
     self, connect_framed, connect_leg, connect_leg_resumed, connect_link, connect_link_staged,
     echo_once, error_kind, Endpoints, DRAIN_TIMEOUT, OP_TIMEOUT,
 };
+use crate::probe::relay::{Relay, RelayStats};
 use crate::proto::{Msg, PayloadGen};
 use crate::report::{
-    unix_nanos, BuildId, ConcurrencySample, ErrorRecord, HandshakeSample, Leg,
-    MessageIntegritySample, MigrationSample, NegativeSample, RekeySample, RttSample, SampleSink,
-    ScenarioSummary, SoakSample, StreamSample, ThroughputSample, WireCheckSample, ZeroRttSample,
+    unix_nanos, BuildId, ClientMetrics, ConcurrencySample, ErrorRecord, HandshakeRepairSample,
+    HandshakeSample, Leg, MessageIntegritySample, MigrationSample, NegativeSample, RekeySample,
+    RttSample, SampleSink, ScenarioSummary, ServerStats, SoakSample, StreamSample,
+    ThroughputSample, WireCheckSample, ZeroRttSample,
 };
 use crate::stats::{Summary, Throughput};
 use crate::wirecheck::{
@@ -496,6 +499,385 @@ pub async fn handshake(ep: &Endpoints, pin: &[u8], leg: Leg, count: usize) -> Sc
     } else {
         out.note("connect_ns spans the full hybrid X25519+ML-KEM-768 / Ed25519+ML-DSA-65 handshake including one network round trip; setup_ns is the socket-and-allocation prefix before the handshake starts");
     }
+    out
+}
+
+// ── 2b. handshake_repair ────────────────────────────────────────────────────
+
+/// The client's first handshake-retransmit interval, and the whole budget it sits in.
+///
+/// Mirrors `HANDSHAKE_RETRANSMIT_BUDGET` and the `[1 s, 2 s, 4 s, 1 s]` interval walk in
+/// `core/src/api/udp_transport.rs` — both `pub(crate)` there, so these are copies rather than
+/// imports. That is exactly why every sample carries them as fields: a reader comparing an
+/// elapsed connect against the schedule reads the numbers this run was judged by, instead of
+/// trusting that a copy made here is still true of the library.
+const FIRST_RETRANSMIT: Duration = Duration::from_secs(1);
+const RETRANSMIT_BUDGET: Duration = Duration::from_secs(8);
+
+/// Movement in the listener's four repair counters across one attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RepairDeltas {
+    /// `initial_on_committed_route_total` — the client's repeated flight arriving.
+    asked: u64,
+    /// `handshake_flight_repeated_total` — an answer going back.
+    answered: u64,
+    /// `handshake_flight_evicted_total` / `handshake_flight_refused_total` — the two ways
+    /// retention fails to cover a session: by running out of budget, and by never arming.
+    evicted: u64,
+    refused: u64,
+}
+
+/// What one attempt established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RepairVerdict {
+    Repaired,
+    Inconclusive(String),
+    Failed(String),
+}
+
+impl RepairVerdict {
+    fn label(&self) -> String {
+        match self {
+            Self::Repaired => "repaired".to_string(),
+            Self::Inconclusive(why) => format!("inconclusive: {why}"),
+            Self::Failed(why) => format!("failed: {why}"),
+        }
+    }
+
+    fn is_pass(&self) -> bool {
+        matches!(self, Self::Repaired)
+    }
+
+    fn is_failure(&self) -> bool {
+        matches!(self, Self::Failed(_))
+    }
+}
+
+/// The rule that separates a pass from a vacuous one, as a function of the facts an attempt
+/// produces and nothing else.
+///
+/// It is a free function so the rule is checkable without a network, and because the rule is
+/// the whole scenario: a connect that completed is not evidence unless a flight was actually
+/// lost first, and even then it says nothing about *this* mechanism unless the listener
+/// recorded both halves — a question arriving and an answer going back. Everything short of
+/// that is inconclusive rather than a pass, and inconclusive is not a failure either: the path
+/// declining to cooperate is not the protocol misbehaving.
+fn classify_repair(swallowed: u64, connected: bool, deltas: Option<RepairDeltas>) -> RepairVerdict {
+    if swallowed == 0 {
+        return RepairVerdict::Inconclusive(
+            "the relay swallowed no flight, so this connect crossed an undamaged path and is \
+             evidence about nothing"
+                .to_string(),
+        );
+    }
+    if !connected {
+        return RepairVerdict::Failed(
+            "the connect did not complete after its reply flight was lost — this is the shape a \
+             listener with no retained flight produces, a timeout at the client's retransmit \
+             budget"
+                .to_string(),
+        );
+    }
+    let Some(d) = deltas else {
+        return RepairVerdict::Inconclusive(
+            "the daemon did not report its counters, so a completed connect cannot be attributed \
+             to the repeat rather than to something else"
+                .to_string(),
+        );
+    };
+    if d.asked == 0 {
+        return RepairVerdict::Inconclusive(
+            "the connect completed but the listener recorded no repeated client flight, so \
+             whatever carried it was not this mechanism"
+                .to_string(),
+        );
+    }
+    if d.answered == 0 {
+        return RepairVerdict::Inconclusive(
+            "the repeated flight reached the listener and nothing went back, so the retention did \
+             not cover this session and the connect completed by some other means"
+                .to_string(),
+        );
+    }
+    RepairVerdict::Repaired
+}
+
+/// One connect through a local relay, timed end to end, with the relay's account of what it did.
+struct RelayConnect {
+    outcome: Result<(), CoreError>,
+    elapsed_ns: u64,
+    stats: Arc<RelayStats>,
+}
+
+async fn relay_connect(server: SocketAddr, pin: &[u8], armed: bool) -> RelayConnect {
+    let relay = match Relay::spawn(server, armed).await {
+        Ok(r) => r,
+        Err(e) => {
+            return RelayConnect {
+                outcome: Err(CoreError::NetworkError(format!("relay setup: {e}"))),
+                elapsed_ns: 0,
+                stats: Arc::new(RelayStats::default()),
+            }
+        }
+    };
+
+    let t0 = Instant::now();
+    let outcome = async {
+        let session = phantom_protocol::connect_pinned_udp(
+            relay.addr().ip().to_string(),
+            relay.addr().port(),
+            pin.to_vec(),
+        )
+        .await?;
+        // The handshake has not run yet at this point — see `conn::connect_leg` for what
+        // measuring without this wait would report instead. The wait is deliberately the
+        // harness's 30 s ceiling and not something tighter: the failure this scenario is
+        // watching for is the library's own 8 s retransmit budget expiring, and a shorter wait
+        // here would replace that answer with this harness's.
+        match tokio::time::timeout(conn::CONNECT_TIMEOUT, session.await_ready()).await {
+            Ok(Ok(())) => Ok(session),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(CoreError::Timeout),
+        }
+    }
+    .await;
+    let elapsed_ns = t0.elapsed().as_nanos() as u64;
+    let stats = relay.stats().clone();
+
+    match outcome {
+        Ok(session) => {
+            conn::close_session(&session).await;
+            RelayConnect {
+                outcome: Ok(()),
+                elapsed_ns,
+                stats,
+            }
+        }
+        Err(e) => RelayConnect {
+            outcome: Err(e),
+            elapsed_ns,
+            stats,
+        },
+    }
+}
+
+/// The listener's own counters, read over a session that is not the one under test.
+///
+/// `None` where the daemon did not answer or predates the fields. Recorded as an absence
+/// rather than as zero, because a counter that was never reported and a counter that did not
+/// move are different statements and only one of them is evidence.
+async fn server_repair_counters(link: &dyn MsgLink) -> Option<ClientMetrics> {
+    let v = conn::fetch_server_stats(link).await.ok()?;
+    let stats: ServerStats = serde_json::from_value(v).ok()?;
+    Some(stats.metrics)
+}
+
+/// Lose exactly one datagram flight of the server's reply, on the real path, and see whether
+/// the connect survives it.
+///
+/// PhantomUDP spends thirteen datagrams on a handshake and six of them are the `ServerHello`
+/// — the one flight that, until recently, had no retransmission of its own. The listener now
+/// retains the flight it sent and repeats it byte for byte when the same question arrives
+/// again. That repair is pinned by the library's own tests and has never been seen working on
+/// a real path: four measurement runs across two days produced 76 consecutive successful UDP
+/// handshakes and `initial_on_committed_route_total = 0`, because the path did not happen to
+/// lose a handshake datagram. Waiting for a lossy day is not a test strategy, so the loss is
+/// manufactured — locally, deterministically, and on one flight only — while everything else
+/// about the exchange stays real.
+///
+/// **What this looks like against a listener without the repair, which is the whole point.**
+/// The client repeats its flight at 1 s, 3 s and 7 s; the demux routes those repeats by
+/// connection id onto a route it has already committed, where a pump that does not parse
+/// handshake messages drops them; nothing triggers a second reply. Every attempt therefore
+/// ends `failed`, with `ready_ns` at the client's 8 s retransmit budget and `asked_delta`
+/// non-zero (the questions did arrive) against `answered_delta` of zero. A reader who sees
+/// that shape is looking at the defect this scenario exists to catch, not at a bad path.
+///
+/// **What a vacuous pass looks like, and why it is not reported as a pass.** If the relay
+/// swallows nothing — a run against a leg that does not fragment its reply, a daemon whose
+/// message sizes moved — the connect completes exactly as it always does, and a scenario that
+/// asserted only on success would report a green result for a mechanism it never exercised.
+/// So `swallowed_datagrams` is checked first, and an attempt that lost nothing is
+/// `inconclusive` regardless of how well it went. The same rule applies to the counters: a
+/// connect that completed while the listener recorded no repeat was carried by something
+/// else, and saying so is worth more than claiming the credit.
+pub async fn handshake_repair(
+    ep: &Endpoints,
+    pin: &[u8],
+    leg: Leg,
+    attempts: usize,
+) -> ScenarioOutput {
+    // PhantomUDP only, and not by preference. The mechanism is a datagram flight and its
+    // repeat; on a byte-pipe leg the handshake rides TCP's own retransmission and no datagram
+    // of it can go missing on its own, so there is nothing here to damage.
+    if leg != Leg::Udp {
+        return skipped(
+            leg,
+            "handshake_repair",
+            "the reply flight and the listener's repeat of it are PhantomUDP's: on a byte-pipe \
+             leg the handshake is carried by the stream underneath, which retransmits it, so no \
+             single datagram of the reply can be lost and there is nothing for a listener to \
+             repeat",
+        );
+    }
+
+    let mut out = ScenarioOutput::new(leg, "handshake_repair");
+    let server = match conn::resolve(ep, leg).await {
+        Ok(a) => a,
+        Err(e) => {
+            out.error(leg, "handshake_repair", "resolve", &e);
+            return out;
+        }
+    };
+
+    // A second session, straight to the daemon, held open across the whole scenario: it is how
+    // the listener's counters are read. It deliberately does not go through the relay, because
+    // a session on the damaged path could not be relied on to answer while the damage is being
+    // done.
+    let t0 = Instant::now();
+    let control = match connect_framed(leg, ep, pin).await {
+        Ok(s) => s,
+        Err(e) => {
+            out.error_after(leg, "handshake_repair", "control connect", &e, t0);
+            return out;
+        }
+    };
+    out.mark(&control, "handshake_repair:begin").await;
+
+    // The denominator, and the instrument's own positive control in one: the same connect
+    // through the same relay with the swallow disarmed. It pays the same loopback hop and
+    // crosses the same WAN, so the difference between it and an armed attempt is the loss and
+    // nothing else — and if it does not complete, nothing measured afterwards is a statement
+    // about the protocol.
+    let baseline = relay_connect(server, pin, false).await;
+    let baseline_ready_ns = match &baseline.outcome {
+        Ok(()) => {
+            out.note(format!(
+                "baseline: the same connect through the same relay with nothing swallowed completed in {:.0} ms",
+                baseline.elapsed_ns as f64 / 1e6
+            ));
+            Some(baseline.elapsed_ns)
+        }
+        Err(e) => {
+            out.error_lasting(
+                leg,
+                "handshake_repair",
+                "baseline connect",
+                e,
+                baseline.elapsed_ns,
+            );
+            out.note(
+                "the undamaged connect through the relay failed, so every attempt below is a statement about the relay rather than about the protocol",
+            );
+            None
+        }
+    };
+
+    let mut repaired_ns = Vec::with_capacity(attempts);
+    let (mut passed, mut inconclusive, mut failed) = (0usize, 0usize, 0usize);
+
+    for seq in 0..attempts as u64 {
+        let before = server_repair_counters(&control).await;
+        let attempt = relay_connect(server, pin, true).await;
+        let after = server_repair_counters(&control).await;
+
+        let deltas = match (&before, &after) {
+            (Some(b), Some(a)) => Some(RepairDeltas {
+                asked: a
+                    .initial_on_committed_route_total
+                    .saturating_sub(b.initial_on_committed_route_total),
+                answered: a
+                    .handshake_flight_repeated_total
+                    .saturating_sub(b.handshake_flight_repeated_total),
+                evicted: a
+                    .handshake_flight_evicted_total
+                    .saturating_sub(b.handshake_flight_evicted_total),
+                refused: a
+                    .handshake_flight_refused_total
+                    .saturating_sub(b.handshake_flight_refused_total),
+            }),
+            _ => None,
+        };
+
+        let swallowed = attempt.stats.swallowed() as u64;
+        let connected = attempt.outcome.is_ok();
+        let verdict = classify_repair(swallowed, connected, deltas);
+
+        if let Err(e) = &attempt.outcome {
+            out.error_lasting(leg, "handshake_repair", "connect", e, attempt.elapsed_ns);
+        }
+        if verdict.is_pass() {
+            passed += 1;
+            out.summary.ok_count += 1;
+            repaired_ns.push(attempt.elapsed_ns);
+        } else if verdict.is_failure() {
+            failed += 1;
+        } else {
+            inconclusive += 1;
+        }
+
+        out.sink.push(&HandshakeRepairSample {
+            seq,
+            leg,
+            t_unix_ns: unix_nanos(),
+            swallowed_datagrams: swallowed,
+            flight_total_chunks: attempt.stats.flight_chunks(),
+            ready_ns: connected.then_some(attempt.elapsed_ns),
+            baseline_ready_ns,
+            first_retransmit_ns: FIRST_RETRANSMIT.as_nanos() as u64,
+            retransmit_budget_ns: RETRANSMIT_BUDGET.as_nanos() as u64,
+            asked_delta: deltas.map(|d| d.asked),
+            answered_delta: deltas.map(|d| d.answered),
+            evicted_delta: deltas.map(|d| d.evicted),
+            refused_delta: deltas.map(|d| d.refused),
+            server_counters: after,
+            ok: verdict.is_pass(),
+            verdict: verdict.label(),
+            error: attempt.outcome.as_ref().err().map(|e| format!("{e:?}")),
+            error_kind: attempt.outcome.as_ref().err().map(error_kind),
+        });
+    }
+
+    out.note(format!(
+        "{attempts} attempt(s): {passed} repaired, {inconclusive} inconclusive, {failed} failed"
+    ));
+    if passed == 0 && failed == 0 {
+        out.note(
+            "no attempt lost a flight and completed, so this run has not exercised the reply-flight repair at all — read the per-attempt verdicts before quoting anything about it",
+        );
+    }
+
+    if !repaired_ns.is_empty() {
+        let s = Summary::of_u64(&repaired_ns);
+        let median = s.p50 as u64;
+        out.summary.latency_ns = Some(s);
+        match baseline_ready_ns {
+            Some(base) if median > base => out.note(format!(
+                "a repaired connect took {:.0} ms against a {:.0} ms undamaged baseline through the same relay — an excess of {:.0} ms. The client repeats its flight after {:.0} ms and abandons the attempt at {:.0} ms, so an excess near the first interval is the listener's repeat carrying the connect, and an excess near the budget is a later retransmit carrying it instead.",
+                median as f64 / 1e6,
+                base as f64 / 1e6,
+                (median - base) as f64 / 1e6,
+                FIRST_RETRANSMIT.as_secs_f64() * 1e3,
+                RETRANSMIT_BUDGET.as_secs_f64() * 1e3,
+            )),
+            Some(base) => out.note(format!(
+                "a repaired connect took {:.0} ms against a {:.0} ms undamaged baseline, so the loss cost no measurable time in this run and the two cannot be separated on a path this variable",
+                median as f64 / 1e6,
+                base as f64 / 1e6,
+            )),
+            None => out.note(format!(
+                "a repaired connect took {:.0} ms, but with no undamaged baseline to subtract there is nothing to attribute it to",
+                median as f64 / 1e6,
+            )),
+        }
+    }
+
+    out.note(
+        "the four counters are the listener's aggregate over every peer it serves, so a delta measured across one attempt could in principle carry another peer's repeat. The independent half of the evidence is the connect completing at all while a flight was swallowed, which on a listener with no retained flight it cannot.",
+    );
+
+    out.mark(&control, "handshake_repair:end").await;
+    conn::close_session(control.session()).await;
     out
 }
 
@@ -3621,6 +4003,223 @@ mod tests {
             "{notes}"
         );
         assert_eq!(out.summary.ok_count, 1);
+    }
+
+    fn deltas(asked: u64, answered: u64) -> Option<RepairDeltas> {
+        Some(RepairDeltas {
+            asked,
+            answered,
+            evicted: 0,
+            refused: 0,
+        })
+    }
+
+    /// A connect that lost nothing is not evidence, however well it went.
+    ///
+    /// This is the failure mode the whole scenario is built against. A relay that swallowed no
+    /// flight leaves an ordinary connect, and an ordinary connect succeeds — so a version of
+    /// this scenario that asserted only on success would report a green result for a mechanism
+    /// it never exercised, on every clean path, forever. The counters cannot rescue it either:
+    /// on a busy listener another peer's repeat would move them inside the same window.
+    #[test]
+    fn a_connect_that_lost_nothing_is_never_a_pass() {
+        for d in [deltas(0, 0), deltas(3, 3), None] {
+            let v = classify_repair(0, true, d);
+            assert!(!v.is_pass(), "{v:?}");
+            assert!(
+                !v.is_failure(),
+                "a clean path is not a protocol failure: {v:?}"
+            );
+            assert!(v.label().contains("swallowed no flight"), "{}", v.label());
+        }
+    }
+
+    /// A repaired connect takes both halves of the counter pair, because either alone is
+    /// ambiguous between the two things it has to tell apart: a question arriving says the
+    /// client asked again, an answer going back says the listener had something to send.
+    #[test]
+    fn a_repair_is_claimed_only_when_the_question_and_the_answer_are_both_recorded() {
+        assert_eq!(
+            classify_repair(6, true, deltas(1, 1)),
+            RepairVerdict::Repaired
+        );
+
+        let no_question = classify_repair(6, true, deltas(0, 5));
+        assert!(!no_question.is_pass());
+        assert!(
+            no_question.label().contains("no repeated client flight"),
+            "{}",
+            no_question.label()
+        );
+
+        let no_answer = classify_repair(6, true, deltas(1, 0));
+        assert!(!no_answer.is_pass());
+        assert!(
+            no_answer.label().contains("nothing went back"),
+            "{}",
+            no_answer.label()
+        );
+
+        // A daemon that did not report at all is an absence, not a zero.
+        let silent = classify_repair(6, true, None);
+        assert!(!silent.is_pass() && !silent.is_failure());
+        assert!(
+            silent.label().contains("did not report its counters"),
+            "{}",
+            silent.label()
+        );
+    }
+
+    /// The one shape that is a finding: a flight really went missing and the connect never
+    /// came back. That is what a listener with no retained flight produces on every attempt,
+    /// so it must count against the run rather than beside it.
+    #[test]
+    fn a_connect_lost_to_a_real_loss_is_counted_as_a_failure() {
+        for d in [deltas(0, 0), deltas(3, 0), None] {
+            let v = classify_repair(6, false, d);
+            assert!(v.is_failure(), "{v:?}");
+            assert!(!v.is_pass());
+            assert!(v.label().starts_with("failed: "), "{}", v.label());
+            assert!(
+                v.label().contains("retransmit budget"),
+                "the reader has to be told which timer produced it: {}",
+                v.label()
+            );
+        }
+    }
+
+    /// The scenario's whole shape, minus the path: a real PhantomUDP handshake against a
+    /// listener in this process, with one reply flight taken out of it by the relay the
+    /// scenario uses, timed by the connect the scenario times, and judged by the rule the
+    /// scenario judges by.
+    ///
+    /// It is a test of the instrument and not of the protocol — the library pins the repair
+    /// itself, over loopback, from the other side. What it guards is the failure that would
+    /// otherwise be silent: a relay that stopped identifying the reply flight, a connect helper
+    /// that stopped waiting for the handshake, or a classifier that stopped asking for both
+    /// counters would go on reporting `inconclusive` against a WAN nobody can rerun on demand,
+    /// and nothing in the artifact would say which of them broke.
+    ///
+    /// Loopback is enough here for the same reason it is not enough elsewhere: the quantity
+    /// under test is a decision about a datagram, not a rate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_swallowed_reply_flight_is_repaired_against_a_listener_in_this_process() {
+        use phantom_protocol::api::udp_listener::PhantomUdpListener;
+
+        let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+            .await
+            .expect("bind a loopback PhantomUDP listener");
+        let server: SocketAddr = listener.local_addr().parse().expect("the bound address");
+        let pin = listener.verifying_key_bytes();
+
+        let acceptor = listener.clone();
+        let accept = tokio::spawn(async move { acceptor.accept().await });
+
+        let attempt = relay_connect(server, &pin, true).await;
+        assert!(
+            attempt.outcome.is_ok(),
+            "the connect must survive a lost reply flight, got {:?} after {:.0} ms",
+            attempt.outcome,
+            attempt.elapsed_ns as f64 / 1e6
+        );
+
+        let swallowed = attempt.stats.swallowed() as u64;
+        assert!(
+            swallowed > 0,
+            "the relay must have taken a flight, or this asserts nothing"
+        );
+        assert_eq!(
+            attempt.stats.flight_chunks(),
+            u16::try_from(swallowed).ok(),
+            "one whole flight and no more: the repeat that follows has to arrive intact"
+        );
+
+        // Read exactly what the scenario reads on the far end — the listener's own
+        // `MetricsSnapshotFfi`, which an accepted session shares.
+        let m = listener.metrics_snapshot();
+        let observed = RepairDeltas {
+            asked: m.initial_on_committed_route_total,
+            answered: m.handshake_flight_repeated_total,
+            evicted: m.handshake_flight_evicted_total,
+            refused: m.handshake_flight_refused_total,
+        };
+        assert!(
+            observed.asked > 0 && observed.answered > 0,
+            "the question and the answer both have to be visible to an operator, saw {observed:?}"
+        );
+        assert_eq!(
+            classify_repair(swallowed, true, Some(observed)),
+            RepairVerdict::Repaired
+        );
+
+        accept.abort();
+        listener.shutdown();
+    }
+
+    /// A reply that never comes ends at the library's own budget, not at this harness's ceiling.
+    ///
+    /// The scenario's documentation says an attempt against a listener with no retained flight
+    /// times out after the client's 8 s retransmit budget, well inside the 30 s the harness is
+    /// willing to wait — and until this test nothing had ever produced that shape. If the two
+    /// ever crossed, by a shorter harness ceiling or a longer library budget, every failed
+    /// attempt would be the harness giving up instead and the finding would be lost inside it.
+    ///
+    /// It also pins the order the classifier asks its questions in. Here nothing was swallowed
+    /// *and* nothing came back, and that is a silent path rather than an absent repair: the
+    /// verdict has to be inconclusive, because the mechanism was never reached.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reply_that_never_comes_ends_at_the_libraries_budget_not_the_harnesss() {
+        // A bound socket nobody reads. The kernel accepts every datagram the relay forwards and
+        // answers none of them; a closed port would answer with ICMP, which is a different
+        // fault from the silence this is about.
+        let blackhole = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("a socket to swallow everything");
+        let addr = blackhole.local_addr().expect("its address");
+
+        let attempt = relay_connect(addr, &unused_pin(), true).await;
+        assert_eq!(
+            attempt.outcome.as_ref().err().map(error_kind).as_deref(),
+            Some("Timeout"),
+            "a handshake nothing answers must end as a typed timeout, got {:?}",
+            attempt.outcome
+        );
+
+        let elapsed = Duration::from_nanos(attempt.elapsed_ns);
+        assert!(
+            elapsed >= RETRANSMIT_BUDGET / 2,
+            "ending in {elapsed:?} means something other than the retransmit schedule stopped it"
+        );
+        assert!(
+            elapsed < conn::CONNECT_TIMEOUT,
+            "the library has to give up first, or every failed attempt reads as this harness's own \
+             ceiling: {elapsed:?} against {:?}",
+            conn::CONNECT_TIMEOUT
+        );
+
+        let v = classify_repair(attempt.stats.swallowed() as u64, false, None);
+        assert!(
+            !v.is_failure() && !v.is_pass(),
+            "a path that carried nothing in either direction is not evidence about the repair: {v:?}"
+        );
+    }
+
+    /// Legs whose handshake rides a byte pipe have no flight to lose, and the artifact has to
+    /// say so — an omitted row is indistinguishable from a scenario that ran and found nothing.
+    #[tokio::test]
+    async fn the_repair_scenario_declines_legs_with_no_flight_to_lose() {
+        for leg in [Leg::Tcp, Leg::Mimic] {
+            let out = handshake_repair(&closed_endpoints(), &unused_pin(), leg, 1).await;
+            assert_eq!(out.summary.ok_count, 0);
+            assert_eq!(out.summary.error_count, 0, "a skip is not a failure");
+            assert!(out.sink.is_empty(), "{leg}: a skip records no samples");
+            let notes = out.summary.notes.join("\n");
+            assert!(notes.contains("PhantomUDP"), "{leg}: {notes}");
+            assert!(
+                notes.contains("retransmits it"),
+                "{leg}: the reason has to name why the loss cannot occur there: {notes}"
+            );
+        }
     }
 
     /// The control this scenario relies on has to be a string that is really on

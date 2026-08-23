@@ -188,7 +188,7 @@ pub async fn connect_leg_unready(
 /// Only the first result is used, matching what `connect_pinned_udp` does on
 /// the Phantom side — a leg that silently tried a second address would not be
 /// measuring the same path as its neighbours.
-async fn resolve(ep: &Endpoints, leg: Leg) -> Result<SocketAddr, CoreError> {
+pub async fn resolve(ep: &Endpoints, leg: Leg) -> Result<SocketAddr, CoreError> {
     let addr = ep.addr_for(leg);
     let mut it = tokio::net::lookup_host(addr.clone())
         .await

@@ -6,6 +6,7 @@
 //! all-or-nothing writer would turn any interruption into a total loss.
 
 pub mod conn;
+pub mod relay;
 pub mod scenarios;
 
 use std::path::{Path, PathBuf};
@@ -48,6 +49,15 @@ impl Profile {
 pub struct Params {
     pub clock_probes: usize,
     pub handshake_count: usize,
+    /// Handshakes deliberately damaged by `handshake_repair`, each losing one
+    /// server reply flight.
+    ///
+    /// Small on every profile, and cheap: an attempt costs one handshake plus
+    /// the client's first retransmit interval, so a couple of seconds. The
+    /// reason to run more than one is not statistics but the path — an attempt
+    /// whose flight the WAN partly lost before the relay saw it spends swallow
+    /// budget on the repeat, and reports inconclusive rather than a result.
+    pub repair_attempts: usize,
     pub rtt_sizes: Vec<usize>,
     pub rtt_per_size: usize,
     /// Sizes walked by `message_integrity`, bracketing the chunk split point
@@ -107,6 +117,7 @@ impl Params {
             Profile::Smoke => Self {
                 clock_probes: 20,
                 handshake_count: 10,
+                repair_attempts: 2,
                 rtt_sizes: vec![64, 1024, 8192],
                 rtt_per_size: 20,
                 integrity_sizes: vec![512, 1024, 1146, 1156, 1166, 2600, 8192],
@@ -136,6 +147,7 @@ impl Params {
             Profile::Standard => Self {
                 clock_probes: 40,
                 handshake_count: 50,
+                repair_attempts: 4,
                 rtt_sizes: vec![16, 128, 512, 1024, 4096, 16384, 65536],
                 rtt_per_size: 50,
                 integrity_sizes: vec![
@@ -167,6 +179,7 @@ impl Params {
             Profile::Deep => Self {
                 clock_probes: 60,
                 handshake_count: 100,
+                repair_attempts: 8,
                 rtt_sizes: vec![16, 128, 512, 1024, 1400, 4096, 16384, 65536],
                 rtt_per_size: 100,
                 integrity_sizes: vec![
@@ -459,6 +472,16 @@ pub async fn run(cfg: ProbeConfig) -> Result<PathBuf> {
                 scenarios::handshake(ep, pin, leg, p.handshake_count).await,
             )?;
         }
+        // Right after the undamaged handshake numbers, because it is read
+        // against them: the same exchange with one reply flight deliberately
+        // missing. Cheap — one handshake plus the client's first retransmit
+        // interval per attempt.
+        if cfg.wants("handshake_repair") {
+            st.absorb(
+                leg,
+                scenarios::handshake_repair(ep, pin, leg, p.repair_attempts).await,
+            )?;
+        }
         // Early, and on its own fresh session: the capture has to be running
         // before the handshake it needs for a positive control.
         if cfg.wants("wire_capture") {
@@ -609,6 +632,7 @@ const RAW_SCENARIOS: &[&str] = &["rtt_sweep", "throughput", "downstream"];
 const PHANTOM_SCENARIOS: &[&str] = &[
     "clock_sync",
     "handshake",
+    "handshake_repair",
     "wire_capture",
     "rtt_sweep",
     "message_integrity",
@@ -647,6 +671,10 @@ const QUIC_SKIPPED: &[(&str, &str)] = &[
     (
         "clock_sync",
         "the run's clock offset is estimated once, on a Phantom leg; a second estimate over a different transport would not be a second measurement of anything",
+    ),
+    (
+        "handshake_repair",
+        "it damages a PhantomUDP handshake on purpose — one datagram flight of the server's reply is dropped before it reaches the client — and then asserts that the listener's retained-flight repeat carries the connect anyway. quinn's handshake is neither shaped like that nor repaired like that: its Initial and Handshake packets are individually acknowledged and retransmitted by the QUIC loss recovery in every implementation, so the failure this exists to catch cannot occur there and the counters it reads have no counterpart",
     ),
     (
         "message_integrity",
@@ -808,6 +836,11 @@ fn caveats(cfg: &ProbeConfig) -> Vec<String> {
         );
         v.push(
             "No capture can show that every post-handshake packet carries the ENCRYPTED flag: header protection masks the whole packet header on the wire. The wire_capture record answers that from the source and says so; nothing measured in this run is evidence about it.".to_string(),
+        );
+    }
+    if cfg.wants("handshake_repair") && cfg.legs.contains(&Leg::Udp) {
+        v.push(
+            "The handshake_repair scenario manufactures its own loss: a relay on this machine drops one datagram flight of the server's reply before it reaches the client. Every datagram still crosses the real path in both directions and only the delivery decision is local, so what it reports is a real handshake with a real flight missing rather than a simulation. An attempt that lost nothing is recorded as inconclusive rather than as a pass, and its numbers are not evidence about the repair.".to_string(),
         );
     }
     if let Some(l) = cfg.soak_leg() {
@@ -1106,6 +1139,51 @@ mod tests {
         assert!(caveats(&cfg)
             .iter()
             .any(|c| c.contains("soak ran only on the udp leg")));
+    }
+
+    /// The damaged-handshake scenario has to run everywhere and stay cheap.
+    ///
+    /// An attempt costs one handshake plus the client's first retransmit interval —
+    /// roughly two seconds on a long path — so a profile asking for dozens would
+    /// quietly turn a ten-minute smoke run into somebody else's soak. The ordering
+    /// is the same rule every other knob follows, and the manufactured loss has to
+    /// travel in the caveats or a reader will take the connect times for ordinary
+    /// ones.
+    #[test]
+    fn the_repair_scenario_runs_on_every_profile_and_says_it_makes_its_own_loss() {
+        let (s, m, d) = (
+            Params::for_profile(Profile::Smoke),
+            Params::for_profile(Profile::Standard),
+            Params::for_profile(Profile::Deep),
+        );
+        for (p, x) in [
+            (Profile::Smoke, &s),
+            (Profile::Standard, &m),
+            (Profile::Deep, &d),
+        ] {
+            assert!(
+                x.repair_attempts > 0,
+                "{p:?}: a scenario that runs zero attempts reports nothing and looks green"
+            );
+        }
+        assert!(s.repair_attempts < m.repair_attempts);
+        assert!(m.repair_attempts < d.repair_attempts);
+        assert!(
+            s.repair_attempts <= 4,
+            "the smoke profile's whole budget is ten minutes"
+        );
+
+        let c = caveats(&demo_cfg(vec![Leg::Udp, Leg::RawUdp], Profile::Smoke)).join("\n");
+        assert!(c.contains("manufactures its own loss"), "{c}");
+        assert!(
+            c.contains("inconclusive rather than as a pass"),
+            "an attempt that damaged nothing must not read as a result: {c}"
+        );
+
+        // A run with no PhantomUDP leg never reaches the scenario, so it must not
+        // carry a caveat about loss it did not manufacture.
+        let no_udp = caveats(&demo_cfg(vec![Leg::Tcp, Leg::RawTcp], Profile::Smoke)).join("\n");
+        assert!(!no_udp.contains("manufactures its own loss"), "{no_udp}");
     }
 
     #[test]
