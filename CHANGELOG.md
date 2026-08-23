@@ -546,8 +546,8 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   the path will not.** The listener's retained-flight repeat is pinned by the library's own
   tests and had never been observed working on a real path: four measurement runs across two
   days produced 76 consecutive successful UDP handshakes and
-  `initial_on_committed_route_total = 0`, because the path did not happen to lose a handshake
-  datagram. The new scenario stands a relay on the probe's own machine, lets every datagram
+  `initial_flights_on_committed_route_total = 0`, because the path did not happen to lose a
+  handshake datagram. The new scenario stands a relay on the probe's own machine, lets every datagram
   cross the WAN in both directions, and drops exactly one fragmented downstream handshake
   flight — identified by that flight's own `total_chunks`, so one flight goes missing however
   many datagrams it is, and every later flight including the repeat arrives. Keying on the
@@ -556,8 +556,9 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
   It refuses to call a completed connect a pass. An attempt is `repaired` only when a flight
   was really lost **and** the listener's own counters moved on both halves —
-  `initial_on_committed_route_total` (the client asked again) and
-  `handshake_flight_repeated_total` (an answer went back). Everything short of that is
+  `initial_flights_on_committed_route_total` (the client asked again) and
+  `handshake_flight_repeated_total` (an answer went back), both counted per flight so that
+  the two are comparable at all. Everything short of that is
   recorded as `inconclusive` with the reason, which is neither a pass nor a failure; the one
   shape that is a finding is a flight really lost and a connect that never came back, which is
   what a listener with no retention produces on every attempt. Each attempt is timed against a
@@ -1067,16 +1068,29 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 - **The investigation above could not determine whether the client's repeated hellos reached
   the server at all**, which is what separates "one reply flight was lost downstream" from
   "the path fell silent in both directions" — and no artifact on either side answered it.
-  `MetricsSnapshotFfi` gains four always-on counters, with OTel counters beside each.
-  `initial_on_committed_route_total` (`phantom.handshake.initial_on_committed_route`) counts
-  handshake-type datagrams arriving on a connection the listener has already routed — the
-  question reaching the server. It is bumped when the datagram arrives, before anything has
+  `MetricsSnapshotFfi` gains five always-on counters, with OTel counters beside each.
+  `initial_flights_on_committed_route_total`
+  (`phantom.handshake.initial_flights_on_committed_route`) counts reassembled handshake
+  messages arriving on a connection the listener has already routed — **one per question**
+  the client asked again, the question reaching the server. It is bumped before anything has
   decided whether an answer is owed, so on its own it reads identically whether the listener
   repaired the connect or had nothing to send; `handshake_flight_repeated_total`
   (`phantom.handshake.flight_repeated`) is the other half, counted where the decision is made,
-  one per repeated flight rather than per datagram of it. Arrivals with no repeats is a
-  listener whose retention did not cover that session; no arrivals at all is a path that never
+  also one per flight rather than per datagram of it. Asks with no repeats is a
+  listener whose retention did not cover that session; no asks at all is a path that never
   carried the question, and those need different remedies.
+
+  **The pair is counted in one unit on purpose, and briefly was not.** The ask started out
+  counted per datagram, before reassembly, while the answer was counted per flight — and a
+  cookie-bearing `ClientHello` is ~3350 bytes, three fragments at `MAX_INNER_FRAG_CHUNK`, so
+  a listener that answered all five of the questions it was asked published `15` and `5`. A
+  reader who knew the mechanism concluded from a live run that ten questions had gone
+  unanswered, and only the daemon's time series disproved it, by showing the two moving in
+  lockstep at 3:1. The per-datagram figure is kept, as a separately named counter
+  `initial_datagrams_on_committed_route_total`
+  (`phantom.handshake.initial_datagrams_on_committed_route`), because it answers a question
+  nothing else here does — how much duplicate wire traffic a repeating client generates — but
+  it is not comparable with the repeat count and its documentation says so.
   `handshake_flight_evicted_total` (`phantom.handshake.flight_evicted`) counts retained
   answers dropped to make room for newer ones — the repair running out of its memory budget,
   which is otherwise invisible because an evicted session behaves exactly like one from before
@@ -1086,7 +1100,7 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   never retained at all, so the mechanism never arms rather than running and letting go. It
   reads zero for every build whose reply is inside the bound, which makes a non-zero value a
   message size having moved past it — a change that alters no byte a peer would notice and
-  that nothing else reports. All four are unlabeled: the only attribution worth having would
+  that nothing else reports. All five are unlabeled: the only attribution worth having would
   be per peer, which the cardinality contract keeps out of instrument labels. Appended at the
   end of the FFI record, so a consumer built against an older copy of the hand-curated C
   header is missing fields rather than misreading the ones it knew.

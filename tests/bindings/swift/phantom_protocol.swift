@@ -3143,6 +3143,18 @@ public struct MetricsSnapshotFfi: Equatable, Hashable {
     public var rttUsPath0: UInt64
     public var activeSessions: Int64
     public var activeStreams: Int64
+    /**
+     * Handshakes **this side** completed — not a count of peers that joined.
+     *
+     * A server records one the moment it has derived keys and sent its `ServerHello`,
+     * and nothing under the handshake acknowledges that reply, so a flight lost on the
+     * way down leaves a session counted here that the peer never saw. A live run held
+     * exactly such a session for 135 s with no byte in either direction, counted as a
+     * success while its client was reporting timeouts. Read a server's total against a
+     * client's failures as two measurements of one path, not as a contradiction; the
+     * two `*_on_committed_route_total` fields and `handshake_flight_repeated_total`
+     * are what say whether the reply was asked for again and re-sent.
+     */
     public var handshakesSuccess: UInt64
     public var handshakesFailure: UInt64
     public var handshakeLatencyNsSum: UInt64
@@ -3165,28 +3177,35 @@ public struct MetricsSnapshotFfi: Equatable, Hashable {
      */
     public var unencryptedDroppedTotal: UInt64
     /**
-     * Handshake-type datagrams that arrived on a PhantomUDP connection the listener
-     * had already committed a route to — a client repeating its flight because it
-     * never saw the reply (PROTOCOL § 6.1). Appended last for the reason above.
+     * **Unit: datagrams.** Handshake-type datagrams that arrived on a PhantomUDP
+     * connection the listener had already committed a route to, counted as each one
+     * lands and before reassembly (PROTOCOL § 6.1). Appended for the reason above.
      *
-     * Repetition is normal on a lossy path and is what the server's repeat answers,
-     * so a small non-zero value is health rather than alarm. What it is for is
-     * reading against a client that timed out connecting: non-zero says its
-     * questions arrived and one reply flight was lost on the way down; zero says the
-     * path fell silent in both directions. Nothing else on either side tells those
-     * apart.
+     * What it measures is the duplicate wire load a repeating client puts on the
+     * listener, which is a real question and the only one this offset has ever
+     * answered — a cookie-bearing hello is three fragments, so one repeated question
+     * moves it by three. It keeps its place in the record for exactly that reason:
+     * the name gained a unit, the number did not change, so a consumer built against
+     * an older header reads the same quantity it always did.
+     *
+     * **Not the field to read against `handshake_flight_repeated_total`** — that one
+     * counts flights, so the comparison is off by the fragment count and reads as
+     * answers gone missing. `initial_flights_on_committed_route_total` is the half
+     * that pairs with it.
      */
-    public var initialOnCommittedRouteTotal: UInt64
+    public var initialDatagramsOnCommittedRouteTotal: UInt64
     /**
-     * Retained reply flights this listener actually repeated (PROTOCOL § 6.1), one
-     * per repeat sent rather than per datagram of it. Appended for the reason above.
+     * **Unit: flights.** Retained reply flights this listener actually repeated
+     * (PROTOCOL § 6.1), one per repeat sent rather than per datagram of it. Appended
+     * for the reason above.
      *
-     * The field before it says a client asked again; this one says an answer went
-     * back, and the pair is what makes a failed connect readable. Questions arriving
-     * and answers going back is the repair working. Questions arriving and no answers
-     * is a listener that had nothing retained for that session — it was evicted,
-     * expired, or the budget for it was already spent. No questions at all is a path
-     * that went silent upstream, which is a different fault in a different direction.
+     * **Meant to be read together with `initial_flights_on_committed_route_total`,
+     * which is in the same unit**: that one says a client asked again, this one says
+     * an answer went back, and the pair is what makes a failed connect readable.
+     * Asks and answers together is the repair working. Asks and no answers is a
+     * listener that had nothing retained for that session — it was evicted, expired,
+     * or the budget for it was already spent. No asks at all is a path that went
+     * silent upstream, which is a different fault in a different direction.
      */
     public var handshakeFlightRepeatedTotal: UInt64
     /**
@@ -3211,10 +3230,43 @@ public struct MetricsSnapshotFfi: Equatable, Hashable {
      * moved, which changes no byte a peer would notice and which nothing else reports.
      */
     public var handshakeFlightRefusedTotal: UInt64
+    /**
+     * **Unit: flights.** Reassembled handshake messages that arrived on a PhantomUDP
+     * connection the listener had already committed a route to — one per question a
+     * client asked again because it never saw the reply (PROTOCOL § 6.1). Appended
+     * last for the reason given above, which is also why it is not adjacent to the
+     * field it is read with.
+     *
+     * Repetition is normal on a lossy path and is what the server's repeat answers,
+     * so a small non-zero value is health rather than alarm. What it is for is
+     * reading against a client that timed out connecting: non-zero says its
+     * questions arrived and one reply flight was lost on the way down; zero says the
+     * path fell silent in both directions. Nothing else on either side tells those
+     * apart.
+     *
+     * **Meant to be read together with `handshake_flight_repeated_total`, which is in
+     * the same unit.** The datagram-unit field of the same event
+     * (`initial_datagrams_on_committed_route_total`) is a different measurement, and
+     * comparing that one with the repeat count invents missing answers that never
+     * existed.
+     */
+    public var initialFlightsOnCommittedRouteTotal: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(packetsSent: UInt64, packetsRecv: UInt64, bytesSent: UInt64, bytesRecv: UInt64, avgEncryptNs: UInt64, avgDecryptNs: UInt64, encryptCount: UInt64, decryptCount: UInt64, rttUsPath0: UInt64, activeSessions: Int64, activeStreams: Int64, handshakesSuccess: UInt64, handshakesFailure: UInt64, handshakeLatencyNsSum: UInt64, handshakeLatencyCount: UInt64, replayRejectedTotal: UInt64, aeadFailureTotal: UInt64, uptimeSecs: UInt64, 
+    public init(packetsSent: UInt64, packetsRecv: UInt64, bytesSent: UInt64, bytesRecv: UInt64, avgEncryptNs: UInt64, avgDecryptNs: UInt64, encryptCount: UInt64, decryptCount: UInt64, rttUsPath0: UInt64, activeSessions: Int64, activeStreams: Int64, 
+        /**
+         * Handshakes **this side** completed — not a count of peers that joined.
+         *
+         * A server records one the moment it has derived keys and sent its `ServerHello`,
+         * and nothing under the handshake acknowledges that reply, so a flight lost on the
+         * way down leaves a session counted here that the peer never saw. A live run held
+         * exactly such a session for 135 s with no byte in either direction, counted as a
+         * success while its client was reporting timeouts. Read a server's total against a
+         * client's failures as two measurements of one path, not as a contradiction; the
+         * two `*_on_committed_route_total` fields and `handshake_flight_repeated_total`
+         * are what say whether the reply was asked for again and re-sent.
+         */handshakesSuccess: UInt64, handshakesFailure: UInt64, handshakeLatencyNsSum: UInt64, handshakeLatencyCount: UInt64, replayRejectedTotal: UInt64, aeadFailureTotal: UInt64, uptimeSecs: UInt64, 
         /**
          * Deliberately near the end of the record, and new fields go after it.
          *
@@ -3229,27 +3281,34 @@ public struct MetricsSnapshotFfi: Equatable, Hashable {
          * misreading the ones it already knew.
          */unencryptedDroppedTotal: UInt64, 
         /**
-         * Handshake-type datagrams that arrived on a PhantomUDP connection the listener
-         * had already committed a route to — a client repeating its flight because it
-         * never saw the reply (PROTOCOL § 6.1). Appended last for the reason above.
+         * **Unit: datagrams.** Handshake-type datagrams that arrived on a PhantomUDP
+         * connection the listener had already committed a route to, counted as each one
+         * lands and before reassembly (PROTOCOL § 6.1). Appended for the reason above.
          *
-         * Repetition is normal on a lossy path and is what the server's repeat answers,
-         * so a small non-zero value is health rather than alarm. What it is for is
-         * reading against a client that timed out connecting: non-zero says its
-         * questions arrived and one reply flight was lost on the way down; zero says the
-         * path fell silent in both directions. Nothing else on either side tells those
-         * apart.
-         */initialOnCommittedRouteTotal: UInt64, 
+         * What it measures is the duplicate wire load a repeating client puts on the
+         * listener, which is a real question and the only one this offset has ever
+         * answered — a cookie-bearing hello is three fragments, so one repeated question
+         * moves it by three. It keeps its place in the record for exactly that reason:
+         * the name gained a unit, the number did not change, so a consumer built against
+         * an older header reads the same quantity it always did.
+         *
+         * **Not the field to read against `handshake_flight_repeated_total`** — that one
+         * counts flights, so the comparison is off by the fragment count and reads as
+         * answers gone missing. `initial_flights_on_committed_route_total` is the half
+         * that pairs with it.
+         */initialDatagramsOnCommittedRouteTotal: UInt64, 
         /**
-         * Retained reply flights this listener actually repeated (PROTOCOL § 6.1), one
-         * per repeat sent rather than per datagram of it. Appended for the reason above.
+         * **Unit: flights.** Retained reply flights this listener actually repeated
+         * (PROTOCOL § 6.1), one per repeat sent rather than per datagram of it. Appended
+         * for the reason above.
          *
-         * The field before it says a client asked again; this one says an answer went
-         * back, and the pair is what makes a failed connect readable. Questions arriving
-         * and answers going back is the repair working. Questions arriving and no answers
-         * is a listener that had nothing retained for that session — it was evicted,
-         * expired, or the budget for it was already spent. No questions at all is a path
-         * that went silent upstream, which is a different fault in a different direction.
+         * **Meant to be read together with `initial_flights_on_committed_route_total`,
+         * which is in the same unit**: that one says a client asked again, this one says
+         * an answer went back, and the pair is what makes a failed connect readable.
+         * Asks and answers together is the repair working. Asks and no answers is a
+         * listener that had nothing retained for that session — it was evicted, expired,
+         * or the budget for it was already spent. No asks at all is a path that went
+         * silent upstream, which is a different fault in a different direction.
          */handshakeFlightRepeatedTotal: UInt64, 
         /**
          * Retained reply flights dropped to make room for a newer one (PROTOCOL § 6.1).
@@ -3270,7 +3329,27 @@ public struct MetricsSnapshotFfi: Equatable, Hashable {
          * means it never armed. It reads zero for every build whose reply is inside the bound —
          * today's is 1.99x against a limit of 3 — so a non-zero value is a message size having
          * moved, which changes no byte a peer would notice and which nothing else reports.
-         */handshakeFlightRefusedTotal: UInt64) {
+         */handshakeFlightRefusedTotal: UInt64, 
+        /**
+         * **Unit: flights.** Reassembled handshake messages that arrived on a PhantomUDP
+         * connection the listener had already committed a route to — one per question a
+         * client asked again because it never saw the reply (PROTOCOL § 6.1). Appended
+         * last for the reason given above, which is also why it is not adjacent to the
+         * field it is read with.
+         *
+         * Repetition is normal on a lossy path and is what the server's repeat answers,
+         * so a small non-zero value is health rather than alarm. What it is for is
+         * reading against a client that timed out connecting: non-zero says its
+         * questions arrived and one reply flight was lost on the way down; zero says the
+         * path fell silent in both directions. Nothing else on either side tells those
+         * apart.
+         *
+         * **Meant to be read together with `handshake_flight_repeated_total`, which is in
+         * the same unit.** The datagram-unit field of the same event
+         * (`initial_datagrams_on_committed_route_total`) is a different measurement, and
+         * comparing that one with the repeat count invents missing answers that never
+         * existed.
+         */initialFlightsOnCommittedRouteTotal: UInt64) {
         self.packetsSent = packetsSent
         self.packetsRecv = packetsRecv
         self.bytesSent = bytesSent
@@ -3290,10 +3369,11 @@ public struct MetricsSnapshotFfi: Equatable, Hashable {
         self.aeadFailureTotal = aeadFailureTotal
         self.uptimeSecs = uptimeSecs
         self.unencryptedDroppedTotal = unencryptedDroppedTotal
-        self.initialOnCommittedRouteTotal = initialOnCommittedRouteTotal
+        self.initialDatagramsOnCommittedRouteTotal = initialDatagramsOnCommittedRouteTotal
         self.handshakeFlightRepeatedTotal = handshakeFlightRepeatedTotal
         self.handshakeFlightEvictedTotal = handshakeFlightEvictedTotal
         self.handshakeFlightRefusedTotal = handshakeFlightRefusedTotal
+        self.initialFlightsOnCommittedRouteTotal = initialFlightsOnCommittedRouteTotal
     }
 
     
@@ -3331,10 +3411,11 @@ public struct FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer {
                 aeadFailureTotal: FfiConverterUInt64.read(from: &buf), 
                 uptimeSecs: FfiConverterUInt64.read(from: &buf), 
                 unencryptedDroppedTotal: FfiConverterUInt64.read(from: &buf), 
-                initialOnCommittedRouteTotal: FfiConverterUInt64.read(from: &buf), 
+                initialDatagramsOnCommittedRouteTotal: FfiConverterUInt64.read(from: &buf), 
                 handshakeFlightRepeatedTotal: FfiConverterUInt64.read(from: &buf), 
                 handshakeFlightEvictedTotal: FfiConverterUInt64.read(from: &buf), 
-                handshakeFlightRefusedTotal: FfiConverterUInt64.read(from: &buf)
+                handshakeFlightRefusedTotal: FfiConverterUInt64.read(from: &buf), 
+                initialFlightsOnCommittedRouteTotal: FfiConverterUInt64.read(from: &buf)
         )
     }
 
@@ -3358,10 +3439,11 @@ public struct FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.aeadFailureTotal, into: &buf)
         FfiConverterUInt64.write(value.uptimeSecs, into: &buf)
         FfiConverterUInt64.write(value.unencryptedDroppedTotal, into: &buf)
-        FfiConverterUInt64.write(value.initialOnCommittedRouteTotal, into: &buf)
+        FfiConverterUInt64.write(value.initialDatagramsOnCommittedRouteTotal, into: &buf)
         FfiConverterUInt64.write(value.handshakeFlightRepeatedTotal, into: &buf)
         FfiConverterUInt64.write(value.handshakeFlightEvictedTotal, into: &buf)
         FfiConverterUInt64.write(value.handshakeFlightRefusedTotal, into: &buf)
+        FfiConverterUInt64.write(value.initialFlightsOnCommittedRouteTotal, into: &buf)
     }
 }
 

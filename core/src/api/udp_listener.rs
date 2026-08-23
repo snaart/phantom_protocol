@@ -1201,13 +1201,22 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
         // separates "one reply flight went missing downstream" from "the path fell silent
         // both ways", and no artifact on either side could tell those apart. Unlabeled and
         // per-listener, never per peer (the cardinality contract in `observability/attrs.rs`).
+        // Only for `Initial`, so the data path pays one comparison rather than a second hash
+        // lookup.
         //
-        // Counted per datagram and before reassembly completes, because a flight that arrives
-        // in pieces is still a flight that arrived; and only for `Initial`, so the data path
-        // pays one comparison rather than a second hash lookup.
+        // Two counters, because there are two questions and one number cannot answer both.
+        // Here, per datagram: the duplicate wire load a repeating client costs this listener,
+        // which nothing else measures — the demux keeps no per-packet counters. Below, per
+        // reassembled flight: how many times the client actually asked. The second is the one
+        // the repeat counter is read against, and it has to be in the same unit as it: a
+        // cookie-bearing hello is three fragments, so five questions answered five times used
+        // to read as 15 against 5 and invite the conclusion that ten answers went missing.
+        // That conclusion was drawn from a live run and took a time series to disprove.
         let on_committed_route = hdr.ty == PacketType::Initial && routes.get(&hdr.cid).is_some();
         if on_committed_route {
-            listener.observability.record_initial_on_committed_route();
+            listener
+                .observability
+                .record_initial_datagram_on_committed_route();
         }
         let Some(frame) = assembled else {
             continue; // partial fragment buffered
@@ -1217,6 +1226,12 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
         // route delivery because the session's pump does not parse handshake messages and
         // would drop it — which is precisely how a single lost reply used to cost a connect.
         if on_committed_route {
+            // The whole question has now arrived, whatever it turns out to contain — counted
+            // before the retained flight is consulted, so this stays "a client asked again"
+            // and the repeat counter alone stays "the listener answered".
+            listener
+                .observability
+                .record_initial_flight_on_committed_route();
             if let Some((datagrams, dst)) = flights.repeat(&hdr.cid, &frame, Instant::now()) {
                 send_flight_repeat(&listener.socket, &datagrams, dst).await;
                 continue;
@@ -2525,7 +2540,9 @@ mod tests {
              recording caught the wrong message"
         );
 
-        let before = listener.metrics_snapshot().initial_on_committed_route_total;
+        let before = listener
+            .metrics_snapshot()
+            .initial_flights_on_committed_route_total;
         let attacker = UdpSocket::bind("127.0.0.1:0")
             .await
             .expect("attacker socket");
@@ -2549,15 +2566,21 @@ mod tests {
         );
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        while listener.metrics_snapshot().initial_on_committed_route_total == before
+        while listener
+            .metrics_snapshot()
+            .initial_flights_on_committed_route_total
+            == before
             && Instant::now() < deadline
         {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(
-            listener.metrics_snapshot().initial_on_committed_route_total > before,
-            "the replayed datagrams must have reached the branch that decides whether to \
-             repeat; if they did not, this test asserts nothing about that branch"
+            listener
+                .metrics_snapshot()
+                .initial_flights_on_committed_route_total
+                > before,
+            "the replayed datagrams must have reassembled and reached the branch that decides \
+             whether to repeat; if they did not, this test asserts nothing about that branch"
         );
 
         // And the session the attacker was aiming at is undisturbed.
@@ -2619,7 +2642,10 @@ mod tests {
              test asserts nothing"
         );
         assert!(
-            listener.metrics_snapshot().initial_on_committed_route_total > 0,
+            listener
+                .metrics_snapshot()
+                .initial_flights_on_committed_route_total
+                > 0,
             "the repeated client flight must be visible to an operator: this counter is the \
              only thing that distinguishes a reply lost on the way down from a path that \
              went silent in both directions"
@@ -2813,15 +2839,18 @@ mod tests {
             observer.send(d).await.expect("replay past the budget");
         }
         let deadline = Instant::now() + Duration::from_secs(5);
-        while listener.metrics_snapshot().initial_on_committed_route_total
-            < spent.initial_on_committed_route_total + flight.len() as u64
+        while listener
+            .metrics_snapshot()
+            .initial_datagrams_on_committed_route_total
+            < spent.initial_datagrams_on_committed_route_total + flight.len() as u64
             && Instant::now() < deadline
         {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let after = listener.metrics_snapshot();
         assert!(
-            after.initial_on_committed_route_total > spent.initial_on_committed_route_total,
+            after.initial_flights_on_committed_route_total
+                > spent.initial_flights_on_committed_route_total,
             "the replay must have reached the branch that decides whether to repeat, or the \
              assertion below is about routing rather than about the budget"
         );
@@ -2838,25 +2867,27 @@ mod tests {
         listener.shutdown();
     }
 
-    /// The two handshake-repair counters answer different questions, and one of them cannot
-    /// answer either question alone.
+    /// The counter that says "a client asked again" must move in the same unit as the one
+    /// that says "the listener answered", or the pair reports answers that never went missing.
     ///
-    /// The counter that says "a client asked again" is bumped when the datagram arrives,
-    /// before anything has decided whether an answer is owed — which is the only place it can
-    /// be, since a flight that arrives in pieces is still a flight that arrived. On its own it
-    /// therefore reads identically whether the listener repaired the connect or had nothing
-    /// retained for it, and telling those apart is the entire reason it was added: an
-    /// investigation into failed connects could not determine, from either side, whether the
-    /// client's repeated hellos reached the server at all.
+    /// The two exist to be read together, and for one release they could not be: the ask was
+    /// counted per datagram, before reassembly, while the answer was counted per flight. A
+    /// cookie-bearing hello is three fragments, so a listener that answered all five of the
+    /// questions it was asked reported 15 and 5 — and a reader who knew the mechanism
+    /// concluded from a live run that ten questions had gone unanswered. Only the daemon's
+    /// time series disproved it, by showing the two moving in lockstep at 3:1.
     ///
-    /// So the repeat is counted separately, where the decision is made. Arrivals without
-    /// repeats is a listener whose retention did not cover that session — evicted, expired, or
-    /// its budget already spent — and it is a different fault from a path that never carried
-    /// the question, needing a different remedy. This drives both halves through the real
-    /// demux: noise on a committed connection id, which is an arrival and nothing more, then
+    /// So the ask is counted per reassembled flight, and the per-datagram figure survives
+    /// under a name that says `datagrams` because it answers a different question — how much
+    /// duplicate traffic a repeating client costs the listener, which nothing else measures.
+    ///
+    /// The fragmented flight is what makes this a test rather than a restatement: a
+    /// single-datagram question moves both counters by one whatever the units are, so only a
+    /// question that arrives in pieces can tell them apart. Both halves are driven through the
+    /// real demux — noise on a committed connection id, which is an ask and nothing more, then
     /// the exact hello, which is both.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_arrival_counter_and_the_repeat_counter_answer_different_questions() {
+    async fn the_ask_counter_moves_once_per_flight_like_the_answer_counter() {
         use crate::transport::phantom_udp::datagram::encode_datagrams;
         use crate::transport::phantom_udp::envelope::decode_header;
 
@@ -2894,13 +2925,22 @@ mod tests {
             seen.get(&newest).cloned().expect("its datagrams")
         };
         let cid = decode_header(&flight[0]).expect("a captured header").0.cid;
+        // The whole point of the fixture: a question that crosses the path in pieces. With one
+        // datagram per flight the two units are indistinguishable and every assertion below
+        // would hold against the defect this test exists for.
+        assert!(
+            flight.len() > 1,
+            "the captured hello must be fragmented, or this test cannot tell a per-flight \
+             count from a per-datagram one"
+        );
 
         let probe = UdpSocket::bind("127.0.0.1:0").await.expect("probe socket");
         probe.connect(server_addr).await.expect("probe connect");
         let before = listener.metrics_snapshot();
 
         // Noise on the committed connection id: a handshake-type datagram that is not the
-        // hello the retained reply answers.
+        // hello the retained reply answers. Short enough to be one datagram per flight, so
+        // this half moves both ask counters equally and the divergence below is the hello's.
         const NOISE: u64 = 4;
         for i in 0..NOISE {
             for d in encode_datagrams(PacketType::Initial, &cid, i as u32, b"not-the-hello")
@@ -2910,18 +2950,20 @@ mod tests {
             }
         }
         let deadline = Instant::now() + Duration::from_secs(5);
-        while listener.metrics_snapshot().initial_on_committed_route_total
-            < before.initial_on_committed_route_total + NOISE
+        while listener
+            .metrics_snapshot()
+            .initial_flights_on_committed_route_total
+            < before.initial_flights_on_committed_route_total + NOISE
             && Instant::now() < deadline
         {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let after_noise = listener.metrics_snapshot();
         assert_eq!(
-            after_noise.initial_on_committed_route_total,
-            before.initial_on_committed_route_total + NOISE,
-            "every handshake datagram on a committed connection is an arrival, whatever it \
-             turns out to contain"
+            after_noise.initial_flights_on_committed_route_total,
+            before.initial_flights_on_committed_route_total + NOISE,
+            "every handshake message on a committed connection is an ask, whatever it turns \
+             out to contain"
         );
         assert_eq!(
             after_noise.handshake_flight_repeated_total, before.handshake_flight_repeated_total,
@@ -2947,10 +2989,109 @@ mod tests {
             "one repeat is owed per repeated flight, not per datagram of it"
         );
         assert_eq!(
-            after_hello.initial_on_committed_route_total,
-            after_noise.initial_on_committed_route_total + flight.len() as u64,
-            "while arrivals are counted per datagram, which is what makes a partially \
-             delivered flight visible at all"
+            after_hello.initial_flights_on_committed_route_total,
+            after_noise.initial_flights_on_committed_route_total + 1,
+            "and the ask moves by exactly one for the same flight — the two are read as a \
+             pair, so a fragmented question that moved this by {} would report {} answers \
+             lost that were never sent",
+            flight.len(),
+            flight.len() - 1
+        );
+        assert_eq!(
+            after_hello.initial_datagrams_on_committed_route_total,
+            after_noise.initial_datagrams_on_committed_route_total + flight.len() as u64,
+            "while the datagram counter carries the wire cost of the repetition, which is the \
+             separate question it is kept for"
+        );
+
+        listener.shutdown();
+    }
+
+    /// A repeat that arrives in pieces is visible only on the datagram counter, and that is
+    /// what the datagram counter is for.
+    ///
+    /// The counter that pairs with the repeat count is bumped on a reassembled message, so a
+    /// client whose repetition is itself half-lost moves nothing there — correctly, since it
+    /// never finished asking and no answer is owed. But something did arrive, and on the
+    /// worst paths it is the only thing that arrives; a listener that shows datagrams with no
+    /// flights is one whose clients cannot get a whole question across, which is a different
+    /// fault from silence and from a lost answer, and needs a different remedy again.
+    ///
+    /// So this drives the shape that would otherwise argue for deleting the per-datagram
+    /// figure as a duplicate: fragments of a real hello, one short of the whole.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repeat_that_never_completes_moves_the_datagram_counter_and_nothing_else() {
+        let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+            .await
+            .expect("bind a loopback PhantomUDP listener");
+        let server_addr: SocketAddr = listener.local_addr().parse().expect("the bound address");
+        let pinned = listener.verifying_key_bytes();
+
+        let acceptor = listener.clone();
+        let accepted = tokio::spawn(async move { acceptor.accept().await });
+        let (relay_addr, captured) = spawn_recording_relay(server_addr).await;
+        let client = crate::api::session::connect_pinned_udp(
+            "127.0.0.1".to_string(),
+            relay_addr.port(),
+            pinned,
+        )
+        .await
+        .expect("the client socket binds");
+        client.await_ready().await.expect("the handshake completes");
+        let _outcome = accepted
+            .await
+            .expect("the accept task")
+            .expect("an accepted session");
+
+        let flight = {
+            let seen = captured.lock();
+            let newest = seen
+                .keys()
+                .copied()
+                .max()
+                .expect("a captured client flight");
+            seen.get(&newest).cloned().expect("its datagrams")
+        };
+        assert!(
+            flight.len() > 1,
+            "a flight of one datagram cannot be delivered partially, so it cannot produce the \
+             shape this test is about"
+        );
+
+        let probe = UdpSocket::bind("127.0.0.1:0").await.expect("probe socket");
+        probe.connect(server_addr).await.expect("probe connect");
+        let before = listener.metrics_snapshot();
+
+        // Every fragment but the last: the assembler holds them and hands nothing up.
+        let partial = &flight[..flight.len() - 1];
+        for d in partial {
+            probe.send(d).await.expect("send a fragment");
+        }
+        let want = before.initial_datagrams_on_committed_route_total + partial.len() as u64;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while listener
+            .metrics_snapshot()
+            .initial_datagrams_on_committed_route_total
+            < want
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let after = listener.metrics_snapshot();
+        assert_eq!(
+            after.initial_datagrams_on_committed_route_total, want,
+            "the fragments arrived, and the only counter that can say so is the one counted \
+             per datagram"
+        );
+        assert_eq!(
+            after.initial_flights_on_committed_route_total,
+            before.initial_flights_on_committed_route_total,
+            "no whole question arrived, so nothing asked — a counter that moved here would be \
+             claiming an answer was owed for a hello the listener has not seen the end of"
+        );
+        assert_eq!(
+            after.handshake_flight_repeated_total, before.handshake_flight_repeated_total,
+            "and nothing was answered"
         );
 
         listener.shutdown();

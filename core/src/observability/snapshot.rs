@@ -9,7 +9,8 @@
 //! byte / timing totals, the session/stream gauges, the handshake
 //! sum+count fields, and the always-on security counters
 //! (`replay_rejected_total`, `aead_failure_total`,
-//! `unencrypted_dropped_total`, `initial_on_committed_route_total`,
+//! `unencrypted_dropped_total`, `initial_datagrams_on_committed_route_total`,
+//! `initial_flights_on_committed_route_total`,
 //! `handshake_flight_repeated_total`, `handshake_flight_evicted_total`,
 //! `handshake_flight_refused_total`). The snapshot is always
 //! available regardless of the `telemetry-otel` feature, since the atomics
@@ -42,6 +43,11 @@ pub struct MetricsSnapshot {
     pub active_sessions: i64,
     pub active_streams: i64,
 
+    /// Handshakes **this side** completed. Not a count of peers that joined: the
+    /// server's `ServerHello` is acknowledged by nothing, so a reply lost on the
+    /// way down leaves a session counted here that the peer never saw — one live
+    /// run held such a session for 135 s with no byte in either direction. A
+    /// server total above a client's is the ordinary reading of a lossy path.
     pub handshakes_success: u64,
     pub handshakes_failure: u64,
     pub handshake_latency_ns_sum: u64,
@@ -57,17 +63,26 @@ pub struct MetricsSnapshot {
     /// (Invariant 2, the stripped-flag downgrade defence). A non-zero value on a
     /// healthy peer means someone on the path is rewriting header flags.
     pub unencrypted_dropped_total: u64,
-    /// Handshake-type datagrams that arrived on a PhantomUDP connection the
-    /// listener had already committed a route to — a client repeating its flight
-    /// because it never saw the reply (PROTOCOL § 6.1). Read against a client that
-    /// timed out connecting, a non-zero value says one reply flight was lost on
-    /// the way down and zero says the path went silent in both directions; nothing
-    /// else distinguishes those.
-    pub initial_on_committed_route_total: u64,
-    /// Retained reply flights this listener actually repeated (PROTOCOL § 6.1),
-    /// one per repeat sent. The counter above says a client asked again; this one
-    /// says an answer went back. Repeats arriving with none going back is a
-    /// listener whose retention did not cover that session.
+    /// **Unit: datagrams.** Handshake-type datagrams that arrived on a PhantomUDP
+    /// connection the listener had already committed a route to, counted before
+    /// reassembly (PROTOCOL § 6.1) — the duplicate wire load a repeating client
+    /// puts on the listener, several per repeated flight. Not comparable with
+    /// `handshake_flight_repeated_total`.
+    pub initial_datagrams_on_committed_route_total: u64,
+    /// **Unit: flights.** Reassembled handshake messages that arrived on a
+    /// PhantomUDP connection the listener had already committed a route to — one
+    /// per question a client asked again because it never saw the reply
+    /// (PROTOCOL § 6.1). Read against a client that timed out connecting, a
+    /// non-zero value says one reply flight was lost on the way down and zero says
+    /// the path went silent in both directions; nothing else distinguishes those.
+    /// **Meant to be read together with `handshake_flight_repeated_total`, which
+    /// is in the same unit.**
+    pub initial_flights_on_committed_route_total: u64,
+    /// **Unit: flights.** Retained reply flights this listener actually repeated
+    /// (PROTOCOL § 6.1), one per repeat sent. **Meant to be read together with
+    /// `initial_flights_on_committed_route_total`**: that one says a client asked
+    /// again, this one says an answer went back. Asks arriving with none going
+    /// back is a listener whose retention did not cover that session.
     pub handshake_flight_repeated_total: u64,
     /// Retained reply flights dropped to make room for a newer one. Non-zero means
     /// the repair is running out of the memory it is allowed and some sessions are
@@ -114,7 +129,8 @@ impl Default for MetricsSnapshot {
             replay_rejected_total: 0,
             aead_failure_total: 0,
             unencrypted_dropped_total: 0,
-            initial_on_committed_route_total: 0,
+            initial_datagrams_on_committed_route_total: 0,
+            initial_flights_on_committed_route_total: 0,
             handshake_flight_repeated_total: 0,
             handshake_flight_evicted_total: 0,
             handshake_flight_refused_total: 0,
@@ -194,7 +210,9 @@ impl MetricsSnapshot {
             replay_rejected_total: h.replay_rejected_total(),
             aead_failure_total: h.aead_failure_total(),
             unencrypted_dropped_total: h.unencrypted_dropped_total(),
-            initial_on_committed_route_total: h.initial_on_committed_route_total(),
+            initial_datagrams_on_committed_route_total: h
+                .initial_datagrams_on_committed_route_total(),
+            initial_flights_on_committed_route_total: h.initial_flights_on_committed_route_total(),
             handshake_flight_repeated_total: h.handshake_flight_repeated_total(),
             handshake_flight_evicted_total: h.handshake_flight_evicted_total(),
             handshake_flight_refused_total: h.handshake_flight_refused_total(),
@@ -232,6 +250,16 @@ pub struct MetricsSnapshotFfi {
     pub rtt_us_path_0: u64,
     pub active_sessions: i64,
     pub active_streams: i64,
+    /// Handshakes **this side** completed — not a count of peers that joined.
+    ///
+    /// A server records one the moment it has derived keys and sent its `ServerHello`,
+    /// and nothing under the handshake acknowledges that reply, so a flight lost on the
+    /// way down leaves a session counted here that the peer never saw. A live run held
+    /// exactly such a session for 135 s with no byte in either direction, counted as a
+    /// success while its client was reporting timeouts. Read a server's total against a
+    /// client's failures as two measurements of one path, not as a contradiction; the
+    /// two `*_on_committed_route_total` fields and `handshake_flight_repeated_total`
+    /// are what say whether the reply was asked for again and re-sent.
     pub handshakes_success: u64,
     pub handshakes_failure: u64,
     pub handshake_latency_ns_sum: u64,
@@ -251,26 +279,33 @@ pub struct MetricsSnapshotFfi {
     /// placement where a stale reader is merely missing a field rather than
     /// misreading the ones it already knew.
     pub unencrypted_dropped_total: u64,
-    /// Handshake-type datagrams that arrived on a PhantomUDP connection the listener
-    /// had already committed a route to — a client repeating its flight because it
-    /// never saw the reply (PROTOCOL § 6.1). Appended last for the reason above.
+    /// **Unit: datagrams.** Handshake-type datagrams that arrived on a PhantomUDP
+    /// connection the listener had already committed a route to, counted as each one
+    /// lands and before reassembly (PROTOCOL § 6.1). Appended for the reason above.
     ///
-    /// Repetition is normal on a lossy path and is what the server's repeat answers,
-    /// so a small non-zero value is health rather than alarm. What it is for is
-    /// reading against a client that timed out connecting: non-zero says its
-    /// questions arrived and one reply flight was lost on the way down; zero says the
-    /// path fell silent in both directions. Nothing else on either side tells those
-    /// apart.
-    pub initial_on_committed_route_total: u64,
-    /// Retained reply flights this listener actually repeated (PROTOCOL § 6.1), one
-    /// per repeat sent rather than per datagram of it. Appended for the reason above.
+    /// What it measures is the duplicate wire load a repeating client puts on the
+    /// listener, which is a real question and the only one this offset has ever
+    /// answered — a cookie-bearing hello is three fragments, so one repeated question
+    /// moves it by three. It keeps its place in the record for exactly that reason:
+    /// the name gained a unit, the number did not change, so a consumer built against
+    /// an older header reads the same quantity it always did.
     ///
-    /// The field before it says a client asked again; this one says an answer went
-    /// back, and the pair is what makes a failed connect readable. Questions arriving
-    /// and answers going back is the repair working. Questions arriving and no answers
-    /// is a listener that had nothing retained for that session — it was evicted,
-    /// expired, or the budget for it was already spent. No questions at all is a path
-    /// that went silent upstream, which is a different fault in a different direction.
+    /// **Not the field to read against `handshake_flight_repeated_total`** — that one
+    /// counts flights, so the comparison is off by the fragment count and reads as
+    /// answers gone missing. `initial_flights_on_committed_route_total` is the half
+    /// that pairs with it.
+    pub initial_datagrams_on_committed_route_total: u64,
+    /// **Unit: flights.** Retained reply flights this listener actually repeated
+    /// (PROTOCOL § 6.1), one per repeat sent rather than per datagram of it. Appended
+    /// for the reason above.
+    ///
+    /// **Meant to be read together with `initial_flights_on_committed_route_total`,
+    /// which is in the same unit**: that one says a client asked again, this one says
+    /// an answer went back, and the pair is what makes a failed connect readable.
+    /// Asks and answers together is the repair working. Asks and no answers is a
+    /// listener that had nothing retained for that session — it was evicted, expired,
+    /// or the budget for it was already spent. No asks at all is a path that went
+    /// silent upstream, which is a different fault in a different direction.
     pub handshake_flight_repeated_total: u64,
     /// Retained reply flights dropped to make room for a newer one (PROTOCOL § 6.1).
     /// Appended for the reason above.
@@ -290,6 +325,25 @@ pub struct MetricsSnapshotFfi {
     /// today's is 1.99x against a limit of 3 — so a non-zero value is a message size having
     /// moved, which changes no byte a peer would notice and which nothing else reports.
     pub handshake_flight_refused_total: u64,
+    /// **Unit: flights.** Reassembled handshake messages that arrived on a PhantomUDP
+    /// connection the listener had already committed a route to — one per question a
+    /// client asked again because it never saw the reply (PROTOCOL § 6.1). Appended
+    /// last for the reason given above, which is also why it is not adjacent to the
+    /// field it is read with.
+    ///
+    /// Repetition is normal on a lossy path and is what the server's repeat answers,
+    /// so a small non-zero value is health rather than alarm. What it is for is
+    /// reading against a client that timed out connecting: non-zero says its
+    /// questions arrived and one reply flight was lost on the way down; zero says the
+    /// path fell silent in both directions. Nothing else on either side tells those
+    /// apart.
+    ///
+    /// **Meant to be read together with `handshake_flight_repeated_total`, which is in
+    /// the same unit.** The datagram-unit field of the same event
+    /// (`initial_datagrams_on_committed_route_total`) is a different measurement, and
+    /// comparing that one with the repeat count invents missing answers that never
+    /// existed.
+    pub initial_flights_on_committed_route_total: u64,
 }
 
 impl From<MetricsSnapshot> for MetricsSnapshotFfi {
@@ -314,10 +368,12 @@ impl From<MetricsSnapshot> for MetricsSnapshotFfi {
             aead_failure_total: s.aead_failure_total,
             uptime_secs: s.uptime_secs,
             unencrypted_dropped_total: s.unencrypted_dropped_total,
-            initial_on_committed_route_total: s.initial_on_committed_route_total,
+            initial_datagrams_on_committed_route_total: s
+                .initial_datagrams_on_committed_route_total,
             handshake_flight_repeated_total: s.handshake_flight_repeated_total,
             handshake_flight_evicted_total: s.handshake_flight_evicted_total,
             handshake_flight_refused_total: s.handshake_flight_refused_total,
+            initial_flights_on_committed_route_total: s.initial_flights_on_committed_route_total,
         }
     }
 }
@@ -373,7 +429,8 @@ mod tests {
         assert_eq!(ffi.replay_rejected_total, 0);
         assert_eq!(ffi.aead_failure_total, 0);
         assert_eq!(ffi.unencrypted_dropped_total, 0);
-        assert_eq!(ffi.initial_on_committed_route_total, 0);
+        assert_eq!(ffi.initial_datagrams_on_committed_route_total, 0);
+        assert_eq!(ffi.initial_flights_on_committed_route_total, 0);
         assert_eq!(ffi.handshake_flight_repeated_total, 0);
         assert_eq!(ffi.handshake_flight_evicted_total, 0);
         assert_eq!(ffi.handshake_flight_refused_total, 0);
@@ -395,7 +452,11 @@ mod tests {
         h.record_replay_rejected();
         h.record_aead_failure();
         h.record_unencrypted_dropped();
-        h.record_initial_on_committed_route();
+        // Two datagrams, one flight: the flatten must keep them in separate fields, since
+        // one of them is comparable with the repeat count and the other is not.
+        h.record_initial_datagram_on_committed_route();
+        h.record_initial_datagram_on_committed_route();
+        h.record_initial_flight_on_committed_route();
         h.record_handshake_flight_repeated();
         h.record_handshake_flight_evicted();
         h.record_handshake_flight_refused();
@@ -421,7 +482,8 @@ mod tests {
         assert_eq!(ffi.replay_rejected_total, 1);
         assert_eq!(ffi.aead_failure_total, 1);
         assert_eq!(ffi.unencrypted_dropped_total, 1);
-        assert_eq!(ffi.initial_on_committed_route_total, 1);
+        assert_eq!(ffi.initial_datagrams_on_committed_route_total, 2);
+        assert_eq!(ffi.initial_flights_on_committed_route_total, 1);
         assert_eq!(ffi.handshake_flight_repeated_total, 1);
         assert_eq!(ffi.handshake_flight_evicted_total, 1);
         assert_eq!(ffi.handshake_flight_refused_total, 1);

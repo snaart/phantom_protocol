@@ -321,14 +321,19 @@ pub struct HandshakeRepairSample {
     /// schedule that produced them without the reader holding a copy of it.
     pub first_retransmit_ns: u64,
     pub retransmit_budget_ns: u64,
-    /// Movement in `initial_on_committed_route_total` on the **server** across
-    /// this attempt: the client's repeated flight arriving.
+    /// Movement in `initial_flights_on_committed_route_total` on the **server**
+    /// across this attempt: the client's repeated flight arriving, one per
+    /// question. The per-datagram counter of the same event is deliberately not
+    /// what this reads — it would count three per question and make the pair
+    /// below unreadable.
     pub asked_delta: Option<u64>,
-    /// Movement in `handshake_flight_repeated_total`: an answer going back.
+    /// Movement in `handshake_flight_repeated_total`: an answer going back, also
+    /// one per flight.
     ///
     /// Asked-and-answered is a repaired connect. Asked-and-not-answered is a
     /// connect the listener's retention could not cover. The pair is the whole
-    /// reading, and either number alone is ambiguous between them.
+    /// reading, and either number alone is ambiguous between them — which is why
+    /// both sides of it have to be counted in the same unit.
     pub answered_delta: Option<u64>,
     /// Movement in `handshake_flight_evicted_total` and
     /// `handshake_flight_refused_total` — the two ways retention fails to cover
@@ -905,6 +910,17 @@ pub struct ClientMetrics {
     pub rtt_us_path_0: u64,
     pub active_sessions: i64,
     pub active_streams: i64,
+    /// Handshakes the **recording side** finished — not connects the other end
+    /// joined, and the difference is not a rounding error.
+    ///
+    /// A listener counts one as soon as it has derived keys and sent its
+    /// `ServerHello`, which nothing acknowledges: a reply lost on the way down
+    /// leaves a session counted here whose peer never spoke. This run's own
+    /// artifacts hold one, at `dur=135.0 s, rx=0, tx=0`, taken from a daemon
+    /// reporting 58 successful handshakes while the probe was reporting timeouts.
+    /// Read a server total against client failures as two measurements of one
+    /// path; the three repair counters below are what say whether the reply was
+    /// asked for again and re-sent.
     pub handshakes_success: u64,
     pub handshakes_failure: u64,
     pub handshake_latency_ns_sum: u64,
@@ -916,18 +932,32 @@ pub struct ClientMetrics {
     /// gate refused something" and "nothing arrived" — a capture cannot tell them
     /// apart, since header protection hides the flag it turns on.
     pub unencrypted_dropped_total: u64,
-    /// Handshake datagrams that arrived for a connection the listener had already
-    /// committed a route to — a client asking its question again.
+    /// **Datagrams**, not questions: handshake datagrams that arrived for a
+    /// connection the listener had already committed a route to, counted before
+    /// reassembly.
+    ///
+    /// A cookie-bearing hello crosses the path in three fragments, so this runs at
+    /// roughly 3× the field below it. What it is good for is the duplicate wire load
+    /// a repeating client costs the listener — **not** for dividing into
+    /// `handshake_flight_repeated_total`, which counts flights and would make a
+    /// listener that answered every question look like one that dropped two thirds
+    /// of them.
+    #[serde(default)]
+    pub initial_datagrams_on_committed_route_total: u64,
+    /// **Flights**: reassembled handshake messages that arrived for a connection the
+    /// listener had already committed a route to — a client asking its question
+    /// again, once per question.
     ///
     /// This is the counter a failed connect is read against, and it exists because
     /// the artifact could not answer the question once already: when four connects
     /// timed out on 2026-08-22 it took the server's own session records plus the
     /// library's constants to establish that the reply had been sent and lost,
     /// rather than the request never arriving. A non-zero value here says the
-    /// client's repeat reached the listener; the two below say what it did with it.
+    /// client's repeat reached the listener; the fields below say what it did with it.
     #[serde(default)]
-    pub initial_on_committed_route_total: u64,
-    /// Retained reply flights actually repeated. Read beside the counter above:
+    pub initial_flights_on_committed_route_total: u64,
+    /// **Flights**: retained reply flights actually repeated. Read beside
+    /// `initial_flights_on_committed_route_total`, which is in the same unit:
     /// asked-and-answered is a repaired connect, asked-and-not-answered is a
     /// connect the retention could not cover, and the two are indistinguishable
     /// without both numbers.
@@ -967,7 +997,9 @@ impl From<phantom_protocol::observability::MetricsSnapshotFfi> for ClientMetrics
             replay_rejected_total: s.replay_rejected_total,
             aead_failure_total: s.aead_failure_total,
             unencrypted_dropped_total: s.unencrypted_dropped_total,
-            initial_on_committed_route_total: s.initial_on_committed_route_total,
+            initial_datagrams_on_committed_route_total: s
+                .initial_datagrams_on_committed_route_total,
+            initial_flights_on_committed_route_total: s.initial_flights_on_committed_route_total,
             handshake_flight_repeated_total: s.handshake_flight_repeated_total,
             handshake_flight_evicted_total: s.handshake_flight_evicted_total,
             handshake_flight_refused_total: s.handshake_flight_refused_total,

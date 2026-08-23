@@ -315,6 +315,13 @@ typedef struct PhantomMetricsSnapshotFfi {
     uint64_t rtt_us_path_0;
     int64_t  active_sessions;
     int64_t  active_streams;
+    /* Handshakes the reporting side finished — NOT connects the peer joined.
+     * A listener counts one as soon as it has derived keys and sent its
+     * ServerHello, which nothing under the handshake acknowledges, so a reply
+     * lost on the way down leaves a session counted here whose peer never
+     * spoke (a live run held one for 135 s with no byte in either direction).
+     * A server total above a client's is the ordinary reading of a lossy path,
+     * not a contradiction. */
     uint64_t handshakes_success;
     uint64_t handshakes_failure;
     uint64_t handshake_latency_ns_sum;
@@ -330,20 +337,22 @@ typedef struct PhantomMetricsSnapshotFfi {
      * knew. Appending leaves such a reader merely missing a field; inserting
      * anywhere else makes it misread every field that followed. */
     uint64_t unencrypted_dropped_total;
-    /* Handshake-type datagrams that arrived on a PhantomUDP connection the
-     * listener had already committed a route to — a client repeating its flight
-     * because it never saw the reply. Repetition is normal on a lossy path and
-     * is what the server's repeat answers, so a small non-zero value is health.
-     * Read against a client that timed out connecting, non-zero says its
-     * questions arrived and one reply flight was lost on the way down, and zero
-     * says the path fell silent in both directions. */
-    uint64_t initial_on_committed_route_total;
-    /* Retained reply flights this listener actually repeated, one per repeated
-     * flight rather than per datagram of it. The field above says a client asked
-     * again; this one says an answer went back, and the pair is what makes a
-     * failed connect readable: arrivals with no repeats is a listener that had
-     * nothing retained for that session, while no arrivals at all is a path that
-     * never carried the question. */
+    /* UNIT: DATAGRAMS. Handshake-type datagrams that arrived on a PhantomUDP
+     * connection the listener had already committed a route to, counted as each
+     * one lands and before reassembly. What it measures is the duplicate wire
+     * load a repeating client puts on the listener: a cookie-bearing ClientHello
+     * is three fragments, so one repeated question moves this by three. NOT the
+     * field to compare with handshake_flight_repeated_total below, which counts
+     * flights — that ratio is the fragment count and reads as answers gone
+     * missing. Use initial_flights_on_committed_route_total for that. */
+    uint64_t initial_datagrams_on_committed_route_total;
+    /* UNIT: FLIGHTS. Retained reply flights this listener actually repeated, one
+     * per repeated flight rather than per datagram of it. Meant to be read
+     * together with initial_flights_on_committed_route_total, which is in the
+     * same unit: that one says a client asked again, this one says an answer
+     * went back, and the pair is what makes a failed connect readable. Asks with
+     * no repeats is a listener that had nothing retained for that session, while
+     * no asks at all is a path that never carried the question. */
     uint64_t handshake_flight_repeated_total;
     /* Retained reply flights dropped to make room for a newer one — the repair
      * running out of the memory it is allowed. Expected to be zero; non-zero
@@ -357,6 +366,17 @@ typedef struct PhantomMetricsSnapshotFfi {
      * never armed. Zero for every build whose reply is inside the bound, so
      * non-zero says a message size has moved past it. */
     uint64_t handshake_flight_refused_total;
+    /* UNIT: FLIGHTS. Reassembled handshake messages that arrived on a PhantomUDP
+     * connection the listener had already committed a route to — one per question
+     * a client asked again, however many datagrams carried it. Appended last per
+     * the rule above, which is why it is not adjacent to the field it is read
+     * with. Repetition is normal on a lossy path and is what the server's repeat
+     * answers, so a small non-zero value is health. Read against a client that
+     * timed out connecting, non-zero says its questions arrived and one reply
+     * flight was lost on the way down, and zero says the path fell silent in
+     * both directions. Meant to be read together with
+     * handshake_flight_repeated_total, which is in the same unit. */
+    uint64_t initial_flights_on_committed_route_total;
 } PhantomMetricsSnapshotFfi;
 
 /* ====================================================================
