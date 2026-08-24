@@ -454,8 +454,9 @@ pub struct RetiredSegment {
 pub struct LostSegment {
     /// Gap-free reliable offset of the lost segment.
     pub stream_offset: SequenceNumber,
-    /// On-wire payload size — the caller reports it to congestion control via
-    /// `Session::on_packet_retransmitted` when it puts the copy on the wire.
+    /// On-wire payload size — the caller reports it to congestion control when
+    /// it puts the copy on the wire (`Session::on_packet_retransmitted`, and
+    /// `Session::on_packet_lost` if this is the segment's first copy).
     pub size: u64,
 }
 
@@ -470,12 +471,14 @@ pub struct SackResult {
     /// Segments newly declared lost (packet- or time-threshold, RFC 9002) by this
     /// SACK — still buffered, now flagged for Pass-0 fast-retransmit.
     ///
-    /// A **declaration**, and on a reordering path not necessarily a loss: the
+    /// A **declaration**, and on a reordering path not necessarily a drop: the
     /// packet threshold fires on a hole three offsets behind `largest_acked`,
     /// which is what a datagram overtaken by three of its successors leaves
-    /// behind. The caller answers it by retransmitting, and reports that
-    /// retransmission through `Session::on_packet_retransmitted`; whether it was
-    /// needed is settled later, when the segment's own acknowledgement arrives.
+    /// behind. Nothing that arrives later distinguishes the two — the
+    /// acknowledgement names the segment's stream offset, and every copy of the
+    /// segment carried that same offset — so the declaration is the sender's
+    /// final answer, and a path that reorders is charged for the overtaking as
+    /// though it had dropped.
     pub lost: Vec<LostSegment>,
 }
 
@@ -498,9 +501,25 @@ pub struct OutboundSegment {
     pub data: Bytes,
     /// Whether the segment is on the reliable (ACK-tracked) path.
     pub reliable: bool,
-    /// True when this is a retransmission (the RTO expired) rather than a first
-    /// transmission — the caller reports it to congestion control as a loss.
+    /// True when this is a copy of an earlier transmission rather than a first
+    /// transmission — the caller reports the copy to congestion control so the
+    /// in-flight figure stays equal to the bytes actually outstanding.
     pub retransmit: bool,
+    /// True when this is the *first* copy of the segment — no earlier copy of it
+    /// has ever been on the wire. Always false when [`Self::retransmit`] is.
+    ///
+    /// This is what separates the bytes the sender spent on repair from the
+    /// number of holes the repair was for, and only the second is a congestion
+    /// signal: the round's loss rate is judged against what the round delivered,
+    /// and a segment being resent for the third time is delivering nothing while
+    /// it happens. Counting every copy would drive the numerator up against a
+    /// denominator that had stopped moving, and read a stalled path as a
+    /// maximally congested one.
+    ///
+    /// It is derived from `PendingData::retries`, which the two retransmit
+    /// passes bump and nothing else does, so it is a fact about this endpoint's
+    /// own send history — nothing the peer sends can turn it on or off.
+    pub first_retransmit: bool,
     /// True when this segment is the reliable FIN sentinel (zero-length data).
     /// The drain path must OR `PacketFlags::FIN` into the wire frame flags.
     pub fin: bool,
@@ -1642,6 +1661,7 @@ impl Stream {
             data: Bytes::new(),
             reliable: true,
             retransmit: false,
+            first_retransmit: false,
             fin: false,
         })
     }
@@ -1698,6 +1718,7 @@ impl Stream {
                 data,
                 reliable: false,
                 retransmit: false,
+                first_retransmit: false,
                 fin: false,
             });
         }
@@ -1721,16 +1742,24 @@ impl Stream {
         // connection delivered since these bytes were first entrusted to the
         // path", and moving its origin forward is what let one acknowledgement
         // report a whole window as having arrived in a millisecond.
+        //
+        // `retries` is read *before* the bump in both retransmit passes: zero
+        // there means no copy of this segment has ever been on the wire, which
+        // is the one transmission of it that stands for a hole rather than for
+        // repeated repair of the same hole. See `OutboundSegment::
+        // first_retransmit`.
         for pending in buffer.iter_mut() {
             if pending.lost && pending.sent_at.is_some() {
                 pending.lost = false;
                 pending.sent_at = Some(now);
+                let first_retransmit = pending.retries == 0;
                 pending.retries += 1;
                 return Ok(OutboundSegment {
                     stream_offset: pending.stream_offset,
                     data: pending.data.clone(),
                     reliable: true,
                     retransmit: true,
+                    first_retransmit,
                     fin: pending.fin,
                 });
             }
@@ -1743,6 +1772,7 @@ impl Stream {
             if let Some(sent_at) = pending.sent_at {
                 if now.duration_since(sent_at) >= timeout {
                     pending.sent_at = Some(now);
+                    let first_retransmit = pending.retries == 0;
                     pending.retries += 1;
                     // Back the RTO off exponentially for the next attempt.
                     self.note_rto_timeout();
@@ -1751,6 +1781,7 @@ impl Stream {
                         data: pending.data.clone(),
                         reliable: true,
                         retransmit: true,
+                        first_retransmit,
                         fin: pending.fin,
                     });
                 }
@@ -1809,6 +1840,7 @@ impl Stream {
                     data: pending.data.clone(),
                     reliable: true,
                     retransmit: false,
+                    first_retransmit: false,
                     fin: is_fin,
                 });
             }
@@ -3305,10 +3337,10 @@ mod tests {
     }
 
     /// Mirror what the data pump's drain does with one segment it pulls out of a
-    /// stream: every transmission joins the flight, and a copy replacing an
-    /// earlier transmission is reported as a **retransmission** — which is not
-    /// the congestion signal, and is the half of the pump this helper exists to
-    /// keep honest. Returns `None` when the stream had nothing to offer.
+    /// stream: every transmission joins the flight, every copy is reported as a
+    /// copy so the flight arithmetic stays right, and the **first** copy of a
+    /// segment is additionally the congestion signal. Returns `None` when the
+    /// stream had nothing to offer.
     async fn drain_one(
         stream: &Stream,
         est: &mut crate::transport::bandwidth_estimator::BandwidthEstimator,
@@ -3319,9 +3351,33 @@ mod tests {
             .ok()?;
         if seg.retransmit {
             est.on_retransmit(seg.data.len() as u64);
+            if seg.first_retransmit {
+                est.on_loss(seg.data.len() as u64);
+            }
         }
         est.on_send(seg.data.len() as u64);
         Some(seg)
+    }
+
+    /// The three counters a sender holds after a segment has been through the
+    /// detector: bytes resent, bytes of hole reported, bytes still outstanding.
+    /// Compared whole so that a test naming two of them cannot quietly stop
+    /// naming the third.
+    #[derive(Debug, PartialEq, Eq)]
+    struct SendLedger {
+        retransmitted: u64,
+        lost: u64,
+        inflight: u64,
+    }
+
+    impl SendLedger {
+        fn of(est: &crate::transport::bandwidth_estimator::BandwidthEstimator) -> Self {
+            Self {
+                retransmitted: est.bytes_retransmitted(),
+                lost: est.bytes_lost(),
+                inflight: est.inflight_bytes(),
+            }
+        }
     }
 
     /// Put a flight of `segments` reliable segments of `payload` bytes on the
@@ -3330,10 +3386,10 @@ mod tests {
     /// three of its successors overtake, which is exactly the input RFC 9002's
     /// packet threshold reads as loss.
     ///
-    /// Returns the estimator, the stream, the acknowledged set, and the copy
-    /// Pass-0 emitted in answer. Shared by the three tests below so that the one
-    /// thing that differs between them — when, and whether, the acknowledgement
-    /// for offset 0 arrives — is the only thing each of them writes down.
+    /// Returns the stream, the estimator, the acknowledged set, and the instant
+    /// the copy went out. Shared by the tests below so that the one thing that
+    /// differs between them — when, and whether, the acknowledgement for offset 0
+    /// arrives — is the only thing each of them writes down.
     async fn flight_with_offset_zero_overtaken(
         segments: u32,
         payload: usize,
@@ -3377,6 +3433,10 @@ mod tests {
             .await
             .expect("Pass-0 must offer the flagged segment");
         assert!(copy.retransmit, "the segment offered must be the copy");
+        assert!(
+            copy.first_retransmit,
+            "no copy of this offset has been on the wire before"
+        );
         assert_eq!(copy.stream_offset, 0, "the copy must be of the hole");
         assert_eq!(
             tokio::time::Instant::now(),
@@ -3387,30 +3447,32 @@ mod tests {
         (stream, est, acked, declared_at)
     }
 
-    /// **A path that reorders and drops nothing must feed the loss response
-    /// nothing — while still retransmitting.**
+    /// **A path that only reorders still costs a retransmission and one loss
+    /// report, and the second of those is a false positive this wire cannot
+    /// refute.**
     ///
-    /// This is the defect. RFC 9002's packet threshold declares a segment lost
-    /// once three of its successors are acknowledged, and a datagram overtaken by
-    /// three of its successors satisfies that without anything having been
-    /// dropped. The reference route's own raw controls show it: 0.48% of upstream
+    /// RFC 9002's packet threshold declares a segment lost once three of its
+    /// successors are acknowledged, and a datagram overtaken by three of its
+    /// successors satisfies that without anything having been dropped. The
+    /// reference route's own raw controls show it happening: 0.48% of upstream
     /// datagrams arrive late, the worst of them 225 positions late — and late in
-    /// *time* by 0.7 ms, against a minimum round trip of 187 ms. Every one of
-    /// those was a segment declared lost, a copy on the wire, and a loss reported
-    /// to a controller whose response is to clamp the volume the sender may have
-    /// outstanding.
+    /// *time* by 0.7 ms, against a minimum round trip of 187 ms.
     ///
-    /// Both assertions are the test. The copy still goes out, on the same
-    /// trigger as before, so recovery is exactly as fast as it was; and the
-    /// congestion signal does not, because by the time the segment is retired the
-    /// sender can see that the acknowledgement it is holding came back too soon
-    /// after the copy to be answering the copy.
+    /// The retransmission is right and the loss report is wrong, and this
+    /// endpoint has no way to find that out. The acknowledgement that eventually
+    /// retires offset 0 names offset 0 — the offset the original and the copy
+    /// both carried — so it is silent about which of them arrived, and the only
+    /// other observable is when it turned up, which the peer chooses. So the
+    /// report stands, and what this pins is that its size is bounded: **one**
+    /// hole, not one per acknowledgement and not one per copy.
+    /// An earlier rule that read the acknowledgement's arrival time to overturn
+    /// such a report was withdrawn: that time is the peer's to choose.
     ///
     /// Deterministic throughout: the clock is frozen and every interval below is
     /// written by the test, so `min_rtt` is a real 250 ms rather than the zero a
     /// paused clock would leave if the test never advanced it.
     #[tokio::test]
-    async fn a_reordered_segment_costs_a_retransmission_and_no_congestion_signal() {
+    async fn a_reordered_segment_costs_one_retransmission_and_one_loss_report() {
         const SEGMENTS: u32 = 6;
         const PAYLOAD: usize = 1200;
         const RTT: Duration = Duration::from_millis(250);
@@ -3431,60 +3493,42 @@ mod tests {
         let sack = Sack::from_received(&acked, 0).expect("sack");
         feed_retirements(&stream, &sack, &mut est).await;
 
-        // The test passes for the stated reason only if the certificate exists
-        // and the arrival is well inside it — otherwise it would be asserting
-        // the absence of a signal on a path that has no measured round trip.
         assert_eq!(
             est.min_rtt(),
             RTT,
-            "the estimator must have timed the path before the verdict is meaningful"
-        );
-        assert!(
-            LATE_BY * 4 < RTT,
-            "the two populations this separates must stay far apart: a lateness of \
-             {LATE_BY:?} against a {RTT:?} round trip"
-        );
-
-        assert_eq!(
-            est.bytes_retransmitted(),
-            PAYLOAD as u64,
-            "the copy must still go out — a mechanism that answered reordering by \
-             retransmitting less would be slowing recovery, not making a false \
-             detection cheap"
+            "the estimator must have timed the path, or this is a reordering test \
+             on a connection with no notion of order in time"
         );
         assert_eq!(
-            est.bytes_lost(),
-            0,
-            "nothing was lost, so the loss response must hear nothing"
-        );
-        assert_eq!(
-            est.bytes_spurious_retransmit(),
-            PAYLOAD as u64,
-            "the wasted copy must be counted somewhere, or a run cannot say what \
-             reordering cost it"
-        );
-        // Six sends, one copy, four retirements and one retransmission
-        // adjustment: the copy is net-neutral on the flight, and what is left is
-        // the two segments still outstanding. A suppressed congestion signal must
-        // not come with a drifting in-flight figure — the drain's budget is
-        // `cwnd − inflight`.
-        assert_eq!(
-            est.inflight_bytes(),
-            2 * PAYLOAD as u64,
-            "the two unacknowledged segments are all that is left in flight"
+            SendLedger::of(&est),
+            SendLedger {
+                // The copy still goes out on the same trigger, so recovery is as
+                // fast as it ever was — a mechanism that answered reordering by
+                // retransmitting *less* would trade recovery for accounting.
+                retransmitted: PAYLOAD as u64,
+                // One hole, charged once.
+                lost: PAYLOAD as u64,
+                // Six sends, one copy, four retirements and one retransmission
+                // adjustment: the copy is net-neutral on the flight and the two
+                // unacknowledged segments are what is left. The drain's new-data
+                // budget is `cwnd − inflight`, so a figure that drifts here is a
+                // sender that withholds while it recovers.
+                inflight: 2 * PAYLOAD as u64,
+            },
         );
     }
 
-    /// **The same path, a real drop: the loss response must still hear it.**
+    /// **The same path, a real drop — and the sender's books read exactly the
+    /// same.**
     ///
     /// The counterweight to the test above, and the reason that one is not
     /// satisfiable by deleting the loss signal. Everything is identical up to the
     /// retransmission; what differs is that no earlier transmission of offset 0
-    /// ever arrived, so the acknowledgement that retires it cannot be answering
-    /// anything but the copy — and it comes back a round trip after the copy
-    /// left, which is what says so.
+    /// ever arrived, so the acknowledgement that retires it is answering the copy
+    /// and comes back a round trip later rather than two milliseconds later. Every
+    /// counter is the same, and the test below checks that equality head on.
     #[tokio::test]
-    async fn a_dropped_segment_on_the_same_path_still_reaches_the_loss_response() {
+    async fn a_dropped_segment_costs_one_retransmission_and_one_loss_report() {
         const SEGMENTS: u32 = 6;
         const PAYLOAD: usize = 1200;
         const RTT: Duration = Duration::from_millis(250);
@@ -3494,27 +3538,19 @@ mod tests {
         let (stream, mut est, mut acked, declared_at) =
             flight_with_offset_zero_overtaken(SEGMENTS, PAYLOAD, RTT, ACK_GAP).await;
 
-        // The copy crossed the path and its acknowledgement came back. Nothing
-        // else could have produced this acknowledgement.
+        // The copy crossed the path and its acknowledgement came back.
         tokio::time::advance(RTT).await;
         acked.push(0);
         let sack = Sack::from_received(&acked, 0).expect("sack");
         feed_retirements(&stream, &sack, &mut est).await;
 
         assert_eq!(
-            est.bytes_lost(),
-            PAYLOAD as u64,
-            "a segment the path actually dropped must reach the loss response"
-        );
-        assert_eq!(
-            est.bytes_spurious_retransmit(),
-            0,
-            "nothing here was spurious"
-        );
-        assert_eq!(
-            est.bytes_retransmitted(),
-            PAYLOAD as u64,
-            "one drop, one copy"
+            SendLedger::of(&est),
+            SendLedger {
+                retransmitted: PAYLOAD as u64,
+                lost: PAYLOAD as u64,
+                inflight: 2 * PAYLOAD as u64,
+            },
         );
         // Recovery is bounded, and the bound is a state rather than a stopwatch
         // reading: the copy left on the declaring acknowledgement itself (the
@@ -3527,28 +3563,71 @@ mod tests {
             "the copy went out at the declaration and was answered one round trip \
              later — no timer took part"
         );
-        // And the flight is exactly the two segments still outstanding: six
-        // sends, one copy, four retirements and one retransmission adjustment.
-        // The copy must be net-neutral on the flight, or the drain's
-        // `cwnd − inflight` budget drifts every time the path loses anything.
+    }
+
+    /// **A path that reorders and a path that drops leave this sender holding
+    /// identical books, and that is a property of the wire rather than a choice.**
+    ///
+    /// The two tests above are the same experiment with one input changed — the
+    /// overtaken original arrives, or it never existed — and this asserts the
+    /// consequence directly, because it is the finding a reader most needs and
+    /// the one an implementer is most likely to assume away.
+    ///
+    /// Why it cannot be otherwise here: an acknowledgement on this wire is a
+    /// [`Sack`] over gap-free reliable **stream offsets**, which the receiver
+    /// builds from its reorder buffer. A retransmission reuses the segment's
+    /// offset, so both transmissions fall inside the same acknowledged range and
+    /// nothing that arrives distinguishes them. The only other observable is
+    /// arrival time, and arrival time is written by the peer — including
+    /// `min_rtt`, the one local reference it could be compared against, which is
+    /// itself a filter over past arrival times.
+    ///
+    /// So this is a statement about the acknowledgement format, not a permanent
+    /// one. If a future wire carries, per acknowledged segment, *which*
+    /// transmission of it arrived, the two arms genuinely come apart and this is
+    /// the test to rewrite first — deliberately, and naming that field.
+    #[tokio::test]
+    async fn reordering_and_a_drop_leave_the_sender_the_same_counters() {
+        const SEGMENTS: u32 = 6;
+        const PAYLOAD: usize = 1200;
+        const RTT: Duration = Duration::from_millis(250);
+        const ACK_GAP: Duration = Duration::from_micros(500);
+        const LATE_BY: Duration = Duration::from_millis(2);
+
+        /// One arm: run the flight, then deliver offset 0's acknowledgement
+        /// `after` the copy went out.
+        async fn arm(after: Duration) -> SendLedger {
+            let (stream, mut est, mut acked, _) =
+                flight_with_offset_zero_overtaken(SEGMENTS, PAYLOAD, RTT, ACK_GAP).await;
+            tokio::time::advance(after).await;
+            acked.push(0);
+            let sack = Sack::from_received(&acked, 0).expect("sack");
+            feed_retirements(&stream, &sack, &mut est).await;
+            SendLedger::of(&est)
+        }
+
+        tokio::time::pause();
+        let reordered = arm(LATE_BY).await;
+        let dropped = arm(RTT).await;
+
         assert_eq!(
-            est.inflight_bytes(),
-            2 * PAYLOAD as u64,
-            "the two unacknowledged segments are all that is left in flight"
+            reordered, dropped,
+            "an overtaken original and a dropped one are one observation to this \
+             sender: {reordered:?} against {dropped:?}"
         );
     }
 
     /// **A segment resent twice is one loss, not two.**
     ///
-    /// The declaration count and the loss count answer different questions, and
-    /// this is where they come apart by construction. Two copies of one segment
-    /// went on the wire, so the sender spent two segments of bandwidth; but what
-    /// the round's loss *rate* is a rate of is holes in the flight, and there was
-    /// one hole. Booking a loss per copy is how one drop on a path that
-    /// re-declares turns into a loss rate that saturates the threshold — the
-    /// shape that pinned `inflight_hi` to its floor for a whole connection.
+    /// The two counters answer different questions and this is where they come
+    /// apart by construction. Two copies went on the wire, so the sender spent
+    /// two segments of bandwidth; but the round's loss *rate* is judged against
+    /// what the round **delivered**, and a segment in its second round of repair
+    /// delivers nothing. Charging per copy drives the numerator up while the
+    /// denominator stands still, so a stalled path reads as a maximally congested
+    /// one and `inflight_hi` sits on its floor for as long as the stall lasts.
     #[tokio::test]
-    async fn a_segment_resent_twice_is_one_established_loss_not_two() {
+    async fn a_segment_resent_twice_is_one_loss_not_two() {
         const SEGMENTS: u32 = 6;
         const PAYLOAD: usize = 1200;
         const RTT: Duration = Duration::from_millis(250);
@@ -3573,6 +3652,11 @@ mod tests {
             .await
             .expect("Pass-0 must offer the re-declared segment");
         assert!(second.retransmit && second.stream_offset == 0);
+        assert!(
+            !second.first_retransmit,
+            "a copy of this offset was already on the wire, so this one repairs a \
+             hole that has already been charged"
+        );
 
         // ...and *this* copy gets through.
         tokio::time::advance(RTT).await;
@@ -3584,7 +3668,7 @@ mod tests {
         assert_eq!(
             est.bytes_retransmitted(),
             2 * PAYLOAD as u64,
-            "two copies went on the wire and the declaration count must say so"
+            "two copies went on the wire and the bandwidth spent must say so"
         );
         assert_eq!(
             est.bytes_lost(),
@@ -3592,6 +3676,53 @@ mod tests {
             "one hole in the flight is one loss, however many copies it took to \
              fill it"
         );
+    }
+
+    /// **A peer that acknowledges nothing at all does not read as a clean path.**
+    ///
+    /// The loss report is raised by this endpoint's own send path, and the way to
+    /// see whether the peer can switch it off is to give the peer nothing to do:
+    /// not one acknowledgement is delivered here. The RTO pass in `poll_send`
+    /// fires anyway — it is a local timer — the copy goes out, and the hole is
+    /// charged.
+    ///
+    /// This is the shape a rule conditioned on an acknowledgement gets wrong, and
+    /// it gets it wrong silently: no loss is reported, ever, while rounds closed
+    /// by other traffic go on relaxing the inflight bound as though the path were
+    /// healthy.
+    #[tokio::test]
+    async fn a_peer_that_never_acknowledges_still_produces_the_loss_report() {
+        use crate::transport::bandwidth_estimator::BandwidthEstimator;
+        const PAYLOAD: usize = 1200;
+
+        tokio::time::pause();
+        let stream = Stream::new(1);
+        let mut est = BandwidthEstimator::new();
+        stream
+            .send_reliable(Bytes::from(vec![0u8; PAYLOAD]))
+            .await
+            .unwrap();
+        let first = drain_one(&stream, &mut est).await.expect("first send");
+        assert!(!first.retransmit);
+        assert_eq!(
+            est.bytes_lost(),
+            0,
+            "a first transmission is not a loss report"
+        );
+
+        // Past the initial timeout with nothing at all having come back.
+        tokio::time::advance(RtoEstimator::INITIAL_RTO + Duration::from_millis(100)).await;
+        let copy = drain_one(&stream, &mut est)
+            .await
+            .expect("the RTO pass must offer the segment");
+        assert!(copy.retransmit && copy.first_retransmit);
+
+        assert_eq!(
+            est.bytes_lost(),
+            PAYLOAD as u64,
+            "silence must not be able to delete the loss signal"
+        );
+        assert_eq!(est.bytes_retransmitted(), PAYLOAD as u64);
     }
 
     /// `received_sack` derives ranges from the reorder state with a gap, and

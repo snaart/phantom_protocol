@@ -1311,18 +1311,40 @@ impl Session {
     /// Record that the send path put a copy of `bytes` bytes back on the wire in
     /// place of an earlier transmission of the same segment.
     ///
-    /// **This is the retransmission, not the loss.** It keeps the in-flight
-    /// figure honest — the copy's own `on_packet_sent` has already counted its
-    /// bytes and the transmission it replaces is no longer outstanding — and it
-    /// deliberately reports nothing to the loss response. What the detector
-    /// declared is a suspicion drawn from a hole in an acknowledgement, and a
-    /// reordering path produces that hole without having dropped anything; the
-    /// suspicion becomes a congestion signal only when the acknowledgement that
-    /// retires the segment shows the copy is what got through, which
-    /// `BandwidthEstimator::on_ack` decides from this endpoint's own send and
-    /// receive instants.
+    /// **This is the flight arithmetic, not the congestion signal.** The copy's
+    /// own `on_packet_sent` has already counted its bytes and the transmission
+    /// it replaces is no longer outstanding, so one of the two has to come back
+    /// off, at the instant the copy leaves — deferring it would leave the figure
+    /// one segment high for a round trip, and the drain's new-data budget is
+    /// `cwnd − inflight`, so the sender would withhold exactly while it was
+    /// recovering.
+    ///
+    /// Called for every copy. The congestion signal is [`Self::on_packet_lost`],
+    /// which the caller raises for the first copy of a segment only.
     pub fn on_packet_retransmitted(&self, bytes: u64) {
         self.bandwidth_estimator.lock().on_retransmit(bytes);
+    }
+
+    /// Report `bytes` of loss to congestion control — one hole, raised at the
+    /// moment the send path puts the segment's **first** copy on the wire.
+    ///
+    /// The instant is chosen for what it is not: it is not conditioned on
+    /// anything the peer does. A rule that waited for an acknowledgement — for
+    /// its arrival, its timing, or the round trip it implied — would be a rule a
+    /// peer can switch off by going quiet or bend by holding its
+    /// acknowledgements, and the quantity it decides is the sender's own window.
+    /// The copy leaves on this endpoint's own timer (`Stream::poll_send`'s RTO
+    /// pass fires against a wholly silent peer), so there is no silence that
+    /// makes a lossy path read as a clean one.
+    ///
+    /// The cost of choosing that instant is stated rather than hidden: at the
+    /// moment the copy leaves it is not yet known whether the original was
+    /// dropped or merely overtaken, and on this wire it never becomes known —
+    /// an acknowledgement names the segment's gap-free stream offset, which
+    /// every copy shared. A path that reorders is therefore charged as a path
+    /// that drops.
+    pub fn on_packet_lost(&self, bytes: u64) {
+        self.bandwidth_estimator.lock().on_loss(bytes);
     }
 
     /// A send pass ended for want of data to send. Opens an application-limited
@@ -1344,28 +1366,20 @@ impl Session {
         self.bandwidth_estimator.lock().note_app_limited_drain();
     }
 
-    /// Bytes whose loss this session has **established** and reported to
-    /// congestion control. Observability / test hook — the observable that a
-    /// retransmission the path actually needed reached the estimator.
+    /// Bytes of hole this session has reported to congestion control — one
+    /// booking per segment whose first copy went on the wire. Observability /
+    /// test hook, and the observable that the send path reports loss at all.
     pub fn bbr_bytes_lost(&self) -> u64 {
         self.bandwidth_estimator.lock().bytes_lost()
     }
 
-    /// Bytes this session has retransmitted, whether or not the loss that
-    /// prompted each copy turned out to be real. Observability / test hook.
+    /// Bytes this session has retransmitted, counting every copy. Observability
+    /// / test hook.
     ///
-    /// The companion to [`Self::bbr_bytes_lost`]: a path that reorders drives
-    /// this figure and not that one, which is the only way to tell it apart from
-    /// a path that drops.
+    /// The companion to [`Self::bbr_bytes_lost`]: their difference is what the
+    /// sender spent re-repairing segments whose first copy did not get through.
     pub fn bbr_bytes_retransmitted(&self) -> u64 {
         self.bandwidth_estimator.lock().bytes_retransmitted()
-    }
-
-    /// Bytes of retransmission this session can show were unnecessary — the
-    /// segment's acknowledgement came back too soon after the copy left to have
-    /// been answering the copy. Observability / test hook.
-    pub fn bbr_bytes_spurious_retransmit(&self) -> u64 {
-        self.bandwidth_estimator.lock().bytes_spurious_retransmit()
     }
 
     /// Reset the congestion controller + pacer to startup (Phase 4 / QUIC §9.4):
@@ -1411,7 +1425,6 @@ impl Session {
             app_limited: est.is_app_limited(),
             bytes_retransmitted: est.bytes_retransmitted(),
             bytes_lost: est.bytes_lost(),
-            bytes_spurious_retransmit: est.bytes_spurious_retransmit(),
             inflight_hi_bytes: est.inflight_hi().unwrap_or(0),
         }
     }
@@ -1791,33 +1804,29 @@ pub struct BandwidthSnapshot {
     /// transport is the bottleneck" from "the application is".
     pub app_limited: bool,
     /// Bytes retransmitted so far — every copy the loss detector ordered,
-    /// whether or not the path had actually dropped anything.
+    /// counting the second and third copies of a segment as well as the first.
     ///
-    /// The three loss figures travel together because no one of them is
-    /// interpretable alone, and until they did, a recorded run could not say
-    /// whether a sender's back-off was bought by drops or by reordering. This is
-    /// what the detector decided; `bytes_lost` is what an acknowledgement went
-    /// on to confirm; `bytes_spurious_retransmit` is what an acknowledgement
-    /// refuted. They do not have to sum: a copy still in flight, or one for a
-    /// segment the peer never acknowledges, is counted here and in neither of
-    /// the others.
+    /// Recorded beside [`Self::bytes_lost`] because neither is interpretable
+    /// alone: one is the bandwidth the sender spent on repair, the other is the
+    /// number of holes the repair was for, and their difference is what went
+    /// into re-repairing segments whose first copy also failed to arrive. Until
+    /// both existed, a recorded run said the sender backed off and could not say
+    /// what it spent doing so.
+    ///
+    /// Neither figure separates a path that drops from a path that reorders;
+    /// nothing this sender can observe does. A row
+    /// showing loss on a route known to reorder is an upper bound on the drops.
     ///
     /// Cumulative over the estimator's life, not the session's:
     /// [`Session::reset_congestion`] replaces the estimator on a migration, so
-    /// these three restart from zero on the new path, exactly as the bandwidth
+    /// these restart from zero on the new path, exactly as the bandwidth
     /// estimate and the round-trip minimum do. A series that spans a migration
     /// therefore is not monotone, and a reader taking a maximum over one gets
     /// the larger of the two paths rather than the sum.
     pub bytes_retransmitted: u64,
-    /// Bytes whose loss was established and fed to the loss response — the
-    /// numerator of the round loss rate `adapt_inflight_bound` judges, summed
-    /// over the connection.
+    /// Bytes of hole fed to the loss response — the numerator of the round loss
+    /// rate `adapt_inflight_bound` judges, summed over the connection.
     pub bytes_lost: u64,
-    /// Bytes of retransmission shown to have been unnecessary. The direct
-    /// measure of what a reordering path costs this sender, and the figure
-    /// whose absence made the reordering question unanswerable from an
-    /// artifact.
-    pub bytes_spurious_retransmit: u64,
     /// The loss-imposed upper bound on inflight, in bytes, or `0` when the path
     /// has given no reason for one.
     ///

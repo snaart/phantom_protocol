@@ -141,18 +141,15 @@ pub struct DeliverySample {
     /// copy is being acknowledged. That can only widen the denominator — an
     /// under-estimate, which a maximum filter discards.
     ///
-    /// **This flag has a second consumer, and the two are one fact rather than
-    /// two.** The fact is "a copy of these bytes had already gone out when this
-    /// acknowledgement arrived", and besides disqualifying the round trip it is
-    /// the precondition of the loss accounting: a retransmission the sender
-    /// emitted is the only thing whose loss there is anything to establish, and
-    /// [`BandwidthEstimator::on_ack`] settles that question in the same place it
-    /// applies Karn's gate (see the commentary there). Should a *different*
-    /// reason to distrust an RTT sample ever appear — a sample straddling a
-    /// migration, say — this field must be split before it is used for it, or
-    /// the new reason would silently switch the loss accounting off along with
-    /// the filter. `a_usable_round_trip_sample_never_books_a_loss` pins the
-    /// coupling in the direction that matters.
+    /// **It gates the round trip and nothing else, and that boundary is load
+    /// bearing.** A version of this file used the same flag to decide whether a
+    /// retransmission had turned out to be necessary, by comparing the
+    /// acknowledgement's arrival against a fraction of `min_rtt`. Both halves of
+    /// that comparison are written by the peer — `min_rtt` is a filter over
+    /// `acked_at − sent_at`, so a receiver that holds every acknowledgement
+    /// raises it without bound — and the loss signal it decided is the one the
+    /// sender's window depends on. Nothing may be inferred here about *what was
+    /// delivered* from *when an acknowledgement arrived*.
     pub rtt_sampled: bool,
 }
 
@@ -639,58 +636,6 @@ const LOSS_THRESH: f64 = 0.02;
 /// same 0.7.
 const INFLIGHT_HI_BETA: f64 = 0.7;
 
-/// The window after a retransmission leaves, inside which an arriving
-/// acknowledgement for that segment is read as answering an **earlier**
-/// transmission rather than the copy — expressed as `min_rtt` divided by this.
-///
-/// See the loss-confirmation block in [`BandwidthEstimator::on_ack`] for what
-/// the window is for. This is the size of it, and the size is the part a reader
-/// should be able to check, so here is the arithmetic.
-///
-/// The window has to separate two populations of elapsed time, and they are far
-/// apart. A segment the path genuinely dropped is acknowledged one round trip
-/// after its copy leaves, because the copy is the only thing that can be
-/// acknowledged. A segment the path merely reordered is acknowledged as soon as
-/// its *original* gets there, and the sender learns of it once the peer's
-/// acknowledgement crosses back — an acknowledgement that was already on the
-/// path when the copy went out, so what is left to elapse is only the extra
-/// transit the overtaken datagram suffered. On the raw controls of the reference
-/// route those two are 187–192 ms and 0.7–1.5 ms respectively: two orders of
-/// magnitude apart, with the worst single displacement recorded on any control
-/// 29 ms — and that one measured a round trip, so the one-way figure is smaller
-/// still.
-///
-/// Half is chosen inside that gap rather than at either edge, and the reason it
-/// is not simply `min_rtt` is a measurement: the first version of this compared
-/// against the whole minimum, and on a constant-delay path a genuine loss
-/// confirmed by 76 µs out of 81 ms — the copy's round trip and the minimum round
-/// trip are two measurements of one quantity there, so the comparison was a coin
-/// toss rather than a test. Half a round trip is the smallest bound that puts
-/// scheduling jitter and queueing variation entirely on one side, and being a
-/// proportion rather than a duration it neither tightens on a fast path nor
-/// loosens on a slow one.
-///
-/// Both directions of error are bounded, and both are benign:
-///
-/// - **A reordered original arriving later than half a round trip** is counted as
-///   a loss. That is a datagram held for tens of milliseconds, not one overtaken
-///   by its successors, and the transport already commits to that reading
-///   elsewhere: `Stream::on_sack`'s RACK threshold declares a segment lost once
-///   it has been outstanding `srtt·9/8`.
-/// - **A genuine loss whose copy is acknowledged in under half the minimum round
-///   trip** books no congestion signal. For that the path must have more than
-///   halved its round trip against its own best of the last ten seconds, which
-///   is a path draining rather than one congesting — and every other segment the
-///   same round dropped still books its own loss.
-const SPURIOUS_ACK_WINDOW_SHARE_OF_MIN_RTT: u32 = 2;
-
-const _: () = assert!(
-    SPURIOUS_ACK_WINDOW_SHARE_OF_MIN_RTT >= 2,
-    "the window must be strictly inside one round trip: a share of one compares a \
-     genuine loss's round trip against the minimum round trip, which is the same \
-     quantity measured twice"
-);
-
 /// Floor on [`BandwidthEstimator::inflight_hi`], as a multiple of the
 /// bandwidth-delay product. **Load-bearing, and the reason this file changed.**
 ///
@@ -905,46 +850,35 @@ pub struct BandwidthEstimator {
     app_limited_at_delivered: u64,
 
     // ── Loss accounting ──
-    /// Bytes whose loss is **established** and which are booked against the
-    /// round trip in progress. Reset by `adapt_inflight_bound` once the round
-    /// has been judged.
+    /// Bytes of *hole* booked against the round trip in progress — one booking
+    /// per segment the detector first ordered a copy of, however many copies it
+    /// went on to take. Reset by `adapt_inflight_bound` once the round has been
+    /// judged.
     round_bytes_lost: u64,
     /// [`Self::delivered_bytes`] as it stood when the current round opened —
     /// the denominator half of the round's loss rate.
     round_delivered_mark: u64,
-    /// Bytes whose loss was established over the life of the connection —
-    /// [`Self::round_bytes_lost`] never reset. Diagnostics, and the observable
-    /// that proves the loss signal reaches congestion control at all.
+    /// [`Self::round_bytes_lost`] never reset — the connection's holes.
+    /// Diagnostics, and the observable that proves the loss signal reaches
+    /// congestion control at all.
     bytes_lost: u64,
     /// Bytes the send path put back on the wire as a copy of an earlier
     /// transmission, over the life of the connection.
     ///
-    /// This is the *declaration* count: what the RFC 9002 detector in
-    /// `Stream::on_sack` decided, one entry per copy emitted. It is what
-    /// [`Self::bytes_lost`] used to be, and the two are separated because they
-    /// answer different questions and had been giving one answer to both. A
-    /// declaration is a guess made from a hole in an acknowledgement; an
-    /// established loss is a guess that has since been shown to have been
-    /// right. On a path that reorders, the first figure exceeds the second by
-    /// the reordering rate, and the difference is
-    /// [`Self::bytes_spurious_retransmit`].
+    /// Every copy the send path emitted, counted per copy — including the
+    /// second and third copies of a segment [`Self::bytes_lost`] has already
+    /// booked once.
     ///
-    /// Diagnostics only. Nothing in this file reads it back, and in particular
-    /// the loss *rate* the round is judged on is computed from the established
-    /// figure — see `on_ack`'s commentary for why a declaration must not reach
-    /// the controller.
+    /// The two answer different questions and had been giving one answer to
+    /// both. This one is the bandwidth the sender spent on repair; that one is
+    /// the number of holes the repair was for. `bytes_retransmitted −
+    /// bytes_lost` is therefore what the sender spent re-repairing segments
+    /// whose first copy did not get through, which on a healthy path is zero
+    /// and on a path in trouble is most of the figure.
+    ///
+    /// Diagnostics only. Nothing in this file reads it back; the loss *rate* a
+    /// round is judged on is computed from [`Self::round_bytes_lost`].
     bytes_retransmitted: u64,
-    /// Bytes of retransmission this endpoint can show were not needed: a copy
-    /// went out, and the acknowledgement that retired the segment arrived too
-    /// soon after the copy to have been an acknowledgement *of* the copy.
-    ///
-    /// The wasted bandwidth of a false detection, and the measurement the
-    /// reordering question could not previously be settled with: an artifact
-    /// carrying [`Self::bytes_retransmitted`] and this side by side says what
-    /// fraction of the sender's retransmissions the path's reordering bought,
-    /// where before there was one counter that read the same on a path that
-    /// reorders and a path that drops. Diagnostics only.
-    bytes_spurious_retransmit: u64,
 
     /// The most recent per-acknowledgement delivery rate this endpoint
     /// computed, before the filter had any say in it. Diagnostics only —
@@ -1007,7 +941,6 @@ impl BandwidthEstimator {
             round_delivered_mark: 0,
             bytes_lost: 0,
             bytes_retransmitted: 0,
-            bytes_spurious_retransmit: 0,
             last_delivery_rate: 0,
         }
     }
@@ -1136,75 +1069,20 @@ impl BandwidthEstimator {
             self.rtt_filter_seeded = true;
         }
 
-        // ── Was the retransmission this segment needed actually needed? ──────
-        //
-        // The same fact Karn's gate above turns on — a copy of these bytes had
-        // gone out before this acknowledgement arrived — is the precondition of
-        // the loss accounting, and this is where the two part company. The
-        // detector that ordered the copy is RFC 9002's packet threshold: three
-        // offsets past a still-unacknowledged one and it is declared lost. A
-        // *reordering* path satisfies that predicate without having dropped
-        // anything, and the measured route does: its raw upstream control shows
-        // 0.48% of datagrams arriving late by up to 225 positions, while the
-        // same datagrams are late by only 0.7 ms.
-        //
-        // Two ways to answer that, and one of them is not available. Detecting
-        // loss more accurately would mean learning a reordering tolerance from
-        // the order of the peer's acknowledgements — and the sender cannot
-        // distinguish "the peer received late" from "the peer acknowledged
-        // late", because it is one observation. Any threshold learned from that
-        // order is a threshold the peer writes, and it writes it in the
-        // direction that suits it: one withheld acknowledgement, and the
-        // tolerance is at its ceiling. So the detection is left exactly as it
-        // is, the copy still goes out on the first suspicion, and what changes
-        // is the *cost of being wrong*: a false detection now costs one wasted
-        // segment and no congestion signal at all.
-        //
-        // What makes that safe to decide here is that every term is this
-        // endpoint's own. `sample.sent_at` is when *we* put the copy on the
-        // wire; `now` is when *we* saw the acknowledgement; `rtt_floor` is the
-        // smallest round trip *we* have timed, and a peer can only decline to
-        // lower it (`ack_delay_adjusted_rtt`). Nothing here is read out of the
-        // ordering or the timing of what the peer sends. The inference is a
-        // physical one: an acknowledgement of the copy cannot come back sooner
-        // than the copy can cross the path and the answer return, so an
-        // acknowledgement that lands promptly after the copy left is answering
-        // an *earlier* transmission — which means an earlier transmission
-        // arrived, which means nothing was lost.
-        //
-        // "Promptly" is `min_rtt / SPURIOUS_ACK_WINDOW_SHARE_OF_MIN_RTT`, and
-        // that constant carries the arithmetic of why a fraction of a round trip
-        // and not a whole one. The direction of the reference matters as much as
-        // its size: a *minimum* is the only round-trip reading a hostile peer
-        // cannot inflate downward (`ack_delay_adjusted_rtt`), and it is read
-        // here, not written. Taking a maximum or the latest sample instead would
-        // hand the peer a full-size step of the bound per acknowledgement with
-        // no decay and no ceiling; that shape was tried in the detector itself
-        // and reverted.
-        //
-        // And when there is no floor at all — a fresh connection, or a fresh
-        // path after `Session::reset_congestion` — there is no certificate and
-        // so nothing is suppressed: the loss is booked exactly as it was before
-        // this rule existed. That is the case a rule gated on an RTT estimate
-        // gets wrong by being silent; here the ungated behaviour is the old
-        // behaviour, which is never worse than what it replaces.
-        //
-        // Booked before `adapt_inflight_bound` runs below, so a loss
-        // established by this acknowledgement is judged in the round this
-        // acknowledgement closes, not the next one.
-        if !sample.rtt_sampled {
-            match self
-                .rtt_floor()
-                .map(|floor| floor / SPURIOUS_ACK_WINDOW_SHARE_OF_MIN_RTT)
-            {
-                Some(window) if send_elapsed < window => {
-                    self.bytes_spurious_retransmit = self
-                        .bytes_spurious_retransmit
-                        .saturating_add(sample.packet_bytes);
-                }
-                _ => self.on_loss_established(sample.packet_bytes),
-            }
-        }
+        // Nothing about whether this segment was lost is decided here, and the
+        // omission is the point. The acknowledgement in hand carries only the
+        // segment's gap-free stream offset — the same offset every copy of it
+        // was sent under — so it is silent about *which* transmission got
+        // through, and the only other quantity on offer is when it arrived.
+        // Arrival time is written by the peer twice over: it chooses when to
+        // send the acknowledgement, and `min_rtt`, the one local reference an
+        // arrival could be judged against, is itself a filter over
+        // `acked_at − sent_at`. A receiver that holds every acknowledgement
+        // raises that reference without bound, and a rule reading it would let
+        // the peer decide how much loss the sender is allowed to notice. The
+        // signal is therefore raised where nothing the peer does can reach it:
+        // at the moment this endpoint puts the first copy on the wire. See
+        // `Self::on_loss`.
 
         // Delivery rate over the interval this packet spanned, per BBR: the
         // bytes the connection delivered between the packet leaving and its
@@ -1327,35 +1205,53 @@ impl BandwidthEstimator {
     /// the drain computes is `cwnd − inflight`, so the sender would withhold
     /// exactly while it was recovering.
     ///
-    /// The counter it advances is a count of *declarations*, kept for
-    /// diagnostics. What reaches the controller is [`Self::on_loss_established`],
-    /// and `on_ack` decides which retransmissions get there.
+    /// The counter it advances counts copies, one per call. The congestion
+    /// signal is [`Self::on_loss`], which the caller raises for the *first* copy
+    /// of a segment only — see there.
     pub fn on_retransmit(&mut self, bytes: u64) {
         self.inflight_bytes = self.inflight_bytes.saturating_sub(bytes);
         self.bytes_retransmitted = self.bytes_retransmitted.saturating_add(bytes);
     }
 
-    /// Book `bytes` of **established** loss against the round trip in progress —
-    /// BBRv2/v3's `BBRHandleLostPacket`.
+    /// Book `bytes` of loss against the round trip in progress — BBRv2/v3's
+    /// `BBRHandleLostPacket`.
+    ///
+    /// **Raised once per hole, at the instant this endpoint puts the first copy
+    /// on the wire.** Both halves of that are deliberate.
+    ///
+    /// *At the first copy*, because that is the last moment in the segment's
+    /// life that is entirely this endpoint's own. Everything later — whether an
+    /// acknowledgement arrives, when it arrives, what round trip it appears to
+    /// take — is authored by the peer, and a signal conditioned on any of it is
+    /// a signal the peer can withhold by going quiet. The copy, by contrast,
+    /// goes out on this endpoint's own timer: the RTO pass in
+    /// `Stream::poll_send` fires against a wholly silent peer, so silence
+    /// produces the copy and therefore produces the signal.
+    ///
+    /// *Once per hole*, because the round's denominator is what the round
+    /// delivered. A segment that has to be resent three times delivers nothing
+    /// while it is being resent, so counting each copy would drive the numerator
+    /// up while the denominator stood still, and `adapt_inflight_bound` would
+    /// read a stalled path as a maximally congested one and pin `inflight_hi` to
+    /// its floor for as long as the stall lasted. `OutboundSegment::
+    /// first_retransmit` is what tells the copies apart.
     ///
     /// This does nothing else. In particular it does not change the state
     /// machine's phase, does not touch a gain, and does not move the congestion
     /// window: the response is decided once per round trip, over the round's
-    /// *loss rate*, in `adapt_inflight_bound`.
-    ///
-    /// The granularity matters more than it looks. On a path losing a few
-    /// percent with a few hundred segments in flight this is several calls per
-    /// round trip, every round trip, forever. A response scaled per call fires
-    /// continuously and carries no information; the draft's `BBRLossThresh`
-    /// exists precisely so that a rate — not an event — is what the sender
-    /// reacts to.
+    /// *loss rate*, in `adapt_inflight_bound`. The granularity matters more than
+    /// it looks — on a path losing a few percent with a few hundred segments in
+    /// flight this is several calls per round trip, forever, and a response
+    /// scaled per call fires continuously and carries no information. The
+    /// draft's `BBRLossThresh` exists precisely so that a rate, not an event, is
+    /// what the sender reacts to.
     ///
     /// It does **not** touch `inflight_bytes`. The flight arithmetic was settled
     /// when the copy went out ([`Self::on_retransmit`]); doing it again here
     /// would take the same bytes off twice, and since the counter is purely
     /// incremental the error accumulates over the connection into a permanent
     /// under-count that inflates the drain's `cwnd − inflight` budget.
-    pub fn on_loss_established(&mut self, bytes: u64) {
+    pub fn on_loss(&mut self, bytes: u64) {
         self.round_bytes_lost = self.round_bytes_lost.saturating_add(bytes);
         self.bytes_lost = self.bytes_lost.saturating_add(bytes);
     }
@@ -1476,45 +1372,35 @@ impl BandwidthEstimator {
         self.inflight_hi
     }
 
-    /// Bytes whose loss was **established** over the life of the connection —
-    /// the observable for "congestion control was told about a loss".
+    /// Bytes of hole this endpoint reported to congestion control over the life
+    /// of the connection — the observable for "congestion control was told about
+    /// a loss".
     ///
     /// It is deliberately a counter and not a state: loss no longer moves the
     /// state machine, so asking which phase the connection is in answers a
     /// different question.
     ///
-    /// Read it beside [`Self::bytes_retransmitted`], never instead of it. This
-    /// one counts the retransmissions an acknowledgement went on to justify;
-    /// that one counts every retransmission the detector ordered. A single
-    /// figure covering both cannot tell a path that drops from a path that
-    /// reorders, and telling those apart is the whole reason there are two.
+    /// **It over-counts on a path that reorders, and no reading of it can say by
+    /// how much.** RFC 9002's packet threshold declares a segment lost once
+    /// three of its successors are acknowledged, which is exactly what a
+    /// datagram overtaken by three of its successors leaves behind, and this
+    /// endpoint has no way to learn afterwards which of the two happened: the
+    /// acknowledgement names the segment's stream offset, the same offset every
+    /// copy carried. Read next to [`Self::bytes_retransmitted`] it says how much
+    /// of the repair went into re-repair; it does not say how much of the repair
+    /// was needed.
     pub fn bytes_lost(&self) -> u64 {
         self.bytes_lost
     }
 
     /// Bytes the send path retransmitted over the life of the connection,
-    /// whether or not the loss that prompted each copy was real.
+    /// counting every copy.
     ///
-    /// The declaration count. `bytes_retransmitted − bytes_lost` is the
-    /// bandwidth a reordering path costs this sender in wasted copies, most of
-    /// which is accounted for exactly by [`Self::bytes_spurious_retransmit`];
-    /// the rest is segments still in flight, or never acknowledged at all.
+    /// `bytes_retransmitted − bytes_lost` is what the sender spent on second and
+    /// later copies of segments whose first copy did not get through — the cost
+    /// of a path that is losing repairs as well as data.
     pub fn bytes_retransmitted(&self) -> u64 {
         self.bytes_retransmitted
-    }
-
-    /// Bytes of retransmission this endpoint can show were unnecessary — the
-    /// segment's acknowledgement arrived too soon after the copy left to have
-    /// been an acknowledgement of the copy, so an earlier transmission had
-    /// arrived after all.
-    ///
-    /// A lower bound on the waste, not a measure of it: the same certificate
-    /// that identifies these is unavailable before the connection has timed a
-    /// round trip, and a reordered original that comes back later than one
-    /// minimum round trip is indistinguishable from a drop and is counted as
-    /// one.
-    pub fn bytes_spurious_retransmit(&self) -> u64 {
-        self.bytes_spurious_retransmit
     }
 
     /// Get estimated bottleneck bandwidth (bytes/sec).
@@ -1976,7 +1862,6 @@ impl std::fmt::Debug for BandwidthEstimator {
             .field("delivered_bytes", &self.delivered_bytes)
             .field("bytes_lost", &self.bytes_lost)
             .field("bytes_retransmitted", &self.bytes_retransmitted)
-            .field("bytes_spurious_retransmit", &self.bytes_spurious_retransmit)
             .field("app_limited", &self.app_limited)
             .finish()
     }
@@ -2015,103 +1900,189 @@ mod tests {
         }
     }
 
-    /// **The Karn flag is the loss gate, and it must stay pointed one way.**
+    /// **A receiver that stretches the round trip this sender measures must not
+    /// be able to decide how much loss the sender is allowed to see.**
     ///
-    /// `rtt_sampled` records one fact — that no copy of these bytes was on the
-    /// wire — and two things read it: the min-RTT filter, and the question of
-    /// whether there is a retransmission whose necessity is open. A sample
-    /// carrying an unambiguous round trip therefore has nothing to establish, and
-    /// no arrival time it could have makes it a loss. Without this, a future
-    /// reason to distrust an RTT sample that had nothing to do with
-    /// retransmission would start booking losses out of ordinary
-    /// acknowledgements.
+    /// The receiver's move costs it nothing and forges nothing: it holds every
+    /// acknowledgement of a first transmission by half again the true round trip
+    /// and writes `ack_delay_us = 0`, so `ack_delay_adjusted_rtt` has nothing to
+    /// subtract back out and `min_rtt` settles at 500 ms on a 200 ms path.
+    /// Retransmissions it answers at once, which costs it nothing either —
+    /// Karn's condition keeps those samples out of the minimum filter, so
+    /// answering them promptly does not undo the inflation.
+    ///
+    /// Against a rule that read a retransmission's acknowledgement as spurious
+    /// when it arrived within a fraction of `min_rtt` of the copy, that receiver
+    /// is decisive: 200 ms is comfortably inside half of 500 ms, so **every**
+    /// drop on the path was refuted. Measured on exactly this sequence, that rule
+    /// reported `bytes_lost = 0` against 40 real drops (48 000 B) and left the
+    /// inflight bound unset, while the honest arithmetic below reports all of it.
+    ///
+    /// There is no clamp that fixes that shape. `min_rtt` is the only round-trip
+    /// figure a sender has, it is a filter over `acked_at − sent_at`, and there
+    /// is no local lower bound on how long a path may take — so any threshold
+    /// expressed in terms of it is a threshold the peer sets. What this test
+    /// pins is the alternative: the loss is booked when the copy goes out, which
+    /// happens before any acknowledgement is consulted.
     #[test]
-    fn a_usable_round_trip_sample_never_books_a_loss() {
+    fn a_receiver_that_inflates_the_round_trip_cannot_suppress_a_real_drop() {
         const PACKET: u64 = 1200;
+        const DROPS: u64 = 40;
+        /// What the path really costs.
+        const TRUE_RTT: Duration = Duration::from_millis(200);
+        /// What the receiver adds on top, for first transmissions only.
+        const HOLD: Duration = Duration::from_millis(300);
+
+        let mut est = BandwidthEstimator::new();
+        let mut now = Instant::now();
+
+        for round in 0..DROPS {
+            // A first transmission, acknowledged late. This is the only sample
+            // kind that reaches the minimum filter.
+            est.on_send(PACKET);
+            let sent_at = now;
+            now += TRUE_RTT + HOLD;
+            est.on_ack(DeliverySample {
+                delivered_bytes: est.delivered_bytes(),
+                delivered_at: est.delivered_time(),
+                sent_at,
+                acked_at: now,
+                packet_bytes: PACKET,
+                is_app_limited: false,
+                ack_delay_us: 0,
+                rtt_sampled: true,
+            });
+
+            // And a segment the path dropped. The copy goes out — which is the
+            // report — and the receiver answers it on the true round trip.
+            est.on_send(PACKET);
+            est.on_retransmit(PACKET);
+            est.on_loss(PACKET);
+            est.on_send(PACKET);
+            let copy_sent_at = now;
+            now += TRUE_RTT;
+            est.on_ack(DeliverySample {
+                delivered_bytes: est.delivered_bytes(),
+                delivered_at: est.delivered_time(),
+                sent_at: copy_sent_at,
+                acked_at: now,
+                packet_bytes: PACKET,
+                is_app_limited: false,
+                ack_delay_us: 0,
+                rtt_sampled: false,
+            });
+
+            if round == 0 {
+                assert_eq!(
+                    est.rtt_floor(),
+                    Some(TRUE_RTT + HOLD),
+                    "precondition: the receiver's hold must actually have moved the \
+                     figure a suppression rule would be reading"
+                );
+            }
+        }
+
+        assert!(
+            TRUE_RTT * 2 < TRUE_RTT + HOLD,
+            "precondition: the copy's acknowledgement must land inside half the \
+             inflated minimum, or this scenario is not the one that defeated the \
+             withdrawn rule"
+        );
+        assert_eq!(
+            est.bytes_lost(),
+            DROPS * PACKET,
+            "every drop must reach the loss response — a receiver's acknowledgement \
+             timing is not a vote on that"
+        );
+    }
+
+    /// **No acknowledgement, arriving at any moment, may book a loss.**
+    ///
+    /// The loss signal is raised where the peer cannot reach it — at the copy
+    /// leaving — and this is the negative half of that statement, which is the
+    /// half a future edit would break. Both populations are here: samples with
+    /// an unambiguous round trip, and samples for a segment that had already
+    /// been resent (`rtt_sampled: false`), the latter arriving at every spacing
+    /// from a microsecond to well past the minimum round trip the loop itself
+    /// establishes. None of them may move `bytes_lost`.
+    ///
+    /// A version of this file booked a loss for the resent ones unless the
+    /// acknowledgement arrived within a fraction of `min_rtt` of the copy — an
+    /// arrival test, over a reference (`min_rtt`) that is itself a filter over
+    /// arrival times. A receiver that holds every acknowledgement raises that
+    /// reference without bound, which is unbounded control over how much loss
+    /// this sender is permitted to see. The rule is not "clamp the reference";
+    /// there is no clamp, because there is no local lower bound on a path's
+    /// round trip. The rule is that arrival time decides nothing.
+    #[test]
+    fn no_acknowledgement_of_any_timing_books_a_loss() {
+        const PACKET: u64 = 1200;
+        const TRUE_RTT: Duration = Duration::from_millis(80);
         let mut est = BandwidthEstimator::new();
         let start = Instant::now();
 
-        // A long, healthy flight — every acknowledgement unambiguous, arriving
-        // at every plausible spacing including instantly.
-        for i in 0..40u64 {
+        // Seed a real round trip so `rtt_floor` is `Some` — without it the test
+        // would be asserting the absence of a rule on an estimator that has no
+        // reference to apply one with, which is a weaker statement than the one
+        // being made.
+        for i in 0..8u64 {
             est.on_send(PACKET);
             let sent_at = start + Duration::from_millis(i);
             est.on_ack(DeliverySample {
                 delivered_bytes: est.delivered_bytes(),
                 delivered_at: est.delivered_time(),
                 sent_at,
-                acked_at: sent_at + Duration::from_micros(i % 7),
+                acked_at: sent_at + TRUE_RTT,
                 packet_bytes: PACKET,
                 is_app_limited: false,
                 ack_delay_us: 0,
                 rtt_sampled: true,
             });
         }
+        assert_eq!(
+            est.rtt_floor(),
+            Some(TRUE_RTT),
+            "precondition: the estimator has timed the path"
+        );
+
+        // Now the ambiguous ones, at every spacing that has ever been proposed
+        // as meaningful: instant, a fraction of the round trip, the round trip
+        // itself, and several of them.
+        for gap in [
+            Duration::from_micros(1),
+            TRUE_RTT / 4,
+            TRUE_RTT / 2,
+            TRUE_RTT,
+            TRUE_RTT * 4,
+        ] {
+            let sent_at = start + Duration::from_secs(1);
+            est.on_send(PACKET);
+            est.on_retransmit(PACKET);
+            est.on_send(PACKET);
+            est.on_ack(DeliverySample {
+                delivered_bytes: est.delivered_bytes(),
+                delivered_at: est.delivered_time(),
+                sent_at,
+                acked_at: sent_at + gap,
+                packet_bytes: PACKET,
+                is_app_limited: false,
+                ack_delay_us: 0,
+                rtt_sampled: false,
+            });
+        }
 
         assert_eq!(
             est.bytes_lost(),
             0,
-            "an acknowledgement of a segment that was never resent cannot establish \
-             a loss, whatever its timing"
+            "the loss signal must come from the send path, never from when an \
+             acknowledgement turned up"
         );
         assert_eq!(
             est.bytes_retransmitted(),
-            0,
-            "and nothing was retransmitted"
-        );
-        assert_eq!(est.bytes_spurious_retransmit(), 0);
-    }
-
-    /// **Before the path has been timed there is no certificate, and the
-    /// unlicensed behaviour is the old behaviour.**
-    ///
-    /// This is the case the rejected time-only detector got wrong by being
-    /// silent. The gate on an RTT estimate is Karn's algorithm, not "an
-    /// acknowledgement arrived", so on a stream whose first flight went entirely
-    /// to retransmission — or on the first flight after
-    /// `Session::reset_congestion` replaces the estimator on a migration — there
-    /// is no round trip this endpoint has timed. A rule that suppressed the loss
-    /// signal there would suppress it exactly where the sender knows least. It
-    /// books the loss instead, which is what the code did before any of this
-    /// existed.
-    #[test]
-    fn without_a_timed_round_trip_a_retransmission_books_its_loss() {
-        const PACKET: u64 = 1200;
-        let mut est = BandwidthEstimator::new();
-        let start = Instant::now();
-
-        assert!(
-            est.rtt_floor().is_none(),
-            "precondition: a fresh estimator has timed nothing"
-        );
-
-        est.on_send(PACKET);
-        est.on_retransmit(PACKET);
-        est.on_send(PACKET);
-        // The copy is acknowledged immediately — far inside any window a timed
-        // round trip would have produced, so the only thing that can decide this
-        // is the absence of a floor.
-        est.on_ack(DeliverySample {
-            delivered_bytes: 0,
-            delivered_at: start,
-            sent_at: start,
-            acked_at: start + Duration::from_micros(1),
-            packet_bytes: PACKET,
-            is_app_limited: false,
-            ack_delay_us: 0,
-            rtt_sampled: false,
-        });
-
-        assert_eq!(
-            est.bytes_lost(),
-            PACKET,
-            "with no measured round trip to check the arrival against, the \
-             retransmission must be taken at face value"
-        );
-        assert_eq!(
-            est.bytes_spurious_retransmit(),
-            0,
-            "nothing was refuted — there was nothing to refute it with"
+            5 * PACKET,
+            "the copies themselves are still counted — this test must not be \
+             satisfiable by an estimator that stopped hearing about retransmission \
+             altogether"
         );
     }
 
@@ -3835,13 +3806,10 @@ mod tests {
     ///
     /// The bytes that were lost are *returned* rather than reported here, and
     /// the caller feeds them back on the following round. That one round of lag
-    /// is where the live path puts them too, and it is exactly what makes the
-    /// difference between a response that clamps the window the sender is about
-    /// to use and one that does not: the copy goes out at the top of the next
-    /// pass, and the acknowledgement establishing that it was needed arrives
-    /// with that pass's acknowledgements. Both halves are applied here, since a
-    /// round is this simulation's unit of time and it cannot resolve the
-    /// interval between them.
+    /// is where the live path puts them too — the hole is discovered from this
+    /// round's acknowledgements and the copy goes out at the top of the next
+    /// pass — and it is exactly what makes the difference between a response
+    /// that clamps the window the sender is about to use and one that does not.
     fn closed_loop_round(
         est: &mut BandwidthEstimator,
         t0: Instant,
@@ -3851,11 +3819,11 @@ mod tests {
         carry_lost: u64,
     ) -> (u64, Duration) {
         // Retransmissions go out first, and `drain_streams_priority_ordered`
-        // reports each of them as it does. On this path they were genuinely
-        // dropped, so their acknowledgements establish the loss.
+        // reports each of them as it does: the copy against the flight, and —
+        // because each of these is a first copy — the hole against the round.
         if carry_lost > 0 {
             est.on_retransmit(carry_lost);
-            est.on_loss_established(carry_lost);
+            est.on_loss(carry_lost);
         }
 
         let window = est.cwnd();
@@ -4057,10 +4025,10 @@ mod tests {
              a fraction of a percent of it ({in_flight} segments)"
         );
 
-        // The drain retransmits one segment, and its acknowledgement goes on to
-        // establish that the copy was needed.
+        // The drain retransmits one segment: the copy against the flight, the
+        // hole against the round.
         est.on_retransmit(SIM_PACKET);
-        est.on_loss_established(SIM_PACKET);
+        est.on_loss(SIM_PACKET);
 
         assert_eq!(
             est.cwnd(),

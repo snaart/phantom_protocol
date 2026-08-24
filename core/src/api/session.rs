@@ -3079,16 +3079,27 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
                     break;
                 }
             };
-            // A retransmission replaces a transmission this sender is no longer
-            // waiting for, so the flight arithmetic is settled here. The
-            // congestion signal is not: what the detector has produced is a
-            // suspicion drawn from a hole in an acknowledgement, and a path that
-            // merely reorders produces that hole without having dropped
-            // anything. The suspicion is confirmed — or refuted — when the
-            // acknowledgement that retires the segment arrives, by
-            // `BandwidthEstimator::on_ack`.
+            // Two different reports, on two different counts.
+            //
+            // Every copy replaces a transmission this sender is no longer
+            // waiting for, so every copy settles the flight arithmetic here —
+            // deferring it would leave `inflight` a segment high for a round
+            // trip, and the budget this loop computes is `cwnd − inflight`.
+            //
+            // The congestion signal is raised for the *first* copy only. It is
+            // raised here, and not on the acknowledgement that eventually
+            // retires the segment, because this instant is the last one in the
+            // segment's life that the peer has no hand in: the copy goes out on
+            // this endpoint's own RTO even if the peer never says anything
+            // again. And once per segment rather than once per copy, because the
+            // round's loss rate is judged against what the round delivered, and
+            // a segment being resent for the third time is delivering nothing
+            // while it happens.
             if seg.retransmit {
                 crypto_session.on_packet_retransmitted(seg.data.len() as u64);
+                if seg.first_retransmit {
+                    crypto_session.on_packet_lost(seg.data.len() as u64);
+                }
             }
             let mut base = if seg.reliable {
                 PacketFlags::RELIABLE
@@ -3249,13 +3260,9 @@ async fn drain_streams_fully<T: SessionTransport>(
 /// `sent_at` when it resent). Only the single `Instant::now()` the
 /// `DeliverySample` already needed is read.
 ///
-/// That same flag is what tells the estimator there is a retransmission whose
-/// necessity is still an open question, so it must continue to mean exactly
-/// "this segment had a copy on the wire" and nothing broader — see
+/// Nothing else is inferred from the flag, and nothing at all is inferred from
+/// *when* the acknowledgement arrived: this path reports no loss. See
 /// [`DeliverySample::rtt_sampled`](crate::transport::bandwidth_estimator::DeliverySample::rtt_sampled).
-/// `sent_at` is load-bearing for the same decision: it is the instant the
-/// *latest* copy left, which is what the estimator measures the acknowledgement
-/// against.
 ///
 /// `path_id` is the **inbound** `header.path_id` (the id the ACK arrived under),
 /// which is the same id space `mark_path_seen` / `begin_path_validation` /
@@ -4475,26 +4482,26 @@ async fn handle_packet<T: SessionTransport>(
             }
             // L1-B: the SACK gap detector just declared
             // segments lost; wake the send loop so Pass-0 fast-retransmits them promptly.
-            // Nothing about that declaration is reported to congestion control from here,
-            // and the two reasons are worth keeping distinct.
+            // Nothing about that declaration is reported to congestion control from here.
+            // Both reports — the copy against the flight and the hole against the round —
+            // are made at the *retransmission* point (`drain_streams_priority_ordered`'s
+            // `if seg.retransmit { … }`), which covers BOTH a SACK-gap fast-retransmit and
+            // an RTO-timeout retransmit and so fires even against a peer that has stopped
+            // acknowledging altogether.
             //
-            // The flight arithmetic belongs at the *retransmission* point
-            // (`drain_streams_priority_ordered`'s `if seg.retransmit
-            // { on_packet_retransmitted(...) }`), which covers BOTH a SACK-gap
-            // fast-retransmit and an RTO-timeout retransmit. Doing it here as well would
-            // take the same bytes off `inflight_bytes` twice: a SACK-gap-lost segment
-            // charged at both detection AND retransmission nets `+b −b −b +b −b = −b` over
-            // its send/loss/resend/ack lifecycle — a permanent under-count that inflates
-            // the cwnd budget (`cwnd − inflight`) and accumulates with every SACK-gap
-            // loss → over-send, exactly when the controller should be backing off.
+            // Reporting here as well would take the same bytes off `inflight_bytes` twice:
+            // a SACK-gap-lost segment charged at both detection AND retransmission nets
+            // `+b −b −b +b −b = −b` over its send/loss/resend/ack lifecycle — a permanent
+            // under-count that inflates the cwnd budget (`cwnd − inflight`) and accumulates
+            // with every SACK-gap loss → over-send, exactly when the controller should be
+            // backing off. And it would double the hole count too, since a declaration
+            // here is answered by a copy there.
             //
-            // The *congestion signal* belongs at neither point, because at neither of them
-            // is it yet known whether anything was lost. A hole three offsets behind
-            // `largest_acked` is what a reordering path produces, and the loop above is
-            // where the answer arrives: `feed_bbr_on_ack` hands the estimator each retired
-            // segment together with the instant its latest copy left, and the estimator
-            // books a loss only for the ones whose acknowledgement came back too late to
-            // have been answering anything but that copy.
+            // Nor does the acknowledgement loop above report any: it is handed each retired
+            // segment and the instant that segment's latest copy left, and it draws no
+            // conclusion about loss from either. What it could conclude is bounded by what
+            // an acknowledgement carries, which is the segment's gap-free stream offset —
+            // shared by every copy — plus the moment it turned up, which the peer chooses.
             //
             // A retirement wakes the loop for two more reasons: it frees
             // congestion-window room for new data, and it returns a send-buffer
@@ -7286,17 +7293,15 @@ mod tests {
         session.disconnect().await.unwrap();
     }
 
-    /// A retransmission (RTO expiry) must be reported to congestion control as a
-    /// **retransmission and not yet as a loss** — proves the drain →
-    /// `on_packet_retransmitted` wiring, and proves that the wiring stops there.
+    /// A retransmission driven by the RTO — with **no acknowledgement in the
+    /// session's history at all** — must reach congestion control as both a copy
+    /// and a loss.
     ///
-    /// Both halves are the test. The drain is the only place that knows a copy
-    /// went on the wire, so if it reported nothing the flight arithmetic would
-    /// be wrong and the recorded declaration count would read zero on a path
-    /// that retransmits continuously. And it is not a place that knows anything
-    /// about whether the original arrived: no acknowledgement has been seen yet.
-    /// A congestion signal raised here is a signal raised on a suspicion, which
-    /// is exactly what a reordering path turns into permanent back-off.
+    /// This is the drain → `on_packet_retransmitted` / `on_packet_lost` wiring,
+    /// and it is deliberately exercised on the silent path. The RTO pass is a
+    /// local timer, so this is the case that shows the loss report is not
+    /// conditioned on anything the peer does: a peer that answers nothing cannot
+    /// make the connection read as a path that lost nothing.
     ///
     /// The observable is the byte counters rather than the BBR phase. Loss no
     /// longer moves the state machine (it bounds inflight instead), and a test
@@ -7331,20 +7336,19 @@ mod tests {
             "an initial transmission is not a loss"
         );
 
-        // The RTO expires; the next drain retransmits and must report that.
+        // The RTO expires; the next drain retransmits and must report both.
         tokio::time::advance(std::time::Duration::from_millis(1100)).await;
         drain_streams_priority_ordered(&transport, &client, sid, &streams, &obs).await;
         assert_eq!(
             client.bbr_bytes_retransmitted(),
             b"payload".len() as u64,
-            "a retransmit must be reported to BBR as a retransmit"
+            "the copy must reach the flight arithmetic"
         );
         assert_eq!(
             client.bbr_bytes_lost(),
-            0,
-            "nothing has been acknowledged, so nothing is yet known to have been \
-             lost: a congestion signal raised at the retransmission is raised on a \
-             suspicion"
+            b"payload".len() as u64,
+            "and the hole must reach the loss response, on a connection that has \
+             never received a single acknowledgement"
         );
     }
 
@@ -7554,10 +7558,10 @@ mod tests {
     /// One round trip of a bulk flight through a bandwidth estimator.
     ///
     /// The loss the previous round suffered is reported at the top, which is
-    /// where the live drain resends it and where the acknowledgement
-    /// establishing that the resend was needed arrives; that one round of lag is
-    /// what puts the judgement on the round the loss belongs to. `app_limited`
-    /// is whatever the drain's stopping reason produced for this round.
+    /// where the live drain resends it and therefore where it reports it; that
+    /// one round of lag is what puts the judgement on the round the loss belongs
+    /// to. `app_limited` is whatever the drain's stopping reason produced for
+    /// this round.
     fn bbr_round(
         est: &mut crate::transport::bandwidth_estimator::BandwidthEstimator,
         t0: std::time::Instant,
@@ -7569,7 +7573,7 @@ mod tests {
         use crate::transport::bandwidth_estimator::DeliverySample;
         if carry_lost > 0 {
             est.on_retransmit(carry_lost * APP_LIMITED_SEG);
-            est.on_loss_established(carry_lost * APP_LIMITED_SEG);
+            est.on_loss(carry_lost * APP_LIMITED_SEG);
         }
         for _ in 0..packets {
             est.on_send(APP_LIMITED_SEG);

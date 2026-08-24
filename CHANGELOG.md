@@ -342,13 +342,13 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   * `BandwidthEstimator::set_app_limited` → pass `app_limited_now` to `Stream::poll_send`.
     The flag belongs to the packet, not to the estimator's current mood: it rides out on the
     segment and comes back on `RetiredSegment::app_limited_at_send`.
-  * `BandwidthEstimator::on_loss` → `on_retransmit` for the flight arithmetic and
-    `on_loss_established` for the congestion signal. One call did both, which is why a
-    reordering path's wasted retransmission was also a back-off; the two now happen at
-    different moments and the split is what makes that possible. See **Fixed**.
-  * `Session::on_packet_lost` → `Session::on_packet_retransmitted`. Same split, and the name
-    is the point: what the send path knows is that it put a copy on the wire, not that
-    anything was lost.
+  * `BandwidthEstimator::on_loss` split: it keeps its name and its meaning (the congestion
+    signal) but no longer touches `inflight_bytes`, and the flight arithmetic moved to the
+    new `on_retransmit`. The caller raises the first for a segment's **first** copy only and
+    the second for every copy. `Session` mirrors it: `on_packet_lost` unchanged in name and
+    meaning, plus a new `Session::on_packet_retransmitted`. See **Fixed**.
+  * `OutboundSegment` gained `first_retransmit: bool` — the field a caller reads to tell a
+    segment's first copy from its second. Exhaustive struct literals need it.
   * `Stream::local_recv_window` → `Stream::advertised_recv_window`.
   * `Stream::apply_peer_window_update(credit: u32)` →
     `Stream::apply_peer_window_limit(limit: u64)`. The argument changed meaning as well as
@@ -384,10 +384,10 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
     in, which is what makes a BBR sample mean anything.
   * `BandwidthSnapshot::{last_delivery_rate_bps, delivered_bytes, delivered_time, state,
     app_limited}` — take it from `Session::bandwidth_snapshot()`.
-  * `BandwidthSnapshot::{bytes_retransmitted, bytes_lost, bytes_spurious_retransmit,
-    inflight_hi_bytes}` — likewise. The four travel together because no one of them is
-    interpretable alone: a single loss counter reads the same on a path that drops 2% and a
-    path that reorders 2%.
+  * `BandwidthSnapshot::{bytes_retransmitted, bytes_lost, inflight_hi_bytes}` — likewise.
+    The first two travel together because neither is interpretable alone: one counts copies
+    emitted, the other counts holes charged, and only their difference says what repairing
+    the path's repairs cost.
   * `DeliverySample::{delivered_at, rtt_sampled}` — built by the ack path.
 
   *Enum variants that are new* — these three enums are exhaustive, so a `match` without a
@@ -521,8 +521,8 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Added
 
-- **The artifact records what the sender's retransmission cost, and how much of it was
-  waste.** Until now no artifact carried any loss quantity at all: the window row held the
+- **The artifact records what the sender's retransmission cost.** Until now no artifact
+  carried any loss quantity at all: the window row held the
   congestion window, bytes outstanding, the bandwidth estimate, the minimum round trip, the
   BBR phase and the app-limited flag — its own documentation said "loss does not appear
   here" — and the metrics snapshot carried packets, bytes, handshakes, replay and AEAD
@@ -535,15 +535,18 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   min_rtt)` falling under the gain, with ProbeRTT samples excluded by hand, which is the
   second half of the same gap.
 
-  Four columns close both halves: `bytes_retransmitted` (what the detector declared),
-  `bytes_lost` (what an acknowledgement confirmed), `bytes_spurious_retransmit` (what an
-  acknowledgement refuted) and `inflight_hi_bytes` (the loss bound as a recorded fact rather
-  than an inference that misreads ProbeRTT and a bound set while the estimate was smaller).
-  They are `serde(default)`, so every archived run still loads — as absent rather than as
-  four measured zeros, and `analyze.py` prints "this run predates the split" for those
-  instead of a reading. They read zero on the `quic` reference leg deliberately: quinn's
-  `lost_packets` is a declaration count in its own units with no such separation, and it
-  travels as prose in the transport note where its definition travels with it.
+  Three columns close it: `bytes_retransmitted` (copies emitted, counting the second and
+  third copy of a segment), `bytes_lost` (holes charged, one per segment) and
+  `inflight_hi_bytes` (the loss bound as a recorded fact rather than an inference that
+  misreads ProbeRTT and a bound set while the estimate was smaller). A fourth — what a path
+  reordered rather than dropped — is **not** here and cannot be: an acknowledgement on this
+  wire names a segment's stream offset, which every copy of it shared, so the sender never
+  learns which transmission arrived. On a route known to reorder, `bytes_lost` is an upper
+  bound on the drops. All three are `serde(default)`, so every archived run still loads,
+  with them absent rather than as measured zeros; `analyze.py` does not read them yet. They
+  read zero on the `quic` reference leg deliberately: quinn counts in its own units over its
+  own packet-number space, and its figures travel as prose in the transport note where their
+  definition travels with them.
 
 - **`FaultControl::arm_hold_next(depth)`** — a reorder with a *depth*, not just an
   incidence. The index sets and the seeded stochastic mode both express reordering as an
@@ -1001,52 +1004,52 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Fixed
 
-- **A path that reorders was read as a path that drops, and the sender paid for it in
-  window.** RFC 9002's packet threshold declares a segment lost once three of its
-  successors have been acknowledged, and a datagram overtaken by three of its successors
-  satisfies that without anything having been dropped. Every such datagram cost a
-  retransmission *and* a loss reported to congestion control, whose response is
-  `inflight_hi` — a bound on the bytes the sender may have outstanding, floored at 1.25×
-  the bandwidth-delay product and taken from a round's loss rate against a 2% threshold.
+- **One dropped segment could be charged to congestion control several times over, and a
+  loss report could be switched off by a peer that simply stopped answering.** Both are the
+  same accounting: `Session::on_packet_lost` was called once per copy the send path emitted,
+  and a superseding attempt then moved it onto the acknowledgement path entirely. Neither is
+  right, and the second was the more dangerous.
 
-  The reordering is measured, on the raw controls of the run that unblocked this: 0.48% of
-  upstream datagrams late, the worst of them **225 positions** late against a fixed
-  threshold of three, and late in *time* by 0.7 ms against a minimum round trip of 187 ms.
-  Two orders of magnitude between the displacement in sequence and the displacement in
-  time is the whole shape of the defect: the threshold reads the first and the sender's
-  own clock can see the second.
+  What ships: the loss report is raised at the moment this endpoint puts a segment's
+  **first** copy on the wire, once per segment. The instant is chosen for what the peer
+  cannot do to it — `Stream::poll_send`'s retransmission timer is local and fires against a
+  wholly silent peer, so no amount of withholding turns a lossy path into a clean-looking
+  one. The count is chosen for what the round's denominator is: the loss *rate* is judged
+  against what the round delivered, and a segment on its third repair delivers nothing, so
+  charging per copy drove the numerator up against a denominator that had stopped moving and
+  read a stalled path as a maximally congested one. The in-flight arithmetic still happens
+  per copy, in the new `Session::on_packet_retransmitted`: deferring it would leave
+  `inflight_bytes` one segment high for a round trip, and the drain's new-data budget is
+  `cwnd − inflight`, so the sender would withhold data precisely while recovering.
 
-  **What changed is the cost of a false detection, not the detection.** The copy still goes
-  out on the same trigger, so recovery is exactly as fast as it was; what moves is the
-  congestion signal, which is no longer raised when the segment is *declared* lost but when
-  the loss is *established* — the acknowledgement that retires the segment arrives later
-  than a fraction of a round trip after the copy left, so it cannot be answering anything
-  but the copy. A reordered segment whose original arrives late now costs one wasted
-  segment of bandwidth and nothing else.
+  **What was attempted and withdrawn, because the measurement is worth more than the
+  silence.** On a path that reorders, RFC 9002's packet threshold declares a segment lost
+  once three of its successors are acknowledged, which is exactly what a datagram overtaken
+  by three of its successors leaves behind — measured on the reference route's raw controls
+  at 0.48% of upstream datagrams, the worst 225 positions late while being only 0.7 ms late
+  in time. An attempt to refute those false detections read a retransmission's
+  acknowledgement as answering an *earlier* transmission when it arrived within a fraction
+  of `min_rtt` of the copy. It is withdrawn, on two measurements:
 
-  **Every term of that decision is local.** The instant the copy left, the instant the
-  acknowledgement arrived, and the smallest round trip this endpoint has itself timed —
-  which a peer can decline to lower but cannot lower. Nothing is learned from the ordering
-  or the timing of what the peer sends, which is the trap the two rejected approaches fell
-  into: a *learned* reordering tolerance is a quantity the peer writes, because the sender
-  cannot distinguish "the peer received late" from "the peer acknowledged late", and a
-  time-only threshold taking `max(smoothed_rtt, latest_rtt)` hands the peer a full-size
-  step per acknowledgement with no decay and no ceiling. What the peer can still do is
-  withhold the acknowledgement of a retransmission, which **delays** a congestion signal it
-  could suppress outright today by acknowledging data it never received — at the cost of
-  its own delivery.
+  * `min_rtt` is a filter over `acked_at − sent_at`, so a receiver that holds
+    acknowledgements of first transmissions and answers retransmissions promptly raises it
+    without bound — Karn's condition keeps the prompt answers out of the minimum filter, so
+    they do not undo the inflation. On a 200 ms path with a 300 ms hold and 40 real drops,
+    that rule reported **0 B** of loss instead of 48 000 B and never set the inflight bound.
+    There is no clamp: `min_rtt` is the only round-trip figure a sender has and there is no
+    local lower bound on how long a path may take, so any threshold expressed through it is
+    a threshold the peer sets.
+  * Booking the loss inside the acknowledgement path meant a peer that never acknowledged a
+    retransmission produced no loss at all, ever — 2312 B resent, 0 B charged, while other
+    traffic went on closing rounds and relaxing the bound.
 
-  Two consequences worth stating separately. A segment retransmitted twice is now **one**
-  loss rather than two: what a round's loss rate is a rate of is holes in the flight, and
-  repeated copies of one segment are one hole. And where there is no certificate — a fresh
-  connection, or a fresh path after `Session::reset_congestion` on migration, neither of
-  which has timed a round trip — nothing is suppressed and the loss is booked exactly as
-  before, so the ungated behaviour is never worse than what it replaced.
-
-  The in-flight arithmetic stays where it was, at the retransmission
-  (`Session::on_packet_retransmitted`): deferring it would leave `inflight_bytes` one
-  segment high for a round trip, and the drain's new-data budget is `cwnd − inflight`, so
-  the sender would withhold data precisely while recovering.
+  **The false detections therefore remain**, and this is a property of the wire rather than
+  a choice: an acknowledgement here is a SACK over gap-free stream offsets, and a
+  retransmission reuses its segment's offset, so nothing that arrives says which
+  transmission got through. A reordering route's `bytes_lost` is an upper bound on its
+  drops. Pinned by `transport::stream::tests::
+  reordering_and_a_drop_leave_the_sender_the_same_counters`, which is the test to revisit
+  first if a future wire ever carries the missing field.
 
 - **`analyze.py` reported a stalled sender on every run, about a side that was never
   sending.** The congestion-window section warned "window never left its 5600 B floor —
