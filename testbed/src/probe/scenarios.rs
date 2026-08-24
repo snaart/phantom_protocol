@@ -5015,6 +5015,12 @@ mod tests {
             delivered_bytes: i * 100_000,
             state: "probe_bw".into(),
             app_limited: false,
+            // Not read by the tail statistic under test; zero rather than a
+            // plausible-looking figure, so nothing here can be mistaken for a
+            // fixture the assertions depend on.
+            bytes_retransmitted: 0,
+            bytes_lost: 0,
+            inflight_hi_bytes: 0,
         }
     }
 

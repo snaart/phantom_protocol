@@ -2277,9 +2277,9 @@ fn reset_congestion_returns_controller_to_initial() {
     let (fresh, _f) = make_session_pair([0x95u8; 32]);
     let initial_cwnd = fresh.bandwidth_snapshot().cwnd_bytes;
 
-    // Perturb the controller: register inflight + a loss.
+    // Perturb the controller: register inflight + a retransmission.
     s.on_packet_sent(200_000);
-    s.on_packet_lost(100_000);
+    s.on_packet_retransmitted(100_000);
     assert!(
         s.bandwidth_snapshot().inflight_bytes > 0,
         "precondition: on_packet_sent should register inflight bytes"
