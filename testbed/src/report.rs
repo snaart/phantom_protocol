@@ -478,44 +478,37 @@ pub struct WindowSample {
     /// application was the limit, not the transport.
     pub app_limited: bool,
     /// Bytes the sender has retransmitted, cumulative — every copy its loss
-    /// detector ordered, whether the path had dropped anything or not.
+    /// detector ordered, counting the second and third copies of a segment as
+    /// well as the first.
     ///
     /// **The row carried no loss quantity at all until this, and that is why one
     /// question could not be answered from an archive.** A run whose window
     /// series shows the loss bound engaged says the sender backed off; it does
-    /// not say what it backed off *from*. RFC 9002's packet threshold declares a
-    /// segment lost once three of its successors are acknowledged, which is what
-    /// a path that reorders produces without having dropped anything — so
-    /// "declared" and "lost" are different quantities, and a single counter
-    /// reads identically on a path that drops 2% and a path that reorders 2%.
-    /// The reference route's own raw controls show reordering at 0.48% with
-    /// displacements up to 225 datagrams, so this is not a hypothetical
-    /// distinction on it.
+    /// not say what it backed off *from*, or what the backing off cost. Together
+    /// with [`Self::bytes_lost`] it now does: that one counts holes, this one
+    /// counts copies, and the difference is the bandwidth that went into
+    /// re-repairing segments whose first copy also failed to arrive.
     ///
-    /// Defaulted on deserialize, so runs recorded before these four fields
-    /// existed load as zeros rather than failing to parse. Zero on the `quic`
-    /// leg, whose controller does not expose the figure.
+    /// **Neither figure separates drops from reordering, and no column here
+    /// can.** RFC 9002's packet threshold declares a segment lost once three of
+    /// its successors are acknowledged, which is what a path that reorders
+    /// produces without having dropped anything, and the sender never learns
+    /// which happened — an acknowledgement on this wire names the segment's
+    /// stream offset, which the original and every copy shared. The reference
+    /// route's own raw controls show reordering at 0.48% with displacements up
+    /// to 225 datagrams, so on that route `bytes_lost` is an **upper bound** on
+    /// the drops and should be read as one.
+    ///
+    /// Defaulted on deserialize, so runs recorded before these fields existed
+    /// load as zeros rather than failing to parse. Zero on the `quic` leg, whose
+    /// controller does not expose the figure.
     #[serde(default)]
     pub bytes_retransmitted: u64,
-    /// Bytes whose loss the sender **established** and fed to congestion
-    /// control, cumulative. The numerator of the round loss rate the inflight
-    /// bound is judged on.
-    ///
-    /// `bytes_retransmitted − bytes_lost` is the wasted half of the sender's
-    /// retransmission, and the pair is the measurement the reordering question
-    /// needs.
+    /// Bytes of hole the sender fed to congestion control, cumulative — one
+    /// booking per segment it first put a copy of on the wire. The numerator of
+    /// the round loss rate the inflight bound is judged on.
     #[serde(default)]
     pub bytes_lost: u64,
-    /// Bytes of retransmission the sender could show were unnecessary: the
-    /// acknowledgement that retired the segment came back too soon after the
-    /// copy left to have been answering the copy, so an earlier transmission had
-    /// arrived after all.
-    ///
-    /// A lower bound on the waste rather than a measure of it — the certificate
-    /// needs a round trip the sender has timed, and a reordered datagram that
-    /// comes back later than a fraction of one is indistinguishable from a drop.
-    #[serde(default)]
-    pub bytes_spurious_retransmit: u64,
     /// The loss-imposed bound on bytes outstanding, or `0` when the path has
     /// given no reason for one.
     ///
@@ -1823,13 +1816,8 @@ mod tests {
              as a measured zero"
         );
         assert_eq!(
-            (
-                s.bytes_retransmitted,
-                s.bytes_lost,
-                s.bytes_spurious_retransmit,
-                s.inflight_hi_bytes
-            ),
-            (0, 0, 0, 0),
+            (s.bytes_retransmitted, s.bytes_lost, s.inflight_hi_bytes),
+            (0, 0, 0),
             "the loss columns postdate this row too; a run recorded before them \
              must load with them absent rather than fail to parse, which is the \
              only reason an archive is worth keeping"
@@ -1839,21 +1827,19 @@ mod tests {
     /// The loss columns have to survive the round trip through the artifact, and
     /// they have to stay told apart.
     ///
-    /// The three of them are one measurement in three parts — what the detector
-    /// declared, what an acknowledgement confirmed, what an acknowledgement
-    /// refuted — and the whole value of recording them is that a reader can
-    /// subtract. A row that serialised two of them into one field, or swapped
-    /// them, would still look like a plausible run: every value is a byte count
-    /// of the same magnitude. Distinct values in the fixture are what makes that
-    /// visible.
+    /// They are one measurement in two parts — copies emitted, holes charged —
+    /// and the whole value of recording them is that a reader can subtract. A row
+    /// that serialised both into one field, or swapped them, would still look
+    /// like a plausible run: both are byte counts of the same magnitude.
+    /// Distinct values in the fixture are what makes that visible.
     #[test]
     fn the_loss_columns_survive_a_round_trip_and_stay_distinct() {
         let row = phantom_leg_window_row();
         assert!(
             row.bytes_retransmitted > row.bytes_lost,
-            "the fixture must describe a sender that retransmitted more than it \
-             established loss for, or it cannot tell a mixed-up column from a \
-             correct one"
+            "the fixture must describe a sender that spent more on copies than it \
+             charged in holes — the shape a path that loses its repairs produces — \
+             or it cannot tell a mixed-up column from a correct one"
         );
 
         let back: WindowSample = serde_json::from_str(
@@ -1863,7 +1849,6 @@ mod tests {
 
         assert_eq!(back.bytes_retransmitted, row.bytes_retransmitted);
         assert_eq!(back.bytes_lost, row.bytes_lost);
-        assert_eq!(back.bytes_spurious_retransmit, row.bytes_spurious_retransmit);
         assert_eq!(back.inflight_hi_bytes, row.inflight_hi_bytes);
     }
 
@@ -1887,7 +1872,6 @@ mod tests {
             app_limited: false,
             bytes_retransmitted: 34_680,
             bytes_lost: 11_560,
-            bytes_spurious_retransmit: 23_120,
             inflight_hi_bytes: 300_000,
         }
     }

@@ -267,12 +267,12 @@ impl MsgLink for Framed {
                 delivered_bytes: bw.delivered_bytes,
                 state: bw.state.as_str().to_string(),
                 app_limited: bw.app_limited,
-                // The three loss figures travel together or not at all: a
-                // declaration count on its own says nothing a single "lost"
-                // counter did not already say wrongly.
+                // The two loss figures travel together or not at all: a count of
+                // copies on its own says nothing about how many holes bought
+                // them, and a count of holes on its own says nothing about what
+                // filling them cost.
                 bytes_retransmitted: bw.bytes_retransmitted,
                 bytes_lost: bw.bytes_lost,
-                bytes_spurious_retransmit: bw.bytes_spurious_retransmit,
                 inflight_hi_bytes: bw.inflight_hi_bytes,
             })
         })
@@ -405,13 +405,12 @@ pub(crate) mod testing {
                     delivered_bytes: 1400,
                     state: "probe_bw".to_string(),
                     app_limited: false,
-                    // A sender that has retransmitted twice as much as it has
-                    // established loss for: the shape a reordering path
-                    // produces, and distinct values so a row that dropped or
-                    // transposed one of these columns is visible.
+                    // A sender that spent two copies on one hole: the shape a
+                    // path that loses its own repairs produces, and distinct
+                    // values so a row that dropped or transposed one of these
+                    // columns is visible.
                     bytes_retransmitted: 2800,
                     bytes_lost: 1400,
-                    bytes_spurious_retransmit: 1400,
                     inflight_hi_bytes: 4200,
                 })
             })

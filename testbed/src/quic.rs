@@ -503,17 +503,14 @@ impl MsgLink for QuicLink {
                 state: "quic:cubic".to_string(),
                 app_limited: false,
                 // Zero, and deliberately not quinn's `lost_packets`/`lost_bytes`.
-                // Those are a *declaration* count in quinn's own units and
-                // carry no separation between a declaration an acknowledgement
-                // later justified and one it refuted, which is precisely what
-                // these three columns exist to separate on the leg under test.
-                // Putting a differently-defined figure in a shared column is how
-                // a cross-leg comparison comes to compare two things. quinn's
-                // numbers travel as prose, in `loss_note`, where their
-                // definition travels with them.
+                // Those are counted in quinn's own units, over quinn's own
+                // packet-number space, and its detector is not the one these
+                // columns describe — putting a differently-defined figure in a
+                // shared column is how a cross-leg comparison comes to compare
+                // two things. quinn's numbers travel as prose, in `loss_note`,
+                // where their definition travels with them.
                 bytes_retransmitted: 0,
                 bytes_lost: 0,
-                bytes_spurious_retransmit: 0,
                 inflight_hi_bytes: 0,
             })
         })

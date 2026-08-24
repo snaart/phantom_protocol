@@ -5020,7 +5020,6 @@ mod tests {
             // fixture the assertions depend on.
             bytes_retransmitted: 0,
             bytes_lost: 0,
-            bytes_spurious_retransmit: 0,
             inflight_hi_bytes: 0,
         }
     }
