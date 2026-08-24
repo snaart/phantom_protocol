@@ -785,6 +785,70 @@ def series_role(rows):
     return "sender" if series_is_a_sender(rows) else "receiver"
 
 
+def retransmission_reading(rows):
+    """What a sender's retransmission cost it, and how much of that was waste.
+
+    `None` when the rows predate the columns — the three loss figures and the
+    inflight bound were added together, so a run recorded before them carries
+    none of them, and four zeros would read as a sender that never retransmitted
+    anything. That distinction is the whole reason this returns `None` rather
+    than a zeroed reading: the runs this question was first asked of are exactly
+    the ones that cannot answer it.
+
+    The reading itself is a subtraction the artifact could not previously
+    support. `declared` is what the loss detector ordered — RFC 9002's packet
+    threshold, which fires on a hole three offsets behind the largest
+    acknowledgement, and a path that reorders leaves that hole without having
+    dropped anything. `established` is the part an acknowledgement went on to
+    justify, and it is the only part congestion control was told about.
+    `refuted` is the part an acknowledgement contradicted: the segment's
+    acknowledgement came back too soon after the copy left to have been
+    answering the copy.
+
+    `refuted / declared` is therefore the share of this sender's retransmission
+    the path's reordering bought, and it is a *lower* bound on the waste — the
+    certificate needs a round trip the sender has timed, and a reordered
+    datagram that returns later than a fraction of one is indistinguishable from
+    a drop.
+
+    `bound_samples` counts the samples in which the loss response was actually
+    binding, read from the recorded bound rather than inferred by comparing the
+    window against the bandwidth-delay product. That inference is what this
+    analysis had to make before the column existed and it misreads two states:
+    ProbeRTT pins the window to four packets for its own reasons, and a bound set
+    while the estimate was smaller stays a fixed byte count while the product
+    grows past it.
+
+    The three totals are read as maxima over the series rather than from its last
+    row, because they are cumulative over the *estimator's* life and not the
+    session's: a migration replaces the estimator and restarts them at zero,
+    exactly as it restarts the bandwidth estimate and the round-trip minimum. A
+    series spanning one is therefore not monotone, and the maximum is the larger
+    of the two paths rather than their sum — which is a reading a migration
+    scenario has to be told about rather than one this can fix.
+    """
+    keys = (
+        "bytes_retransmitted",
+        "bytes_lost",
+        "bytes_spurious_retransmit",
+        "inflight_hi_bytes",
+    )
+    if not any(k in r for r in rows for k in keys):
+        return None
+    declared = max((r.get("bytes_retransmitted", 0) or 0) for r in rows)
+    established = max((r.get("bytes_lost", 0) or 0) for r in rows)
+    refuted = max((r.get("bytes_spurious_retransmit", 0) or 0) for r in rows)
+    bound_samples = sum(1 for r in rows if (r.get("inflight_hi_bytes", 0) or 0) > 0)
+    return {
+        "declared": declared,
+        "established": established,
+        "refuted": refuted,
+        "refuted_share": (refuted / declared) if declared else None,
+        "bound_samples": bound_samples,
+        "samples": len(rows),
+    }
+
+
 def frame_bytes_of(transfer_rows, direction=None):
     """Mean application frame size, from the transfer's own byte and frame counts.
 
@@ -1676,6 +1740,30 @@ def window_series_reading(leg, phase, rows):
     # "sender-bound" was a finding this tool printed on every run, about a
     # side that was never sending.
     role = series_role(rows)
+    # What the retransmission cost, printed only for a sending side: a receiver
+    # retransmits nothing and the reference leg reports nothing, and in both
+    # cases zeros would read as a measurement.
+    if role == "sender":
+        rx = retransmission_reading(rows)
+        if rx is None:
+            print(
+                "         (no loss columns — this run predates the "
+                "declared/established/refuted split)"
+            )
+        elif rx["declared"] == 0:
+            print("         retransmitted nothing; the loss response was never engaged")
+        else:
+            share = rx["refuted_share"]
+            print(
+                f"         retransmitted {rx['declared']:>8} B, of which "
+                f"{rx['established']:>8} B established as loss and {rx['refuted']:>8} B "
+                f"refuted by their own acknowledgements"
+                + (f" ({share * 100:.1f}% waste)" if share is not None else "")
+            )
+            print(
+                f"         {'':18} inflight bound engaged in "
+                f"{rx['bound_samples']}/{rx['samples']} samples"
+            )
     if role == "reference":
         print("         reference leg — no bytes-in-flight statistic, so neither reading applies")
     elif role == "receiver":
@@ -2758,6 +2846,44 @@ def self_test():
         ([win(delivered_bytes=0, state="quic:cubic", cwnd_bytes=12000)], "reference"),
         ([win(delivered_bytes=8192, cwnd_bytes=5600, inflight_bytes=5600)], "sender"),
     ]
+    # The loss columns must keep three states apart, and the middle one is the
+    # one a default would destroy: a run recorded before the columns existed
+    # carries no reading at all, and printing four zeros for it would say the
+    # sender retransmitted nothing — which is the answer this whole question
+    # exists to stop being invented.
+    retransmit_cases = [
+        # A path that reorders: most of the retransmission refuted.
+        (
+            [
+                win(
+                    bytes_retransmitted=10_000,
+                    bytes_lost=1_000,
+                    bytes_spurious_retransmit=9_000,
+                    inflight_hi_bytes=0,
+                )
+            ],
+            (10_000, 1_000, 9_000, 0.9, 0),
+        ),
+        # A path that drops: none of it refuted, and the bound engaged.
+        (
+            [
+                win(
+                    bytes_retransmitted=10_000,
+                    bytes_lost=10_000,
+                    bytes_spurious_retransmit=0,
+                    inflight_hi_bytes=300_000,
+                )
+            ],
+            (10_000, 10_000, 0, 0.0, 1),
+        ),
+        # Present and zero is a real reading — nothing was retransmitted — and
+        # the share is undefined rather than zero, because there is nothing to
+        # take a share of.
+        (
+            [win(bytes_retransmitted=0, bytes_lost=0, bytes_spurious_retransmit=0)],
+            (0, 0, 0, None, 0),
+        ),
+    ]
     # The buffer's ceiling is a segment count, so it moves with the frame size;
     # the peer's window is a byte count and does not. That difference is the
     # only thing that ever tells them apart.
@@ -3253,6 +3379,31 @@ def self_test():
             f"cwnd={rows[0]['cwnd_bytes']}, inflight={rows[0]['inflight_bytes']}) "
             f"-> {got!r} (want {want_role!r})"
         )
+    for rows, want in retransmit_cases:
+        rx = retransmission_reading(rows)
+        got = (
+            (
+                rx["declared"],
+                rx["established"],
+                rx["refuted"],
+                rx["refuted_share"],
+                rx["bound_samples"],
+            )
+            if rx
+            else None
+        )
+        ok = got == want
+        failures += 0 if ok else 1
+        print(f"  {'ok' if ok else 'FAIL'}: retransmission_reading -> {got} (want {want})")
+    # And a row from before the columns existed must answer "no reading", not a
+    # zeroed one.
+    old_row = {k: v for k, v in win().items()}
+    ok = retransmission_reading([old_row]) is None
+    failures += 0 if ok else 1
+    print(
+        f"  {'ok' if ok else 'FAIL'}: retransmission_reading refuses a run recorded "
+        "before the loss columns"
+    )
     for frame, want_arq, want_sep in ceiling_split_cases:
         c = ceilings_separable(frame)
         got = (c["arq"], c["separable"]) if c else (None, None)
@@ -3345,6 +3496,8 @@ def self_test():
 
     extra = (
         len(side_cases)
+        + len(retransmit_cases)
+        + 1  # the run that predates the loss columns
         + len(ceiling_split_cases)
         + len(startup_cases)
         + len(shape_cases)
