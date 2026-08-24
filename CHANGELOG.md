@@ -342,6 +342,13 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   * `BandwidthEstimator::set_app_limited` → pass `app_limited_now` to `Stream::poll_send`.
     The flag belongs to the packet, not to the estimator's current mood: it rides out on the
     segment and comes back on `RetiredSegment::app_limited_at_send`.
+  * `BandwidthEstimator::on_loss` → `on_retransmit` for the flight arithmetic and
+    `on_loss_established` for the congestion signal. One call did both, which is why a
+    reordering path's wasted retransmission was also a back-off; the two now happen at
+    different moments and the split is what makes that possible. See **Fixed**.
+  * `Session::on_packet_lost` → `Session::on_packet_retransmitted`. Same split, and the name
+    is the point: what the send path knows is that it put a copy on the wire, not that
+    anything was lost.
   * `Stream::local_recv_window` → `Stream::advertised_recv_window`.
   * `Stream::apply_peer_window_update(credit: u32)` →
     `Stream::apply_peer_window_limit(limit: u64)`. The argument changed meaning as well as
@@ -377,6 +384,10 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
     in, which is what makes a BBR sample mean anything.
   * `BandwidthSnapshot::{last_delivery_rate_bps, delivered_bytes, delivered_time, state,
     app_limited}` — take it from `Session::bandwidth_snapshot()`.
+  * `BandwidthSnapshot::{bytes_retransmitted, bytes_lost, bytes_spurious_retransmit,
+    inflight_hi_bytes}` — likewise. The four travel together because no one of them is
+    interpretable alone: a single loss counter reads the same on a path that drops 2% and a
+    path that reorders 2%.
   * `DeliverySample::{delivered_at, rtt_sampled}` — built by the ack path.
 
   *Enum variants that are new* — these three enums are exhaustive, so a `match` without a
@@ -509,6 +520,38 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   Breaking, within the pre-1.0 0.2.x window.
 
 ### Added
+
+- **The artifact records what the sender's retransmission cost, and how much of it was
+  waste.** Until now no artifact carried any loss quantity at all: the window row held the
+  congestion window, bytes outstanding, the bandwidth estimate, the minimum round trip, the
+  BBR phase and the app-limited flag — its own documentation said "loss does not appear
+  here" — and the metrics snapshot carried packets, bytes, handshakes, replay and AEAD
+  failures. So a run whose loss response was engaged said the sender backed off and could
+  not say what from. Asked of the reordering campaign directly: on the `udp upload` transfer
+  of run `20260823-182411` the loss bound was engaged in **43 of 105** samples that had a
+  bandwidth-delay product to compare against — 41% of the transfer, in three episodes, the
+  first from 1611 ms — and the archive cannot say how much of the loss behind that was real,
+  because it recorded none of it. That figure is itself an inference from `cwnd / (btl_bw ×
+  min_rtt)` falling under the gain, with ProbeRTT samples excluded by hand, which is the
+  second half of the same gap.
+
+  Four columns close both halves: `bytes_retransmitted` (what the detector declared),
+  `bytes_lost` (what an acknowledgement confirmed), `bytes_spurious_retransmit` (what an
+  acknowledgement refuted) and `inflight_hi_bytes` (the loss bound as a recorded fact rather
+  than an inference that misreads ProbeRTT and a bound set while the estimate was smaller).
+  They are `serde(default)`, so every archived run still loads — as absent rather than as
+  four measured zeros, and `analyze.py` prints "this run predates the split" for those
+  instead of a reading. They read zero on the `quic` reference leg deliberately: quinn's
+  `lost_packets` is a declaration count in its own units with no such separation, and it
+  travels as prose in the transport note where its definition travels with it.
+
+- **`FaultControl::arm_hold_next(depth)`** — a reorder with a *depth*, not just an
+  incidence. The index sets and the seeded stochastic mode both express reordering as an
+  adjacent swap, which exercises out-of-order reassembly and can reach nothing else: RFC
+  9002's packet threshold declares a segment lost only once three of its successors are
+  acknowledged, so a frame one position late never reaches the loss detector at all. The
+  reference route shows datagrams up to 225 positions late while being under a millisecond
+  late in time, and that is the input a test of reordering needs to be able to state.
 
 - **The WAN harness now answers "what stopped the sender", instead of only "how fast did it
   go".** `analyze.py` gained a per-sample census over every *sending* window series: at each
@@ -957,6 +1000,53 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   replay window are identical on every transport.
 
 ### Fixed
+
+- **A path that reorders was read as a path that drops, and the sender paid for it in
+  window.** RFC 9002's packet threshold declares a segment lost once three of its
+  successors have been acknowledged, and a datagram overtaken by three of its successors
+  satisfies that without anything having been dropped. Every such datagram cost a
+  retransmission *and* a loss reported to congestion control, whose response is
+  `inflight_hi` — a bound on the bytes the sender may have outstanding, floored at 1.25×
+  the bandwidth-delay product and taken from a round's loss rate against a 2% threshold.
+
+  The reordering is measured, on the raw controls of the run that unblocked this: 0.48% of
+  upstream datagrams late, the worst of them **225 positions** late against a fixed
+  threshold of three, and late in *time* by 0.7 ms against a minimum round trip of 187 ms.
+  Two orders of magnitude between the displacement in sequence and the displacement in
+  time is the whole shape of the defect: the threshold reads the first and the sender's
+  own clock can see the second.
+
+  **What changed is the cost of a false detection, not the detection.** The copy still goes
+  out on the same trigger, so recovery is exactly as fast as it was; what moves is the
+  congestion signal, which is no longer raised when the segment is *declared* lost but when
+  the loss is *established* — the acknowledgement that retires the segment arrives later
+  than a fraction of a round trip after the copy left, so it cannot be answering anything
+  but the copy. A reordered segment whose original arrives late now costs one wasted
+  segment of bandwidth and nothing else.
+
+  **Every term of that decision is local.** The instant the copy left, the instant the
+  acknowledgement arrived, and the smallest round trip this endpoint has itself timed —
+  which a peer can decline to lower but cannot lower. Nothing is learned from the ordering
+  or the timing of what the peer sends, which is the trap the two rejected approaches fell
+  into: a *learned* reordering tolerance is a quantity the peer writes, because the sender
+  cannot distinguish "the peer received late" from "the peer acknowledged late", and a
+  time-only threshold taking `max(smoothed_rtt, latest_rtt)` hands the peer a full-size
+  step per acknowledgement with no decay and no ceiling. What the peer can still do is
+  withhold the acknowledgement of a retransmission, which **delays** a congestion signal it
+  could suppress outright today by acknowledging data it never received — at the cost of
+  its own delivery.
+
+  Two consequences worth stating separately. A segment retransmitted twice is now **one**
+  loss rather than two: what a round's loss rate is a rate of is holes in the flight, and
+  repeated copies of one segment are one hole. And where there is no certificate — a fresh
+  connection, or a fresh path after `Session::reset_congestion` on migration, neither of
+  which has timed a round trip — nothing is suppressed and the loss is booked exactly as
+  before, so the ungated behaviour is never worse than what it replaced.
+
+  The in-flight arithmetic stays where it was, at the retransmission
+  (`Session::on_packet_retransmitted`): deferring it would leave `inflight_bytes` one
+  segment high for a round trip, and the drain's new-data budget is `cwnd − inflight`, so
+  the sender would withhold data precisely while recovering.
 
 - **`analyze.py` reported a stalled sender on every run, about a side that was never
   sending.** The congestion-window section warned "window never left its 5600 B floor —

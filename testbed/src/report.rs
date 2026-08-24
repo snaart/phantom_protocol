@@ -470,12 +470,66 @@ pub struct WindowSample {
     pub pacing_rate_bps: u64,
     pub min_rtt_us: u64,
     pub delivered_bytes: u64,
-    /// BBR phase: startup / drain / probe_bw / probe_rtt. Loss does not appear
-    /// here — it is answered by a bound on inflight, not by a phase change.
+    /// BBR phase: startup / drain / probe_bw / probe_rtt. Loss does not move
+    /// this — it is answered by a bound on inflight, which is
+    /// [`Self::inflight_hi_bytes`] below.
     pub state: String,
     /// True when the window had room and there was nothing to send — the
     /// application was the limit, not the transport.
     pub app_limited: bool,
+    /// Bytes the sender has retransmitted, cumulative — every copy its loss
+    /// detector ordered, whether the path had dropped anything or not.
+    ///
+    /// **The row carried no loss quantity at all until this, and that is why one
+    /// question could not be answered from an archive.** A run whose window
+    /// series shows the loss bound engaged says the sender backed off; it does
+    /// not say what it backed off *from*. RFC 9002's packet threshold declares a
+    /// segment lost once three of its successors are acknowledged, which is what
+    /// a path that reorders produces without having dropped anything — so
+    /// "declared" and "lost" are different quantities, and a single counter
+    /// reads identically on a path that drops 2% and a path that reorders 2%.
+    /// The reference route's own raw controls show reordering at 0.48% with
+    /// displacements up to 225 datagrams, so this is not a hypothetical
+    /// distinction on it.
+    ///
+    /// Defaulted on deserialize, so runs recorded before these four fields
+    /// existed load as zeros rather than failing to parse. Zero on the `quic`
+    /// leg, whose controller does not expose the figure.
+    #[serde(default)]
+    pub bytes_retransmitted: u64,
+    /// Bytes whose loss the sender **established** and fed to congestion
+    /// control, cumulative. The numerator of the round loss rate the inflight
+    /// bound is judged on.
+    ///
+    /// `bytes_retransmitted − bytes_lost` is the wasted half of the sender's
+    /// retransmission, and the pair is the measurement the reordering question
+    /// needs.
+    #[serde(default)]
+    pub bytes_lost: u64,
+    /// Bytes of retransmission the sender could show were unnecessary: the
+    /// acknowledgement that retired the segment came back too soon after the
+    /// copy left to have been answering the copy, so an earlier transmission had
+    /// arrived after all.
+    ///
+    /// A lower bound on the waste rather than a measure of it — the certificate
+    /// needs a round trip the sender has timed, and a reordered datagram that
+    /// comes back later than a fraction of one is indistinguishable from a drop.
+    #[serde(default)]
+    pub bytes_spurious_retransmit: u64,
+    /// The loss-imposed bound on bytes outstanding, or `0` when the path has
+    /// given no reason for one.
+    ///
+    /// Recorded rather than inferred, and the reason is a reading this harness
+    /// has already had to make by hand: the bound is applied inside the window
+    /// calculation, so from the outside its engagement can only be guessed at by
+    /// comparing `cwnd_bytes` against `bottleneck_bw_bps × min_rtt_us` — and
+    /// that guess misreads exactly the states worth reading. ProbeRTT pins the
+    /// window to four packets for reasons of its own, and a bound set while the
+    /// estimate was smaller stays a fixed byte count while the product it is
+    /// compared against keeps growing, so the ratio drops below the floor the
+    /// bound is supposed to respect. Zero here is unambiguous.
+    #[serde(default)]
+    pub inflight_hi_bytes: u64,
 }
 
 /// One rung of the byte-ceiling sweep: a saturating transfer at one frame size,
@@ -1768,6 +1822,49 @@ mod tests {
             "and the raw sample it also predates stays absent rather than reading \
              as a measured zero"
         );
+        assert_eq!(
+            (
+                s.bytes_retransmitted,
+                s.bytes_lost,
+                s.bytes_spurious_retransmit,
+                s.inflight_hi_bytes
+            ),
+            (0, 0, 0, 0),
+            "the loss columns postdate this row too; a run recorded before them \
+             must load with them absent rather than fail to parse, which is the \
+             only reason an archive is worth keeping"
+        );
+    }
+
+    /// The loss columns have to survive the round trip through the artifact, and
+    /// they have to stay told apart.
+    ///
+    /// The three of them are one measurement in three parts — what the detector
+    /// declared, what an acknowledgement confirmed, what an acknowledgement
+    /// refuted — and the whole value of recording them is that a reader can
+    /// subtract. A row that serialised two of them into one field, or swapped
+    /// them, would still look like a plausible run: every value is a byte count
+    /// of the same magnitude. Distinct values in the fixture are what makes that
+    /// visible.
+    #[test]
+    fn the_loss_columns_survive_a_round_trip_and_stay_distinct() {
+        let row = phantom_leg_window_row();
+        assert!(
+            row.bytes_retransmitted > row.bytes_lost,
+            "the fixture must describe a sender that retransmitted more than it \
+             established loss for, or it cannot tell a mixed-up column from a \
+             correct one"
+        );
+
+        let back: WindowSample = serde_json::from_str(
+            &serde_json::to_string(&row).expect("a window row must serialize"),
+        )
+        .expect("and load back");
+
+        assert_eq!(back.bytes_retransmitted, row.bytes_retransmitted);
+        assert_eq!(back.bytes_lost, row.bytes_lost);
+        assert_eq!(back.bytes_spurious_retransmit, row.bytes_spurious_retransmit);
+        assert_eq!(back.inflight_hi_bytes, row.inflight_hi_bytes);
     }
 
     /// A window row shaped the way the Phantom legs record one.
@@ -1788,6 +1885,10 @@ mod tests {
             delivered_bytes: 500_000,
             state: "probe_bw".to_string(),
             app_limited: false,
+            bytes_retransmitted: 34_680,
+            bytes_lost: 11_560,
+            bytes_spurious_retransmit: 23_120,
+            inflight_hi_bytes: 300_000,
         }
     }
 

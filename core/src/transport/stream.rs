@@ -107,7 +107,12 @@ pub const MAX_RECV_REORDER_BYTES_CEILING: usize =
 
 /// RFC 9002 §6.1.1 packet-threshold: a still-unacked segment is declared lost
 /// once a segment at least this many offsets *newer* has been SACK-acked.
-const PACKET_THRESHOLD: u32 = 3;
+///
+/// `pub(crate)` so that a test of *reordering* can derive the displacement it has
+/// to inject rather than restate the figure: a frame fewer than this many
+/// positions late never reaches the detector at all, and a test that quietly
+/// stopped reaching it would keep passing.
+pub(crate) const PACKET_THRESHOLD: u32 = 3;
 
 /// Initial per-stream send window — caps how many bytes the local
 /// side will put on the wire before receiving a `WINDOW_UPDATE` from
@@ -450,7 +455,7 @@ pub struct LostSegment {
     /// Gap-free reliable offset of the lost segment.
     pub stream_offset: SequenceNumber,
     /// On-wire payload size — the caller reports it to congestion control via
-    /// `Session::on_packet_lost`.
+    /// `Session::on_packet_retransmitted` when it puts the copy on the wire.
     pub size: u64,
 }
 
@@ -463,8 +468,14 @@ pub struct SackResult {
     /// duplicate or stale ACK).
     pub retired: Vec<RetiredSegment>,
     /// Segments newly declared lost (packet- or time-threshold, RFC 9002) by this
-    /// SACK — still buffered, now flagged for Pass-0 fast-retransmit. The caller
-    /// feeds each into `Session::on_packet_lost` (the real BBR loss signal).
+    /// SACK — still buffered, now flagged for Pass-0 fast-retransmit.
+    ///
+    /// A **declaration**, and on a reordering path not necessarily a loss: the
+    /// packet threshold fires on a hole three offsets behind `largest_acked`,
+    /// which is what a datagram overtaken by three of its successors leaves
+    /// behind. The caller answers it by retransmitting, and reports that
+    /// retransmission through `Session::on_packet_retransmitted`; whether it was
+    /// needed is settled later, when the segment's own acknowledgement arrives.
     pub lost: Vec<LostSegment>,
 }
 
@@ -3291,6 +3302,296 @@ mod tests {
                 rtt_sampled: !retired.was_retransmit,
             });
         }
+    }
+
+    /// Mirror what the data pump's drain does with one segment it pulls out of a
+    /// stream: every transmission joins the flight, and a copy replacing an
+    /// earlier transmission is reported as a **retransmission** — which is not
+    /// the congestion signal, and is the half of the pump this helper exists to
+    /// keep honest. Returns `None` when the stream had nothing to offer.
+    async fn drain_one(
+        stream: &Stream,
+        est: &mut crate::transport::bandwidth_estimator::BandwidthEstimator,
+    ) -> Option<OutboundSegment> {
+        let seg = stream
+            .poll_send(u64::MAX, est.delivered_bytes(), est.delivered_time(), false)
+            .await
+            .ok()?;
+        if seg.retransmit {
+            est.on_retransmit(seg.data.len() as u64);
+        }
+        est.on_send(seg.data.len() as u64);
+        Some(seg)
+    }
+
+    /// Put a flight of `segments` reliable segments of `payload` bytes on the
+    /// wire back to back, then let one round trip pass and deliver the peer's
+    /// acknowledgements for every offset **except 0** — the offset the path let
+    /// three of its successors overtake, which is exactly the input RFC 9002's
+    /// packet threshold reads as loss.
+    ///
+    /// Returns the estimator, the stream, the acknowledged set, and the copy
+    /// Pass-0 emitted in answer. Shared by the three tests below so that the one
+    /// thing that differs between them — when, and whether, the acknowledgement
+    /// for offset 0 arrives — is the only thing each of them writes down.
+    async fn flight_with_offset_zero_overtaken(
+        segments: u32,
+        payload: usize,
+        rtt: Duration,
+        ack_gap: Duration,
+    ) -> (
+        Stream,
+        crate::transport::bandwidth_estimator::BandwidthEstimator,
+        Vec<u32>,
+        tokio::time::Instant,
+    ) {
+        use crate::transport::bandwidth_estimator::BandwidthEstimator;
+
+        let stream = Stream::new(1);
+        let mut est = BandwidthEstimator::new();
+        let bytes = Bytes::from(vec![0u8; payload]);
+        for _ in 0..segments {
+            stream.send_reliable(bytes.clone()).await.unwrap();
+            let sent = drain_one(&stream, &mut est).await.expect("in flight");
+            assert!(!sent.retransmit, "the opening flight is all first sends");
+        }
+
+        // One round trip later the acknowledgements arrive, one per received
+        // packet. Offset 0 is not among them.
+        tokio::time::advance(rtt).await;
+        let mut acked: Vec<u32> = Vec::new();
+        for offset in 1..=PACKET_THRESHOLD {
+            acked.push(offset);
+            let sack = Sack::from_received(&acked, 0).expect("sack");
+            feed_retirements(&stream, &sack, &mut est).await;
+            if offset < PACKET_THRESHOLD {
+                tokio::time::advance(ack_gap).await;
+            }
+        }
+
+        // The threshold has qualified offset 0, and the pump answers it on the
+        // spot — no timer is consulted, which is what makes this the fast
+        // retransmit rather than the RTO.
+        let declared_at = tokio::time::Instant::now();
+        let copy = drain_one(&stream, &mut est)
+            .await
+            .expect("Pass-0 must offer the flagged segment");
+        assert!(copy.retransmit, "the segment offered must be the copy");
+        assert_eq!(copy.stream_offset, 0, "the copy must be of the hole");
+        assert_eq!(
+            tokio::time::Instant::now(),
+            declared_at,
+            "the copy left on the acknowledgement that declared the loss, with no \
+             timer in between"
+        );
+        (stream, est, acked, declared_at)
+    }
+
+    /// **A path that reorders and drops nothing must feed the loss response
+    /// nothing — while still retransmitting.**
+    ///
+    /// This is the defect. RFC 9002's packet threshold declares a segment lost
+    /// once three of its successors are acknowledged, and a datagram overtaken by
+    /// three of its successors satisfies that without anything having been
+    /// dropped. The reference route's own raw controls show it: 0.48% of upstream
+    /// datagrams arrive late, the worst of them 225 positions late — and late in
+    /// *time* by 0.7 ms, against a minimum round trip of 187 ms. Every one of
+    /// those was a segment declared lost, a copy on the wire, and a loss reported
+    /// to a controller whose response is to clamp the volume the sender may have
+    /// outstanding.
+    ///
+    /// Both assertions are the test. The copy still goes out, on the same
+    /// trigger as before, so recovery is exactly as fast as it was; and the
+    /// congestion signal does not, because by the time the segment is retired the
+    /// sender can see that the acknowledgement it is holding came back too soon
+    /// after the copy to be answering the copy.
+    ///
+    /// Deterministic throughout: the clock is frozen and every interval below is
+    /// written by the test, so `min_rtt` is a real 250 ms rather than the zero a
+    /// paused clock would leave if the test never advanced it.
+    #[tokio::test]
+    async fn a_reordered_segment_costs_a_retransmission_and_no_congestion_signal() {
+        const SEGMENTS: u32 = 6;
+        const PAYLOAD: usize = 1200;
+        const RTT: Duration = Duration::from_millis(250);
+        const ACK_GAP: Duration = Duration::from_micros(500);
+        /// How much later than its successors' acknowledgements the overtaken
+        /// segment's own acknowledgement lands. The measured route's figure is
+        /// 0.7 ms; this is generous by a factor of three.
+        const LATE_BY: Duration = Duration::from_millis(2);
+
+        tokio::time::pause();
+        let (stream, mut est, mut acked, _) =
+            flight_with_offset_zero_overtaken(SEGMENTS, PAYLOAD, RTT, ACK_GAP).await;
+
+        // The original's own acknowledgement was already on the path when the
+        // copy went out, and here it lands.
+        tokio::time::advance(LATE_BY).await;
+        acked.push(0);
+        let sack = Sack::from_received(&acked, 0).expect("sack");
+        feed_retirements(&stream, &sack, &mut est).await;
+
+        // The test passes for the stated reason only if the certificate exists
+        // and the arrival is well inside it — otherwise it would be asserting
+        // the absence of a signal on a path that has no measured round trip.
+        assert_eq!(
+            est.min_rtt(),
+            RTT,
+            "the estimator must have timed the path before the verdict is meaningful"
+        );
+        assert!(
+            LATE_BY * 4 < RTT,
+            "the two populations this separates must stay far apart: a lateness of \
+             {LATE_BY:?} against a {RTT:?} round trip"
+        );
+
+        assert_eq!(
+            est.bytes_retransmitted(),
+            PAYLOAD as u64,
+            "the copy must still go out — a mechanism that answered reordering by \
+             retransmitting less would be slowing recovery, not making a false \
+             detection cheap"
+        );
+        assert_eq!(
+            est.bytes_lost(),
+            0,
+            "nothing was lost, so the loss response must hear nothing"
+        );
+        assert_eq!(
+            est.bytes_spurious_retransmit(),
+            PAYLOAD as u64,
+            "the wasted copy must be counted somewhere, or a run cannot say what \
+             reordering cost it"
+        );
+        // Six sends, one copy, four retirements and one retransmission
+        // adjustment: the copy is net-neutral on the flight, and what is left is
+        // the two segments still outstanding. A suppressed congestion signal must
+        // not come with a drifting in-flight figure — the drain's budget is
+        // `cwnd − inflight`.
+        assert_eq!(
+            est.inflight_bytes(),
+            2 * PAYLOAD as u64,
+            "the two unacknowledged segments are all that is left in flight"
+        );
+    }
+
+    /// **The same path, a real drop: the loss response must still hear it.**
+    ///
+    /// The counterweight to the test above, and the reason that one is not
+    /// satisfiable by deleting the loss signal. Everything is identical up to the
+    /// retransmission; what differs is that no earlier transmission of offset 0
+    /// ever arrived, so the acknowledgement that retires it cannot be answering
+    /// anything but the copy — and it comes back a round trip after the copy
+    /// left, which is what says so.
+    #[tokio::test]
+    async fn a_dropped_segment_on_the_same_path_still_reaches_the_loss_response() {
+        const SEGMENTS: u32 = 6;
+        const PAYLOAD: usize = 1200;
+        const RTT: Duration = Duration::from_millis(250);
+        const ACK_GAP: Duration = Duration::from_micros(500);
+
+        tokio::time::pause();
+        let (stream, mut est, mut acked, declared_at) =
+            flight_with_offset_zero_overtaken(SEGMENTS, PAYLOAD, RTT, ACK_GAP).await;
+
+        // The copy crossed the path and its acknowledgement came back. Nothing
+        // else could have produced this acknowledgement.
+        tokio::time::advance(RTT).await;
+        acked.push(0);
+        let sack = Sack::from_received(&acked, 0).expect("sack");
+        feed_retirements(&stream, &sack, &mut est).await;
+
+        assert_eq!(
+            est.bytes_lost(),
+            PAYLOAD as u64,
+            "a segment the path actually dropped must reach the loss response"
+        );
+        assert_eq!(
+            est.bytes_spurious_retransmit(),
+            0,
+            "nothing here was spurious"
+        );
+        assert_eq!(
+            est.bytes_retransmitted(),
+            PAYLOAD as u64,
+            "one drop, one copy"
+        );
+        // Recovery is bounded, and the bound is a state rather than a stopwatch
+        // reading: the copy left on the declaring acknowledgement itself (the
+        // helper asserts the frozen clock did not move), so the segment was
+        // recovered by the detector inside one round trip and not by waiting out
+        // an RTO, whose floor alone is `MIN_RTO`.
+        assert_eq!(
+            declared_at + RTT,
+            tokio::time::Instant::now(),
+            "the copy went out at the declaration and was answered one round trip \
+             later — no timer took part"
+        );
+        // And the flight is exactly the two segments still outstanding: six
+        // sends, one copy, four retirements and one retransmission adjustment.
+        // The copy must be net-neutral on the flight, or the drain's
+        // `cwnd − inflight` budget drifts every time the path loses anything.
+        assert_eq!(
+            est.inflight_bytes(),
+            2 * PAYLOAD as u64,
+            "the two unacknowledged segments are all that is left in flight"
+        );
+    }
+
+    /// **A segment resent twice is one loss, not two.**
+    ///
+    /// The declaration count and the loss count answer different questions, and
+    /// this is where they come apart by construction. Two copies of one segment
+    /// went on the wire, so the sender spent two segments of bandwidth; but what
+    /// the round's loss *rate* is a rate of is holes in the flight, and there was
+    /// one hole. Booking a loss per copy is how one drop on a path that
+    /// re-declares turns into a loss rate that saturates the threshold — the
+    /// shape that pinned `inflight_hi` to its floor for a whole connection.
+    #[tokio::test]
+    async fn a_segment_resent_twice_is_one_established_loss_not_two() {
+        const SEGMENTS: u32 = 6;
+        const PAYLOAD: usize = 1200;
+        const RTT: Duration = Duration::from_millis(250);
+        const ACK_GAP: Duration = Duration::from_micros(500);
+
+        tokio::time::pause();
+        let (stream, mut est, acked, _) =
+            flight_with_offset_zero_overtaken(SEGMENTS, PAYLOAD, RTT, ACK_GAP).await;
+
+        // The copy is not acknowledged either. Once it has been outstanding
+        // longer than the RACK threshold (`srtt·9/8`) the next acknowledgement
+        // re-declares the segment, and a second copy goes out.
+        tokio::time::advance(RTT * 3 / 2).await;
+        let sack = Sack::from_received(&acked, 0).expect("sack");
+        let result = stream.on_sack(&sack).await;
+        assert_eq!(
+            result.lost_offsets(),
+            vec![0],
+            "the copy has aged past the time threshold and must be re-declared"
+        );
+        let second = drain_one(&stream, &mut est)
+            .await
+            .expect("Pass-0 must offer the re-declared segment");
+        assert!(second.retransmit && second.stream_offset == 0);
+
+        // ...and *this* copy gets through.
+        tokio::time::advance(RTT).await;
+        let mut acked = acked;
+        acked.push(0);
+        let sack = Sack::from_received(&acked, 0).expect("sack");
+        feed_retirements(&stream, &sack, &mut est).await;
+
+        assert_eq!(
+            est.bytes_retransmitted(),
+            2 * PAYLOAD as u64,
+            "two copies went on the wire and the declaration count must say so"
+        );
+        assert_eq!(
+            est.bytes_lost(),
+            PAYLOAD as u64,
+            "one hole in the flight is one loss, however many copies it took to \
+             fill it"
+        );
     }
 
     /// `received_sack` derives ranges from the reorder state with a gap, and

@@ -267,6 +267,13 @@ impl MsgLink for Framed {
                 delivered_bytes: bw.delivered_bytes,
                 state: bw.state.as_str().to_string(),
                 app_limited: bw.app_limited,
+                // The three loss figures travel together or not at all: a
+                // declaration count on its own says nothing a single "lost"
+                // counter did not already say wrongly.
+                bytes_retransmitted: bw.bytes_retransmitted,
+                bytes_lost: bw.bytes_lost,
+                bytes_spurious_retransmit: bw.bytes_spurious_retransmit,
+                inflight_hi_bytes: bw.inflight_hi_bytes,
             })
         })
     }
@@ -398,6 +405,14 @@ pub(crate) mod testing {
                     delivered_bytes: 1400,
                     state: "probe_bw".to_string(),
                     app_limited: false,
+                    // A sender that has retransmitted twice as much as it has
+                    // established loss for: the shape a reordering path
+                    // produces, and distinct values so a row that dropped or
+                    // transposed one of these columns is visible.
+                    bytes_retransmitted: 2800,
+                    bytes_lost: 1400,
+                    bytes_spurious_retransmit: 1400,
+                    inflight_hi_bytes: 4200,
                 })
             })
         }

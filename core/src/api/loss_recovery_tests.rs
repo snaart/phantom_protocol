@@ -704,6 +704,185 @@ async fn a_single_dropped_segment_is_reported_to_congestion_control_once() {
     client.disconnect().await.expect("client clean disconnect");
 }
 
+/// **A path that reorders and drops nothing must cost a retransmission and no
+/// congestion signal — through the real pumps.**
+///
+/// The sibling test above takes a segment off the wire; this one takes the same
+/// segment and merely puts it behind its own successors, which is what the
+/// reference route's raw controls actually show (0.48% of upstream datagrams
+/// late, the worst of them 225 positions late, and late in *time* by 0.7 ms).
+/// RFC 9002's packet threshold cannot tell those two inputs apart — both leave a
+/// hole three offsets behind `largest_acked` — so the sender retransmits either
+/// way. What it can tell apart is what happened afterwards, and that is what the
+/// two tests assert side by side: identical retransmission, opposite congestion
+/// signal.
+///
+/// **Why the displacement is derived and not chosen.** A held frame has to come
+/// out from behind at least [`PACKET_THRESHOLD`] of its successors or the
+/// detector never looks at it, and it must come out from behind them *before* the
+/// copy goes on the wire — otherwise the acknowledgement that retires it is one
+/// round trip behind the copy and is indistinguishable from an acknowledgement of
+/// the copy, which is the honest reading in that case. The first flight is
+/// whatever the opening congestion window admits, so the depth is read from the
+/// window the session actually reports rather than assumed; if that arithmetic
+/// ever stops working, the retransmission assertion below goes red rather than
+/// the test passing on a path where nothing was ever declared.
+#[tokio::test]
+async fn a_reordered_segment_is_retransmitted_but_reports_no_loss_end_to_end() {
+    /// `PhantomSession::send` splits here, so a payload of `CHUNKS × CHUNK` is
+    /// exactly that many reliable segments.
+    const CHUNK: usize = crate::transport::mtu::MAX_APP_CHUNK;
+    const CHUNKS: usize = 12;
+    /// One-way delay on the acknowledgement path, and so the round trip the
+    /// server measures. Large against the spacing below, because the whole
+    /// verdict is "did this acknowledgement arrive within a fraction of a round
+    /// trip of the copy leaving" and the spacing is what that fraction is
+    /// compared against.
+    const ACK_PATH_DELAY: Duration = Duration::from_millis(200);
+    /// Minimum spacing between acknowledgements on that path — the link rate,
+    /// expressed as time per frame. It is also the interval between the
+    /// acknowledgement that declares the hole and the one that fills it, i.e.
+    /// the elapsed time the verdict is taken over.
+    const ACK_SPACING: Duration = Duration::from_millis(3);
+
+    let server_hs = HandshakeServer::new().expect("HandshakeServer::new");
+    let server_pinned_key = server_hs.verifying_key().clone();
+    let (client_channel, server_channel) = ChannelTransport::pair();
+
+    let client = PhantomSession::connect_with_transport(
+        "test-server:9000",
+        DelayLine::new(client_channel, ACK_PATH_DELAY, ACK_SPACING),
+        server_pinned_key,
+    );
+
+    let client_ip = "127.0.0.1".parse().expect("parse IP");
+    let hello_bytes = server_channel
+        .recv_bytes()
+        .await
+        .expect("server recv ClientHello");
+    let client_hello =
+        borsh::from_slice::<ClientHello>(&hello_bytes).expect("deserialize ClientHello");
+    let inner_session = match server_hs.process_client_hello(&client_hello, 0, client_ip) {
+        HandshakeResponse::Success(server_hello, session, _) => {
+            let b = ServerReply::Hello(server_hello)
+                .to_wire()
+                .expect("serialize ServerHello");
+            server_channel
+                .send_bytes(&b)
+                .await
+                .expect("server send ServerHello");
+            session
+        }
+        HandshakeResponse::Retry(retry) => {
+            let retry_bytes = ServerReply::Retry(retry)
+                .to_wire()
+                .expect("serialize retry");
+            server_channel
+                .send_bytes(&retry_bytes)
+                .await
+                .expect("server send retry");
+            let next_bytes = server_channel
+                .recv_bytes()
+                .await
+                .expect("server recv retry ClientHello");
+            let next_hello =
+                borsh::from_slice::<ClientHello>(&next_bytes).expect("deserialize retry hello");
+            match server_hs.process_client_hello(&next_hello, 0, client_ip) {
+                HandshakeResponse::Success(server_hello, session, _) => {
+                    let b = ServerReply::Hello(server_hello)
+                        .to_wire()
+                        .expect("serialize ServerHello");
+                    server_channel
+                        .send_bytes(&b)
+                        .await
+                        .expect("server send ServerHello");
+                    session
+                }
+                other => panic!("expected Success after retry, got {other:?}"),
+            }
+        }
+        HandshakeResponse::Reject(r) => panic!("unexpected Reject: {r:?}"),
+        HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
+    };
+
+    let inner = Arc::new(inner_session);
+    let congestion = inner.clone();
+    let faults = FaultControl::new();
+    let server = PhantomSession::from_accepted_server_session(
+        "test-client".into(),
+        LossyTransport::new(server_channel, faults.clone()),
+        inner,
+    );
+
+    let mut established = false;
+    for _ in 0..200 {
+        if client.connection_state() == ConnectionState::Connected {
+            established = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(established, "client session never became established");
+
+    // How many segments the opening window admits, and therefore how many
+    // successors the held frame can hide behind before the sender runs out of
+    // window and the only thing left to send is the copy.
+    let first_flight = congestion.bandwidth_snapshot().cwnd_bytes as usize / CHUNK;
+    let depth = first_flight.saturating_sub(1);
+    assert!(
+        depth >= crate::transport::stream::PACKET_THRESHOLD as usize,
+        "the opening window admits {first_flight} segments, so a held frame can \
+         only be put {depth} positions late — below the packet threshold, where \
+         the detector never looks and this test would prove nothing"
+    );
+
+    let payload: Vec<u8> = (0..CHUNK * CHUNKS).map(|i| (i % 251) as u8).collect();
+    // The next frame this pump sends is the payload's first chunk. It is held —
+    // not dropped — until `depth` of its successors have gone out.
+    faults.arm_hold_next(depth as u64);
+    server.send(payload.clone()).await.expect("server send");
+
+    let mut received = Vec::with_capacity(payload.len());
+    for i in 0..CHUNKS {
+        let chunk = timeout(Duration::from_secs(30), client.recv())
+            .await
+            .unwrap_or_else(|_| panic!("client recv timed out on chunk {i} — not recovered"))
+            .expect("client recv error");
+        received.extend_from_slice(&chunk);
+    }
+    assert_eq!(
+        received, payload,
+        "a reordered segment must still be delivered byte-exact and in order"
+    );
+
+    // The positive control: the detector did fire and a copy did go on the wire.
+    // Without this the test would also pass on a build that had simply stopped
+    // detecting anything.
+    assert!(
+        congestion.bbr_bytes_retransmitted() >= CHUNK as u64,
+        "the reordering must have cost at least one retransmission ({} B seen) — \
+         otherwise nothing was declared and there was no false detection to make \
+         cheap",
+        congestion.bbr_bytes_retransmitted()
+    );
+    assert_eq!(
+        congestion.bbr_bytes_lost(),
+        0,
+        "nothing was dropped on this path, so the loss response must hear nothing; \
+         {} B of retransmission and {} B refuted by their own acknowledgements",
+        congestion.bbr_bytes_retransmitted(),
+        congestion.bbr_bytes_spurious_retransmit()
+    );
+    assert!(
+        congestion.bbr_bytes_spurious_retransmit() >= CHUNK as u64,
+        "the wasted copy must be recorded as waste, or a run cannot say what the \
+         reordering cost it"
+    );
+
+    server.disconnect().await.expect("server clean disconnect");
+    client.disconnect().await.expect("client clean disconnect");
+}
+
 /// **Seeded-loss survival.** A real session survives seeded packet loss + light
 /// reorder on every application send, recovering every message byte-exact and in
 /// order via the existing RTO retransmit path. Seeded ⇒ fully deterministic:

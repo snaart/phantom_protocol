@@ -45,6 +45,18 @@
 //! transport that can drop, dup, reorder, or delay a frame, retransmission and
 //! out-of-order handling cannot be exercised at all.
 //!
+//! **Reordering has a depth as well as an incidence, and only one of the two is
+//! a probability.** The index sets and the stochastic mode both express it as an
+//! adjacent swap: a frame is held and released after the next forwarded send, so
+//! it arrives exactly one position late. That is enough to exercise
+//! out-of-order *reassembly* and nothing else — RFC 9002's packet threshold
+//! declares a segment lost only once `PACKET_THRESHOLD` of its successors have
+//! been acknowledged, so a frame one position late never reaches the loss
+//! detector at all. [`FaultControl::arm_hold_next`] takes the depth, which is
+//! what lets a test state the phenomenon the reference route actually shows:
+//! datagrams late by up to 225 positions while being late in *time* by under a
+//! millisecond.
+//!
 //! Fault state lives behind a cloneable [`FaultControl`] handle so a test can
 //! arm faults *after* the transport has been moved into a session's data pump
 //! (e.g. drop the first data frame once the handshake has completed).
@@ -113,8 +125,13 @@ struct FaultState {
     /// Fixed 0-based send indices to hold and release after the next send
     /// (adjacent reorder).
     reorder_indices: HashSet<u64>,
-    /// A frame held back by a reorder, awaiting the next forwarded send.
-    pending_reorder: Mutex<Option<Vec<u8>>>,
+    /// How many forwarded sends the *next* send is to be held behind, when a
+    /// test has armed a deeper reorder than the adjacent swap the index sets
+    /// produce. `0` = not armed. Consumed by the send it applies to.
+    arm_hold_depth: AtomicU64,
+    /// A frame held back by a reorder, with the number of forwarded sends still
+    /// to pass before it is released. One for the adjacent swap.
+    pending_reorder: Mutex<Option<(Vec<u8>, u64)>>,
     /// Per-send forwarding delay in milliseconds (0 = none).
     delay_ms: AtomicU64,
     /// Seeded stochastic config (None = stochastic mode disabled — the default).
@@ -139,8 +156,11 @@ enum SendFault {
     Drop,
     /// Forward twice.
     Duplicate,
-    /// Hold this frame and release it after the next forwarded send.
-    Reorder,
+    /// Hold this frame and release it after this many forwarded sends. One is
+    /// the adjacent swap; larger values put the frame further behind its own
+    /// successors, which is what a loss detector keyed on a *distance* needs to
+    /// see anything at all.
+    Reorder(u64),
 }
 
 /// Lock a `Mutex`, recovering the inner value even if a previous holder
@@ -176,6 +196,7 @@ impl FaultControl {
                 drop_indices,
                 dup_indices,
                 reorder_indices,
+                arm_hold_depth: AtomicU64::new(0),
                 pending_reorder: Mutex::new(None),
                 delay_ms: AtomicU64::new(delay_ms),
                 // A stochastic config is armed at construction; a control with
@@ -281,6 +302,26 @@ impl FaultControl {
         self.state.arm_drop.store(n, Ordering::Relaxed);
     }
 
+    /// Hold the next send back until `depth` further sends have been forwarded,
+    /// then release it — the frame arrives `depth` positions late instead of one.
+    ///
+    /// The index sets and the stochastic mode both express reordering as an
+    /// adjacent swap, and an adjacent swap is invisible to the thing a test of
+    /// reordering usually wants to reach: RFC 9002's packet threshold declares a
+    /// segment lost once `PACKET_THRESHOLD` of its successors have been
+    /// acknowledged, so a frame one position late is never declared anything.
+    /// Depth is what makes the harness able to state the phenomenon the measured
+    /// route actually shows — 0.48% of datagrams late, by up to 225 positions,
+    /// while being late in *time* by well under a millisecond.
+    ///
+    /// Armed rather than indexed for the same reason as [`Self::arm_drop_next`]:
+    /// a test that wants the first frame of an application write does not want to
+    /// count the handshake's sends to find its index. Consumed by the send it
+    /// applies to; `0` disarms.
+    pub fn arm_hold_next(&self, depth: u64) {
+        self.state.arm_hold_depth.store(depth, Ordering::Relaxed);
+    }
+
     /// Set the per-send forwarding delay (latency injection). `Duration::ZERO`
     /// disables it.
     pub fn set_delay(&self, delay: Duration) {
@@ -327,8 +368,11 @@ impl FaultControl {
         if self.state.dup_indices.contains(&index) {
             return SendFault::Duplicate;
         }
+        if let Some(depth) = self.consume_armed_hold() {
+            return SendFault::Reorder(depth);
+        }
         if self.state.reorder_indices.contains(&index) {
-            return SendFault::Reorder;
+            return SendFault::Reorder(1);
         }
 
         // Seeded stochastic faults (default-off; armed by `with_seed`, gated by
@@ -345,7 +389,7 @@ impl FaultControl {
                     return SendFault::Duplicate;
                 }
                 if cfg.reorder_threshold > 0 && self.draw() < cfg.reorder_threshold {
-                    return SendFault::Reorder;
+                    return SendFault::Reorder(1);
                 }
             }
         }
@@ -361,15 +405,46 @@ impl FaultControl {
         }
     }
 
-    /// Take any frame held back by a reorder (to release after the current send).
+    /// Take any frame held back by a reorder, whatever depth is left to run —
+    /// the unconditional flush [`LossyTransport::flush`] needs when a held frame
+    /// has no further sends coming to release it.
     fn take_pending_reorder(&self) -> Option<Vec<u8>> {
-        lock_recover(&self.state.pending_reorder).take()
+        lock_recover(&self.state.pending_reorder)
+            .take()
+            .map(|(data, _)| data)
     }
 
-    /// Hold a frame for reorder; returns any previously-held frame so the caller
-    /// can flush it (a second reorder before the first is released).
-    fn hold_for_reorder(&self, data: Vec<u8>) -> Option<Vec<u8>> {
-        lock_recover(&self.state.pending_reorder).replace(data)
+    /// Count one forwarded send against a held frame, and take the frame if that
+    /// was the last send it was waiting behind.
+    fn count_down_pending_reorder(&self) -> Option<Vec<u8>> {
+        let mut held = lock_recover(&self.state.pending_reorder);
+        match held.take() {
+            None => None,
+            Some((data, remaining)) => match remaining.saturating_sub(1) {
+                0 => Some(data),
+                left => {
+                    *held = Some((data, left));
+                    None
+                }
+            },
+        }
+    }
+
+    /// Hold a frame for reorder behind `depth` forwarded sends; returns any
+    /// previously-held frame so the caller can flush it (a second reorder before
+    /// the first is released).
+    fn hold_for_reorder(&self, data: Vec<u8>, depth: u64) -> Option<Vec<u8>> {
+        lock_recover(&self.state.pending_reorder)
+            .replace((data, depth.max(1)))
+            .map(|(prev, _)| prev)
+    }
+
+    /// The armed hold depth, consumed so it applies to exactly one send.
+    fn consume_armed_hold(&self) -> Option<u64> {
+        match self.state.arm_hold_depth.swap(0, Ordering::Relaxed) {
+            0 => None,
+            depth => Some(depth),
+        }
     }
 
     fn consume_armed_drop(&self) -> bool {
@@ -451,10 +526,10 @@ impl<T: SessionTransport> SessionTransport for LossyTransport<T> {
                 // next forwarded send or an explicit `flush`.
                 Ok(())
             }
-            SendFault::Reorder => {
+            SendFault::Reorder(depth) => {
                 // Hold this frame; release any previously-held frame first so a
                 // second reorder before the first is delivered doesn't lose it.
-                if let Some(prev) = self.control.hold_for_reorder(data.to_vec()) {
+                if let Some(prev) = self.control.hold_for_reorder(data.to_vec(), depth) {
                     self.inner.send_bytes(&prev).await?;
                 }
                 Ok(())
@@ -513,7 +588,7 @@ impl<T: SessionTransport> LossyTransport<T> {
     /// Release a frame held by a reorder *after* the current frame was
     /// forwarded, so the held frame lands later in the stream (the swap).
     async fn release_pending_reorder(&self) -> Result<(), CoreError> {
-        if let Some(held) = self.control.take_pending_reorder() {
+        if let Some(held) = self.control.count_down_pending_reorder() {
             self.inner.send_bytes(&held).await?;
         }
         Ok(())
@@ -629,6 +704,56 @@ mod tests {
             &*got,
             &[b"r0".to_vec(), b"r2".to_vec(), b"r1".to_vec()],
             "the reordered frame must land after the following frame"
+        );
+    }
+
+    /// **A reorder has a depth, and the depth is what a loss detector reads.**
+    /// An armed hold of four puts the frame behind four of its own successors,
+    /// not one — the distance RFC 9002's packet threshold needs before it will
+    /// say anything at all, and the distance the reference route's own controls
+    /// show. The final assertion is the whole point: the held frame is still
+    /// delivered, so a test using this is testing a path that reorders rather
+    /// than one that drops.
+    #[tokio::test]
+    async fn an_armed_hold_puts_a_frame_the_configured_distance_late() {
+        let forwarded = Arc::new(Mutex::new(Vec::new()));
+        let inner = RecordingTransport {
+            forwarded: forwarded.clone(),
+        };
+        let control = FaultControl::new();
+        let lossy = LossyTransport::new(inner, control.clone());
+
+        control.arm_hold_next(4);
+        lossy.send_bytes(b"h0").await.expect("send h0"); // held
+        for frame in [b"h1", b"h2", b"h3"] {
+            lossy.send_bytes(frame).await.expect("send");
+        }
+        assert_eq!(
+            &*forwarded.lock().expect("poisoned"),
+            &[b"h1".to_vec(), b"h2".to_vec(), b"h3".to_vec()],
+            "three forwarded sends is one short of the armed depth, so the held \
+             frame must still be held"
+        );
+
+        lossy.send_bytes(b"h4").await.expect("send h4");
+        assert_eq!(
+            &*forwarded.lock().expect("poisoned"),
+            &[
+                b"h1".to_vec(),
+                b"h2".to_vec(),
+                b"h3".to_vec(),
+                b"h4".to_vec(),
+                b"h0".to_vec()
+            ],
+            "the fourth forwarded send releases the frame, four positions late"
+        );
+
+        // Armed for exactly one send: nothing after it is held.
+        lossy.send_bytes(b"h5").await.expect("send h5");
+        assert_eq!(
+            forwarded.lock().expect("poisoned").last(),
+            Some(&b"h5".to_vec()),
+            "the arm is consumed by the send it applies to"
         );
     }
 

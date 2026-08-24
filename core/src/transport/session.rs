@@ -1308,10 +1308,21 @@ impl Session {
         self.pacer.time_until_credit()
     }
 
-    /// Record that a packet of `bytes` length was lost (no ACK before
-    /// retransmit timer fired). Drives BBR's loss-based feedback.
-    pub fn on_packet_lost(&self, bytes: u64) {
-        self.bandwidth_estimator.lock().on_loss(bytes);
+    /// Record that the send path put a copy of `bytes` bytes back on the wire in
+    /// place of an earlier transmission of the same segment.
+    ///
+    /// **This is the retransmission, not the loss.** It keeps the in-flight
+    /// figure honest — the copy's own `on_packet_sent` has already counted its
+    /// bytes and the transmission it replaces is no longer outstanding — and it
+    /// deliberately reports nothing to the loss response. What the detector
+    /// declared is a suspicion drawn from a hole in an acknowledgement, and a
+    /// reordering path produces that hole without having dropped anything; the
+    /// suspicion becomes a congestion signal only when the acknowledgement that
+    /// retires the segment shows the copy is what got through, which
+    /// `BandwidthEstimator::on_ack` decides from this endpoint's own send and
+    /// receive instants.
+    pub fn on_packet_retransmitted(&self, bytes: u64) {
+        self.bandwidth_estimator.lock().on_retransmit(bytes);
     }
 
     /// A send pass ended for want of data to send. Opens an application-limited
@@ -1333,11 +1344,28 @@ impl Session {
         self.bandwidth_estimator.lock().note_app_limited_drain();
     }
 
-    /// Bytes this session has reported to congestion control as lost.
-    /// Observability / test hook — the observable that a retransmission on the
-    /// send path actually reached the estimator.
+    /// Bytes whose loss this session has **established** and reported to
+    /// congestion control. Observability / test hook — the observable that a
+    /// retransmission the path actually needed reached the estimator.
     pub fn bbr_bytes_lost(&self) -> u64 {
         self.bandwidth_estimator.lock().bytes_lost()
+    }
+
+    /// Bytes this session has retransmitted, whether or not the loss that
+    /// prompted each copy turned out to be real. Observability / test hook.
+    ///
+    /// The companion to [`Self::bbr_bytes_lost`]: a path that reorders drives
+    /// this figure and not that one, which is the only way to tell it apart from
+    /// a path that drops.
+    pub fn bbr_bytes_retransmitted(&self) -> u64 {
+        self.bandwidth_estimator.lock().bytes_retransmitted()
+    }
+
+    /// Bytes of retransmission this session can show were unnecessary — the
+    /// segment's acknowledgement came back too soon after the copy left to have
+    /// been answering the copy. Observability / test hook.
+    pub fn bbr_bytes_spurious_retransmit(&self) -> u64 {
+        self.bandwidth_estimator.lock().bytes_spurious_retransmit()
     }
 
     /// Reset the congestion controller + pacer to startup (Phase 4 / QUIC §9.4):
@@ -1381,6 +1409,10 @@ impl Session {
             delivered_time: est.delivered_time(),
             state: est.state(),
             app_limited: est.is_app_limited(),
+            bytes_retransmitted: est.bytes_retransmitted(),
+            bytes_lost: est.bytes_lost(),
+            bytes_spurious_retransmit: est.bytes_spurious_retransmit(),
+            inflight_hi_bytes: est.inflight_hi().unwrap_or(0),
         }
     }
 
@@ -1758,6 +1790,45 @@ pub struct BandwidthSnapshot {
     /// has room and there is simply nothing to send. Distinguishes "the
     /// transport is the bottleneck" from "the application is".
     pub app_limited: bool,
+    /// Bytes retransmitted so far — every copy the loss detector ordered,
+    /// whether or not the path had actually dropped anything.
+    ///
+    /// The three loss figures travel together because no one of them is
+    /// interpretable alone, and until they did, a recorded run could not say
+    /// whether a sender's back-off was bought by drops or by reordering. This is
+    /// what the detector decided; `bytes_lost` is what an acknowledgement went
+    /// on to confirm; `bytes_spurious_retransmit` is what an acknowledgement
+    /// refuted. They do not have to sum: a copy still in flight, or one for a
+    /// segment the peer never acknowledges, is counted here and in neither of
+    /// the others.
+    ///
+    /// Cumulative over the estimator's life, not the session's:
+    /// [`Session::reset_congestion`] replaces the estimator on a migration, so
+    /// these three restart from zero on the new path, exactly as the bandwidth
+    /// estimate and the round-trip minimum do. A series that spans a migration
+    /// therefore is not monotone, and a reader taking a maximum over one gets
+    /// the larger of the two paths rather than the sum.
+    pub bytes_retransmitted: u64,
+    /// Bytes whose loss was established and fed to the loss response — the
+    /// numerator of the round loss rate `adapt_inflight_bound` judges, summed
+    /// over the connection.
+    pub bytes_lost: u64,
+    /// Bytes of retransmission shown to have been unnecessary. The direct
+    /// measure of what a reordering path costs this sender, and the figure
+    /// whose absence made the reordering question unanswerable from an
+    /// artifact.
+    pub bytes_spurious_retransmit: u64,
+    /// The loss-imposed upper bound on inflight, in bytes, or `0` when the path
+    /// has given no reason for one.
+    ///
+    /// Recorded rather than inferred. The bound is applied inside `cwnd()`, so
+    /// from the outside its engagement can only be guessed at by comparing
+    /// `cwnd_bytes` against `bottleneck_bw_bps × min_rtt` — and that guess is
+    /// wrong in exactly the states worth reading: ProbeRTT pins the window to
+    /// four packets for reasons of its own, and a bound set when the estimate
+    /// was smaller stays a fixed byte count while the product it is compared
+    /// against keeps growing. Zero here is unambiguous.
+    pub inflight_hi_bytes: u64,
 }
 
 impl std::fmt::Debug for Session {
