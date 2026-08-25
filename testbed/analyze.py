@@ -205,8 +205,31 @@ def reorder_summary(rows):
     late = sum(r["reorder"]["late_datagrams"] for r in pool)
     arrivals = sum(r.get("received_datagrams", 0) for r in pool)
     horizon = max(r["reorder"]["horizon"] for r in pool)
+    # Three maxima, each over the whole pool and each independent of the others.
+    # They are not three properties of one datagram and must never be printed as
+    # though they were: distance scales with how densely the rung packed its
+    # datagrams, so the rung that produced the worst distance is usually the
+    # fastest one, while the worst time comes from wherever the path stalled
+    # longest. A pairing of the two reads as a single event that this instrument
+    # never observed — and at the rates involved usually cannot exist, since 200
+    # datagrams genuinely arriving inside 1.5 ms is over a gigabit per second.
+    #
+    # Which of the two times matters depends on the threshold being sized.
+    # `displacement_ns` is measured wholly on the receiver's clock — the gap
+    # between the arrival that revealed the hole and the arrival that filled it.
+    # `transit_excess_ns` adds the head start the late datagram had on the
+    # sender's clock, so it is how much longer the path took over it, and it is
+    # the one that pairs with distance: distance ≈ transit excess × the sending
+    # rate. Sizing a packet threshold against the displacement compares a count
+    # of datagrams with a duration that excludes most of the delay.
     worst_distance = max(r["reorder"]["distance"]["max"] for r in pool)
     worst_ms = max(r["reorder"]["displacement_ns"]["max"] for r in pool) / 1e6
+    excess = [
+        r["reorder"]["transit_excess_ns"]["max"]
+        for r in pool
+        if "transit_excess_ns" in r["reorder"]
+    ]
+    worst_transit_ms = (max(excess) / 1e6) if excess else None
     return {
         "rungs": len(pool),
         "admissible": bool(admissible),
@@ -215,6 +238,11 @@ def reorder_summary(rows):
         "fraction": (late / arrivals) if arrivals else None,
         "worst_distance": worst_distance,
         "worst_ms": worst_ms,
+        "worst_transit_ms": worst_transit_ms,
+        # True when the pool holds more than one rung, i.e. when the maxima above
+        # are not even guaranteed to describe the same rung, let alone the same
+        # datagram.
+        "maxima_from_one_rung": len(pool) == 1,
         # A tail that reached the receiver's own window is the instrument's tail,
         # not the path's, and a tolerance sized on it is sized on this harness.
         "clipped": bool(late) and worst_distance >= horizon,
@@ -244,11 +272,23 @@ def reorder_headline(by_direction):
             )
             continue
         frac = f"{s['fraction']:.2%}" if s["fraction"] is not None else "—"
+        transit = (
+            f", transit excess {s['worst_transit_ms']:.1f} ms"
+            if s["worst_transit_ms"] is not None
+            else ""
+        )
         lines.append(
             f"  {direction:24} \033[1m{s['late']} late of {s['arrivals']} ({frac})\033[0m — worst "
-            f"{s['worst_distance']:.0f} datagrams and {s['worst_ms']:.1f} ms behind"
+            f"distance {s['worst_distance']:.0f} datagrams, worst displacement "
+            f"{s['worst_ms']:.1f} ms{transit}"
             f"{'' if s['admissible'] else '  (no admissible rung — read with care)'}"
         )
+        if not s["maxima_from_one_rung"]:
+            lines.append(
+                f"  {'':24} separate maxima over {s['rungs']} rungs — not one datagram: "
+                "distance comes from whichever rung packed datagrams tightest, the times "
+                "from wherever the path stalled longest"
+            )
         if s["clipped"]:
             lines.append(
                 f"  {'':24} \033[33mthe worst distance reached the receiver's own window "
@@ -1646,17 +1686,35 @@ def analyze_client(run_dir):
                 f"{ro['gaps_filled']:>8} {ro['gaps_lost']:>8} {ro['gaps_open_at_end']:>6}{mark}"
             )
         # Sizing a threshold means clearing the worst tail that was measured,
-        # not the typical one — so the headline is a maximum over the rungs.
+        # not the typical one — so the headline is a maximum over the rungs. Each
+        # maximum separately: see `reorder_summary` for why pairing them describes
+        # an event nothing observed.
         adm = [r for r in rows if r.get("admissible")]
         pool = adm or rows
         worst_d = max(r["reorder"]["distance"]["max"] for r in pool)
         worst_t = max(r["reorder"]["displacement_ns"]["max"] for r in pool)
+        excess = [
+            r["reorder"]["transit_excess_ns"]["max"]
+            for r in pool
+            if "transit_excess_ns" in r["reorder"]
+        ]
         horizon = max(r["reorder"]["horizon"] for r in pool)
         print(
-            f"\n  worst reorder seen{'' if adm else ' (no admissible rung — read with care)'}: "
-            f"{worst_d:.0f} datagrams and {worst_t / 1e6:.1f} ms behind. A packet-threshold "
-            f"or time-threshold below either declares reordering as loss."
+            f"\n  worst reorder seen{'' if adm else ' (no admissible rung — read with care)'}, "
+            f"each maximum over {len(pool)} rung(s) on its own: distance {worst_d:.0f} datagrams; "
+            f"displacement {worst_t / 1e6:.1f} ms"
+            + (f"; transit excess {max(excess) / 1e6:.1f} ms" if excess else "")
         )
+        print(
+            "  a packet threshold is sized against the transit excess, not the displacement — "
+            "distance is that excess times the sending rate, which is why the same path shows a "
+            "larger distance on a faster rung"
+        )
+        if len(pool) > 1:
+            print(
+                "  the figures above are not one datagram: they are maxima taken independently, "
+                "and the rung that produced each is usually a different one"
+            )
         if worst_d >= horizon:
             print(
                 "  \033[33mthe worst distance reached the receiver's own window "
@@ -3074,18 +3132,33 @@ def self_test():
         ),
     ]
 
-    def rung_with_reorder(direction, late, *, admissible=True, distance=12, horizon=4096, arrivals=1000):
+    def rung_with_reorder(
+        direction,
+        late,
+        *,
+        admissible=True,
+        distance=12,
+        horizon=4096,
+        arrivals=1000,
+        displacement_ns=40_000_000,
+        transit_excess_ns=None,
+        offered_bps=5e6,
+    ):
         return {
             "direction": direction,
             "rung": 0,
-            "offered_bps": 5e6,
+            "offered_bps": offered_bps,
             "admissible": admissible,
             "received_datagrams": arrivals,
             "reorder": {
                 "late_datagrams": late,
                 "horizon": horizon,
                 "distance": {"max": distance, "count": late},
-                "displacement_ns": {"max": 40_000_000, "count": late},
+                "displacement_ns": {"max": displacement_ns, "count": late},
+                "transit_excess_ns": {
+                    "max": displacement_ns if transit_excess_ns is None else transit_excess_ns,
+                    "count": late,
+                },
                 "gaps_filled": late,
                 "gaps_lost": 0,
                 "gaps_open_at_end": 0,
@@ -3117,6 +3190,42 @@ def self_test():
             "clipped by the instrument",
             {"raw_udp_downstream": [rung_with_reorder("raw_udp_downstream", 9, distance=4096)]},
             ["the instrument's, not the path's"],
+        ),
+        # The two worst figures are maxima over the rung pool, taken independently,
+        # so they routinely belong to different rungs and therefore to different
+        # events. Printed side by side without saying so, they read as one datagram
+        # that was both 200 positions and 40 ms late — a pairing this instrument
+        # cannot observe and, at the rates involved, usually cannot exist. They
+        # were read exactly that way for two campaigns.
+        (
+            "two maxima from two rungs",
+            {
+                "raw_udp_upstream": [
+                    rung_with_reorder(
+                        "raw_udp_upstream",
+                        40,
+                        distance=200,
+                        displacement_ns=1_500_000,
+                        transit_excess_ns=11_000_000,
+                        offered_bps=200e6,
+                    ),
+                    rung_with_reorder(
+                        "raw_udp_upstream",
+                        9,
+                        distance=3,
+                        displacement_ns=40_000_000,
+                        transit_excess_ns=44_000_000,
+                        offered_bps=5e6,
+                    ),
+                ]
+            },
+            [
+                "separate maxima",
+                "not one datagram",
+                "worst distance 200 datagrams",
+                "worst displacement 40.0 ms",
+                "transit excess 44.0 ms",
+            ],
         ),
     ]
 
