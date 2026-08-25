@@ -15,6 +15,7 @@ import argparse
 import json
 import math
 import pathlib
+import re
 import sys
 import tempfile
 from collections import defaultdict
@@ -785,31 +786,91 @@ def series_role(rows):
     return "sender" if series_is_a_sender(rows) else "receiver"
 
 
-def retransmission_reading(rows):
-    """What a sender's retransmission cost it, and how much of that was waste.
+#: Window-sample columns the retransmission reading below consults, named once so
+#: the self-test can hold them against what the artifact actually carries. A name
+#: here that `WindowSample` does not define reads as zero through `dict.get`, and a
+#: zero in this particular reading is not "nothing happened" — it is a measurement
+#: of a quantity nobody measured. The gate is `reads_only_columns_the_artifact_carries`.
+RETRANSMISSION_COLUMNS = (
+    "bytes_retransmitted",
+    "bytes_lost",
+    "inflight_hi_bytes",
+)
 
-    `None` when the rows predate the columns — the three loss figures and the
+
+def window_sample_columns():
+    """The field names `WindowSample` serialises, read out of the recorder itself.
+
+    Returns `None` only when the source is not beside this script — a copy of
+    this file deployed on its own is a legitimate way to read an archive, and it
+    simply cannot run this check. The caller reports that as skipped rather than
+    passed, because a check that cannot fail is not evidence.
+
+    A file that *is* there and does not parse returns an empty set instead, and
+    the difference is load-bearing: both were `None` in the first version of this
+    function, so renaming the struct in `report.rs` would have turned the gate
+    off silently and reported it as an absent file. That is the same shape as the
+    defect the gate exists to catch — a check that stopped checking and said
+    nothing — and the mutation that found it was renaming the struct.
+
+    Parsing Rust with a regular expression is normally a bad trade, but the
+    target here is narrow: the `pub name: type,` lines of one struct, in a file
+    this repository owns. The alternative is a remembered list, which is the
+    failure this exists to catch, one level up.
+    """
+    src = pathlib.Path(__file__).resolve().parent / "src" / "report.rs"
+    try:
+        text = src.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    start = text.find("pub struct WindowSample")
+    if start < 0:
+        return set()
+    depth = 0
+    end = None
+    for i in range(text.find("{", start), len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    if end is None:
+        return set()
+    return set(re.findall(r"^\s*pub ([a-z_0-9]+):", text[start:end], re.MULTILINE))
+
+
+def retransmission_reading(rows):
+    """What a sender's retransmission cost it — copies against holes.
+
+    `None` when the rows predate the columns — the two loss figures and the
     inflight bound were added together, so a run recorded before them carries
-    none of them, and four zeros would read as a sender that never retransmitted
+    none of them, and zeros would read as a sender that never retransmitted
     anything. That distinction is the whole reason this returns `None` rather
     than a zeroed reading: the runs this question was first asked of are exactly
     the ones that cannot answer it.
 
-    The reading itself is a subtraction the artifact could not previously
-    support. `declared` is what the loss detector ordered — RFC 9002's packet
-    threshold, which fires on a hole three offsets behind the largest
-    acknowledgement, and a path that reorders leaves that hole without having
-    dropped anything. `established` is the part an acknowledgement went on to
-    justify, and it is the only part congestion control was told about.
-    `refuted` is the part an acknowledgement contradicted: the segment's
-    acknowledgement came back too soon after the copy left to have been
-    answering the copy.
+    `declared` counts copies: every retransmission the loss detector ordered,
+    including the second and third copy of a segment whose first copy also
+    failed. `established` counts holes: one booking per segment the sender first
+    put a copy of on the wire, which is the numerator the round's loss rate is
+    judged on. Their difference is the bandwidth that went into re-repairing.
 
-    `refuted / declared` is therefore the share of this sender's retransmission
-    the path's reordering bought, and it is a *lower* bound on the waste — the
-    certificate needs a round trip the sender has timed, and a reordered
-    datagram that returns later than a fraction of one is indistinguishable from
-    a drop.
+    **Neither of them separates a drop from reordering, and no column here can.**
+    The packet threshold declares a segment lost once its successors are
+    acknowledged, which is exactly what an overtaken datagram produces without
+    anything having been dropped, and the acknowledgement names the segment's
+    stream offset — a value the original and every copy shared. So the sender
+    never learns which of the two happened, `established` is an **upper bound**
+    on the drops, and a fourth figure naming the refuted part would have to come
+    from a wire that carried which transmission arrived. Two attempts to derive
+    one from acknowledgement timing instead were withdrawn after measurement,
+    because a duration derived from acknowledgements is a duration the peer
+    writes. A column for it was read here for a while after the mechanism behind
+    it was withdrawn, and printed zero on every run — which reads as "none of
+    the retransmission was waste", the strongest of the three possible claims
+    and the one nobody measured.
 
     `bound_samples` counts the samples in which the loss response was actually
     binding, read from the recorded bound rather than inferred by comparing the
@@ -819,31 +880,24 @@ def retransmission_reading(rows):
     while the estimate was smaller stays a fixed byte count while the product
     grows past it.
 
-    The three totals are read as maxima over the series rather than from its last
-    row, because they are cumulative over the *estimator's* life and not the
+    The totals are read as maxima over the series rather than from its last row,
+    because they are cumulative over the *estimator's* life and not the
     session's: a migration replaces the estimator and restarts them at zero,
     exactly as it restarts the bandwidth estimate and the round-trip minimum. A
     series spanning one is therefore not monotone, and the maximum is the larger
     of the two paths rather than their sum — which is a reading a migration
     scenario has to be told about rather than one this can fix.
     """
-    keys = (
-        "bytes_retransmitted",
-        "bytes_lost",
-        "bytes_spurious_retransmit",
-        "inflight_hi_bytes",
-    )
+    keys = RETRANSMISSION_COLUMNS
     if not any(k in r for r in rows for k in keys):
         return None
     declared = max((r.get("bytes_retransmitted", 0) or 0) for r in rows)
     established = max((r.get("bytes_lost", 0) or 0) for r in rows)
-    refuted = max((r.get("bytes_spurious_retransmit", 0) or 0) for r in rows)
     bound_samples = sum(1 for r in rows if (r.get("inflight_hi_bytes", 0) or 0) > 0)
     return {
         "declared": declared,
         "established": established,
-        "refuted": refuted,
-        "refuted_share": (refuted / declared) if declared else None,
+        "repair_share": (declared - established) / declared if declared else None,
         "bound_samples": bound_samples,
         "samples": len(rows),
     }
@@ -1748,17 +1802,20 @@ def window_series_reading(leg, phase, rows):
         if rx is None:
             print(
                 "         (no loss columns — this run predates the "
-                "declared/established/refuted split)"
+                "copies/holes split)"
             )
         elif rx["declared"] == 0:
             print("         retransmitted nothing; the loss response was never engaged")
         else:
-            share = rx["refuted_share"]
+            share = rx["repair_share"]
             print(
-                f"         retransmitted {rx['declared']:>8} B, of which "
-                f"{rx['established']:>8} B established as loss and {rx['refuted']:>8} B "
-                f"refuted by their own acknowledgements"
-                + (f" ({share * 100:.1f}% waste)" if share is not None else "")
+                f"         retransmitted {rx['declared']:>8} B in copies against "
+                f"{rx['established']:>8} B of holes charged to congestion control"
+                + (f" ({share * 100:.1f}% of it re-repair)" if share else "")
+            )
+            print(
+                f"         {'':18} holes are an upper bound on drops: an overtaken "
+                "segment is declared the same way and the wire does not say which"
             )
             print(
                 f"         {'':18} inflight bound engaged in "
@@ -2852,36 +2909,36 @@ def self_test():
     # sender retransmitted nothing — which is the answer this whole question
     # exists to stop being invented.
     retransmit_cases = [
-        # A path that reorders: most of the retransmission refuted.
+        # Nine of every ten copies went into re-repairing segments whose first
+        # copy also failed: ten thousand bytes of copies against one thousand
+        # bytes of hole. Says nothing about whether those holes were drops.
         (
             [
                 win(
                     bytes_retransmitted=10_000,
                     bytes_lost=1_000,
-                    bytes_spurious_retransmit=9_000,
                     inflight_hi_bytes=0,
                 )
             ],
-            (10_000, 1_000, 9_000, 0.9, 0),
+            (10_000, 1_000, 0.9, 0),
         ),
-        # A path that drops: none of it refuted, and the bound engaged.
+        # One copy per hole, and the bound engaged.
         (
             [
                 win(
                     bytes_retransmitted=10_000,
                     bytes_lost=10_000,
-                    bytes_spurious_retransmit=0,
                     inflight_hi_bytes=300_000,
                 )
             ],
-            (10_000, 10_000, 0, 0.0, 1),
+            (10_000, 10_000, 0.0, 1),
         ),
         # Present and zero is a real reading — nothing was retransmitted — and
         # the share is undefined rather than zero, because there is nothing to
         # take a share of.
         (
-            [win(bytes_retransmitted=0, bytes_lost=0, bytes_spurious_retransmit=0)],
-            (0, 0, 0, None, 0),
+            [win(bytes_retransmitted=0, bytes_lost=0)],
+            (0, 0, None, 0),
         ),
     ]
     # The buffer's ceiling is a segment count, so it moves with the frame size;
@@ -3288,6 +3345,41 @@ def self_test():
     ]
 
     failures = 0
+    #: Checks that could not run here, with the reason. Reported separately from
+    #: passes: a check that did not execute is not a check that succeeded.
+    skipped = []
+    # Every column this file consults by name must be one the recorder writes.
+    # A name that is not reads as zero through `dict.get`, and the zero is
+    # indistinguishable from a measured zero at every point downstream — which is
+    # how a reading of a mechanism that had been withdrawn survived in the output
+    # for as long as it did, printed on every run and believed.
+    #
+    # The check carries its own positive control, because "found no unknown
+    # column" and "found no columns at all" are the same answer otherwise: the
+    # parse has to have produced a set containing a field this file certainly
+    # reads. Failing that, it is the parser that is broken, not the columns.
+    carried = window_sample_columns()
+    if carried is None:
+        skipped.append(
+            "window-sample column gate: src/report.rs is not beside this script, "
+            "so this copy cannot check its column names against the recorder"
+        )
+    elif "cwnd_bytes" not in carried:
+        failures += 1
+        print(
+            "  FAIL: window_sample_columns() parsed "
+            f"{len(carried)} field(s) and none was cwnd_bytes — the parser is broken, "
+            "so its silence about unknown columns means nothing"
+        )
+    else:
+        unknown = sorted(set(RETRANSMISSION_COLUMNS) - carried)
+        ok = not unknown
+        failures += 0 if ok else 1
+        print(
+            f"  {'ok' if ok else 'FAIL'}: retransmission columns are carried by WindowSample "
+            f"({len(carried)} fields parsed)"
+            + (f" — not carried: {', '.join(unknown)}" if unknown else "")
+        )
     for leg, want in role_cases:
         got = leg_role(leg)
         ok = got == want
@@ -3385,8 +3477,7 @@ def self_test():
             (
                 rx["declared"],
                 rx["established"],
-                rx["refuted"],
-                rx["refuted_share"],
+                rx["repair_share"],
                 rx["bound_samples"],
             )
             if rx
@@ -3497,6 +3588,7 @@ def self_test():
     extra = (
         len(side_cases)
         + len(retransmit_cases)
+        + (0 if skipped else 1)  # the window-sample column gate, when it could run
         + 1  # the run that predates the loss columns
         + len(ceiling_split_cases)
         + len(startup_cases)
@@ -3559,7 +3651,9 @@ def self_test():
         + len(reading_cases)
         + len(ladder_cases)
     )
-    print(f"{total - failures}/{total} ok")
+    for why in skipped:
+        print(f"  skipped: {why}")
+    print(f"{total - failures}/{total} ok" + (f", {len(skipped)} skipped" if skipped else ""))
     return 1 if failures else 0
 
 
