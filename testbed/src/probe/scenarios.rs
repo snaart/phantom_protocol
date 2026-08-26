@@ -5012,6 +5012,7 @@ mod tests {
             bw_filter_window_ms: 10_000,
             pacing_rate_bps: 1_000_000,
             min_rtt_us: 200_000,
+            drain_outcomes: Vec::new(),
             smoothed_rtt_us: 0,
             rtt_variation_us: 0,
             delivered_bytes: i * 100_000,

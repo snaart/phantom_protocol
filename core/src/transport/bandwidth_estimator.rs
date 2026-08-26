@@ -55,6 +55,35 @@ use crate::transport::stream::LossCause;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+/// Why a drain pass ended, as a tally rather than as a schedule.
+///
+/// The pump's own `DrainStop` carries a pacing delay it needs in order to
+/// schedule the next pass; this is the same set of outcomes with that stripped,
+/// because how many passes the pacer stopped and how long the next one waits are
+/// different questions.
+///
+/// It exists because the census of what stopped a sender was an inference: an
+/// analysis compared bytes outstanding against the window, the bandwidth-delay
+/// product and the two byte ceilings, and named whichever came closest. That
+/// inference cannot separate a pass the pacer metered from one that ran dry with
+/// the window open — both leave the same window behind them — and those two are
+/// exactly the pair the application-limited flag turns on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainOutcome {
+    /// Every stream ran dry: the application had nothing more to give.
+    Drained,
+    /// The local congestion window had no room for the head segment.
+    CongestionLimited,
+    /// The peer's advertised flow-control window had no room for it.
+    FlowControlled,
+    /// The local send path refused the write.
+    TransportRefused,
+    /// The pass hit its per-pass segment budget with data still offered.
+    SegmentBudget,
+    /// The pacer had no credit.
+    Paced,
+}
+
 /// BBR state machine states
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BbrState {
@@ -911,6 +940,13 @@ pub struct BandwidthEstimator {
     /// takes part in.
     declared_by_rto: u64,
 
+    /// Drain passes by the reason each ended, indexed by [`DrainOutcome`] in
+    /// declaration order.
+    ///
+    /// A tally of a decision this endpoint made about its own send path, taken
+    /// where it was made. Nothing the peer sends enters it, and nothing in this
+    /// file reads it back.
+    drain_outcomes: [u64; 6],
     /// Smoothed round trip over the acknowledgements this endpoint timed, and
     /// its variation — RFC 6298's SRTT and RTTVAR, from the same samples
     /// `min_rtt` is filtered from and under the same Karn gate.
@@ -992,6 +1028,7 @@ impl BandwidthEstimator {
             declared_by_packet_threshold: 0,
             declared_by_time_threshold: 0,
             declared_by_rto: 0,
+            drain_outcomes: [0; 6],
             smoothed_rtt: None,
             rtt_variation: Duration::ZERO,
             last_delivery_rate: 0,
@@ -1531,6 +1568,29 @@ impl BandwidthEstimator {
     /// [`Self::bytes_lost`] is the byte weight of.
     pub fn loss_declarations(&self) -> u64 {
         self.loss_declarations
+    }
+
+    /// Count a drain pass that ended for `outcome`.
+    ///
+    /// Recorded and read by nothing. The pump's scheduling reads the pass's own
+    /// `DrainStop`; this is the census beside it.
+    pub fn note_drain_outcome(&mut self, outcome: DrainOutcome) {
+        let i = match outcome {
+            DrainOutcome::Drained => 0,
+            DrainOutcome::CongestionLimited => 1,
+            DrainOutcome::FlowControlled => 2,
+            DrainOutcome::TransportRefused => 3,
+            DrainOutcome::SegmentBudget => 4,
+            DrainOutcome::Paced => 5,
+        };
+        self.drain_outcomes[i] = self.drain_outcomes[i].saturating_add(1);
+    }
+
+    /// Drain passes by the reason each ended, in [`DrainOutcome`] declaration
+    /// order: drained, congestion-limited, flow-controlled, transport-refused,
+    /// segment-budget, paced.
+    pub fn drain_outcomes(&self) -> [u64; 6] {
+        self.drain_outcomes
     }
 
     /// Smoothed round trip over timed acknowledgements, and its variation.

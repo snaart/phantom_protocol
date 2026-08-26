@@ -97,6 +97,7 @@ use crate::observability::attrs::{
 };
 use crate::observability::{Observability, ObservabilityConfig};
 use crate::runtime::{Runtime, TokioRuntime};
+use crate::transport::bandwidth_estimator::DrainOutcome;
 use crate::transport::handshake::{HandshakeClient, ServerReject, ServerReply, EARLY_DATA_MAX_LEN};
 use crate::transport::mtu::{MAX_RECV_FRAME, MAX_RECV_PAYLOAD};
 use crate::transport::multiplexer::StreamDemultiplexer;
@@ -3016,6 +3017,44 @@ async fn flush_deferred_sends<T: SessionTransport>(
 /// are also small and infrequent enough that leaving them out of the rate
 /// accounting costs a fraction of a percent of it.
 async fn drain_streams_priority_ordered<T: SessionTransport>(
+    transport: &Arc<T>,
+    crypto_session: &Arc<Session>,
+    session_id: SessionId,
+    streams: &Arc<DashMap<u32, Arc<Stream>>>,
+    observability: &Observability,
+) -> DrainStop {
+    let stop = drain_streams_inner(
+        transport,
+        crypto_session,
+        session_id,
+        streams,
+        observability,
+    )
+    .await;
+    // Counted here and nowhere else. The pass has six exits and five callers, so
+    // a tally at the call sites would be five places to forget and six to get
+    // wrong; a wrapper has one of each. What it buys is a census of what actually
+    // stopped the sender, rather than the one an analysis infers afterwards from
+    // the window and the bytes outstanding — an inference that cannot see the
+    // difference between a pass the pacer metered and a pass that ran dry with
+    // the window open, because both leave the same window behind them.
+    //
+    // Nothing the peer sends enters this. It is a tally of a decision this
+    // endpoint made about its own send path, taken at the moment it made it.
+    crypto_session.note_drain_stop(match stop {
+        DrainStop::Drained => DrainOutcome::Drained,
+        DrainStop::CongestionLimited => DrainOutcome::CongestionLimited,
+        DrainStop::FlowControlled => DrainOutcome::FlowControlled,
+        DrainStop::TransportRefused => DrainOutcome::TransportRefused,
+        DrainStop::SegmentBudget => DrainOutcome::SegmentBudget,
+        DrainStop::Paced(_) => DrainOutcome::Paced,
+    });
+    stop
+}
+
+/// The pass itself. See [`drain_streams_priority_ordered`], which wraps it so the
+/// outcome is counted at one point rather than at six.
+async fn drain_streams_inner<T: SessionTransport>(
     transport: &Arc<T>,
     crypto_session: &Arc<Session>,
     session_id: SessionId,
@@ -7698,6 +7737,76 @@ mod tests {
     /// be outstanding and how fast it may leave. Those are exactly the rounds a
     /// loss response is meant to judge, and marking them app-limited would
     /// disable it in the only regime where it matters.
+    /// **The census records what stopped each pass, where an inference could not.**
+    ///
+    /// Every reading of "what stopped the sender" in the harness was drawn
+    /// afterwards from the window and the bytes outstanding, and that inference
+    /// is blind in exactly one place: a pass the pacer metered and a pass that
+    /// ran dry with the window open leave the same window behind them. Those two
+    /// are the pair the application-limited flag turns on, so telling them apart
+    /// decides whether a run's rate describes the path or the application.
+    ///
+    /// The two halves here are that pair, and the census separates them.
+    #[tokio::test]
+    async fn the_reason_a_pass_ended_is_counted_where_the_pass_ended() {
+        const SEGMENT: usize = 1_200;
+        let sid = fixed_session_id();
+
+        // A stream with nothing to give: the pass runs dry.
+        let (dry, _server) = paired_sessions(sid);
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        streams.insert(1u32, Arc::new(TransportStream::new(1)));
+        let (client_t, _server_t) = ChannelTransport::pair();
+        let transport = Arc::new(client_t);
+        let obs = Observability::new(ObservabilityConfig::default());
+        let stop = drain_streams_priority_ordered(&transport, &dry, sid, &streams, &obs).await;
+        assert_eq!(stop, DrainStop::Drained, "precondition: nothing to send");
+
+        let census = dry.bandwidth_snapshot().drain_outcomes;
+        assert_eq!(
+            census[0], 1,
+            "a pass that ran dry must be counted as drained, not inferred later \
+             from a window it left untouched"
+        );
+        assert_eq!(
+            census[5], 0,
+            "and it must not be counted as paced — that confusion is what the \
+             census exists to end"
+        );
+
+        // A stream with plenty to give, against a rate the pacer will not grant:
+        // the pass stops on the rate, and from outside it leaves the same open
+        // window the dry pass did.
+        let (paced, _server2) = paired_sessions(sid);
+        seed_bandwidth_estimate(&paced, 100, 1_200, std::time::Duration::from_millis(200));
+        let stream = Arc::new(TransportStream::new(1));
+        for _ in 0..32 {
+            stream
+                .send_reliable(Bytes::from(vec![0x5Au8; SEGMENT]))
+                .await
+                .unwrap();
+        }
+        let streams2: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        streams2.insert(1u32, stream);
+        let (client_t2, _server_t2) = ChannelTransport::pair();
+        let transport2 = Arc::new(client_t2);
+        let stop2 = drain_streams_priority_ordered(&transport2, &paced, sid, &streams2, &obs).await;
+        assert!(
+            matches!(stop2, DrainStop::Paced(_)),
+            "precondition: the pacer must be what stopped this pass, got {stop2:?}"
+        );
+
+        let census2 = paced.bandwidth_snapshot().drain_outcomes;
+        assert_eq!(
+            census2[5], 1,
+            "a pass the pacer stopped is counted as paced"
+        );
+        assert_eq!(
+            census2[0], 0,
+            "and not as drained — the stream had thirty-two segments waiting"
+        );
+    }
+
     #[tokio::test]
     async fn a_drain_stopped_by_the_congestion_window_or_the_pacer_is_not_app_limited() {
         const SEGMENT: usize = 1_200;

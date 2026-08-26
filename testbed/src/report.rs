@@ -469,6 +469,20 @@ pub struct WindowSample {
     pub bw_filter_window_ms: u64,
     pub pacing_rate_bps: u64,
     pub min_rtt_us: u64,
+    /// Drain passes by the reason each ended, in the transport's own
+    /// `DrainOutcome` order: drained, congestion-limited, flow-controlled,
+    /// transport-refused, segment-budget, paced. Empty on a leg or a run that
+    /// carries none.
+    ///
+    /// A census the sender kept, where every other reading of "what stopped it"
+    /// in this harness is an inference drawn afterwards from the window and the
+    /// bytes outstanding. The inference cannot separate a pass the pacer metered
+    /// from one that ran dry with the window open — both leave the same window
+    /// behind — and those two are the pair the application-limited flag turns on,
+    /// so telling them apart decides whether a run's rate describes the path or
+    /// the application.
+    #[serde(default)]
+    pub drain_outcomes: Vec<u64>,
     /// Smoothed round trip and its variation, in microseconds, beside the
     /// minimum. Zero on a leg or a run that carries neither.
     ///
@@ -1975,6 +1989,7 @@ mod tests {
                 .as_millis() as u64,
             pacing_rate_bps: 1_000_000,
             min_rtt_us: 235_000,
+            drain_outcomes: vec![41, 7, 3, 0, 11, 29],
             smoothed_rtt_us: 248_000,
             rtt_variation_us: 11_000,
             delivered_bytes: 500_000,

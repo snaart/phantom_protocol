@@ -977,6 +977,52 @@ def retransmission_reading(rows):
     }
 
 
+#: The transport's `DrainOutcome`, in declaration order — the index of each
+#: counter in a row's `drain_outcomes`.
+DRAIN_OUTCOMES = (
+    "drained",
+    "cwnd",
+    "peer window",
+    "transport refused",
+    "segment budget",
+    "paced",
+)
+
+
+def drain_census(rows):
+    """What actually stopped each drain pass, as the sender counted it.
+
+    `None` for a run recorded before the census existed. The distinction matters
+    more here than elsewhere: six zeros would read as a sender whose every pass
+    ran dry, which is the strongest possible statement about an application and
+    one nobody measured.
+
+    Read off the last row that carries a non-empty census, because the counters
+    are cumulative over the estimator's life and a migration restarts them —
+    maximising each of six independently would mix two paths and report a
+    distribution neither produced.
+
+    This is the recorded answer to the question `bound_census` infers. Both are
+    printed: the inference covers every run in the archive and this one does not,
+    and where they disagree the disagreement is itself the finding.
+    """
+    carrier = None
+    for r in rows:
+        if r.get("drain_outcomes"):
+            carrier = r
+    if carrier is None:
+        return None
+    counts = list(carrier["drain_outcomes"])
+    total = sum(counts)
+    if total == 0:
+        return None
+    return {
+        "counts": counts,
+        "total": total,
+        "shares": [c / total for c in counts],
+    }
+
+
 def rto_margin_ms(rows):
     """What a timer-ordered repair costs over a threshold-ordered one, in ms.
 
@@ -991,27 +1037,40 @@ def rto_margin_ms(rows):
     Using the minimum would flatter the margin by whatever standing queue the
     transfer built.
 
-    Both figures are read off the last row that carries them, for the reason the
-    attribution counters are: they are cumulative over the estimator's life and a
-    migration restarts them.
+    **Distributed over the series, not read off its last row.** Both terms move
+    by an order of magnitude within a single transfer — one run gave a variation
+    whose median was 1.8 ms and whose maximum was 110 — so a value taken at the
+    instant the transfer happened to end is a sample of when the sampler stopped,
+    not a property of the transfer. The first version of this function did
+    exactly that and would have published a four-millisecond price for a run
+    whose worst margin was four hundred.
+
+    Unlike the attribution counters, these are not cumulative, so a series
+    spanning a migration needs no special reading: each row is its own
+    measurement and the percentiles simply cover both paths.
     """
-    carrier = None
+    margins, srtts, rttvars = [], [], []
     for r in rows:
-        if (r.get("smoothed_rtt_us") or 0) > 0:
-            carrier = r
-    if carrier is None:
+        srtt_us = r.get("smoothed_rtt_us") or 0
+        if srtt_us <= 0:
+            continue
+        rttvar_us = r.get("rtt_variation_us", 0) or 0
+        # RFC 6298 (2.2)/(2.3) with the transport's own floor and granularity,
+        # from core/src/transport/stream.rs::RtoEstimator.
+        rto_us = max(200_000, srtt_us + max(1_000, 4 * rttvar_us))
+        margins.append((rto_us - srtt_us) / 1000)
+        srtts.append(srtt_us / 1000)
+        rttvars.append(rttvar_us / 1000)
+    if not margins:
         return None
-    srtt_us = carrier["smoothed_rtt_us"]
-    rttvar_us = carrier.get("rtt_variation_us", 0) or 0
-    # RFC 6298 (2.2)/(2.3) with the transport's own floor and granularity, from
-    # core/src/transport/stream.rs::RtoEstimator.
-    rto_us = max(200_000, srtt_us + max(1_000, 4 * rttvar_us))
     return {
-        "srtt_ms": srtt_us / 1000,
-        "rttvar_ms": rttvar_us / 1000,
-        "rto_ms": rto_us / 1000,
-        "reference_ms": srtt_us / 1000,
-        "margin_ms": (rto_us - srtt_us) / 1000,
+        "samples": len(margins),
+        "srtt_p50_ms": pct(srtts, 0.5),
+        "rttvar_p50_ms": pct(rttvars, 0.5),
+        "rttvar_max_ms": max(rttvars),
+        "margin_p50_ms": pct(margins, 0.5),
+        "margin_p90_ms": pct(margins, 0.9),
+        "margin_max_ms": max(margins),
     }
 
 
@@ -2153,15 +2212,36 @@ def send_bound_series(f, scenario, phase, tag, rows):
     # `srtt + max(1 ms, 4·rttvar)`, floored at 200 ms. So the interval between
     # them is the variation, and a run recording only the minimum could report
     # the split without being able to price it.
+    census = drain_census(rows)
+    if census:
+        parts = ", ".join(
+            f"{name} {share:.0%}"
+            for name, share in zip(DRAIN_OUTCOMES, census["shares"])
+            if share > 0
+        )
+        print(
+            f"{pad} why each pass ended, as the sender counted it over "
+            f"{census['total']} pass(es): {parts}"
+        )
+        print(
+            f"{pad} {'':2}recorded, not inferred — the census above this line is "
+            "drawn from the window afterwards and cannot tell a pass the pacer "
+            "metered from one that ran dry with the window open"
+        )
+
     timing = rto_margin_ms(rows)
     if timing:
         print(
-            f"{pad} smoothed round trip {timing['srtt_ms']:.0f} ms ± "
-            f"{timing['rttvar_ms']:.0f} ms → retransmission timer at "
-            f"{timing['rto_ms']:.0f} ms, which is {timing['margin_ms']:+.0f} ms "
-            f"against the {timing['reference_ms']:.0f} ms the packet threshold "
-            "needs — the price of a repair the timer ordered rather than the "
-            "threshold"
+            f"{pad} smoothed round trip median {timing['srtt_p50_ms']:.0f} ms, "
+            f"variation median {timing['rttvar_p50_ms']:.1f} ms / max "
+            f"{timing['rttvar_max_ms']:.0f} ms"
+        )
+        print(
+            f"{pad} {'':2}so a repair the timer ordered rather than the packet "
+            f"threshold cost {timing['margin_p50_ms']:.0f} ms at the median, "
+            f"{timing['margin_p90_ms']:.0f} ms at p90 and "
+            f"{timing['margin_max_ms']:.0f} ms at worst, over "
+            f"{timing['samples']} sample(s) — the timer fires at srtt + 4·variation"
         )
 
     est, raw = delivery_ratios(rows)
@@ -3126,6 +3206,28 @@ def self_test():
     # carries no reading at all, and printing four zeros for it would say the
     # sender retransmitted nothing — which is the answer this whole question
     # exists to stop being invented.
+    # The recorded census, and the one case that must not be six zeros: a run
+    # from before it existed. Zeros there would say every pass ran dry, which is
+    # the strongest available statement about an application and one nobody made.
+    drain_census_cases = [
+        (
+            "carries a census",
+            [win(drain_outcomes=[41, 7, 3, 0, 11, 29])],
+            {"total": 91, "counts": [41, 7, 3, 0, 11, 29]},
+        ),
+        (
+            "cumulative across a migration — read off the later row, not maximised",
+            [
+                win(drain_outcomes=[100, 10, 0, 0, 5, 40]),
+                win(drain_outcomes=[3, 1, 0, 0, 0, 2]),
+            ],
+            {"total": 6, "counts": [3, 1, 0, 0, 0, 2]},
+        ),
+        ("predates the census", [win(min_rtt_us=200_000)], None),
+        ("present but empty", [win(drain_outcomes=[])], None),
+        ("present and all zero", [win(drain_outcomes=[0, 0, 0, 0, 0, 0])], None),
+    ]
+
     # The margin between the two rules, and the one case that must not be a
     # number: a run recorded before the smoothed round trip existed cannot state
     # it, and a zero would say the timer and the threshold fire together.
@@ -3133,13 +3235,31 @@ def self_test():
         (
             "carries the smoothed round trip",
             [win(min_rtt_us=200_000, smoothed_rtt_us=230_000, rtt_variation_us=15_000)],
-            {"rto_ms": 290.0, "margin_ms": 60.0, "reference_ms": 230.0},
+            {"margin_p50_ms": 60.0, "margin_max_ms": 60.0, "srtt_p50_ms": 230.0},
         ),
         (
             "variation so small the floor binds",
             [win(min_rtt_us=100_000, smoothed_rtt_us=110_000, rtt_variation_us=100)],
-            # srtt 110 ms + max(1 ms, 0.4 ms) = 111 ms, under the 200 ms floor.
-            {"rto_ms": 200.0, "margin_ms": 90.0, "reference_ms": 110.0},
+            # srtt 110 ms + max(1 ms, 0.4 ms) = 111 ms, under the 200 ms floor,
+            # so the timer sits 90 ms past the round trip rather than 1 ms.
+            {"margin_p50_ms": 90.0, "margin_max_ms": 90.0},
+        ),
+        # The reason this is a distribution. A transfer whose variation is a
+        # millisecond for most of its life and a hundred at its worst has two
+        # different prices, and the last row it happens to end on is a sample of
+        # when the sampler stopped. Reading the tail off the median, or the
+        # median off the last row, is the same mistake twice.
+        (
+            "a variation that moves within one transfer",
+            [
+                win(smoothed_rtt_us=230_000, rtt_variation_us=1_000),
+                win(smoothed_rtt_us=235_000, rtt_variation_us=2_000),
+                win(smoothed_rtt_us=240_000, rtt_variation_us=110_000),
+                win(smoothed_rtt_us=232_000, rtt_variation_us=1_000),
+            ],
+            # Margins sorted: 4, 4, 8, 440. Nearest-rank p50 of four values is
+            # the second, so 4 ms — and the worst is 440, a hundredfold apart.
+            {"margin_p50_ms": 4.0, "margin_max_ms": 440.0, "rttvar_max_ms": 110.0},
         ),
         (
             "predates the column",
@@ -3843,6 +3963,14 @@ def self_test():
         f"  {'ok' if ok else 'FAIL'}: retransmission_reading(across a migration) -> "
         f"{got} (want {want})"
     )
+    for name, rows_c, want in drain_census_cases:
+        got = drain_census(rows_c)
+        if want is None:
+            ok = got is None
+        else:
+            ok = got is not None and all(got[k] == v for k, v in want.items())
+        failures += 0 if ok else 1
+        print(f"  {'ok' if ok else 'FAIL'}: drain_census({name}) -> {got}")
     for name, rows_c, want in rto_margin_cases:
         got = rto_margin_ms(rows_c)
         if want is None:
@@ -3974,6 +4102,7 @@ def self_test():
         len(side_cases)
         + 1  # the migration-spanning attribution read
         + len(rto_margin_cases)
+        + len(drain_census_cases)
         + len(arm_cases)
         + len(retransmit_cases)
         + (0 if skipped else 1)  # the window-sample column gate, when it could run

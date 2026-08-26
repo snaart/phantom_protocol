@@ -264,6 +264,7 @@ impl MsgLink for Framed {
                 bw_filter_window_ms: BW_FILTER_WINDOW.as_millis() as u64,
                 pacing_rate_bps: bw.pacing_rate_bps,
                 min_rtt_us: bw.min_rtt.as_micros() as u64,
+                drain_outcomes: bw.drain_outcomes.to_vec(),
                 smoothed_rtt_us: bw.smoothed_rtt.map(|d| d.as_micros() as u64).unwrap_or(0),
                 rtt_variation_us: bw.rtt_variation.as_micros() as u64,
                 delivered_bytes: bw.delivered_bytes,
@@ -414,6 +415,7 @@ pub(crate) mod testing {
                     bw_filter_window_ms: BW_FILTER_WINDOW.as_millis() as u64,
                     pacing_rate_bps: 125_000,
                     min_rtt_us: 230_000,
+                    drain_outcomes: vec![9, 2, 1, 0, 4, 6],
                     smoothed_rtt_us: 244_000,
                     rtt_variation_us: 9_000,
                     delivered_bytes: 1400,
@@ -636,6 +638,13 @@ mod tests {
                  binary's estimator used, not one restated here",
             ),
             ("min_rtt_us", "converted from bw.min_rtt, a Duration"),
+            (
+                "drain_outcomes",
+                "converted from bw.drain_outcomes, a fixed array — the artifact \
+                 carries a Vec so a run recorded before the census loads as empty \
+                 rather than as six zeros, which would read as a sender whose \
+                 every pass ran dry",
+            ),
             (
                 "smoothed_rtt_us",
                 "converted from bw.smoothed_rtt, an Option<Duration> — absent \

@@ -388,6 +388,14 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
     The first two travel together because neither is interpretable alone: one counts copies
     emitted, the other counts holes charged, and only their difference says what repairing
     the path's repairs cost.
+  * `BandwidthSnapshot::drain_outcomes` — six counters, one per reason a drain pass
+    can end, in `DrainOutcome` declaration order. A census the sender keeps where
+    every other reading of "what stopped it" is an inference drawn afterwards from
+    the window and the bytes outstanding. That inference cannot separate a pass the
+    pacer metered from one that ran dry with the window open, because both leave the
+    same window behind — and those two are the pair the application-limited flag
+    turns on, so telling them apart decides whether a run's rate describes the path
+    or the application. New type: `transport::bandwidth_estimator::DrainOutcome`.
   * `BandwidthSnapshot::{smoothed_rtt, rtt_variation}` — RFC 6298's SRTT and RTTVAR
     over the same samples `min_rtt` is filtered from, under the same Karn gate.
     Diagnostics: nothing in the transport reads either back, and the timer the wire

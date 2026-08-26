@@ -1348,6 +1348,19 @@ impl Session {
         self.bandwidth_estimator.lock().on_loss(bytes);
     }
 
+    /// Count a drain pass that ended for `outcome`.
+    ///
+    /// Recorded and read by nothing: the pump schedules from the pass's own
+    /// `DrainStop`, which carries the pacing delay this does not. What the tally
+    /// adds is a census of what actually stopped the sender, where an analysis
+    /// could previously only infer one from the window and the bytes outstanding
+    /// — and that inference cannot tell a pass the pacer metered from a pass that
+    /// ran dry with the window open, because the two leave the same window
+    /// behind.
+    pub fn note_drain_stop(&self, outcome: crate::transport::bandwidth_estimator::DrainOutcome) {
+        self.bandwidth_estimator.lock().note_drain_outcome(outcome);
+    }
+
     /// Record which rule ordered a repair. Called for **every** copy, unlike
     /// [`Self::on_packet_lost`], which is called once per hole.
     ///
@@ -1460,6 +1473,7 @@ impl Session {
             bottleneck_bw_bps: est.bottleneck_bandwidth(),
             last_delivery_rate_bps: est.last_delivery_rate(),
             min_rtt: est.min_rtt(),
+            drain_outcomes: est.drain_outcomes(),
             smoothed_rtt: est.smoothed_rtt(),
             rtt_variation: est.rtt_variation(),
             pacing_rate_bps: est.pacing_rate(),
@@ -1834,6 +1848,17 @@ pub struct BandwidthSnapshot {
     /// one, and labels each with the statistic behind it for that reason.
     pub last_delivery_rate_bps: u64,
     pub min_rtt: Duration,
+    /// Drain passes by the reason each ended, in `DrainOutcome` declaration
+    /// order: drained, congestion-limited, flow-controlled, transport-refused,
+    /// segment-budget, paced.
+    ///
+    /// The census an analysis previously had to infer from the window and the
+    /// bytes outstanding. That inference cannot separate a pass the pacer metered
+    /// from one that ran dry with the window open — they leave the same window
+    /// behind — and those two are the pair the application-limited flag turns on,
+    /// so the difference between them decides whether a run's rate describes the
+    /// path or the application.
+    pub drain_outcomes: [u64; 6],
     /// Smoothed round trip and its variation, beside the minimum because the
     /// minimum alone cannot price a delay.
     ///
