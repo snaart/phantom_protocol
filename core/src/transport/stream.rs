@@ -1927,6 +1927,21 @@ impl Stream {
         Err(SendBlocked::Idle)
     }
 
+    /// Whether the ARQ send buffer has no room for another segment.
+    ///
+    /// Read where a drain pass has come up empty, to tell two states apart that
+    /// `poll_send` reports identically: a stream with nothing to send, and a
+    /// stream whose every segment is already on the wire with the buffer at its
+    /// bound. Only the first is an application limit; the second is this
+    /// endpoint's own ceiling, and the application is parked against it.
+    ///
+    /// A permit count rather than the buffer's length because the permit is what
+    /// the application actually waits on — a segment retired but not yet
+    /// permitted back would make the length lie in the direction that matters.
+    pub fn send_buffer_full(&self) -> bool {
+        self.send_semaphore.available_permits() == 0
+    }
+
     /// Mark a sequence number as acknowledged.
     /// Returns the timestamp when the packet was originally sent and its size, if found.
     pub async fn ack(&self, stream_offset: SequenceNumber) -> Option<(tokio::time::Instant, u64)> {

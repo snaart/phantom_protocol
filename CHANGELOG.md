@@ -388,6 +388,18 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
     The first two travel together because neither is interpretable alone: one counts copies
     emitted, the other counts holes charged, and only their difference says what repairing
     the path's repairs cost.
+  * `BandwidthSnapshot::{dry_passes_against_a_full_buffer, app_limited_acked_bytes}`
+    — the two halves of the application-limited question that a recorded run could
+    not previously separate. `Stream::poll_send` answers the same `Idle` for a
+    stream with nothing buffered and for one whose every segment is on the wire
+    with the ARQ buffer at its bound, and both open a phase that disables the loss
+    response, the Startup exit judgement and the bandwidth filter's right to a new
+    maximum; the first counter splits that population. The second is the share of
+    *acknowledged bytes* whose segment left inside the phase, which is what those
+    three decisions are gated on — the flag published beside it is the phase read
+    at sampling time, a duty cycle over wall clock that stands for a whole round
+    trip whenever a phase opens with a flight already outstanding. Neither
+    counter is read by the transport. New method: `Stream::send_buffer_full`.
   * `BandwidthSnapshot::drain_outcomes` — six counters, one per reason a drain pass
     can end, in `DrainOutcome` declaration order. A census the sender keeps where
     every other reading of "what stopped it" is an inference drawn afterwards from

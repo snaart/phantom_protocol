@@ -264,6 +264,9 @@ impl MsgLink for Framed {
                 bw_filter_window_ms: BW_FILTER_WINDOW.as_millis() as u64,
                 pacing_rate_bps: bw.pacing_rate_bps,
                 min_rtt_us: bw.min_rtt.as_micros() as u64,
+                dry_passes_against_a_full_buffer: bw.dry_passes_against_a_full_buffer,
+                app_limited_acked_bytes: bw.app_limited_acked_bytes.0,
+                acked_bytes_total: bw.app_limited_acked_bytes.1,
                 drain_outcomes: bw.drain_outcomes.to_vec(),
                 smoothed_rtt_us: bw.smoothed_rtt.map(|d| d.as_micros() as u64).unwrap_or(0),
                 rtt_variation_us: bw.rtt_variation.as_micros() as u64,
@@ -415,6 +418,9 @@ pub(crate) mod testing {
                     bw_filter_window_ms: BW_FILTER_WINDOW.as_millis() as u64,
                     pacing_rate_bps: 125_000,
                     min_rtt_us: 230_000,
+                    dry_passes_against_a_full_buffer: 5,
+                    app_limited_acked_bytes: 700,
+                    acked_bytes_total: 2800,
                     drain_outcomes: vec![9, 2, 1, 0, 4, 6],
                     smoothed_rtt_us: 244_000,
                     rtt_variation_us: 9_000,
@@ -638,6 +644,12 @@ mod tests {
                  binary's estimator used, not one restated here",
             ),
             ("min_rtt_us", "converted from bw.min_rtt, a Duration"),
+            (
+                "app_limited_acked_bytes",
+                "the first half of bw.app_limited_acked_bytes, a pair — the two \
+                 halves travel as one field because neither is a reading alone",
+            ),
+            ("acked_bytes_total", "the second half of that same pair"),
             (
                 "drain_outcomes",
                 "converted from bw.drain_outcomes, a fixed array — the artifact \

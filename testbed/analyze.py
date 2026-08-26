@@ -1016,10 +1016,48 @@ def drain_census(rows):
     total = sum(counts)
     if total == 0:
         return None
+    dry_full = carrier.get("dry_passes_against_a_full_buffer", 0) or 0
     return {
         "counts": counts,
         "total": total,
         "shares": [c / total for c in counts],
+        # Of the passes that came up empty, those that did so with a stream's send
+        # buffer full. `poll_send` answers the same `Idle` either way, and both
+        # open the application-limited phase, so without this the two are one
+        # number: "the application was the limit" and "the application was waiting
+        # for us" added together.
+        "dry_against_a_full_buffer": dry_full,
+        "dry_share_full_buffer": (dry_full / counts[0]) if counts[0] else None,
+    }
+
+
+def app_limited_reading(rows):
+    """The share of acknowledged bytes whose segment left inside the phase.
+
+    `None` for a run recorded before the column. This is the quantity the loss
+    response, the Startup exit and the bandwidth filter are gated on — each reads
+    the stamp a segment left with. The `app_limited` column beside it is a
+    different measurement: the phase read at sampling time, a duty cycle over
+    wall clock, which stands for a whole round trip whenever a phase opens with a
+    full flight outstanding and stamps nothing in the meantime.
+
+    Reported together for that reason: where the two disagree, the wall-clock
+    figure is the one that overstates, and a run has been read off it.
+    """
+    carrier = None
+    for r in rows:
+        if (r.get("acked_bytes_total") or 0) > 0:
+            carrier = r
+    if carrier is None:
+        return None
+    total = carrier["acked_bytes_total"]
+    stamped = carrier.get("app_limited_acked_bytes", 0) or 0
+    flagged = [1 for r in rows if r.get("app_limited")]
+    return {
+        "stamped_bytes": stamped,
+        "total_bytes": total,
+        "stamped_share": stamped / total,
+        "wall_clock_share": len(flagged) / len(rows) if rows else None,
     }
 
 
@@ -2228,6 +2266,28 @@ def send_bound_series(f, scenario, phase, tag, rows):
             "drawn from the window afterwards and cannot tell a pass the pacer "
             "metered from one that ran dry with the window open"
         )
+        if census["counts"][0]:
+            share = census["dry_share_full_buffer"]
+            print(
+                f"{pad} {'':2}of the {census['counts'][0]} that ran dry, "
+                f"{census['dry_against_a_full_buffer']} did so against a full send "
+                f"buffer" + (f" ({share:.0%})" if share is not None else "")
+                + " — the application waiting on us, not the other way round"
+            )
+
+    al = app_limited_reading(rows)
+    if al:
+        print(
+            f"{pad} app-limited: {al['stamped_share']:.1%} of acknowledged bytes "
+            f"left inside the phase, against {al['wall_clock_share']:.0%} of "
+            "samples with the flag standing"
+        )
+        print(
+            f"{pad} {'':2}the first is what the loss response, the Startup exit "
+            "and the bandwidth filter are gated on; the second is a duty cycle "
+            "over wall clock and is the larger whenever a phase opens with a "
+            "flight already outstanding"
+        )
 
     timing = rto_margin_ms(rows)
     if timing:
@@ -3228,6 +3288,42 @@ def self_test():
         ("present and all zero", [win(drain_outcomes=[0, 0, 0, 0, 0, 0])], None),
     ]
 
+    # The two readings of "app-limited", and why they are printed together: one is
+    # what the decisions are gated on, the other is a duty cycle over wall clock,
+    # and a run has been read off the second.
+    app_limited_cases = [
+        (
+            "stamped share far under the wall-clock share",
+            [
+                win(app_limited=True, app_limited_acked_bytes=1_000, acked_bytes_total=100_000),
+                win(app_limited=True, app_limited_acked_bytes=1_000, acked_bytes_total=100_000),
+                win(app_limited=False, app_limited_acked_bytes=1_000, acked_bytes_total=100_000),
+                win(app_limited=False, app_limited_acked_bytes=1_000, acked_bytes_total=100_000),
+            ],
+            {"stamped_share": 0.01, "wall_clock_share": 0.5},
+        ),
+        ("predates the column", [win(app_limited=True)], None),
+    ]
+
+    # Of the passes that ran dry, how many did so against a full send buffer.
+    dry_split_cases = [
+        (
+            "half of them against a full buffer",
+            [win(drain_outcomes=[40, 1, 1, 0, 0, 8], dry_passes_against_a_full_buffer=20)],
+            {"dry_against_a_full_buffer": 20, "dry_share_full_buffer": 0.5},
+        ),
+        (
+            "none of them — a genuinely idle application",
+            [win(drain_outcomes=[40, 1, 1, 0, 0, 8], dry_passes_against_a_full_buffer=0)],
+            {"dry_against_a_full_buffer": 0, "dry_share_full_buffer": 0.0},
+        ),
+        (
+            "no dry passes at all — the share is undefined, not zero",
+            [win(drain_outcomes=[0, 1, 1, 0, 0, 8], dry_passes_against_a_full_buffer=0)],
+            {"dry_share_full_buffer": None},
+        ),
+    ]
+
     # The margin between the two rules, and the one case that must not be a
     # number: a run recorded before the smoothed round trip existed cannot state
     # it, and a zero would say the timer and the threshold fire together.
@@ -3963,6 +4059,19 @@ def self_test():
         f"  {'ok' if ok else 'FAIL'}: retransmission_reading(across a migration) -> "
         f"{got} (want {want})"
     )
+    for name, rows_c, want in app_limited_cases:
+        got = app_limited_reading(rows_c)
+        if want is None:
+            ok = got is None
+        else:
+            ok = got is not None and all(abs(got[k] - v) < 1e-9 for k, v in want.items())
+        failures += 0 if ok else 1
+        print(f"  {'ok' if ok else 'FAIL'}: app_limited_reading({name}) -> {got}")
+    for name, rows_c, want in dry_split_cases:
+        got = drain_census(rows_c)
+        ok = got is not None and all(got[k] == v for k, v in want.items())
+        failures += 0 if ok else 1
+        print(f"  {'ok' if ok else 'FAIL'}: drain_census dry split ({name})")
     for name, rows_c, want in drain_census_cases:
         got = drain_census(rows_c)
         if want is None:
@@ -4103,6 +4212,8 @@ def self_test():
         + 1  # the migration-spanning attribution read
         + len(rto_margin_cases)
         + len(drain_census_cases)
+        + len(app_limited_cases)
+        + len(dry_split_cases)
         + len(arm_cases)
         + len(retransmit_cases)
         + (0 if skipped else 1)  # the window-sample column gate, when it could run

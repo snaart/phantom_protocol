@@ -3082,7 +3082,7 @@ async fn drain_streams_inner<T: SessionTransport>(
     // ever speaks for what a stream had to offer, because the two answer
     // different questions and only this one is about the local send path.
     let mut transport_refused = false;
-    for (_priority, stream_id, stream) in snapshot {
+    for (_priority, stream_id, stream) in snapshot.iter().map(|(p, id, s)| (p, *id, s)) {
         loop {
             if sent >= DRAIN_MAX_SEGMENTS_PER_PASS {
                 // Budget spent. Congestion and flow control are unchanged — this
@@ -3214,7 +3214,22 @@ async fn drain_streams_inner<T: SessionTransport>(
         return DrainStop::TransportRefused;
     }
     match blocked {
-        None | Some(SendBlocked::Idle) => DrainStop::Drained,
+        None | Some(SendBlocked::Idle) => {
+            // A pass that came up empty is not necessarily an application that
+            // came up empty, and the two have been reported identically. Ask the
+            // streams which it was, once, here — where the snapshot of them is
+            // still in hand and the answer is a local fact about this endpoint's
+            // own buffers.
+            //
+            // The distinction is not acted on: it is counted. `poll_send` still
+            // returns `Idle`, this pass is still `Drained`, and the
+            // application-limited phase still opens exactly where it did. What
+            // changes is that a recorded run can say which of the two it saw,
+            // where until now it could only say how often the pair happened.
+            let dry_against_a_full_buffer = snapshot.iter().any(|(_, _, s)| s.send_buffer_full());
+            crypto_session.note_dry_pass(dry_against_a_full_buffer);
+            DrainStop::Drained
+        }
         Some(SendBlocked::FlowControl) => DrainStop::FlowControlled,
         Some(SendBlocked::CongestionWindow) => DrainStop::CongestionLimited,
     }
@@ -7737,6 +7752,109 @@ mod tests {
     /// be outstanding and how fast it may leave. Those are exactly the rounds a
     /// loss response is meant to judge, and marking them app-limited would
     /// disable it in the only regime where it matters.
+    /// **A dry pass says which of two states it found, where `poll_send` says only
+    /// one.**
+    ///
+    /// `Stream::poll_send` reaches its final `Idle` whenever no segment is unsent.
+    /// A stream holding nothing satisfies that; so does a stream whose every
+    /// segment is on the wire with the ARQ buffer at its bound, and in the second
+    /// case the application is not idle at all — it is parked against a ceiling
+    /// this endpoint chose. Both open an application-limited phase, which
+    /// disables the loss response, the Startup exit judgement and the bandwidth
+    /// filter's right to a new maximum.
+    ///
+    /// The 2026-08-25 frame sweep measured the consequence: at a 256-byte frame,
+    /// where the ARQ buffer is the lower of the two byte ceilings, the flag stood
+    /// in 68.6% and 100% of steady-state samples with `inflight` pinned exactly at
+    /// `1024 × 260`. At 2308 bytes, where the peer's window binds first, it stood
+    /// in 0.0%.
+    ///
+    /// Nothing here changes what the sender does — the phase opens for both, as
+    /// before. What it changes is that a run can now say which it saw.
+    #[tokio::test]
+    async fn a_dry_pass_records_whether_the_send_buffer_was_full() {
+        // One byte per segment. The ARQ buffer is bounded in *segments* and the
+        // congestion window in *bytes*, so a thousand tiny writes fill the buffer
+        // while leaving the opening window — 5600 B, four minimum packets — able
+        // to carry every one of them onto the wire. At a realistic segment size
+        // the pass would stop on the window long before the buffer filled, and
+        // this test would be measuring the window instead.
+        const SEGMENT: usize = 1;
+        let sid = fixed_session_id();
+        let obs = Observability::new(ObservabilityConfig::default());
+
+        // Genuinely dry: a stream with nothing in it at all.
+        let (idle, _s1) = paired_sessions(sid);
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        streams.insert(1u32, Arc::new(TransportStream::new(1)));
+        let (t1, _r1) = ChannelTransport::pair();
+        let stop = drain_streams_priority_ordered(&Arc::new(t1), &idle, sid, &streams, &obs).await;
+        assert_eq!(stop, DrainStop::Drained, "precondition: nothing buffered");
+        let snap = idle.bandwidth_snapshot();
+        assert_eq!(snap.drain_outcomes[0], 1, "the pass is counted as drained");
+        assert_eq!(
+            snap.dry_passes_against_a_full_buffer, 0,
+            "an empty stream is the application's limit and must not be filed \
+             under this endpoint's ceiling"
+        );
+
+        // Dry against a full buffer: fill the ARQ buffer to its bound, put every
+        // segment on the wire, then drain again. `poll_send` answers `Idle` for
+        // the same reason it did above, and the application is provably unable to
+        // add more.
+        let (full, _s2) = paired_sessions(sid);
+        let stream = Arc::new(TransportStream::new(1));
+        // A peer window large enough that the ARQ buffer is the binding ceiling —
+        // at the default frame the peer's 1 MiB binds four segments sooner, and
+        // then the pass answers FlowControl instead and this case does not arise.
+        stream.apply_peer_window_limit(u64::MAX / 2);
+        let mut queued = 0usize;
+        while stream
+            .try_send_reliable(&Bytes::from(vec![0x11u8; SEGMENT]))
+            .await
+            .unwrap_or(false)
+        {
+            queued += 1;
+        }
+        assert!(
+            queued > 0
+                && !stream
+                    .try_send_reliable(&Bytes::new())
+                    .await
+                    .unwrap_or(false),
+            "precondition: the buffer must be full and refusing the application"
+        );
+        let streams2: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        streams2.insert(1u32, stream);
+        let (t2, r2) = ChannelTransport::pair();
+        // Drain the far end. The pair's channels hold 64 frames, and this half of
+        // the test puts a thousand on the wire — without a reader the send blocks
+        // and the drain never reaches the state under test.
+        tokio::spawn(async move { while r2.recv_bytes().await.is_ok() {} });
+        let transport2 = Arc::new(t2);
+        // Drain until everything queued is on the wire; the pass that follows has
+        // nothing unsent and no room for more.
+        for _ in 0..64 {
+            if drain_streams_priority_ordered(&transport2, &full, sid, &streams2, &obs).await
+                == DrainStop::Drained
+            {
+                break;
+            }
+        }
+        let snap2 = full.bandwidth_snapshot();
+        assert!(
+            snap2.drain_outcomes[0] >= 1,
+            "precondition: a pass must have come up dry, got census {:?}",
+            snap2.drain_outcomes
+        );
+        assert!(
+            snap2.dry_passes_against_a_full_buffer >= 1,
+            "a pass that came up dry against a full send buffer must be recorded \
+             as such — it is the state the application is waiting on us for, and \
+             it is indistinguishable from an idle application everywhere else"
+        );
+    }
+
     /// **The census records what stopped each pass, where an inference could not.**
     ///
     /// Every reading of "what stopped the sender" in the harness was drawn

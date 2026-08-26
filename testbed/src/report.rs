@@ -469,6 +469,35 @@ pub struct WindowSample {
     pub bw_filter_window_ms: u64,
     pub pacing_rate_bps: u64,
     pub min_rtt_us: u64,
+    /// Of the drain passes that came up empty, how many did so with a stream's
+    /// send buffer full — the application parked against this endpoint's own
+    /// ceiling rather than out of data. Read against `drain_outcomes[0]`, which
+    /// counts all of them.
+    ///
+    /// `Stream::poll_send` reports both states as the same `Idle`, and both open
+    /// an application-limited phase that disables the loss response, the Startup
+    /// exit judgement and the bandwidth filter's right to a new maximum. Which of
+    /// the two a run saw was an argument until this column; the frame sweep of
+    /// 2026-08-25 is the measurement that made it worth having, since at a
+    /// 256-byte frame — where the ARQ buffer is the lower of the two byte
+    /// ceilings — the flag stood in 68.6% and 100% of steady-state samples.
+    #[serde(default)]
+    pub dry_passes_against_a_full_buffer: u64,
+    /// Acknowledged bytes whose segment left inside an application-limited phase,
+    /// and acknowledged bytes in total.
+    ///
+    /// **The pair the gated decisions actually read.** Each of the three gates on
+    /// the stamp a segment left with, not on the phase as it stands now — so this
+    /// share, and not the `app_limited` flag beside it, is what a run's
+    /// congestion decisions were taken against. The flag is a duty cycle over
+    /// wall clock and can be much the larger of the two: a phase opened while a
+    /// full flight is outstanding holds the flag up for a round trip while
+    /// stamping nothing, because the segments it would stamp already left.
+    #[serde(default)]
+    pub app_limited_acked_bytes: u64,
+    /// See [`Self::app_limited_acked_bytes`].
+    #[serde(default)]
+    pub acked_bytes_total: u64,
     /// Drain passes by the reason each ended, in the transport's own
     /// `DrainOutcome` order: drained, congestion-limited, flow-controlled,
     /// transport-refused, segment-budget, paced. Empty on a leg or a run that
@@ -1989,6 +2018,9 @@ mod tests {
                 .as_millis() as u64,
             pacing_rate_bps: 1_000_000,
             min_rtt_us: 235_000,
+            dry_passes_against_a_full_buffer: 26,
+            app_limited_acked_bytes: 4_112_000,
+            acked_bytes_total: 34_680_000,
             drain_outcomes: vec![41, 7, 3, 0, 11, 29],
             smoothed_rtt_us: 248_000,
             rtt_variation_us: 11_000,

@@ -1348,6 +1348,25 @@ impl Session {
         self.bandwidth_estimator.lock().on_loss(bytes);
     }
 
+    /// Count a drain pass that came up empty, and whether any of its streams was
+    /// empty *because its send buffer was full* rather than because the
+    /// application had nothing to give.
+    ///
+    /// Recorded, not acted on. The phase still opens for both, exactly as before;
+    /// what this adds is that a run can say which of the two it saw. The two are
+    /// reported identically by `poll_send` — its final `Idle` is reached whenever
+    /// no segment is unsent, which a buffer holding nothing and a buffer holding
+    /// only unacknowledged segments both satisfy — and the application-limited
+    /// phase they open disables the loss response, the Startup exit judgement and
+    /// the bandwidth filter's right to a new maximum. Which of the two is
+    /// producing that on a given path has been an argument; this makes it a
+    /// column.
+    pub fn note_dry_pass(&self, against_a_full_buffer: bool) {
+        self.bandwidth_estimator
+            .lock()
+            .note_dry_pass(against_a_full_buffer);
+    }
+
     /// Count a drain pass that ended for `outcome`.
     ///
     /// Recorded and read by nothing: the pump schedules from the pass's own
@@ -1474,6 +1493,8 @@ impl Session {
             last_delivery_rate_bps: est.last_delivery_rate(),
             min_rtt: est.min_rtt(),
             drain_outcomes: est.drain_outcomes(),
+            dry_passes_against_a_full_buffer: est.dry_passes_against_a_full_buffer(),
+            app_limited_acked_bytes: est.app_limited_acked_bytes(),
             smoothed_rtt: est.smoothed_rtt(),
             rtt_variation: est.rtt_variation(),
             pacing_rate_bps: est.pacing_rate(),
@@ -1848,6 +1869,24 @@ pub struct BandwidthSnapshot {
     /// one, and labels each with the statistic behind it for that reason.
     pub last_delivery_rate_bps: u64,
     pub min_rtt: Duration,
+    /// Of the drain passes that came up empty, how many did so with at least one
+    /// stream's send buffer full — i.e. with the application parked against this
+    /// endpoint's own ceiling rather than out of data.
+    ///
+    /// Read against `drain_outcomes[0]`, which counts all of them. The two are
+    /// the same population split in two, and the split is the difference between
+    /// "the application was the limit" and "the application was waiting for us".
+    pub dry_passes_against_a_full_buffer: u64,
+    /// Acknowledged bytes whose segment left inside an application-limited phase,
+    /// and acknowledged bytes in total.
+    ///
+    /// The share between them is what the loss response, the Startup exit and the
+    /// bandwidth filter actually read — each gates on the stamp a segment left
+    /// with. The `app_limited` flag recorded beside it is a different quantity:
+    /// the phase as read at sampling time, a duty cycle over wall clock. A phase
+    /// opened while a full flight is outstanding holds that flag up for a round
+    /// trip while stamping nothing.
+    pub app_limited_acked_bytes: (u64, u64),
     /// Drain passes by the reason each ended, in `DrainOutcome` declaration
     /// order: drained, congestion-limited, flow-controlled, transport-refused,
     /// segment-budget, paced.

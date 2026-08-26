@@ -940,6 +940,23 @@ pub struct BandwidthEstimator {
     /// takes part in.
     declared_by_rto: u64,
 
+    /// Of the drain passes that came up empty, those that did so with a stream's
+    /// send buffer full — the application parked against this endpoint's own
+    /// ceiling rather than out of data.
+    dry_passes_against_a_full_buffer: u64,
+    /// Acknowledged bytes whose segment was **sent** inside an application-limited
+    /// phase, and acknowledged bytes in total.
+    ///
+    /// The share between them is what the loss response, the Startup exit and the
+    /// bandwidth filter are gated on — each reads `sample.is_app_limited`, which
+    /// is the stamp the segment left with. A run's recorded `app_limited` column
+    /// is something else: the phase as read at sampling time, a duty cycle over
+    /// wall clock. A phase opened while a full flight is outstanding holds that
+    /// column up for a whole round trip while stamping nothing, because the
+    /// segments it would have stamped were already on the wire.
+    acked_bytes_app_limited: u64,
+    /// See [`Self::acked_bytes_app_limited`].
+    acked_bytes_total: u64,
     /// Drain passes by the reason each ended, indexed by [`DrainOutcome`] in
     /// declaration order.
     ///
@@ -1028,6 +1045,9 @@ impl BandwidthEstimator {
             declared_by_packet_threshold: 0,
             declared_by_time_threshold: 0,
             declared_by_rto: 0,
+            dry_passes_against_a_full_buffer: 0,
+            acked_bytes_app_limited: 0,
+            acked_bytes_total: 0,
             drain_outcomes: [0; 6],
             smoothed_rtt: None,
             rtt_variation: Duration::ZERO,
@@ -1284,6 +1304,22 @@ impl BandwidthEstimator {
         // algorithm this file implements puts it.
         if delivery_rate > 0 && (!sample.is_app_limited || delivery_rate >= self.btl_bw) {
             self.btl_bw = self.bw_filter.update_max(now, delivery_rate);
+        }
+
+        // The acknowledged bytes whose segment left inside an application-limited
+        // phase, against all of them. **This is the quantity the three decisions
+        // above and below are actually gated on**, and it is not the one a
+        // recorded run has been carrying: that column is `is_app_limited()` read
+        // at sampling time, a wall-clock duty cycle of the phase. The two answer
+        // different questions and can differ by a lot — a phase that opens while
+        // a full flight is outstanding covers a whole round trip of wall clock
+        // while stamping nothing, because the segments it would stamp have
+        // already left.
+        self.acked_bytes_total = self.acked_bytes_total.saturating_add(sample.packet_bytes);
+        if sample.is_app_limited {
+            self.acked_bytes_app_limited = self
+                .acked_bytes_app_limited
+                .saturating_add(sample.packet_bytes);
         }
 
         // The app-limited phase ends once everything that was outstanding when
@@ -1570,6 +1606,21 @@ impl BandwidthEstimator {
         self.loss_declarations
     }
 
+    /// Count a drain pass that came up empty, and whether it did so against a full
+    /// send buffer. Recorded and read by nothing.
+    pub fn note_dry_pass(&mut self, against_a_full_buffer: bool) {
+        if against_a_full_buffer {
+            self.dry_passes_against_a_full_buffer =
+                self.dry_passes_against_a_full_buffer.saturating_add(1);
+        }
+    }
+
+    /// Of the passes counted as [`DrainOutcome::Drained`], how many found at
+    /// least one stream empty only because its send buffer was full.
+    pub fn dry_passes_against_a_full_buffer(&self) -> u64 {
+        self.dry_passes_against_a_full_buffer
+    }
+
     /// Count a drain pass that ended for `outcome`.
     ///
     /// Recorded and read by nothing. The pump's scheduling reads the pass's own
@@ -1584,6 +1635,13 @@ impl BandwidthEstimator {
             DrainOutcome::Paced => 5,
         };
         self.drain_outcomes[i] = self.drain_outcomes[i].saturating_add(1);
+    }
+
+    /// Acknowledged bytes whose segment left inside an application-limited phase,
+    /// and acknowledged bytes in total — the pair the three gated decisions
+    /// actually read, as opposed to the phase's wall-clock duty cycle.
+    pub fn app_limited_acked_bytes(&self) -> (u64, u64) {
+        (self.acked_bytes_app_limited, self.acked_bytes_total)
     }
 
     /// Drain passes by the reason each ended, in [`DrainOutcome`] declaration
