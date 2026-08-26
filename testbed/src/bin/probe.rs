@@ -130,6 +130,23 @@ struct Args {
     #[arg(long, conflicts_with = "upload_secs")]
     upload_converge: bool,
 
+    /// Override the bytes the `download` scenario asks the daemon to send.
+    ///
+    /// The receive and duplex scenarios are bounded by a byte budget where
+    /// `upload` is bounded by a clock, and that difference is what made the two
+    /// incomparable: at the rates this path gives a receiver, the profile's eight
+    /// mebibytes are spent in under twenty seconds — well inside the ramp — so
+    /// the mean is a convergence time while the upload beside it is a capacity.
+    /// Comparing them produced a misleading "we lose in duplex" reading.
+    #[arg(long)]
+    download_mib: Option<u64>,
+
+    /// Override the bytes each direction of the `bidir` scenario carries. Same
+    /// reason as `--download-mib`: four mebibytes is a fifth of what the
+    /// controller needs to converge on this path.
+    #[arg(long)]
+    bidir_mib: Option<u64>,
+
     /// Override the application frame size used by `upload`, `download` and
     /// `bidir`, in bytes.
     ///
@@ -263,6 +280,14 @@ fn resolved_params(args: &Args) -> Result<Params> {
         // quietly does not take is worse than one that is refused.
         params.transfer_cap = params.transfer_cap.max(params.upload);
     }
+    if let Some(m) = args.download_mib {
+        anyhow::ensure!(m > 0, "--download-mib must be at least 1");
+        params.download_bytes = m * 1024 * 1024;
+    }
+    if let Some(m) = args.bidir_mib {
+        anyhow::ensure!(m > 0, "--bidir-mib must be at least 1");
+        params.bidir_bytes = m * 1024 * 1024;
+    }
     if let Some(f) = args.transfer_frame {
         // The sink message carries a length prefix, a verb and a sequence
         // number before any payload; below that the frame is header alone.
@@ -372,11 +397,31 @@ mod tests {
         assert_eq!(p.transfer_frame, 512);
     }
 
+    /// The receive and duplex budgets are counted in bytes where the upload's is
+    /// counted in seconds, and at this path's rates the profile's eight and four
+    /// mebibytes are spent inside the ramp. Without a way to raise them the two
+    /// halves of a duplex comparison are a capacity and a convergence time, which
+    /// is the comparison the misleading duplex reading was built on.
+    #[test]
+    fn the_receive_and_duplex_budgets_can_be_raised() {
+        let p = resolved_params(&parse(&["--download-mib", "150"])).expect("override must apply");
+        assert_eq!(p.download_bytes, 150 * 1024 * 1024);
+        let p = resolved_params(&parse(&["--bidir-mib", "120"])).expect("override must apply");
+        assert_eq!(p.bidir_bytes, 120 * 1024 * 1024);
+        // And each leaves the other alone.
+        let base = resolved_params(&parse(&[])).expect("defaults");
+        let only_down =
+            resolved_params(&parse(&["--download-mib", "150"])).expect("override must apply");
+        assert_eq!(only_down.bidir_bytes, base.bidir_bytes);
+    }
+
     #[test]
     fn overrides_that_would_produce_an_unmeasurable_run_are_refused() {
         for argv in [
             vec!["--upload-secs", "0"],
             vec!["--transfer-frame", "8"],
+            vec!["--download-mib", "0"],
+            vec!["--bidir-mib", "0"],
             vec!["--raw-rung-secs", "0"],
         ] {
             assert!(
