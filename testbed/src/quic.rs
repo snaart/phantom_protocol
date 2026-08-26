@@ -499,6 +499,8 @@ impl MsgLink for QuicLink {
                 bw_filter_window_ms: 0,
                 pacing_rate_bps: 0,
                 min_rtt_us: s.path.rtt.as_micros() as u64,
+                smoothed_rtt_us: 0,
+                rtt_variation_us: 0,
                 delivered_bytes: 0,
                 state: "quic:cubic".to_string(),
                 app_limited: false,

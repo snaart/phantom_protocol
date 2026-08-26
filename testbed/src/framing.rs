@@ -264,6 +264,8 @@ impl MsgLink for Framed {
                 bw_filter_window_ms: BW_FILTER_WINDOW.as_millis() as u64,
                 pacing_rate_bps: bw.pacing_rate_bps,
                 min_rtt_us: bw.min_rtt.as_micros() as u64,
+                smoothed_rtt_us: bw.smoothed_rtt.map(|d| d.as_micros() as u64).unwrap_or(0),
+                rtt_variation_us: bw.rtt_variation.as_micros() as u64,
                 delivered_bytes: bw.delivered_bytes,
                 state: bw.state.as_str().to_string(),
                 app_limited: bw.app_limited,
@@ -412,6 +414,8 @@ pub(crate) mod testing {
                     bw_filter_window_ms: BW_FILTER_WINDOW.as_millis() as u64,
                     pacing_rate_bps: 125_000,
                     min_rtt_us: 230_000,
+                    smoothed_rtt_us: 244_000,
+                    rtt_variation_us: 9_000,
                     delivered_bytes: 1400,
                     state: "probe_bw".to_string(),
                     app_limited: false,
@@ -632,6 +636,16 @@ mod tests {
                  binary's estimator used, not one restated here",
             ),
             ("min_rtt_us", "converted from bw.min_rtt, a Duration"),
+            (
+                "smoothed_rtt_us",
+                "converted from bw.smoothed_rtt, an Option<Duration> — absent \
+                 before the first sample survives Karn's gate, and zero here \
+                 rather than a guess",
+            ),
+            (
+                "rtt_variation_us",
+                "converted from bw.rtt_variation, a Duration",
+            ),
             ("state", "converted from bw.state, an enum"),
         ];
 

@@ -977,6 +977,44 @@ def retransmission_reading(rows):
     }
 
 
+def rto_margin_ms(rows):
+    """What a timer-ordered repair costs over a threshold-ordered one, in ms.
+
+    `None` when the rows predate the smoothed round trip, because the margin is
+    `4·rttvar` and a run without the variation cannot state it — printing zero
+    would say the two rules fire together, which is the one reading the absence
+    must not be mistaken for.
+
+    The reference the margin is taken against is the smoothed round trip itself,
+    not the minimum: the packet threshold fires on the acknowledgement of a
+    segment's successors, which travels the path the smoothed value describes.
+    Using the minimum would flatter the margin by whatever standing queue the
+    transfer built.
+
+    Both figures are read off the last row that carries them, for the reason the
+    attribution counters are: they are cumulative over the estimator's life and a
+    migration restarts them.
+    """
+    carrier = None
+    for r in rows:
+        if (r.get("smoothed_rtt_us") or 0) > 0:
+            carrier = r
+    if carrier is None:
+        return None
+    srtt_us = carrier["smoothed_rtt_us"]
+    rttvar_us = carrier.get("rtt_variation_us", 0) or 0
+    # RFC 6298 (2.2)/(2.3) with the transport's own floor and granularity, from
+    # core/src/transport/stream.rs::RtoEstimator.
+    rto_us = max(200_000, srtt_us + max(1_000, 4 * rttvar_us))
+    return {
+        "srtt_ms": srtt_us / 1000,
+        "rttvar_ms": rttvar_us / 1000,
+        "rto_ms": rto_us / 1000,
+        "reference_ms": srtt_us / 1000,
+        "margin_ms": (rto_us - srtt_us) / 1000,
+    }
+
+
 def which_arm_reading(rx):
     """What the split between the three declaration rules says, in one sentence.
 
@@ -2109,6 +2147,23 @@ def send_bound_series(f, scenario, phase, tag, rows):
             f"— {(implied - rtt_us) / 1000:+.0f} ms of standing queue"
         )
 
+    # What a repair ordered by the timer cost over one ordered by the packet
+    # threshold. The threshold fires when the acknowledgement of a segment's
+    # successors arrives, about a round trip after the send; the timer fires at
+    # `srtt + max(1 ms, 4·rttvar)`, floored at 200 ms. So the interval between
+    # them is the variation, and a run recording only the minimum could report
+    # the split without being able to price it.
+    timing = rto_margin_ms(rows)
+    if timing:
+        print(
+            f"{pad} smoothed round trip {timing['srtt_ms']:.0f} ms ± "
+            f"{timing['rttvar_ms']:.0f} ms → retransmission timer at "
+            f"{timing['rto_ms']:.0f} ms, which is {timing['margin_ms']:+.0f} ms "
+            f"against the {timing['reference_ms']:.0f} ms the packet threshold "
+            "needs — the price of a repair the timer ordered rather than the "
+            "threshold"
+        )
+
     est, raw = delivery_ratios(rows)
     if est:
         raw_txt = f"{pct(raw, 0.5):.2f}×" if raw else "absent in this artifact"
@@ -3071,6 +3126,28 @@ def self_test():
     # carries no reading at all, and printing four zeros for it would say the
     # sender retransmitted nothing — which is the answer this whole question
     # exists to stop being invented.
+    # The margin between the two rules, and the one case that must not be a
+    # number: a run recorded before the smoothed round trip existed cannot state
+    # it, and a zero would say the timer and the threshold fire together.
+    rto_margin_cases = [
+        (
+            "carries the smoothed round trip",
+            [win(min_rtt_us=200_000, smoothed_rtt_us=230_000, rtt_variation_us=15_000)],
+            {"rto_ms": 290.0, "margin_ms": 60.0, "reference_ms": 230.0},
+        ),
+        (
+            "variation so small the floor binds",
+            [win(min_rtt_us=100_000, smoothed_rtt_us=110_000, rtt_variation_us=100)],
+            # srtt 110 ms + max(1 ms, 0.4 ms) = 111 ms, under the 200 ms floor.
+            {"rto_ms": 200.0, "margin_ms": 90.0, "reference_ms": 110.0},
+        ),
+        (
+            "predates the column",
+            [win(min_rtt_us=200_000)],
+            None,
+        ),
+    ]
+
     # Which arm ordered the declarations is a reading, and the three readings are
     # not interchangeable: one points at the raw controls, one points away from
     # reordering entirely, and one refuses to point anywhere. A run whose holes
@@ -3766,6 +3843,14 @@ def self_test():
         f"  {'ok' if ok else 'FAIL'}: retransmission_reading(across a migration) -> "
         f"{got} (want {want})"
     )
+    for name, rows_c, want in rto_margin_cases:
+        got = rto_margin_ms(rows_c)
+        if want is None:
+            ok = got is None
+        else:
+            ok = got is not None and all(abs(got[k] - v) < 0.01 for k, v in want.items())
+        failures += 0 if ok else 1
+        print(f"  {'ok' if ok else 'FAIL'}: rto_margin_ms({name}) -> {got}")
     for name, rx, wanted in arm_cases:
         got = which_arm_reading(rx)
         ok = all(w in got for w in wanted)
@@ -3888,6 +3973,7 @@ def self_test():
     extra = (
         len(side_cases)
         + 1  # the migration-spanning attribution read
+        + len(rto_margin_cases)
         + len(arm_cases)
         + len(retransmit_cases)
         + (0 if skipped else 1)  # the window-sample column gate, when it could run

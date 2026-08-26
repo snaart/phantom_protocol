@@ -469,6 +469,19 @@ pub struct WindowSample {
     pub bw_filter_window_ms: u64,
     pub pacing_rate_bps: u64,
     pub min_rtt_us: u64,
+    /// Smoothed round trip and its variation, in microseconds, beside the
+    /// minimum. Zero on a leg or a run that carries neither.
+    ///
+    /// The minimum alone cannot price a delay, and a run needed it to: the split
+    /// below can say a quarter of a sender's repairs were ordered by the
+    /// retransmission timer rather than the packet threshold, and the interval
+    /// between those two is `4 · rtt_variation_us` — tens of milliseconds or
+    /// hundreds, which are different findings about the same run.
+    #[serde(default)]
+    pub smoothed_rtt_us: u64,
+    /// See [`Self::smoothed_rtt_us`].
+    #[serde(default)]
+    pub rtt_variation_us: u64,
     pub delivered_bytes: u64,
     /// BBR phase: startup / drain / probe_bw / probe_rtt. Loss does not move
     /// this — it is answered by a bound on inflight, which is
@@ -1962,6 +1975,8 @@ mod tests {
                 .as_millis() as u64,
             pacing_rate_bps: 1_000_000,
             min_rtt_us: 235_000,
+            smoothed_rtt_us: 248_000,
+            rtt_variation_us: 11_000,
             delivered_bytes: 500_000,
             state: "probe_bw".to_string(),
             app_limited: false,

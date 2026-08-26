@@ -1460,6 +1460,8 @@ impl Session {
             bottleneck_bw_bps: est.bottleneck_bandwidth(),
             last_delivery_rate_bps: est.last_delivery_rate(),
             min_rtt: est.min_rtt(),
+            smoothed_rtt: est.smoothed_rtt(),
+            rtt_variation: est.rtt_variation(),
             pacing_rate_bps: est.pacing_rate(),
             cwnd_bytes: est.cwnd(),
             inflight_bytes: est.inflight_bytes(),
@@ -1832,6 +1834,21 @@ pub struct BandwidthSnapshot {
     /// one, and labels each with the statistic behind it for that reason.
     pub last_delivery_rate_bps: u64,
     pub min_rtt: Duration,
+    /// Smoothed round trip and its variation, beside the minimum because the
+    /// minimum alone cannot price a delay.
+    ///
+    /// A recorded run could say a quarter of its repairs were ordered by the
+    /// retransmission timer rather than by the packet threshold, and could not
+    /// say what that cost: the threshold fires about a round trip after the
+    /// send, the timer at `srtt + 4·rttvar`, and the difference between them is
+    /// the variation — tens of milliseconds or hundreds, two different findings.
+    /// `None` until the first acknowledgement survives Karn's gate.
+    ///
+    /// Diagnostics. The timer the wire waits on is per stream and keeps its own
+    /// pair; these are the session's, and nothing reads them back.
+    pub smoothed_rtt: Option<Duration>,
+    /// See [`Self::smoothed_rtt`].
+    pub rtt_variation: Duration,
     pub pacing_rate_bps: u64,
     pub cwnd_bytes: u64,
     pub inflight_bytes: u64,

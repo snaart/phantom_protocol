@@ -388,6 +388,13 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
     The first two travel together because neither is interpretable alone: one counts copies
     emitted, the other counts holes charged, and only their difference says what repairing
     the path's repairs cost.
+  * `BandwidthSnapshot::{smoothed_rtt, rtt_variation}` — RFC 6298's SRTT and RTTVAR
+    over the same samples `min_rtt` is filtered from, under the same Karn gate.
+    Diagnostics: nothing in the transport reads either back, and the timer the wire
+    waits on keeps its own pair per stream. They are here because a minimum cannot
+    price a delay — the interval between a repair the packet threshold ordered and
+    one the retransmission timer ordered is `4 · rttvar`, so a run recording only
+    the minimum can report that split without being able to say what it cost.
   * `BandwidthSnapshot::{loss_declarations, repairs_attributed, declared_by_packet_threshold,
     declared_by_time_threshold, declared_by_rto}` — likewise, and read as two pairs rather
     than five figures. `loss_declarations` is the count the byte total above is the weight

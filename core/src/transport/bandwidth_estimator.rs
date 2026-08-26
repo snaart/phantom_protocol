@@ -911,6 +911,21 @@ pub struct BandwidthEstimator {
     /// takes part in.
     declared_by_rto: u64,
 
+    /// Smoothed round trip over the acknowledgements this endpoint timed, and
+    /// its variation — RFC 6298's SRTT and RTTVAR, from the same samples
+    /// `min_rtt` is filtered from and under the same Karn gate.
+    ///
+    /// **Diagnostics only, and structurally so:** nothing in this file reads
+    /// either back, and the timer the wire waits on keeps its own pair per
+    /// stream. They exist because a minimum cannot price a delay — the gap
+    /// between a repair the packet threshold ordered and one the timer ordered
+    /// is `4 · rttvar`, and a run that records only the minimum can report the
+    /// split without being able to say what it cost.
+    ///
+    /// `None` until the first sample survives the Karn gate.
+    smoothed_rtt: Option<Duration>,
+    /// See [`Self::smoothed_rtt`]. Zero until the first sample.
+    rtt_variation: Duration,
     /// The most recent per-acknowledgement delivery rate this endpoint
     /// computed, before the filter had any say in it. Diagnostics only —
     /// nothing in this file reads it back.
@@ -977,6 +992,8 @@ impl BandwidthEstimator {
             declared_by_packet_threshold: 0,
             declared_by_time_threshold: 0,
             declared_by_rto: 0,
+            smoothed_rtt: None,
+            rtt_variation: Duration::ZERO,
             last_delivery_rate: 0,
         }
     }
@@ -1103,6 +1120,33 @@ impl BandwidthEstimator {
             let min_rtt_us = self.rtt_filter.update_min(now, rtt_us);
             self.min_rtt = Duration::from_micros(min_rtt_us);
             self.rtt_filter_seeded = true;
+            // The smoothed round trip and its variation, under the same Karn
+            // gate and from the same adjusted sample. **Diagnostics only** —
+            // nothing in this file reads either back, and the retransmission
+            // timer keeps its own pair per stream, which is the one the wire
+            // actually waits on.
+            //
+            // They are here because a recorded run carried `min_rtt` alone, and
+            // a minimum cannot price anything: the interval between a repair
+            // ordered by the packet threshold and one ordered by the timer is
+            // `4 · rttvar` plus a granularity floor, so without the variation a
+            // run can say a quarter of its repairs came from the timer and not
+            // say whether that cost tens of milliseconds or hundreds.
+            let (srtt, rttvar) = match self.smoothed_rtt {
+                // RFC 6298 (2.2): first measurement seeds both.
+                None => (adjusted_rtt, adjusted_rtt / 2),
+                Some(prev) => {
+                    // RFC 6298 (2.3), in the same 1/8 and 1/4 weights the
+                    // per-stream estimator uses.
+                    let diff = adjusted_rtt.abs_diff(prev);
+                    (
+                        (prev * 7 + adjusted_rtt) / 8,
+                        (self.rtt_variation * 3 + diff) / 4,
+                    )
+                }
+            };
+            self.smoothed_rtt = Some(srtt);
+            self.rtt_variation = rttvar;
         }
 
         // Nothing about whether this segment was lost is decided here, and the
@@ -1487,6 +1531,17 @@ impl BandwidthEstimator {
     /// [`Self::bytes_lost`] is the byte weight of.
     pub fn loss_declarations(&self) -> u64 {
         self.loss_declarations
+    }
+
+    /// Smoothed round trip over timed acknowledgements, and its variation.
+    /// `None` before the first sample. Diagnostics only — see the fields.
+    pub fn smoothed_rtt(&self) -> Option<Duration> {
+        self.smoothed_rtt
+    }
+
+    /// See [`Self::smoothed_rtt`].
+    pub fn rtt_variation(&self) -> Duration {
+        self.rtt_variation
     }
 
     /// Copies whose ordering rule was recorded — the denominator of the three
@@ -2051,6 +2106,105 @@ mod tests {
     /// have different denominators by design: one of the three rules can only
     /// fire on a segment with no copy on the wire, and counting arms per hole
     /// would have fixed its share by construction rather than measuring it.
+    /// **The smoothed round trip and its variation are a second reading, not a
+    /// copy of the minimum.**
+    ///
+    /// A run that records only `min_rtt` cannot price the difference between a
+    /// repair the packet threshold ordered and one the timer ordered: the first
+    /// happens about a round trip after the send, the second at `srtt +
+    /// 4·rttvar`, and only the variation separates "tens of milliseconds" from
+    /// "hundreds". A pair that merely tracked the minimum would answer that
+    /// question with the minimum's answer, which is no answer.
+    ///
+    /// So the path here rises and falls around a mean, and the assertions are
+    /// that the smoothed value sits above the minimum and that the variation is
+    /// non-zero. Both fail if the smoothing is replaced by the latest sample, by
+    /// the minimum, or by a constant.
+    #[test]
+    fn the_smoothed_round_trip_is_not_the_minimum() {
+        let mut est = BandwidthEstimator::new();
+        let mut now = Instant::now();
+        // A path whose round trip varies between 100 and 300 ms — a minimum of
+        // 100, a mean near 200.
+        for (i, rtt_ms) in [100u64, 300, 150, 250, 120, 280, 200, 220]
+            .into_iter()
+            .cycle()
+            .take(40)
+            .enumerate()
+        {
+            let rtt = Duration::from_millis(rtt_ms);
+            now += rtt;
+            est.on_send(1200);
+            est.on_ack(DeliverySample {
+                delivered_bytes: est.delivered_bytes(),
+                delivered_at: est.delivered_time(),
+                sent_at: now - rtt,
+                acked_at: now,
+                packet_bytes: 1200,
+                is_app_limited: false,
+                ack_delay_us: 0,
+                rtt_sampled: true,
+            });
+            let _ = i;
+        }
+
+        let srtt = est.smoothed_rtt().expect("samples were taken");
+        assert_eq!(
+            est.min_rtt(),
+            Duration::from_millis(100),
+            "precondition: the minimum filter must have found the floor of this \
+             path, or the comparison below is against the wrong number"
+        );
+        assert!(
+            srtt > Duration::from_millis(150),
+            "the smoothed round trip must sit above the minimum on a path that \
+             varies — it read {srtt:?}, which is the minimum's answer and not a \
+             second one"
+        );
+        assert!(
+            est.rtt_variation() >= Duration::from_millis(20),
+            "the variation must be non-zero on a path that varies: it is the term \
+             the timer is further out by, and a zero would say the timer fires a \
+             granularity after the threshold"
+        );
+
+        // And it has to be *smoothed*, not merely "not the minimum": one outlier
+        // must move it by about an eighth of the gap and no more. Without this the
+        // assertions above are satisfied by handing back the latest sample, which
+        // is what a mutation replacing the RFC 6298 weights with `adjusted_rtt`
+        // does — and by the seeding branch running on every sample, which is what
+        // a mutation disabling the "have I a previous value" test does.
+        let before = srtt;
+        let outlier = Duration::from_secs(1);
+        now += outlier;
+        est.on_send(1200);
+        est.on_ack(DeliverySample {
+            delivered_bytes: est.delivered_bytes(),
+            delivered_at: est.delivered_time(),
+            sent_at: now - outlier,
+            acked_at: now,
+            packet_bytes: 1200,
+            is_app_limited: false,
+            ack_delay_us: 0,
+            rtt_sampled: true,
+        });
+        let after = est.smoothed_rtt().expect("still sampled");
+        let moved = after.saturating_sub(before);
+        let gap = outlier.saturating_sub(before);
+        assert!(
+            moved <= gap / 4,
+            "a one-second outlier against a smoothed {before:?} moved it by \
+             {moved:?}; RFC 6298's eighth of the gap is {:?}, so anything near the \
+             whole gap means the value is the latest sample wearing another name",
+            gap / 8
+        );
+        assert!(
+            moved >= gap / 32,
+            "and it must move at all — a value that ignores a sample this far out \
+             is a constant, not an estimate"
+        );
+    }
+
     #[test]
     fn the_rule_that_ordered_each_repair_is_recorded_apart_from_the_bytes() {
         let mut est = BandwidthEstimator::new();
