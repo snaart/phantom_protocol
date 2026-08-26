@@ -2305,6 +2305,20 @@ def send_bound_series(f, scenario, phase, tag, rows):
             "drawn from the window afterwards and cannot tell a pass the pacer "
             "metered from one that ran dry with the window open"
         )
+        # The two are in different units and their percentages must not be
+        # compared. This one counts *events*: a pass ends, and the reason it
+        # ended is tallied. The one above counts *states*: every 200 ms a sample
+        # asks where the sender stood. A pass lasts a fraction of a millisecond,
+        # so a pacer that hands out credit in small grants ends nearly every pass
+        # for want of it while the sender still spends most of its time well
+        # inside the window — which is exactly what these two runs show, 85% of
+        # passes against a third of samples with headroom. Read as a
+        # contradiction that is a finding; read as two units it is arithmetic.
+        print(
+            f"{pad} {'':2}events, not states: a pass lasts well under a "
+            "millisecond and a sample covers 200 ms, so this percentage and the "
+            "one above answer different questions and do not subtract"
+        )
         sentence = dry_split_sentence(census)
         if sentence:
             print(f"{pad} {'':2}{sentence}")
