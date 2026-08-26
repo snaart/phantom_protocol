@@ -511,6 +511,16 @@ impl MsgLink for QuicLink {
                 // where their definition travels with them.
                 bytes_retransmitted: 0,
                 bytes_lost: 0,
+                // Zero for the same reason and one more: the split names three
+                // rules — this project's packet threshold, its RACK arm and its
+                // RTO — and quinn's detector is not built from them, so a count
+                // filed under any of the three would be a reading of a mechanism
+                // that is not there.
+                loss_declarations: 0,
+                repairs_attributed: 0,
+                declared_by_packet_threshold: 0,
+                declared_by_time_threshold: 0,
+                declared_by_rto: 0,
                 inflight_hi_bytes: 0,
             })
         })

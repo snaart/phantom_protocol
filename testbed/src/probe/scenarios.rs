@@ -5020,6 +5020,11 @@ mod tests {
             // fixture the assertions depend on.
             bytes_retransmitted: 0,
             bytes_lost: 0,
+            loss_declarations: 0,
+            repairs_attributed: 0,
+            declared_by_packet_threshold: 0,
+            declared_by_time_threshold: 0,
+            declared_by_rto: 0,
             inflight_hi_bytes: 0,
         }
     }

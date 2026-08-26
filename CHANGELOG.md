@@ -388,6 +388,14 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
     The first two travel together because neither is interpretable alone: one counts copies
     emitted, the other counts holes charged, and only their difference says what repairing
     the path's repairs cost.
+  * `BandwidthSnapshot::{loss_declarations, repairs_attributed, declared_by_packet_threshold,
+    declared_by_time_threshold, declared_by_rto}` — likewise, and read as two pairs rather
+    than five figures. `loss_declarations` is the count the byte total above is the weight
+    of: holes, once each however many copies repaired them. The other four are over
+    *copies*, because one of the three rules can only ever fire on a segment with no copy on
+    the wire, and attributing per hole would have fixed that rule's share by construction.
+    The three arms sum past `repairs_attributed` by exactly the copies both thresholds
+    ordered.
   * `DeliverySample::{delivered_at, rtt_sampled}` — built by the ack path.
 
   *Enum variants that are new* — these three enums are exhaustive, so a `match` without a
@@ -405,6 +413,11 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
     third argument is the session's published state, which is what lets a write into a
     `Draining` session be refused rather than queued for a pump that will discard it.
   * `PhantomUdpListener::accept`: `&Arc<Self>` → `Arc<Self>` — full entry below.
+  * `BandwidthEstimator::on_loss(bytes)` and `Session::on_packet_lost(bytes)` keep their
+    shape, and a second method now sits beside each: `note_repair_ordered_by(cause)`. The
+    caller reports the hole once, as before, and the ordering rule once per copy. Splitting
+    it rather than widening `on_loss` is what keeps the two populations from sharing a
+    denominator they do not share.
 
 - **`BandwidthEstimator::on_ack` and `Session::on_packet_acked` now hand back the RTT sample
   the acknowledgement produced.** `on_ack` returns `(u64, Duration)` where it returned the

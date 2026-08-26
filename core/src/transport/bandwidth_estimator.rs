@@ -51,6 +51,7 @@
 //!   BandwidthEstimator ──rate──▶ Pacer ──paced_send──▶ UdpClientTransport / UdpServerTransport
 //! ```
 
+use crate::transport::stream::LossCause;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -879,6 +880,36 @@ pub struct BandwidthEstimator {
     /// Diagnostics only. Nothing in this file reads it back; the loss *rate* a
     /// round is judged on is computed from [`Self::round_bytes_lost`].
     bytes_retransmitted: u64,
+    /// Holes declared over the life of the connection — one per segment the
+    /// detector first ordered a copy of, so the count [`Self::bytes_lost`] is
+    /// the byte weight of.
+    ///
+    /// Without it a recorded run has a numerator and no denominator: two
+    /// megabytes of holes is a different finding at 1156 bytes a hole than at
+    /// two hundred, and nothing else says which.
+    loss_declarations: u64,
+    /// Copies whose ordering rule was recorded — the denominator of the three
+    /// arm counters below, and **not** the same population as
+    /// [`Self::loss_declarations`], which counts holes.
+    repairs_attributed: u64,
+    /// Of those, the ones the packet threshold ordered — `largest_acked` reached
+    /// `PACKET_THRESHOLD` past a segment no copy of which had been sent.
+    ///
+    /// This is the arm that fires on a route that reorders, since an overtaken
+    /// datagram produces exactly the evidence it reads. A run whose declarations
+    /// are mostly here, on a route whose raw controls show no reordering, is
+    /// saying its holes are drops.
+    declared_by_packet_threshold: u64,
+    /// Of those, the ones RACK's time threshold ordered — the segment aged past
+    /// `srtt·9/8` with an acknowledgement having moved past it.
+    ///
+    /// Sums with the counter above to more than [`Self::loss_declarations`] by
+    /// exactly the number of declarations both arms made.
+    declared_by_time_threshold: u64,
+    /// Of those, the ones the retransmission timer ordered against a peer that
+    /// had acknowledged nothing — the backstop, and the arm no acknowledgement
+    /// takes part in.
+    declared_by_rto: u64,
 
     /// The most recent per-acknowledgement delivery rate this endpoint
     /// computed, before the filter had any say in it. Diagnostics only —
@@ -941,6 +972,11 @@ impl BandwidthEstimator {
             round_delivered_mark: 0,
             bytes_lost: 0,
             bytes_retransmitted: 0,
+            loss_declarations: 0,
+            repairs_attributed: 0,
+            declared_by_packet_threshold: 0,
+            declared_by_time_threshold: 0,
+            declared_by_rto: 0,
             last_delivery_rate: 0,
         }
     }
@@ -1251,9 +1287,53 @@ impl BandwidthEstimator {
     /// would take the same bytes off twice, and since the counter is purely
     /// incremental the error accumulates over the connection into a permanent
     /// under-count that inflates the drain's `cwnd − inflight` budget.
+    /// `cause` is recorded and nothing else: it moves no threshold, enters no
+    /// rate and reaches no decision. It exists because the byte count alone
+    /// cannot say whether a sender's holes came from acknowledgements that named
+    /// its successors, from a clock running out on a peer that went quiet, or
+    /// from a peer that said nothing at all — three findings that ask for three
+    /// different pieces of work. Attribution is per hole, matching the byte
+    /// count, because both are raised at the same instant by the same caller.
     pub fn on_loss(&mut self, bytes: u64) {
         self.round_bytes_lost = self.round_bytes_lost.saturating_add(bytes);
         self.bytes_lost = self.bytes_lost.saturating_add(bytes);
+        self.loss_declarations = self.loss_declarations.saturating_add(1);
+    }
+
+    /// Record which rule ordered a repair, once per copy.
+    ///
+    /// Separate from [`Self::on_loss`] because the two count different things
+    /// over different populations: holes, once each however many copies they
+    /// take, against copies, each attributed to the rule that ordered it. The
+    /// arms therefore pair with `bytes_retransmitted` and not with `bytes_lost`.
+    ///
+    /// A copy both threshold arms ordered counts against both, so the arms sum
+    /// to more than the copies by exactly the number of joint orders. That
+    /// excess is the only place the joint population survives, and giving either
+    /// arm priority would erase it silently.
+    ///
+    /// **Written here and read nowhere.** Nothing below this line consults it,
+    /// and nothing may: which arm fires is selectable by the peer through what
+    /// it acknowledges and when.
+    pub fn note_repair_ordered_by(&mut self, cause: LossCause) {
+        self.repairs_attributed = self.repairs_attributed.saturating_add(1);
+        match cause {
+            LossCause::PacketThreshold => {
+                self.declared_by_packet_threshold =
+                    self.declared_by_packet_threshold.saturating_add(1);
+            }
+            LossCause::TimeThreshold => {
+                self.declared_by_time_threshold = self.declared_by_time_threshold.saturating_add(1);
+            }
+            LossCause::BothThresholds => {
+                self.declared_by_packet_threshold =
+                    self.declared_by_packet_threshold.saturating_add(1);
+                self.declared_by_time_threshold = self.declared_by_time_threshold.saturating_add(1);
+            }
+            LossCause::Rto => {
+                self.declared_by_rto = self.declared_by_rto.saturating_add(1);
+            }
+        }
     }
 
     /// A send pass ended because the application had nothing more to give.
@@ -1401,6 +1481,38 @@ impl BandwidthEstimator {
     /// of a path that is losing repairs as well as data.
     pub fn bytes_retransmitted(&self) -> u64 {
         self.bytes_retransmitted
+    }
+
+    /// Holes declared over the life of the connection — the count
+    /// [`Self::bytes_lost`] is the byte weight of.
+    pub fn loss_declarations(&self) -> u64 {
+        self.loss_declarations
+    }
+
+    /// Copies whose ordering rule was recorded — the denominator of the three
+    /// arm counters, and not the same population as [`Self::loss_declarations`].
+    pub fn repairs_attributed(&self) -> u64 {
+        self.repairs_attributed
+    }
+
+    /// Of those copies, the ones the packet threshold ordered.
+    ///
+    /// Sums with [`Self::declared_by_time_threshold`] and
+    /// [`Self::declared_by_rto`] to more than [`Self::repairs_attributed`] by the
+    /// number of copies both threshold arms ordered.
+    pub fn declared_by_packet_threshold(&self) -> u64 {
+        self.declared_by_packet_threshold
+    }
+
+    /// Of those, the ones RACK's time threshold ordered.
+    pub fn declared_by_time_threshold(&self) -> u64 {
+        self.declared_by_time_threshold
+    }
+
+    /// Of those, the ones the retransmission timer ordered against a peer that
+    /// had acknowledged nothing.
+    pub fn declared_by_rto(&self) -> u64 {
+        self.declared_by_rto
     }
 
     /// Get estimated bottleneck bandwidth (bytes/sec).
@@ -1924,6 +2036,187 @@ mod tests {
     /// expressed in terms of it is a threshold the peer sets. What this test
     /// pins is the alternative: the loss is booked when the copy goes out, which
     /// happens before any acknowledgement is consulted.
+    /// **The three rules that can order a repair stay apart in the record.**
+    ///
+    /// A byte count of holes answers "how much" and cannot answer "found how".
+    /// The packet threshold reads evidence acknowledgements carried — successors
+    /// arrived, this one did not — which is exactly what an overtaken datagram
+    /// produces on a route that reorders. RACK's threshold reads a clock, so it
+    /// also covers a peer that acknowledged something and then went quiet. The
+    /// RTO reads a clock against a peer that said nothing at all. A run whose
+    /// raw controls show a clean path while its sender books holes is a
+    /// different finding under each, and the counters are what tell them apart.
+    ///
+    /// Attribution is per **copy** and the hole count is per **hole**, so the two
+    /// have different denominators by design: one of the three rules can only
+    /// fire on a segment with no copy on the wire, and counting arms per hole
+    /// would have fixed its share by construction rather than measuring it.
+    #[test]
+    fn the_rule_that_ordered_each_repair_is_recorded_apart_from_the_bytes() {
+        let mut est = BandwidthEstimator::new();
+        const HOLE: u64 = 1200;
+
+        // Two holes, and four copies between them: one of the holes took three
+        // attempts, which is the shape that separates the two populations.
+        est.on_loss(HOLE);
+        est.note_repair_ordered_by(LossCause::PacketThreshold);
+        est.note_repair_ordered_by(LossCause::TimeThreshold);
+        est.note_repair_ordered_by(LossCause::Rto);
+        est.on_loss(HOLE);
+        est.note_repair_ordered_by(LossCause::BothThresholds);
+
+        assert_eq!(
+            est.bytes_lost(),
+            2 * HOLE,
+            "every hole weighs its bytes once, however many copies repaired it"
+        );
+        assert_eq!(
+            est.loss_declarations(),
+            2,
+            "one count per hole — the denominator bytes_lost never had"
+        );
+        assert_eq!(
+            est.repairs_attributed(),
+            4,
+            "one attribution per copy, which is a different population and must \
+             not be conflated with the hole count"
+        );
+        assert_eq!(
+            est.declared_by_packet_threshold(),
+            2,
+            "the packet-threshold arm ordered one copy alone and one jointly"
+        );
+        assert_eq!(
+            est.declared_by_time_threshold(),
+            2,
+            "the RACK arm ordered one copy alone and one jointly"
+        );
+        assert_eq!(est.declared_by_rto(), 1, "the timer ordered one copy");
+        assert_eq!(
+            est.declared_by_packet_threshold()
+                + est.declared_by_time_threshold()
+                + est.declared_by_rto()
+                - est.repairs_attributed(),
+            1,
+            "the arms exceed the copies by exactly the joint orders, which is the \
+             only place that number survives"
+        );
+    }
+
+    /// Two-sided companion: the attribution must not reach a decision.
+    ///
+    /// This is the property the whole change rests on, so the test has to be able
+    /// to *observe* a violation — and two earlier versions of it could not. The
+    /// first built a fresh estimator and compared `cwnd()` without ever crossing a
+    /// round boundary, so `adapt_inflight_bound` never ran and the comparison held
+    /// whatever the loss path did. The second crossed the boundary but ran the
+    /// loss rate far above `LOSS_THRESH`, where the response is `inflight_hi ×
+    /// BETA` and does not depend on the size of the loss at all — so a mutation
+    /// multiplying the round's loss numerator by eight still changed nothing.
+    ///
+    /// The loss rate is therefore run **just under the threshold**, which is the
+    /// only regime where the magnitude decides anything: a cause that quietly
+    /// inflated or suppressed the numerator would push its round across and set a
+    /// bound the others do not have. The over-threshold case runs too, as the
+    /// positive control — without it, "no bound under any cause" would be
+    /// satisfied by an estimator that can no longer set one.
+    #[test]
+    fn which_rule_ordered_a_repair_changes_no_decision() {
+        const SEG: u64 = 1200;
+        const RTT: Duration = Duration::from_millis(50);
+
+        // `holes` per `SEGMENTS` delivered, four rounds. The delivered counter is
+        // stamped as of the send, not as of the acknowledgement: stamping the
+        // current value opens a fresh round on every ack, which zeroes the round's
+        // loss before it can ever be judged.
+        let run = |cause: LossCause, holes: u32| {
+            const SEGMENTS: u32 = 100;
+            let mut est = BandwidthEstimator::new();
+            let mut now = Instant::now();
+            for round in 0..4u32 {
+                let delivered_at_send = est.delivered_bytes();
+                for _ in 0..SEGMENTS {
+                    est.on_send(SEG);
+                }
+                // Not in the opening round. The first acknowledgement of a
+                // connection opens the first round with almost nothing delivered
+                // against it, so any loss booked there is judged against a
+                // near-zero denominator and reads as a heavily congested round
+                // whatever its true rate.
+                if round > 0 {
+                    for _ in 0..holes {
+                        est.on_retransmit(SEG);
+                        est.on_loss(SEG);
+                        est.note_repair_ordered_by(cause);
+                    }
+                }
+                now += RTT;
+                for _ in 0..SEGMENTS {
+                    est.on_ack(DeliverySample {
+                        delivered_bytes: delivered_at_send,
+                        delivered_at: est.delivered_time(),
+                        sent_at: now - RTT,
+                        acked_at: now,
+                        packet_bytes: SEG,
+                        is_app_limited: false,
+                        ack_delay_us: 0,
+                        rtt_sampled: round == 0,
+                    });
+                }
+            }
+            (
+                est.cwnd(),
+                est.inflight_hi(),
+                est.pacing_rate(),
+                est.bytes_lost(),
+                est.bottleneck_bandwidth(),
+            )
+        };
+
+        const ALL: [LossCause; 4] = [
+            LossCause::PacketThreshold,
+            LossCause::TimeThreshold,
+            LossCause::BothThresholds,
+            LossCause::Rto,
+        ];
+
+        // One hole in a hundred is 0.99% of the round — under LOSS_THRESH (2%),
+        // and near enough that any inflation of the numerator crosses it.
+        let under = run(LossCause::PacketThreshold, 1);
+        assert!(
+            under.1.is_none(),
+            "precondition: a round under the threshold must set no bound, or this \
+             half of the test is not in the regime where magnitude decides"
+        );
+        for cause in ALL {
+            assert_eq!(
+                run(cause, 1),
+                under,
+                "under the loss threshold, attributing the same holes to {cause:?} \
+                 changed a congestion decision — the record has become a mechanism, \
+                 and one arm of it is selectable by the peer"
+            );
+        }
+
+        // Positive control: the same shape above the threshold must engage the
+        // bound, so "no bound" above cannot be the estimator having lost the
+        // ability to set one.
+        let over = run(LossCause::PacketThreshold, 5);
+        assert!(
+            over.1.is_some(),
+            "positive control: five holes in a hundred is 4.8% and must engage the \
+             bound, or the under-threshold half proves nothing"
+        );
+        for cause in ALL {
+            assert_eq!(
+                run(cause, 5),
+                over,
+                "above the loss threshold, attributing the same holes to {cause:?} \
+                 changed a congestion decision"
+            );
+        }
+    }
+
     #[test]
     fn a_receiver_that_inflates_the_round_trip_cannot_suppress_a_real_drop() {
         const PACKET: u64 = 1200;

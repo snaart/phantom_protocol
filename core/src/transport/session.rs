@@ -1343,8 +1343,36 @@ impl Session {
     /// an acknowledgement names the segment's gap-free stream offset, which
     /// every copy shared. A path that reorders is therefore charged as a path
     /// that drops.
+    ///
     pub fn on_packet_lost(&self, bytes: u64) {
         self.bandwidth_estimator.lock().on_loss(bytes);
+    }
+
+    /// Record which rule ordered a repair. Called for **every** copy, unlike
+    /// [`Self::on_packet_lost`], which is called once per hole.
+    ///
+    /// The two counts share no denominator on purpose. A hole is booked once
+    /// however many copies it takes, so its count pairs with the bytes charged
+    /// to congestion control; a rule's rate of firing is a property of the
+    /// copies, and one of the three rules can only fire on a segment with no
+    /// copy on the wire. Counting arms per hole would have made that rule's
+    /// share a construction rather than a measurement.
+    ///
+    /// **Recorded, and read by nothing.** It moves no threshold, enters no rate
+    /// and reaches no decision — which matters more here than the wording
+    /// suggests, because *which arm fires is a choice the peer can make*. A
+    /// receiver picks the packet-threshold arm by acknowledging a segment's
+    /// successors while withholding it, and the RACK arm by acknowledging just
+    /// short of the threshold and then going quiet past `srtt·9/8`; both gates
+    /// read values written by the peer, and the round-trip estimate the second
+    /// is expressed in is sampled from the peer's own acknowledgement timing. So
+    /// this split is a record of what the peer's acknowledgements made this
+    /// endpoint conclude, not a property of the path — and that is exactly why
+    /// it must stay out of every decision.
+    pub fn note_repair_ordered_by(&self, cause: crate::transport::stream::LossCause) {
+        self.bandwidth_estimator
+            .lock()
+            .note_repair_ordered_by(cause);
     }
 
     /// A send pass ended for want of data to send. Opens an application-limited
@@ -1371,6 +1399,22 @@ impl Session {
     /// test hook, and the observable that the send path reports loss at all.
     pub fn bbr_bytes_lost(&self) -> u64 {
         self.bandwidth_estimator.lock().bytes_lost()
+    }
+
+    /// Which rule ordered each repair this session emitted, as
+    /// `(packet threshold, RACK time threshold, RTO)` over copies.
+    ///
+    /// Observability / test hook, and the only reach the attribution has outside
+    /// the estimator: nothing in the transport reads it, and nothing may — which
+    /// arm fires is a choice a hostile peer can make through what it
+    /// acknowledges and when.
+    pub fn bbr_repairs_by_cause(&self) -> (u64, u64, u64) {
+        let est = self.bandwidth_estimator.lock();
+        (
+            est.declared_by_packet_threshold(),
+            est.declared_by_time_threshold(),
+            est.declared_by_rto(),
+        )
     }
 
     /// Bytes this session has retransmitted, counting every copy. Observability
@@ -1425,6 +1469,11 @@ impl Session {
             app_limited: est.is_app_limited(),
             bytes_retransmitted: est.bytes_retransmitted(),
             bytes_lost: est.bytes_lost(),
+            loss_declarations: est.loss_declarations(),
+            repairs_attributed: est.repairs_attributed(),
+            declared_by_packet_threshold: est.declared_by_packet_threshold(),
+            declared_by_time_threshold: est.declared_by_time_threshold(),
+            declared_by_rto: est.declared_by_rto(),
             inflight_hi_bytes: est.inflight_hi().unwrap_or(0),
         }
     }
@@ -1827,6 +1876,38 @@ pub struct BandwidthSnapshot {
     /// Bytes of hole fed to the loss response — the numerator of the round loss
     /// rate `adapt_inflight_bound` judges, summed over the connection.
     pub bytes_lost: u64,
+    /// Holes declared, one per segment the detector first ordered a copy of —
+    /// the count [`Self::bytes_lost`] is the byte weight of.
+    ///
+    /// A recorded run had the weight and not the count, and the two are
+    /// different findings: two megabytes of holes at 1156 bytes each is a
+    /// different path from two megabytes at two hundred.
+    pub loss_declarations: u64,
+    /// Copies whose ordering rule was recorded — the denominator of the three arm
+    /// counters below.
+    ///
+    /// **Not** the same population as [`Self::loss_declarations`]: a hole is
+    /// counted once however many copies repairing it took, while every copy is
+    /// attributed. One of the three rules can only fire on a segment with no copy
+    /// on the wire, so attributing per hole would have made its share a
+    /// construction rather than a measurement.
+    pub repairs_attributed: u64,
+    /// Of those copies, the ones the packet threshold ordered — successors of a
+    /// segment were acknowledged and it was not.
+    ///
+    /// This is the arm an overtaken datagram satisfies without anything having
+    /// been dropped, so a run whose declarations sit here while its raw controls
+    /// show no reordering is saying its holes were drops. Sums with
+    /// [`Self::declared_by_time_threshold`] to more than
+    /// [`Self::loss_declarations`] by the number of declarations both arms made.
+    pub declared_by_packet_threshold: u64,
+    /// Of those, the ones RACK's time threshold ordered — the segment aged past
+    /// `srtt·9/8` since its latest transmission.
+    pub declared_by_time_threshold: u64,
+    /// Of those, the ones the retransmission timer ordered against a peer that
+    /// had acknowledged nothing. The backstop, and the only arm no
+    /// acknowledgement takes part in.
+    pub declared_by_rto: u64,
     /// The loss-imposed upper bound on inflight, in bytes, or `0` when the path
     /// has given no reason for one.
     ///

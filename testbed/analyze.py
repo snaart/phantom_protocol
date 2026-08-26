@@ -834,6 +834,11 @@ def series_role(rows):
 RETRANSMISSION_COLUMNS = (
     "bytes_retransmitted",
     "bytes_lost",
+    "loss_declarations",
+    "repairs_attributed",
+    "declared_by_packet_threshold",
+    "declared_by_time_threshold",
+    "declared_by_rto",
     "inflight_hi_bytes",
 )
 
@@ -933,14 +938,98 @@ def retransmission_reading(rows):
         return None
     declared = max((r.get("bytes_retransmitted", 0) or 0) for r in rows)
     established = max((r.get("bytes_lost", 0) or 0) for r in rows)
+    # The attribution counters are read off ONE row — the last that carries them —
+    # rather than maximised field by field. Taken independently they are five
+    # cumulative counters that a migration restarts at zero (`Session::
+    # reset_congestion` replaces the estimator), so a series spanning one yields a
+    # hole count from the longer path, an arm count from the other, and a
+    # difference between them that describes no epoch of the connection. The byte
+    # figures above keep their maxima because that is the documented reading for
+    # them; a count and a difference of counts cannot be read the same way.
+    attributed = None
+    for r in rows:
+        if "loss_declarations" in r or "declared_by_packet_threshold" in r:
+            attributed = r
+    holes = (attributed or {}).get("loss_declarations", 0) or 0
+    repairs = (attributed or {}).get("repairs_attributed", 0) or 0
+    by_packet = (attributed or {}).get("declared_by_packet_threshold", 0) or 0
+    by_time = (attributed or {}).get("declared_by_time_threshold", 0) or 0
+    by_rto = (attributed or {}).get("declared_by_rto", 0) or 0
     bound_samples = sum(1 for r in rows if (r.get("inflight_hi_bytes", 0) or 0) > 0)
     return {
         "declared": declared,
         "established": established,
         "repair_share": (declared - established) / declared if declared else None,
+        # None, not zero: a run recorded before the split carries no such column,
+        # and printing a zero would say the sender declared nothing.
+        "has_attribution": attributed is not None,
+        "holes": holes,
+        "repairs": repairs,
+        "by_packet": by_packet,
+        "by_time": by_time,
+        "by_rto": by_rto,
+        # The arms exceed the COPY count by exactly the copies both thresholds
+        # ordered — not the hole count, which is a different population.
+        "joint": max(0, by_packet + by_time + by_rto - repairs) if repairs else 0,
+        "mean_hole_bytes": (established / holes) if holes else None,
         "bound_samples": bound_samples,
         "samples": len(rows),
     }
+
+
+def which_arm_reading(rx):
+    """What the split between the three declaration rules says, in one sentence.
+
+    The three rules read different evidence, so the same hole count means
+    different things depending on which ordered it.
+
+    The packet threshold reads what acknowledgements carried — successors of a
+    segment arrived and it did not — which is exactly what an overtaken datagram
+    produces without anything having been dropped. So declarations concentrated
+    here are the population reordering can explain, and whether it does is
+    settled by the raw controls in the same run, not here: this reads the
+    sender's book, and the controls read the path.
+
+    RACK's threshold reads a clock and fires against a peer that acknowledged
+    something and then went quiet, or against a segment whose own repair is
+    overdue. The RTO reads a clock against a peer that has said nothing at all.
+    Neither is evidence about reordering, and a run whose holes sit there is
+    describing silence rather than displacement.
+
+    Deliberately not a verdict. A sentence naming the majority arm is a reading;
+    a sentence naming a cause would be this file deciding something the artifact
+    cannot support — which is the mistake the withdrawn refuted column made.
+    """
+    # The denominator is the COPIES attributed, not the sum of the arms. Summing
+    # them double-counts every copy both thresholds ordered, so a run where the
+    # arms agree on everything reported "50% by the packet threshold" when the
+    # truth was that the packet threshold ordered all of them — and so did RACK.
+    total = rx["repairs"]
+    if not total:
+        return "no copy carries an attribution, so the split says nothing"
+    parts = [
+        ("the packet threshold", rx["by_packet"]),
+        ("RACK's time threshold", rx["by_time"]),
+        ("the RTO", rx["by_rto"]),
+    ]
+    name, count = max(parts, key=lambda p: p[1])
+    share = count / total
+    if share < 0.5:
+        return (
+            "no rule ordered a majority of them, so the sender's holes came from "
+            "more than one condition and a single explanation will not fit"
+        )
+    if name == "the packet threshold":
+        return (
+            f"{share:.0%} were ordered by {name} — the arm an overtaken datagram "
+            "satisfies as readily as a drop, so read this against the raw "
+            "controls' reordering in this same run before calling them drops"
+        )
+    return (
+        f"{share:.0%} were ordered by {name}, which reads a clock rather than an "
+        "acknowledgement — that is a statement about silence or about a repair "
+        "going overdue, and reordering does not produce it"
+    )
 
 
 def frame_bytes_of(transfer_rows, direction=None):
@@ -1875,6 +1964,22 @@ def window_series_reading(leg, phase, rows):
                 f"         {'':18} holes are an upper bound on drops: an overtaken "
                 "segment is declared the same way and the wire does not say which"
             )
+            if rx["has_attribution"]:
+                mean = rx["mean_hole_bytes"]
+                print(
+                    f"         {'':18} {rx['holes']} hole(s)"
+                    + (f", mean {mean:.0f} B" if mean else "")
+                    + f"; {rx['repairs']} copy(ies) attributed — packet threshold "
+                    f"{rx['by_packet']}, RACK {rx['by_time']}, RTO {rx['by_rto']}"
+                    + (f" ({rx['joint']} ordered by both)" if rx["joint"] else "")
+                )
+                print(f"         {'':18} " + which_arm_reading(rx))
+            else:
+                print(
+                    f"         {'':18} which rule ordered them is not in this run — "
+                    "the split postdates it, and a zeroed count would read as a "
+                    "sender no rule ever ordered a repair for"
+                )
             print(
                 f"         {'':18} inflight bound engaged in "
                 f"{rx['bound_samples']}/{rx['samples']} samples"
@@ -2966,6 +3071,47 @@ def self_test():
     # carries no reading at all, and printing four zeros for it would say the
     # sender retransmitted nothing — which is the answer this whole question
     # exists to stop being invented.
+    # Which arm ordered the declarations is a reading, and the three readings are
+    # not interchangeable: one points at the raw controls, one points away from
+    # reordering entirely, and one refuses to point anywhere. A run whose holes
+    # are RACK's is not a reordering story however many of them there are.
+    arm_cases = [
+        (
+            "packet threshold in the majority",
+            {"repairs": 10, "by_packet": 9, "by_time": 1, "by_rto": 0},
+            ["90%", "packet threshold", "raw controls"],
+        ),
+        (
+            "RACK in the majority",
+            {"repairs": 10, "by_packet": 1, "by_time": 9, "by_rto": 0},
+            ["90%", "clock rather than an acknowledgement", "reordering does not produce it"],
+        ),
+        (
+            "the RTO in the majority",
+            {"repairs": 10, "by_packet": 0, "by_time": 1, "by_rto": 9},
+            ["90%", "the RTO", "silence"],
+        ),
+        (
+            "no majority",
+            {"repairs": 11, "by_packet": 4, "by_time": 4, "by_rto": 3},
+            ["more than one condition"],
+        ),
+        (
+            "nothing counted",
+            {"repairs": 0, "by_packet": 0, "by_time": 0, "by_rto": 0},
+            ["says nothing"],
+        ),
+        # Every copy ordered by both thresholds. Dividing by the sum of the arms
+        # would call this "50% by the packet threshold" — half of a population it
+        # ordered entirely — and would then reach for the qualified reading that
+        # goes with a bare majority. The copies are the denominator.
+        (
+            "every copy ordered by both arms",
+            {"repairs": 10, "by_packet": 10, "by_time": 10, "by_rto": 0},
+            ["100%", "packet threshold"],
+        ),
+    ]
+
     retransmit_cases = [
         # Nine of every ten copies went into re-repairing segments whose first
         # copy also failed: ten thousand bytes of copies against one thousand
@@ -2999,6 +3145,37 @@ def self_test():
             (0, 0, None, 0),
         ),
     ]
+
+    # The attribution counters restart at zero on a migration, so a series that
+    # spans one is not monotone. Read field by field with a maximum each, the
+    # counts come from different epochs and their difference describes neither:
+    # here the hole count would come from the first path and the arms from the
+    # second, reporting joint orders that never happened. Read off one row, the
+    # figures at least belong together.
+    migration_attribution_case = (
+        [
+            win(
+                bytes_retransmitted=12_000,
+                bytes_lost=12_000,
+                loss_declarations=10,
+                repairs_attributed=12,
+                declared_by_packet_threshold=9,
+                declared_by_time_threshold=2,
+                declared_by_rto=1,
+            ),
+            win(
+                bytes_retransmitted=1_200,
+                bytes_lost=1_200,
+                loss_declarations=1,
+                repairs_attributed=1,
+                declared_by_packet_threshold=0,
+                declared_by_time_threshold=0,
+                declared_by_rto=1,
+            ),
+        ],
+        # The second (post-migration) row, taken whole.
+        {"holes": 1, "repairs": 1, "by_packet": 0, "by_time": 0, "by_rto": 1, "joint": 0},
+    )
     # The buffer's ceiling is a segment count, so it moves with the frame size;
     # the peer's window is a byte count and does not. That difference is the
     # only thing that ever tells them apart.
@@ -3580,6 +3757,20 @@ def self_test():
             f"cwnd={rows[0]['cwnd_bytes']}, inflight={rows[0]['inflight_bytes']}) "
             f"-> {got!r} (want {want_role!r})"
         )
+    rows, want = migration_attribution_case
+    rx = retransmission_reading(rows)
+    got = {k: rx[k] for k in want}
+    ok = got == want
+    failures += 0 if ok else 1
+    print(
+        f"  {'ok' if ok else 'FAIL'}: retransmission_reading(across a migration) -> "
+        f"{got} (want {want})"
+    )
+    for name, rx, wanted in arm_cases:
+        got = which_arm_reading(rx)
+        ok = all(w in got for w in wanted)
+        failures += 0 if ok else 1
+        print(f"  {'ok' if ok else 'FAIL'}: which_arm_reading({name}) -> {got[:60]!r}")
     for rows, want in retransmit_cases:
         rx = retransmission_reading(rows)
         got = (
@@ -3696,6 +3887,8 @@ def self_test():
 
     extra = (
         len(side_cases)
+        + 1  # the migration-spanning attribution read
+        + len(arm_cases)
         + len(retransmit_cases)
         + (0 if skipped else 1)  # the window-sample column gate, when it could run
         + 1  # the run that predates the loss columns

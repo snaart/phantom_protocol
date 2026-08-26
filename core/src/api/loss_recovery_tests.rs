@@ -700,6 +700,22 @@ async fn a_single_dropped_segment_is_reported_to_congestion_control_once() {
          per acknowledgement"
     );
 
+    // And the record must say which rule ordered the repair, through the live
+    // pump rather than through a helper that mirrors it. This is the only
+    // end-to-end reach of the attribution: the drain reads the cause off the
+    // segment and hands it to the estimator, and replacing that read with any
+    // constant leaves every other test in the crate green. The drop here is
+    // recovered by the packet threshold — the surviving chunks' acknowledgements
+    // carry `largest_acked` three offsets past the hole long before `srtt·9/8`
+    // elapses, and the RTO is an order of magnitude further out still.
+    let (by_packet, by_time, by_rto) = congestion.bbr_repairs_by_cause();
+    assert_eq!(
+        (by_packet, by_rto),
+        (1, 0),
+        "the one repair was ordered by the packet threshold and must be recorded \
+         under it: got packet={by_packet}, RACK={by_time}, RTO={by_rto}"
+    );
+
     server.disconnect().await.expect("server clean disconnect");
     client.disconnect().await.expect("client clean disconnect");
 }

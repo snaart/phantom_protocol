@@ -396,9 +396,15 @@ struct PendingData {
     #[allow(dead_code)]
     retries: u32,
     /// Flagged lost by the SACK-driven loss detector (RFC 9002 packet- or
-    /// time-threshold, L1-B). `poll_send`'s Pass-0 fast-retransmits it ahead of
-    /// cwnd/window, then clears the flag. Distinct from the RTO pass (Pass-1).
-    lost: bool,
+    /// time-threshold, L1-B), carrying which of the two arms fired.
+    /// `poll_send`'s Pass-0 fast-retransmits it ahead of cwnd/window, then
+    /// clears the flag. Distinct from the RTO pass (Pass-1), which sets no flag
+    /// at all and attributes its own copies to [`LossCause::Rto`].
+    ///
+    /// A cause rather than a bare `bool` because the flag is cleared the instant
+    /// Pass-0 hands the copy out, so this is the only place the attribution can
+    /// live between the declaration and the wire.
+    lost: Option<LossCause>,
     /// True when this is the reliable FIN sentinel (zero-length data, marks
     /// end-of-stream). The drain path ORs `PacketFlags::FIN` into the wire frame
     /// flags when it sees this segment. Stays in the send buffer until SACKed so
@@ -446,6 +452,45 @@ pub struct RetiredSegment {
     /// rate is judged at all — so it has to describe the flight the segment left
     /// with, not the phase in force when its acknowledgement happened to arrive.
     pub app_limited_at_send: bool,
+}
+
+/// Which rule ordered a repair — the one thing a recorded hole never said.
+///
+/// The three arms fire on different evidence and a run that conflates them cannot
+/// be read. The packet threshold fires on what acknowledgements carried:
+/// successors of a segment arrived and it did not. On a route that reorders, an
+/// overtaken datagram produces that same evidence without anything having been
+/// dropped, so this arm carries the whole false-declaration surface. RACK's time
+/// threshold fires on a clock instead, so it also covers a peer that acknowledged
+/// something and then went quiet. The RTO fires against a peer that has said
+/// nothing at all, and it is the backstop the other two are measured against.
+///
+/// **Which arm fires is selectable by the peer, and that is why the attribution
+/// must never reach a decision.** A receiver picks the packet-threshold arm by
+/// acknowledging a segment's successors while withholding the segment itself; it
+/// picks the RACK arm by acknowledging just short of `PACKET_THRESHOLD` and then
+/// going quiet past `srtt·9/8`, a duration derived from its own acknowledgement
+/// timing. The T5.4 clamp on `largest_acked` bounds how far the peer can push the
+/// value, not which rule the value satisfies. So this records what the peer's
+/// acknowledgements made this endpoint conclude — useful as a reading of a run,
+/// worthless as an input to anything, and dangerous if it ever becomes one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LossCause {
+    /// `largest_acked` reached `PACKET_THRESHOLD` past the segment's offset while
+    /// no copy of it had ever been on the wire.
+    PacketThreshold,
+    /// RACK: the segment aged past `srtt·9/8` since its latest transmission, with
+    /// an acknowledgement having moved past it.
+    TimeThreshold,
+    /// Both arms were satisfied by the same acknowledgement. Kept apart from the
+    /// two rather than folded into either, because the share of declarations that
+    /// only one arm would have made is the question this enum exists to answer,
+    /// and folding it in silently attributes them to whichever arm was tested
+    /// first.
+    BothThresholds,
+    /// The retransmission timer expired. Ordered by a local clock against a peer
+    /// that acknowledged nothing.
+    Rto,
 }
 
 /// One segment newly declared lost by [`Stream::on_sack`]'s RFC-9002 loss
@@ -520,6 +565,16 @@ pub struct OutboundSegment {
     /// passes bump and nothing else does, so it is a fact about this endpoint's
     /// own send history — nothing the peer sends can turn it on or off.
     pub first_retransmit: bool,
+    /// Which rule ordered this copy, or `None` for a first transmission, which no
+    /// rule ordered.
+    ///
+    /// Travels with the segment rather than being reported where the declaration
+    /// was made, because the congestion signal is raised where the copy reaches
+    /// the wire and not where the hole was noticed — that instant is the last one
+    /// in the segment's life the peer has no hand in, and it is where the count
+    /// has to be attributed for the attribution to mean the same thing as the
+    /// byte count beside it.
+    pub loss_cause: Option<LossCause>,
     /// True when this segment is the reliable FIN sentinel (zero-length data).
     /// The drain path must OR `PacketFlags::FIN` into the wire frame flags.
     pub fin: bool,
@@ -1403,7 +1458,7 @@ impl Stream {
             delivered_time_at_send: None,
             app_limited_at_send: false,
             retries: 0,
-            lost: false,
+            lost: None,
             fin: false,
             charged: false,
         };
@@ -1447,7 +1502,7 @@ impl Stream {
             delivered_time_at_send: None,
             app_limited_at_send: false,
             retries: 0,
-            lost: false,
+            lost: None,
             fin: false,
             charged: false,
         });
@@ -1474,7 +1529,7 @@ impl Stream {
             delivered_time_at_send: None,
             app_limited_at_send: false,
             retries: 0,
-            lost: false,
+            lost: None,
             fin: true,
             charged: false,
         });
@@ -1520,7 +1575,7 @@ impl Stream {
             delivered_time_at_send: None,
             app_limited_at_send: false,
             retries: 0,
-            lost: false,
+            lost: None,
             fin: true,
             charged: false,
         };
@@ -1662,6 +1717,7 @@ impl Stream {
             reliable: true,
             retransmit: false,
             first_retransmit: false,
+            loss_cause: None,
             fin: false,
         })
     }
@@ -1719,6 +1775,7 @@ impl Stream {
                 reliable: false,
                 retransmit: false,
                 first_retransmit: false,
+                loss_cause: None,
                 fin: false,
             });
         }
@@ -1749,8 +1806,8 @@ impl Stream {
         // repeated repair of the same hole. See `OutboundSegment::
         // first_retransmit`.
         for pending in buffer.iter_mut() {
-            if pending.lost && pending.sent_at.is_some() {
-                pending.lost = false;
+            if let (Some(cause), true) = (pending.lost, pending.sent_at.is_some()) {
+                pending.lost = None;
                 pending.sent_at = Some(now);
                 let first_retransmit = pending.retries == 0;
                 pending.retries += 1;
@@ -1760,6 +1817,7 @@ impl Stream {
                     reliable: true,
                     retransmit: true,
                     first_retransmit,
+                    loss_cause: Some(cause),
                     fin: pending.fin,
                 });
             }
@@ -1776,12 +1834,19 @@ impl Stream {
                     pending.retries += 1;
                     // Back the RTO off exponentially for the next attempt.
                     self.note_rto_timeout();
+                    // No flag to clear: Pass-0 returns on the first segment with
+                    // one, and `on_sack` only ever flags a segment that has been
+                    // sent — which is Pass-0's own take condition. So a segment
+                    // reaching this pass provably carries none, and a defensive
+                    // clear here would be a line that never runs, read by the next
+                    // person as evidence that it can.
                     return Ok(OutboundSegment {
                         stream_offset: pending.stream_offset,
                         data: pending.data.clone(),
                         reliable: true,
                         retransmit: true,
                         first_retransmit,
+                        loss_cause: Some(LossCause::Rto),
                         fin: pending.fin,
                     });
                 }
@@ -1841,6 +1906,7 @@ impl Stream {
                     reliable: true,
                     retransmit: false,
                     first_retransmit: false,
+                    loss_cause: None,
                     fin: is_fin,
                 });
             }
@@ -2086,7 +2152,7 @@ impl Stream {
             .map(|r| std::cmp::max(Duration::from_millis(1), r * 9 / 8));
         let mut lost = Vec::new();
         for pending in buffer.iter_mut() {
-            if pending.lost {
+            if pending.lost.is_some() {
                 continue;
             }
             let Some(sent_at) = pending.sent_at else {
@@ -2120,8 +2186,17 @@ impl Stream {
             let packet_lost = pending.retries == 0
                 && largest_acked >= pending.stream_offset.saturating_add(PACKET_THRESHOLD);
             let time_lost = time_threshold.is_some_and(|t| now.duration_since(sent_at) >= t);
-            if packet_lost || time_lost {
-                pending.lost = true;
+            // Which arm fired is kept rather than collapsed into the `if`, because
+            // the two carry different evidence about the path and a recorded run
+            // that cannot tell them apart cannot say what the sender's holes were.
+            let cause = match (packet_lost, time_lost) {
+                (true, true) => Some(LossCause::BothThresholds),
+                (true, false) => Some(LossCause::PacketThreshold),
+                (false, true) => Some(LossCause::TimeThreshold),
+                (false, false) => None,
+            };
+            if let Some(cause) = cause {
+                pending.lost = Some(cause);
                 lost.push(LostSegment {
                     stream_offset: pending.stream_offset,
                     size: pending.data.len() as u64,
@@ -3105,6 +3180,164 @@ mod tests {
         );
     }
 
+    /// **Which rule declared a segment lost survives as far as the copy going out.**
+    ///
+    /// Three rules can order a retransmission and they mean different things about
+    /// the path. The packet threshold fires on evidence carried by acknowledgements
+    /// — successors arrived and this one did not — and on a route that reorders it
+    /// fires on an overtake as readily as on a drop. RACK's time threshold fires on
+    /// a clock, so it also fires against a peer that has gone quiet after
+    /// acknowledging something. The RTO fires against a peer that has said nothing
+    /// at all. A recorded run that cannot tell them apart cannot say whether a
+    /// sender's holes came from the path, from its own queue, or from silence, and
+    /// the three ask for different work.
+    ///
+    /// The cause is carried on the segment rather than reported at declaration time
+    /// because the congestion signal is raised where the copy is put on the wire —
+    /// `api/session.rs`, `if seg.first_retransmit` — and that is the instant the
+    /// count has to be attributed at, once per hole.
+    #[tokio::test]
+    async fn a_declaration_carries_which_rule_ordered_it() {
+        tokio::time::pause();
+        // A round trip the retires below will measure, so the RACK arm is tested
+        // against `srtt·9/8` rather than against the 1 ms `kGranularity` floor.
+        // Under a paused clock a retire that follows its send instantly measures
+        // zero, the threshold falls to the floor, and the arm then fires for a
+        // reason this test does not name: an earlier version of it passed with
+        // the multiplier in `srtt·9/8` replaced by a million.
+        const ROUND_TRIP: Duration = Duration::from_millis(100);
+
+        let (stream, sack) = stream_with_one_open_hole().await;
+        tokio::time::advance(ROUND_TRIP).await;
+
+        // The packet threshold on its own. Offset 0 sits three behind
+        // `largest_acked` with no copy of it on the wire, and its age is under
+        // `srtt·9/8`, so the RACK arm cannot have fired.
+        let result = stream.on_sack(&sack).await;
+        assert_eq!(result.lost_offsets(), vec![0]);
+        let seg = stream
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
+            .await
+            .expect("Pass-0 hands back the flagged copy");
+        assert!(
+            seg.first_retransmit,
+            "no copy of offset 0 has been sent yet"
+        );
+        assert_eq!(
+            seg.loss_cause,
+            Some(LossCause::PacketThreshold),
+            "a hole three offsets behind largest_acked, never resent and younger \
+             than the time threshold, is the packet-threshold arm alone"
+        );
+
+        // RACK on its own. Offset 0 now has a copy on the wire, so the packet
+        // threshold can no longer fire for it (`retries == 0` is false), and the
+        // retires above supplied the RTT sample the time threshold is expressed
+        // in. Age the copy past `srtt·9/8` and the same SACK re-declares it.
+        let srtt = stream
+            .smoothed_rtt()
+            .expect("the retires supplied a sample");
+        assert!(
+            srtt >= ROUND_TRIP / 2,
+            "precondition: the measured round trip must be well clear of the 1 ms \
+             floor, or this case tests the floor and not srtt·9/8 (got {srtt:?})"
+        );
+        tokio::time::advance(srtt * 2).await;
+        let again = stream.on_sack(&sack).await;
+        assert_eq!(
+            again.lost_offsets(),
+            vec![0],
+            "RACK re-declares a segment whose copy is itself overdue"
+        );
+        let rack_copy = stream
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
+            .await
+            .expect("Pass-0 again");
+        assert_eq!(
+            rack_copy.loss_cause,
+            Some(LossCause::TimeThreshold),
+            "a segment already resent cannot satisfy the packet threshold, so this \
+             declaration is the clock's and must not be filed under the arm that \
+             reads acknowledgements"
+        );
+        assert!(
+            !rack_copy.first_retransmit,
+            "this copy is not the segment's first, which is why the attribution \
+             cannot be booked per hole: doing so would drop every RACK \
+             re-declaration and leave the packet-threshold arm looking dominant \
+             by construction"
+        );
+
+        // The RTO: a segment nothing has acknowledged and nothing has flagged,
+        // whose timer simply expired.
+        let fresh = Stream::new(2);
+        fresh
+            .send_reliable(Bytes::from_static(b"x"))
+            .await
+            .expect("queued");
+        let first = fresh
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
+            .await
+            .expect("first transmission");
+        assert_eq!(
+            first.loss_cause, None,
+            "a first transmission was ordered by nothing — it is not a repair"
+        );
+        tokio::time::advance(Duration::from_secs(3)).await;
+        let after_rto = fresh
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
+            .await
+            .expect("the RTO pass");
+        assert!(after_rto.retransmit && after_rto.first_retransmit);
+        assert_eq!(
+            after_rto.loss_cause,
+            Some(LossCause::Rto),
+            "a copy the timer ordered must not be attributed to a threshold the \
+             acknowledgements never satisfied"
+        );
+
+        // Both arms at once. Offsets 1..=3 are acknowledged while 0 is not, which
+        // satisfies the packet threshold for a segment never resent — and enough
+        // time has passed for RACK as well.
+        let both = Stream::new(3);
+        for _ in 0..4u32 {
+            both.send_reliable(Bytes::from_static(b"x"))
+                .await
+                .expect("queued");
+            both.poll_send(u64::MAX, 0, std::time::Instant::now(), false)
+                .await
+                .expect("in flight");
+        }
+        tokio::time::advance(ROUND_TRIP).await;
+        // One retire first, so the stream has an RTT sample and therefore a time
+        // threshold at all; without it RACK cannot fire and this case degenerates
+        // into the packet-threshold one it exists to be distinguished from.
+        let seed = Sack::from_received(&[1], 0).expect("one retire");
+        both.on_sack(&seed).await;
+        let srtt_both = both.smoothed_rtt().expect("the retire supplied a sample");
+        assert!(
+            srtt_both >= ROUND_TRIP / 2,
+            "precondition: same as above — the joint case has to clear srtt·9/8 \
+             and not the floor (got {srtt_both:?})"
+        );
+        tokio::time::advance(srtt_both * 2).await;
+        let result = both
+            .on_sack(&Sack::from_received(&[1, 2, 3], 0).expect("sack"))
+            .await;
+        assert_eq!(result.lost_offsets(), vec![0]);
+        let joint = both
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
+            .await
+            .expect("Pass-0");
+        assert_eq!(
+            joint.loss_cause,
+            Some(LossCause::BothThresholds),
+            "a declaration both rules would have made on their own is its own \
+             answer: folding it into either arm hides how many copies only one \
+             rule was responsible for"
+        );
+    }
+
     /// Two-sided companion: a retransmission that is *itself* lost must be
     /// re-declared. The rule that replaces the packet threshold is RACK's time
     /// threshold measured from the latest transmission — so the re-detection is
@@ -3351,6 +3584,9 @@ mod tests {
             .ok()?;
         if seg.retransmit {
             est.on_retransmit(seg.data.len() as u64);
+            if let Some(cause) = seg.loss_cause {
+                est.note_repair_ordered_by(cause);
+            }
             if seg.first_retransmit {
                 est.on_loss(seg.data.len() as u64);
             }

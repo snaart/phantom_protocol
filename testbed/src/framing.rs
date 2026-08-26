@@ -273,6 +273,16 @@ impl MsgLink for Framed {
                 // filling them cost.
                 bytes_retransmitted: bw.bytes_retransmitted,
                 bytes_lost: bw.bytes_lost,
+                // And the count those bytes weigh, split by which rule ordered
+                // each repair. A byte total cannot say whether a sender's holes
+                // were found by acknowledgements naming their successors or by a
+                // clock running out, and the two are different findings about the
+                // path.
+                loss_declarations: bw.loss_declarations,
+                repairs_attributed: bw.repairs_attributed,
+                declared_by_packet_threshold: bw.declared_by_packet_threshold,
+                declared_by_time_threshold: bw.declared_by_time_threshold,
+                declared_by_rto: bw.declared_by_rto,
                 inflight_hi_bytes: bw.inflight_hi_bytes,
             })
         })
@@ -411,6 +421,11 @@ pub(crate) mod testing {
                     // columns is visible.
                     bytes_retransmitted: 2800,
                     bytes_lost: 1400,
+                    loss_declarations: 1,
+                    repairs_attributed: 2,
+                    declared_by_packet_threshold: 1,
+                    declared_by_time_threshold: 0,
+                    declared_by_rto: 0,
                     inflight_hi_bytes: 4200,
                 })
             })
@@ -578,5 +593,142 @@ mod tests {
         );
         assert_eq!(got[0].1.message_len, a.encode().len());
         assert_eq!(got[1].1.message_len, b.encode().len());
+    }
+
+    /// **Every column the artifact carries must actually be read out of the
+    /// snapshot, and the compiler cannot say so.**
+    ///
+    /// `WindowSample` is a plain struct: a field assigned `0` compiles exactly as
+    /// well as one assigned `bw.field`, and the row that results looks like a
+    /// measured zero rather than a column that stopped being written. That is not
+    /// hypothetical — a previous set of counters reached `MetricsSnapshotFfi` and
+    /// stopped there, so a run that was supposed to prove a mechanism worked
+    /// recorded nothing and could not say it had recorded nothing. The break was
+    /// in the writing, not in the deciding, and nothing failed.
+    ///
+    /// So this reads the two sources it sits between: the field list of
+    /// `WindowSample` out of `report.rs`, and this file's own Phantom-leg
+    /// constructor. Every field must either be assigned from `bw` or appear in
+    /// the exemption list below with a reason. Adding a column to `report.rs`
+    /// without wiring it here turns this red, which is the whole point.
+    ///
+    /// The exemptions are exemptions from *this* check, not from being recorded:
+    /// each is written from something other than the snapshot, and the check
+    /// verifies each is at least mentioned so a typo cannot hide inside one.
+    #[test]
+    fn every_recorded_column_is_read_from_the_snapshot() {
+        const REPORT_SRC: &str = include_str!("report.rs");
+        const FRAMING_SRC: &str = include_str!("framing.rs");
+
+        // Written from something other than `bw`, each for its own reason.
+        const NOT_FROM_THE_SNAPSHOT: &[(&str, &str)] = &[
+            ("leg", "an argument — which leg this row describes"),
+            ("phase", "an argument — the scenario that was running"),
+            ("t_unix_ns", "the sampler's own clock"),
+            ("elapsed_ms", "an argument — offset within the transfer"),
+            (
+                "bw_filter_window_ms",
+                "read from the library constant so the row names the horizon this \
+                 binary's estimator used, not one restated here",
+            ),
+            ("min_rtt_us", "converted from bw.min_rtt, a Duration"),
+            ("state", "converted from bw.state, an enum"),
+        ];
+
+        let fields = window_sample_fields(REPORT_SRC);
+        assert!(
+            fields.contains(&"cwnd_bytes".to_string()),
+            "the field parse produced {} name(s) and none was cwnd_bytes — the \
+             parse is broken, so its silence about missing columns means nothing",
+            fields.len()
+        );
+
+        let ctor = phantom_leg_constructor(FRAMING_SRC);
+        assert!(
+            ctor.contains("cwnd_bytes: bw.cwnd_bytes"),
+            "the constructor slice does not contain a known assignment, so this \
+             check is reading the wrong text"
+        );
+
+        let mut unwired = Vec::new();
+        for f in &fields {
+            if let Some((_, _why)) = NOT_FROM_THE_SNAPSHOT.iter().find(|(n, _)| n == f) {
+                // Either `name: expr,` or the shorthand `name,` — both are
+                // assignments and only the second has no colon.
+                assert!(
+                    ctor.contains(&format!("{f}:")) || ctor.contains(&format!("{f},")),
+                    "{f} is exempted from being read out of the snapshot but is not \
+                     written at all"
+                );
+                continue;
+            }
+            if !ctor.contains(&format!("{f}: bw.{f},")) {
+                unwired.push(f.clone());
+            }
+        }
+        assert!(
+            unwired.is_empty(),
+            "these columns exist in the artifact but are not read from the \
+             snapshot: {unwired:?}"
+        );
+    }
+
+    /// Field names of `WindowSample`, read out of `report.rs`.
+    fn window_sample_fields(src: &str) -> Vec<String> {
+        let Some(start) = src.find("pub struct WindowSample") else {
+            return Vec::new();
+        };
+        let mut depth = 0usize;
+        let mut end = start;
+        for (i, c) in src[start..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        src[start..end]
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                let rest = l.strip_prefix("pub ")?;
+                let name = rest.split(':').next()?;
+                name.chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
+                    .then(|| name.to_string())
+            })
+            .collect()
+    }
+
+    /// The Phantom leg's `WindowSample` constructor, as text, with comments
+    /// stripped.
+    ///
+    /// Stripping them is the whole difference between a gate and a decoration.
+    /// The check is a substring test, and every field it looks for is *named* in
+    /// the prose above its own assignment — so commenting an assignment out and
+    /// hardcoding a zero beside it left the name in view and the gate green. That
+    /// is the exact shape of break this exists to catch, and it survived the first
+    /// version of it.
+    fn phantom_leg_constructor(src: &str) -> String {
+        let anchor = "let bw = self.session.bandwidth_snapshot().await?;";
+        let Some(start) = src.find(anchor) else {
+            return String::new();
+        };
+        let tail = &src[start..];
+        let end = tail.find("\n        })").unwrap_or(tail.len());
+        tail[..end]
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

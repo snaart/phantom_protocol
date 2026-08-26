@@ -509,6 +509,43 @@ pub struct WindowSample {
     /// the round loss rate the inflight bound is judged on.
     #[serde(default)]
     pub bytes_lost: u64,
+    /// Holes declared, one per segment the sender first ordered a copy of — the
+    /// count [`Self::bytes_lost`] is the byte weight of.
+    ///
+    /// The row carried the weight and not the count, and they are different
+    /// findings: two megabytes of holes at 1156 bytes each is a different path
+    /// from two megabytes at two hundred.
+    #[serde(default)]
+    pub loss_declarations: u64,
+    /// Copies whose ordering rule was recorded — the denominator of the three arm
+    /// counters below, and **not** the same population as
+    /// [`Self::loss_declarations`]: a hole is counted once however many copies
+    /// repairing it took, while every copy is attributed. One of the three rules
+    /// can only fire on a segment with no copy on the wire, so attributing per
+    /// hole would have fixed its share by construction rather than measuring it.
+    #[serde(default)]
+    pub repairs_attributed: u64,
+    /// Of those copies, the ones the packet threshold ordered — successors of a
+    /// segment were acknowledged and it was not.
+    ///
+    /// This is the arm an overtaken datagram satisfies without anything having
+    /// been dropped, so a run whose repairs sit here while its raw controls
+    /// report no reordering is saying its holes were drops. Sums with
+    /// [`Self::declared_by_time_threshold`] and [`Self::declared_by_rto`] to more
+    /// than [`Self::repairs_attributed`] by the number of copies both threshold
+    /// arms ordered.
+    #[serde(default)]
+    pub declared_by_packet_threshold: u64,
+    /// Of those copies, the ones RACK's time threshold ordered — the segment aged
+    /// past `srtt·9/8` since its latest transmission, with an acknowledgement having
+    /// moved past it.
+    #[serde(default)]
+    pub declared_by_time_threshold: u64,
+    /// Of those, the ones the retransmission timer ordered against a peer that
+    /// had acknowledged nothing — the backstop underneath the other two, and the
+    /// only arm no acknowledgement takes part in.
+    #[serde(default)]
+    pub declared_by_rto: u64,
     /// The loss-imposed bound on bytes outstanding, or `0` when the path has
     /// given no reason for one.
     ///
@@ -1822,6 +1859,17 @@ mod tests {
              must load with them absent rather than fail to parse, which is the \
              only reason an archive is worth keeping"
         );
+        assert_eq!(
+            (
+                s.loss_declarations,
+                s.declared_by_packet_threshold,
+                s.declared_by_time_threshold,
+                s.declared_by_rto
+            ),
+            (0, 0, 0, 0),
+            "and so does the declaration count and its split, which postdate even \
+             the byte columns"
+        );
     }
 
     /// The loss columns have to survive the round trip through the artifact, and
@@ -1850,6 +1898,53 @@ mod tests {
         assert_eq!(back.bytes_retransmitted, row.bytes_retransmitted);
         assert_eq!(back.bytes_lost, row.bytes_lost);
         assert_eq!(back.inflight_hi_bytes, row.inflight_hi_bytes);
+
+        // The declaration count and its split ride the same trip, and the same
+        // hazard applies with more surface: four small integers of similar size,
+        // any pair of which could be swapped without the row looking wrong. The
+        // fixture keeps all four apart and keeps the arms summing past the total,
+        // which is the shape a real split has.
+        assert_eq!(back.loss_declarations, row.loss_declarations);
+        assert_eq!(back.repairs_attributed, row.repairs_attributed);
+        assert_eq!(
+            back.declared_by_packet_threshold,
+            row.declared_by_packet_threshold
+        );
+        assert_eq!(
+            back.declared_by_time_threshold,
+            row.declared_by_time_threshold
+        );
+        assert_eq!(back.declared_by_rto, row.declared_by_rto);
+        assert!(
+            back.declared_by_packet_threshold != back.declared_by_time_threshold
+                && back.declared_by_time_threshold != back.declared_by_rto
+                && back.declared_by_packet_threshold != back.declared_by_rto,
+            "the fixture must keep the three arms at distinct values, or a swap \
+             between two of them survives this test"
+        );
+        assert!(
+            [
+                back.loss_declarations,
+                back.repairs_attributed,
+                back.declared_by_packet_threshold,
+                back.declared_by_time_threshold,
+                back.declared_by_rto,
+            ]
+            .iter()
+            .all(|v| *v != 0),
+            "no count in this fixture may be zero: a zero round-trips through a \
+             dropped field, a skipped serialization and a mistyped name alike, so \
+             a column pinned at zero is a column this test cannot see"
+        );
+        assert!(
+            back.declared_by_packet_threshold
+                + back.declared_by_time_threshold
+                + back.declared_by_rto
+                > back.repairs_attributed,
+            "the arms exceed the copies by the joint orders; a fixture where they \
+             merely summed to it could not tell a lost joint count from a correct \
+             one"
+        );
     }
 
     /// A window row shaped the way the Phantom legs record one.
@@ -1872,6 +1967,11 @@ mod tests {
             app_limited: false,
             bytes_retransmitted: 34_680,
             bytes_lost: 11_560,
+            loss_declarations: 10,
+            repairs_attributed: 12,
+            declared_by_packet_threshold: 7,
+            declared_by_time_threshold: 4,
+            declared_by_rto: 3,
             inflight_hi_bytes: 300_000,
         }
     }

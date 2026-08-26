@@ -3097,6 +3097,24 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
             // while it happens.
             if seg.retransmit {
                 crypto_session.on_packet_retransmitted(seg.data.len() as u64);
+                // Which rule ordered this copy is recorded for **every** copy,
+                // and deliberately not only for the first.
+                //
+                // The two counts answer different questions and share no
+                // denominator. A hole is booked once however many copies it
+                // takes, so the hole count pairs with the bytes charged to
+                // congestion control. But a rule's *rate of firing* is a
+                // property of the copies it ordered, and RACK's characteristic
+                // failure — re-declaring a segment whose repair is merely slow,
+                // once per `srtt·9/8` — lives entirely in the copies after the
+                // first. Attributing only first copies would have left the
+                // instrument blind to precisely the behaviour it was built to
+                // look for, and every run would have reported a packet-threshold
+                // majority by construction, since that arm can only ever fire on
+                // a segment with no copy on the wire.
+                if let Some(cause) = seg.loss_cause {
+                    crypto_session.note_repair_ordered_by(cause);
+                }
                 if seg.first_retransmit {
                     crypto_session.on_packet_lost(seg.data.len() as u64);
                 }
