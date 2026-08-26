@@ -1031,6 +1031,30 @@ def drain_census(rows):
     }
 
 
+def dry_split_sentence(census):
+    """How the dry-pass split reads, or `None` when no pass ran dry.
+
+    The sentence has to say the opposite thing at zero, and the first version did
+    not: it ended "the application waiting on us, not the other way round"
+    whatever the count was, which at zero states the reverse of the finding. Zero
+    is what the first run carrying the column reported — 0 of 1375 and 0 of 3668 —
+    so the wrong half of the sentence would have been the one printed.
+    """
+    dry = census["counts"][0]
+    if not dry:
+        return None
+    full = census["dry_against_a_full_buffer"]
+    share = census["dry_share_full_buffer"] or 0.0
+    tail = (
+        " — the application was waiting on this endpoint's own ceiling, not the "
+        "other way round"
+        if full
+        else " — so this endpoint's own send buffer is not what emptied those "
+        "passes, and whatever did is still unnamed"
+    )
+    return f"of the {dry} that ran dry, {full} did so against a full send buffer ({share:.0%}){tail}"
+
+
 def app_limited_reading(rows):
     """The share of acknowledged bytes whose segment left inside the phase.
 
@@ -2266,14 +2290,9 @@ def send_bound_series(f, scenario, phase, tag, rows):
             "drawn from the window afterwards and cannot tell a pass the pacer "
             "metered from one that ran dry with the window open"
         )
-        if census["counts"][0]:
-            share = census["dry_share_full_buffer"]
-            print(
-                f"{pad} {'':2}of the {census['counts'][0]} that ran dry, "
-                f"{census['dry_against_a_full_buffer']} did so against a full send "
-                f"buffer" + (f" ({share:.0%})" if share is not None else "")
-                + " — the application waiting on us, not the other way round"
-            )
+        sentence = dry_split_sentence(census)
+        if sentence:
+            print(f"{pad} {'':2}{sentence}")
 
     al = app_limited_reading(rows)
     if al:
@@ -3324,6 +3343,21 @@ def self_test():
         ),
     ]
 
+    # The sentence that goes with the split has to say the opposite thing at zero.
+    # It read "the application waiting on us, not the other way round" whatever the
+    # count was, which at zero states the reverse of the finding — and zero is what
+    # the first run carrying the column actually reported.
+    dry_sentence_cases = [
+        ([win(drain_outcomes=[40, 0, 0, 0, 0, 0], dry_passes_against_a_full_buffer=20)],
+         "waiting on this endpoint's own ceiling"),
+        ([win(drain_outcomes=[40, 0, 0, 0, 0, 0], dry_passes_against_a_full_buffer=0)],
+         "still unnamed"),
+        # No pass ran dry at all: there is nothing to split and no sentence to
+        # print. A zero share here would be a statement about a population of
+        # none.
+        ([win(drain_outcomes=[0, 5, 0, 0, 0, 5], dry_passes_against_a_full_buffer=0)], None),
+    ]
+
     # The margin between the two rules, and the one case that must not be a
     # number: a run recorded before the smoothed round trip existed cannot state
     # it, and a zero would say the timer and the threshold fire together.
@@ -4072,6 +4106,11 @@ def self_test():
         ok = got is not None and all(got[k] == v for k, v in want.items())
         failures += 0 if ok else 1
         print(f"  {'ok' if ok else 'FAIL'}: drain_census dry split ({name})")
+    for rows_c, wanted in dry_sentence_cases:
+        got = dry_split_sentence(drain_census(rows_c))
+        ok = (got is None) if wanted is None else (got is not None and wanted in got)
+        failures += 0 if ok else 1
+        print(f"  {'ok' if ok else 'FAIL'}: dry_split_sentence says {wanted!r}")
     for name, rows_c, want in drain_census_cases:
         got = drain_census(rows_c)
         if want is None:
@@ -4214,6 +4253,7 @@ def self_test():
         + len(drain_census_cases)
         + len(app_limited_cases)
         + len(dry_split_cases)
+        + len(dry_sentence_cases)
         + len(arm_cases)
         + len(retransmit_cases)
         + (0 if skipped else 1)  # the window-sample column gate, when it could run
