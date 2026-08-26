@@ -483,6 +483,17 @@ pub struct WindowSample {
     /// ceilings — the flag stood in 68.6% and 100% of steady-state samples.
     #[serde(default)]
     pub dry_passes_against_a_full_buffer: u64,
+    /// Room left in the peer's advertised window as of the last drain pass, in
+    /// bytes — the minimum over the streams that pass looked at.
+    ///
+    /// The sender settles at 0.81-0.88 MB against a 1.05 MB ceiling in five runs,
+    /// and bytes outstanding cannot say whether the missing fifth is the peer's
+    /// grant lagging or something on this side. The grant is cumulative and rides
+    /// in a frame nothing retransmits, so under load it trails by about a round
+    /// trip; that reads here as a remainder well under the nominal window while
+    /// nothing else constrains the sender.
+    #[serde(default)]
+    pub peer_window_remaining: u64,
     /// Of the dry passes, those that met a stream with no room left in the peer's
     /// advertised window — the pass `poll_send` would have called `FlowControl`
     /// had it held an unsent segment to be refused.
@@ -2039,6 +2050,7 @@ mod tests {
             pacing_rate_bps: 1_000_000,
             min_rtt_us: 235_000,
             dry_passes_against_a_full_buffer: 26,
+            peer_window_remaining: 212_992,
             dry_passes_with_no_peer_window: 9,
             dry_passes_with_pump_work: 17,
             app_limited_acked_bytes: 4_112_000,

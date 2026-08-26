@@ -388,6 +388,12 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
     The first two travel together because neither is interpretable alone: one counts copies
     emitted, the other counts holes charged, and only their difference says what repairing
     the path's repairs cost.
+  * `BandwidthSnapshot::peer_window_remaining` — the room the peer's advertised window
+    had left as of the last drain pass, the minimum over the streams that pass looked
+    at. The sender settles a fifth below the nominal ceiling in five recorded runs and
+    bytes outstanding cannot say why; the grant is cumulative and rides in a frame
+    nothing retransmits, so under load it trails by about a round trip, which reads
+    here as a remainder well under the nominal window. Read by nothing.
   * `BandwidthSnapshot::{dry_passes_with_no_peer_window, dry_passes_with_pump_work}` —
     the two remaining states a dry drain pass can have been in, neither of them an
     application that ran out. The first is a stream whose peer window is spent:

@@ -1367,6 +1367,14 @@ impl Session {
             .note_dry_pass(against_a_full_buffer, peer_window_exhausted);
     }
 
+    /// Record the room left in the peer's advertised window, as the drain saw it.
+    /// Recorded, read by nothing.
+    pub fn note_peer_window_remaining(&self, bytes: u64) {
+        self.bandwidth_estimator
+            .lock()
+            .note_peer_window_remaining(bytes);
+    }
+
     /// Count a dry pass that happened while the pump held application bytes of its
     /// own — deferred, or unread in its command channel. Recorded, not acted on.
     ///
@@ -1508,6 +1516,7 @@ impl Session {
             min_rtt: est.min_rtt(),
             drain_outcomes: est.drain_outcomes(),
             dry_passes_against_a_full_buffer: est.dry_passes_against_a_full_buffer(),
+            peer_window_remaining: est.peer_window_remaining(),
             dry_passes_with_no_peer_window: est.dry_passes_with_no_peer_window(),
             dry_passes_with_pump_work: est.dry_passes_with_pump_work(),
             app_limited_acked_bytes: est.app_limited_acked_bytes(),
@@ -1893,6 +1902,16 @@ pub struct BandwidthSnapshot {
     /// the same population split in two, and the split is the difference between
     /// "the application was the limit" and "the application was waiting for us".
     pub dry_passes_against_a_full_buffer: u64,
+    /// Room left in the peer's advertised window as of the last drain pass — the
+    /// minimum over the streams that pass looked at.
+    ///
+    /// The sender settles at 0.81-0.88 MB against a 1.05 MB ceiling, and whether
+    /// the missing fifth is the peer's grant arriving late or something on this
+    /// side cannot be told from `inflight` alone. The grant is cumulative and
+    /// rides in a frame nothing retransmits, so under load it lags by about a
+    /// round trip; that would read here as a remainder well under the nominal
+    /// window while nothing else constrains the sender.
+    pub peer_window_remaining: u64,
     /// Of the dry passes, those that found a stream with no room left in the peer's
     /// advertised window — the pass `poll_send` would have called `FlowControl`
     /// had it held an unsent segment to be refused.

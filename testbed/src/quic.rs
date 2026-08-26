@@ -500,6 +500,7 @@ impl MsgLink for QuicLink {
                 pacing_rate_bps: 0,
                 min_rtt_us: s.path.rtt.as_micros() as u64,
                 dry_passes_against_a_full_buffer: 0,
+                peer_window_remaining: 0,
                 dry_passes_with_no_peer_window: 0,
                 dry_passes_with_pump_work: 0,
                 app_limited_acked_bytes: 0,

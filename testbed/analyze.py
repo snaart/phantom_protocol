@@ -2323,6 +2323,18 @@ def send_bound_series(f, scenario, phase, tag, rows):
         if sentence:
             print(f"{pad} {'':2}{sentence}")
 
+    # How much of the peer's window was actually on offer. The nominal ceiling is a
+    # constant; what the sender could use is this, and the two differ by however
+    # far the peer's cumulative grant trails under load.
+    remains = [r.get("peer_window_remaining") or 0 for r in rows if "peer_window_remaining" in r]
+    if remains and max(remains) > 0:
+        print(
+            f"{pad} peer window left, as the drain saw it: median "
+            f"{pct(remains, 0.5) / 1024:.0f} KiB, p10 {pct(remains, 0.1) / 1024:.0f}, "
+            f"max {max(remains) / 1024:.0f} — against a nominal "
+            f"{PEER_SEND_WINDOW_BYTES / 1024:.0f} KiB"
+        )
+
     al = app_limited_reading(rows)
     if al:
         print(

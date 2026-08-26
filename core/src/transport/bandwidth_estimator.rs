@@ -944,6 +944,9 @@ pub struct BandwidthEstimator {
     /// send buffer full — the application parked against this endpoint's own
     /// ceiling rather than out of data.
     dry_passes_against_a_full_buffer: u64,
+    /// Room left in the peer's advertised window as of the last drain pass, the
+    /// minimum over the streams it looked at. Diagnostics only.
+    peer_window_remaining: u64,
     /// Of the dry passes, those that found a stream with no room left in the
     /// peer's advertised window.
     ///
@@ -1060,6 +1063,7 @@ impl BandwidthEstimator {
             declared_by_time_threshold: 0,
             declared_by_rto: 0,
             dry_passes_against_a_full_buffer: 0,
+            peer_window_remaining: 0,
             dry_passes_with_no_peer_window: 0,
             dry_passes_with_pump_work: 0,
             acked_bytes_app_limited: 0,
@@ -1651,6 +1655,24 @@ impl BandwidthEstimator {
             self.dry_passes_with_no_peer_window =
                 self.dry_passes_with_no_peer_window.saturating_add(1);
         }
+    }
+
+    /// Record the room left in the peer's advertised window, as the drain saw it.
+    ///
+    /// Recorded and read by nothing. It answers a question the artifact could not:
+    /// the sender settles at 0.81-0.88 MB against a 1.05 MB ceiling, and whether
+    /// the missing fifth is the peer's grant arriving late or something on this
+    /// side is not decidable from `inflight` alone. The grant is cumulative and
+    /// travels in a frame nothing retransmits, so it lags by about a round trip
+    /// under load — which would show up here as a remainder well under the
+    /// nominal window while the sender is otherwise unconstrained.
+    pub fn note_peer_window_remaining(&mut self, bytes: u64) {
+        self.peer_window_remaining = bytes;
+    }
+
+    /// Room left in the peer's advertised window as of the last drain pass.
+    pub fn peer_window_remaining(&self) -> u64 {
+        self.peer_window_remaining
     }
 
     /// Count a dry pass that happened while the pump itself was holding

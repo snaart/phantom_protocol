@@ -5013,6 +5013,7 @@ mod tests {
             pacing_rate_bps: 1_000_000,
             min_rtt_us: 200_000,
             dry_passes_against_a_full_buffer: 0,
+            peer_window_remaining: 0,
             dry_passes_with_no_peer_window: 0,
             dry_passes_with_pump_work: 0,
             app_limited_acked_bytes: 0,

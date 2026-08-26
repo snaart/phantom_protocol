@@ -3227,6 +3227,20 @@ async fn drain_streams_inner<T: SessionTransport>(
             sent += 1;
         }
     }
+    // The room the peer has left, as this pass saw it — the minimum over the
+    // streams it looked at, and zero when it looked at none. Recorded on every
+    // pass rather than only on the dry ones, because the question it answers is
+    // about the passes that *did* send: the sender settles a fifth below the
+    // nominal ceiling, and whether that fifth is the peer's cumulative grant
+    // lagging under load or something on this side cannot be told from bytes
+    // outstanding alone.
+    crypto_session.note_peer_window_remaining(
+        snapshot
+            .iter()
+            .map(|(_, _, s)| u64::from(s.peer_send_window()))
+            .min()
+            .unwrap_or(0),
+    );
     // A refusal outranks everything a stream reported: whatever the streams had
     // to say about their own buffers, this pass ended because the wire would not
     // take the bytes.
