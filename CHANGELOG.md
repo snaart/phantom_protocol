@@ -388,6 +388,15 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
     The first two travel together because neither is interpretable alone: one counts copies
     emitted, the other counts holes charged, and only their difference says what repairing
     the path's repairs cost.
+  * `BandwidthSnapshot::{dry_passes_with_no_peer_window, dry_passes_with_pump_work}` —
+    the two remaining states a dry drain pass can have been in, neither of them an
+    application that ran out. The first is a stream whose peer window is spent:
+    `poll_send` reports `FlowControl` only when it holds an unsent segment for the
+    peer to refuse, so with nothing unsent it answers the same `Idle` an empty
+    stream gives, and which of the two a pass reports turns on whether the peer's
+    SACK or its `WINDOW_UPDATE` arrived first — only one of them opens the phase.
+    The second is the pump holding application bytes of its own, deferred or unread,
+    while reporting that the application had none. Read by nothing.
   * `BandwidthSnapshot::{dry_passes_against_a_full_buffer, app_limited_acked_bytes}`
     — the two halves of the application-limited question that a recorded run could
     not previously separate. `Stream::poll_send` answers the same `Idle` for a

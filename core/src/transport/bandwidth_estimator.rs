@@ -944,6 +944,20 @@ pub struct BandwidthEstimator {
     /// send buffer full — the application parked against this endpoint's own
     /// ceiling rather than out of data.
     dry_passes_against_a_full_buffer: u64,
+    /// Of the dry passes, those that found a stream with no room left in the
+    /// peer's advertised window.
+    ///
+    /// `poll_send` reports `FlowControl` only when it has an *unsent* segment to
+    /// be refused; with nothing unsent it answers the same `Idle` an empty stream
+    /// gives, whatever the peer's window says. So which of the two a pass reports
+    /// is decided by whether the peer's SACK or its `WINDOW_UPDATE` arrived first
+    /// — a peer-chosen ordering reaching a local decision, since only one of the
+    /// two opens an application-limited phase. This counts how often that
+    /// mattered.
+    dry_passes_with_no_peer_window: u64,
+    /// Of the dry passes, those that happened while the pump was holding
+    /// application bytes of its own — deferred, or unread in its command channel.
+    dry_passes_with_pump_work: u64,
     /// Acknowledged bytes whose segment was **sent** inside an application-limited
     /// phase, and acknowledged bytes in total.
     ///
@@ -1046,6 +1060,8 @@ impl BandwidthEstimator {
             declared_by_time_threshold: 0,
             declared_by_rto: 0,
             dry_passes_against_a_full_buffer: 0,
+            dry_passes_with_no_peer_window: 0,
+            dry_passes_with_pump_work: 0,
             acked_bytes_app_limited: 0,
             acked_bytes_total: 0,
             drain_outcomes: [0; 6],
@@ -1459,9 +1475,27 @@ impl BandwidthEstimator {
     /// still had room: a stream can run dry with the window *already* full — the
     /// last segment it had fitted exactly — and that pass was bounded by the
     /// window, not by the application. Requiring room left over is what keeps
-    /// "ran out of data" from quietly covering "ran out of window", and it is
-    /// canonical (Linux's `tcp_rate_check_app_limited` carries the same
-    /// `packets_in_flight < cwnd` term).
+    /// "ran out of data" from quietly covering "ran out of window".
+    ///
+    /// **That term is Linux's, and the rest of Linux's condition is not here.**
+    /// `tcp_rate_check_app_limited` requires four things together: less than one
+    /// MSS of *unsent* data in the socket send buffer, nothing queued in the
+    /// local transmit path, `packets_in_flight < cwnd`, and every declared loss
+    /// already retransmitted. This carries the third and half of the first — the
+    /// caller reaches here when a drain pass found no unsent segment, which is
+    /// not the same as knowing the application has none. The other two are
+    /// absent, and the second of them is exactly the state measured to matter:
+    /// the pump's own ingestion of application data competes for the same
+    /// `select!` as the drain, so bytes can be inside this process and unread
+    /// while a pass reports the application had nothing to give.
+    ///
+    /// Stated rather than closed, because closing it is a behaviour change on
+    /// every path — the phase disables the loss response, and enabling that
+    /// response in more rounds is a change whose input, on this transport,
+    /// cannot tell reordering from loss. What the missing terms cost is being
+    /// measured instead: `dry_passes_with_pump_work` and
+    /// `dry_passes_with_no_peer_window` count the two states the condition does
+    /// not exclude, and the WAN testbed's `analyze.py` reports both per run.
     ///
     /// The check lives here rather than at the call site because both figures
     /// are behind this lock; asking for them first meant a snapshot and two
@@ -1608,11 +1642,34 @@ impl BandwidthEstimator {
 
     /// Count a drain pass that came up empty, and whether it did so against a full
     /// send buffer. Recorded and read by nothing.
-    pub fn note_dry_pass(&mut self, against_a_full_buffer: bool) {
+    pub fn note_dry_pass(&mut self, against_a_full_buffer: bool, peer_window_exhausted: bool) {
         if against_a_full_buffer {
             self.dry_passes_against_a_full_buffer =
                 self.dry_passes_against_a_full_buffer.saturating_add(1);
         }
+        if peer_window_exhausted {
+            self.dry_passes_with_no_peer_window =
+                self.dry_passes_with_no_peer_window.saturating_add(1);
+        }
+    }
+
+    /// Count a dry pass that happened while the pump itself was holding
+    /// application bytes — a refused chunk deferred, or a command unread.
+    /// Recorded and read by nothing.
+    pub fn note_dry_pass_with_pump_work(&mut self) {
+        self.dry_passes_with_pump_work = self.dry_passes_with_pump_work.saturating_add(1);
+    }
+
+    /// Of the dry passes, those that met a stream with no room left in the peer's
+    /// advertised window.
+    pub fn dry_passes_with_no_peer_window(&self) -> u64 {
+        self.dry_passes_with_no_peer_window
+    }
+
+    /// Of the dry passes, those that happened while the pump held application
+    /// bytes of its own.
+    pub fn dry_passes_with_pump_work(&self) -> u64 {
+        self.dry_passes_with_pump_work
     }
 
     /// Of the passes counted as [`DrainOutcome::Drained`], how many found at

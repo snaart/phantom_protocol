@@ -1361,10 +1361,24 @@ impl Session {
     /// the bandwidth filter's right to a new maximum. Which of the two is
     /// producing that on a given path has been an argument; this makes it a
     /// column.
-    pub fn note_dry_pass(&self, against_a_full_buffer: bool) {
+    pub fn note_dry_pass(&self, against_a_full_buffer: bool, peer_window_exhausted: bool) {
         self.bandwidth_estimator
             .lock()
-            .note_dry_pass(against_a_full_buffer);
+            .note_dry_pass(against_a_full_buffer, peer_window_exhausted);
+    }
+
+    /// Count a dry pass that happened while the pump held application bytes of its
+    /// own — deferred, or unread in its command channel. Recorded, not acted on.
+    ///
+    /// The drain and the pump's ingestion of application data are competing
+    /// branches of one `select!`, so a turn spent draining is a turn not spent
+    /// reading. A pass can therefore find every stream empty while the
+    /// application's next chunk is already inside this process, and the phase that
+    /// opens then blames the application for this endpoint's own scheduling.
+    pub fn note_dry_pass_with_pump_work(&self) {
+        self.bandwidth_estimator
+            .lock()
+            .note_dry_pass_with_pump_work();
     }
 
     /// Count a drain pass that ended for `outcome`.
@@ -1494,6 +1508,8 @@ impl Session {
             min_rtt: est.min_rtt(),
             drain_outcomes: est.drain_outcomes(),
             dry_passes_against_a_full_buffer: est.dry_passes_against_a_full_buffer(),
+            dry_passes_with_no_peer_window: est.dry_passes_with_no_peer_window(),
+            dry_passes_with_pump_work: est.dry_passes_with_pump_work(),
             app_limited_acked_bytes: est.app_limited_acked_bytes(),
             smoothed_rtt: est.smoothed_rtt(),
             rtt_variation: est.rtt_variation(),
@@ -1877,6 +1893,18 @@ pub struct BandwidthSnapshot {
     /// the same population split in two, and the split is the difference between
     /// "the application was the limit" and "the application was waiting for us".
     pub dry_passes_against_a_full_buffer: u64,
+    /// Of the dry passes, those that found a stream with no room left in the peer's
+    /// advertised window — the pass `poll_send` would have called `FlowControl`
+    /// had it held an unsent segment to be refused.
+    ///
+    /// Which of the two a pass reports is therefore decided by whether the peer's
+    /// SACK or its `WINDOW_UPDATE` arrived first, and only one of the two opens an
+    /// application-limited phase. A peer-chosen ordering reaching a local
+    /// decision; this says how often it did.
+    pub dry_passes_with_no_peer_window: u64,
+    /// Of the dry passes, those that happened while the pump held application
+    /// bytes of its own — deferred, or unread in its command channel.
+    pub dry_passes_with_pump_work: u64,
     /// Acknowledged bytes whose segment left inside an application-limited phase,
     /// and acknowledged bytes in total.
     ///

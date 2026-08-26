@@ -1017,6 +1017,8 @@ def drain_census(rows):
     if total == 0:
         return None
     dry_full = carrier.get("dry_passes_against_a_full_buffer", 0) or 0
+    dry_window = carrier.get("dry_passes_with_no_peer_window", 0) or 0
+    dry_pump = carrier.get("dry_passes_with_pump_work", 0) or 0
     return {
         "counts": counts,
         "total": total,
@@ -1028,6 +1030,11 @@ def drain_census(rows):
         # for us" added together.
         "dry_against_a_full_buffer": dry_full,
         "dry_share_full_buffer": (dry_full / counts[0]) if counts[0] else None,
+        # The other two states a dry pass can have been in, neither of which is an
+        # application that ran out. They are not exclusive of each other or of the
+        # buffer, so the three do not sum to the dry count.
+        "dry_with_no_peer_window": dry_window,
+        "dry_with_pump_work": dry_pump,
     }
 
 
@@ -1045,14 +1052,22 @@ def dry_split_sentence(census):
         return None
     full = census["dry_against_a_full_buffer"]
     share = census["dry_share_full_buffer"] or 0.0
+    window = census["dry_with_no_peer_window"]
+    pump = census["dry_with_pump_work"]
+    # Three states, none of them an application that ran out, and none exclusive
+    # of the others — so they are listed rather than summed.
+    parts = [
+        f"{full} against a full send buffer ({share:.0%})",
+        f"{window} with the peer's window spent ({window / dry:.0%})",
+        f"{pump} while the pump still held bytes of its own ({pump / dry:.0%})",
+    ]
+    accounted = full or window or pump
     tail = (
-        " — the application was waiting on this endpoint's own ceiling, not the "
-        "other way round"
-        if full
-        else " — so this endpoint's own send buffer is not what emptied those "
-        "passes, and whatever did is still unnamed"
+        ""
+        if accounted
+        else " — none of the three, so what emptied them is still unnamed"
     )
-    return f"of the {dry} that ran dry, {full} did so against a full send buffer ({share:.0%}){tail}"
+    return f"of the {dry} that ran dry: " + ", ".join(parts) + tail
 
 
 def app_limited_reading(rows):
@@ -3348,10 +3363,33 @@ def self_test():
     # count was, which at zero states the reverse of the finding — and zero is what
     # the first run carrying the column actually reported.
     dry_sentence_cases = [
-        ([win(drain_outcomes=[40, 0, 0, 0, 0, 0], dry_passes_against_a_full_buffer=20)],
-         "waiting on this endpoint's own ceiling"),
-        ([win(drain_outcomes=[40, 0, 0, 0, 0, 0], dry_passes_against_a_full_buffer=0)],
-         "still unnamed"),
+        # The three states are listed, not summed: none of them is an application
+        # that ran out, and a pass can be in more than one at once.
+        (
+            [
+                win(
+                    drain_outcomes=[40, 0, 0, 0, 0, 0],
+                    dry_passes_against_a_full_buffer=20,
+                    dry_passes_with_no_peer_window=8,
+                    dry_passes_with_pump_work=30,
+                )
+            ],
+            "20 against a full send buffer (50%), 8 with the peer's window spent (20%), 30 while the pump still held bytes of its own (75%)",
+        ),
+        # All three zero. The sentence has to say the opposite thing here, and its
+        # first version said the same thing whatever the counts were — while zero
+        # is exactly what the first run carrying the columns reported.
+        (
+            [
+                win(
+                    drain_outcomes=[40, 0, 0, 0, 0, 0],
+                    dry_passes_against_a_full_buffer=0,
+                    dry_passes_with_no_peer_window=0,
+                    dry_passes_with_pump_work=0,
+                )
+            ],
+            "still unnamed",
+        ),
         # No pass ran dry at all: there is nothing to split and no sentence to
         # print. A zero share here would be a statement about a population of
         # none.

@@ -483,6 +483,26 @@ pub struct WindowSample {
     /// ceilings — the flag stood in 68.6% and 100% of steady-state samples.
     #[serde(default)]
     pub dry_passes_against_a_full_buffer: u64,
+    /// Of the dry passes, those that met a stream with no room left in the peer's
+    /// advertised window — the pass `poll_send` would have called `FlowControl`
+    /// had it held an unsent segment to be refused.
+    ///
+    /// Which of the two a pass reports turns on whether the peer's SACK or its
+    /// `WINDOW_UPDATE` arrived first, and only one of the two opens the phase.
+    #[serde(default)]
+    pub dry_passes_with_no_peer_window: u64,
+    /// Of the dry passes, those that happened while the pump itself held
+    /// application bytes — a refused chunk deferred, or a command unread in its
+    /// channel.
+    ///
+    /// The drain and the pump's ingestion of application data are competing
+    /// branches of one `select!`, so a turn spent draining is a turn not spent
+    /// reading: a pass can find every stream empty while the application's next
+    /// chunk is already inside the process. After the send-buffer explanation came
+    /// back zero on the first runs to carry it, this is the remaining named
+    /// candidate for the phase standing a quarter to two fifths of the time.
+    #[serde(default)]
+    pub dry_passes_with_pump_work: u64,
     /// Acknowledged bytes whose segment left inside an application-limited phase,
     /// and acknowledged bytes in total.
     ///
@@ -2019,6 +2039,8 @@ mod tests {
             pacing_rate_bps: 1_000_000,
             min_rtt_us: 235_000,
             dry_passes_against_a_full_buffer: 26,
+            dry_passes_with_no_peer_window: 9,
+            dry_passes_with_pump_work: 17,
             app_limited_acked_bytes: 4_112_000,
             acked_bytes_total: 34_680_000,
             drain_outcomes: vec![41, 7, 3, 0, 11, 29],

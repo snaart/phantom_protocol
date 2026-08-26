@@ -1733,12 +1733,29 @@ fn drain_stop_is_app_limited(stop: DrainStop) -> bool {
 /// from the acknowledgement stream alone, a round in which the sender had
 /// nothing to send is indistinguishable from one in which the path refused to
 /// carry more.
+/// `pump_had_work` says whether the pump itself was holding application bytes at
+/// the moment the pass came up empty — a refused chunk in `deferred`, or a command
+/// still unread in its channel. Only meaningful for a pass that ran dry, and
+/// recorded there rather than acted on.
+///
+/// It exists because the drain and the pump's ingestion of application data are
+/// competing branches of one `select!`. A turn spent draining is a turn not spent
+/// reading the channel, so a pass can find every stream empty while the
+/// application's next chunk is already in the process — and the phase that opens
+/// then says the application was the limit, when the limit was this endpoint's own
+/// scheduling. Measurement rather than assertion: the ARQ-buffer explanation for
+/// the same observation was closed by a counter that came back zero, and this is
+/// the remaining named candidate.
 fn apply_drain_outcome(
     crypto_session: &Arc<Session>,
     stop: DrainStop,
+    pump_had_work: bool,
 ) -> Option<tokio::time::Instant> {
     if drain_stop_is_app_limited(stop) {
         crypto_session.note_app_limited_drain();
+        if pump_had_work {
+            crypto_session.note_dry_pass_with_pump_work();
+        }
     }
     match stop {
         DrainStop::Drained
@@ -2302,6 +2319,7 @@ async fn run_data_pump<T: SessionTransport>(
                         &observability,
                     )
                     .await,
+                    !deferred.is_empty() || !cmd_rx.is_empty(),
                 );
                 // Idle keep-alive (download-only liveness): on an
                 // otherwise-idle Connected path, emit one small ENCRYPTED PING so a
@@ -2369,6 +2387,7 @@ async fn run_data_pump<T: SessionTransport>(
                         &observability,
                     )
                     .await,
+                    !deferred.is_empty() || !cmd_rx.is_empty(),
                 );
             }
             // Pacing wake-up. Armed only while the previous drain stopped for
@@ -2389,6 +2408,7 @@ async fn run_data_pump<T: SessionTransport>(
                         &observability,
                     )
                     .await,
+                    !deferred.is_empty() || !cmd_rx.is_empty(),
                 );
             }
             // Disabled while `deferred` holds work: the queue must clear in FIFO
@@ -3227,7 +3247,16 @@ async fn drain_streams_inner<T: SessionTransport>(
             // changes is that a recorded run can say which of the two it saw,
             // where until now it could only say how often the pair happened.
             let dry_against_a_full_buffer = snapshot.iter().any(|(_, _, s)| s.send_buffer_full());
-            crypto_session.note_dry_pass(dry_against_a_full_buffer);
+            // And whether any stream was out of peer window. `poll_send` reports
+            // `FlowControl` only when it holds an unsent segment for the peer to
+            // refuse; with nothing unsent it answers the same `Idle` an empty
+            // stream gives, however closed the window is. So whether a pass calls
+            // itself flow-controlled or application-limited turns on whether the
+            // peer's SACK or its WINDOW_UPDATE arrived first — and only one of
+            // those two opens a phase that disables the loss response.
+            let dry_with_no_peer_window =
+                snapshot.iter().any(|(_, _, s)| s.peer_send_window() == 0);
+            crypto_session.note_dry_pass(dry_against_a_full_buffer, dry_with_no_peer_window);
             DrainStop::Drained
         }
         Some(SendBlocked::FlowControl) => DrainStop::FlowControlled,
@@ -7705,7 +7734,7 @@ mod tests {
         let transport = Arc::new(client_t);
         let obs = Observability::new(ObservabilityConfig::default());
         let stop = drain_streams_priority_ordered(&transport, &client, sid, &streams, &obs).await;
-        apply_drain_outcome(&client, stop);
+        apply_drain_outcome(&client, stop, false);
 
         assert!(
             client.bandwidth_snapshot().app_limited,
@@ -7853,6 +7882,65 @@ mod tests {
              as such — it is the state the application is waiting on us for, and \
              it is indistinguishable from an idle application everywhere else"
         );
+
+        // Dry with the peer's window closed. `poll_send` answers `FlowControl`
+        // only when it has an unsent segment for the peer to refuse; with nothing
+        // unsent it answers the same `Idle` an empty stream gives, however closed
+        // the window is. Which of the two a pass reports therefore turns on
+        // whether the peer's SACK or its WINDOW_UPDATE arrived first — and only
+        // one of the two opens a phase that disables the loss response.
+        // The peer's limit is cumulative and only ever grows, so a shut window is
+        // reached by spending it rather than by setting it: exactly
+        // `INITIAL_STREAM_WINDOW` bytes go out and the grant is used up. The
+        // congestion window has to be raised first or the pass stops on cwnd long
+        // before the peer's window is spent, and the test would be measuring the
+        // wrong ceiling.
+        let (shut, _s3) = paired_sessions(sid);
+        seed_bandwidth_estimate(&shut, 200, 8_192, std::time::Duration::from_millis(10));
+        let closed = Arc::new(TransportStream::new(1));
+        let grant = crate::transport::stream::INITIAL_STREAM_WINDOW as usize;
+        let chunk = grant / 64;
+        for _ in 0..64 {
+            closed
+                .send_reliable(Bytes::from(vec![0x22u8; chunk]))
+                .await
+                .expect("queued");
+        }
+        let streams3: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        streams3.insert(1u32, closed.clone());
+        let (t3, r3) = ChannelTransport::pair();
+        tokio::spawn(async move { while r3.recv_bytes().await.is_ok() {} });
+        let transport3 = Arc::new(t3);
+        let mut stop3 = DrainStop::SegmentBudget;
+        for _ in 0..64 {
+            stop3 = drain_streams_priority_ordered(&transport3, &shut, sid, &streams3, &obs).await;
+            if closed.peer_send_window() == 0 && stop3 == DrainStop::Drained {
+                break;
+            }
+        }
+        assert_eq!(
+            closed.peer_send_window(),
+            0,
+            "precondition: the peer's whole grant must be spent, or the window is \
+             not the state under test"
+        );
+        assert_eq!(
+            stop3,
+            DrainStop::Drained,
+            "the pass has nothing unsent, so it reports Idle and not FlowControl \
+             even though the peer's window is shut — which is the conflation"
+        );
+        let snap3 = shut.bandwidth_snapshot();
+        assert_eq!(
+            snap3.dry_passes_with_no_peer_window, 1,
+            "a dry pass that met a shut peer window must be recorded, or the \
+             record cannot say how often an application-limited phase opened on a \
+             state the peer chose"
+        );
+        assert_eq!(
+            snap3.dry_passes_against_a_full_buffer, 0,
+            "and it must not be filed under the send buffer, which was empty"
+        );
     }
 
     /// **The census records what stopped each pass, where an inference could not.**
@@ -7949,7 +8037,7 @@ mod tests {
         let transport = Arc::new(client_t);
         let obs = Observability::new(ObservabilityConfig::default());
         let stop = drain_streams_priority_ordered(&transport, &client, sid, &streams, &obs).await;
-        apply_drain_outcome(&client, stop);
+        apply_drain_outcome(&client, stop, false);
 
         let snap = client.bandwidth_snapshot();
         assert!(
@@ -7980,7 +8068,7 @@ mod tests {
         let (client_t2, _server_t2) = ChannelTransport::pair();
         let transport2 = Arc::new(client_t2);
         let stop2 = drain_streams_priority_ordered(&transport2, &paced, sid, &streams2, &obs).await;
-        apply_drain_outcome(&paced, stop2);
+        apply_drain_outcome(&paced, stop2, false);
         assert!(
             matches!(stop2, DrainStop::Paced(_)),
             "precondition: a 240 KB window and 64 segments offered should leave pacing \
@@ -8118,7 +8206,7 @@ mod tests {
         let transport = Arc::new(client_t);
         let obs = Observability::new(ObservabilityConfig::default());
         let stop = drain_streams_priority_ordered(&transport, &client, sid, &streams, &obs).await;
-        apply_drain_outcome(&client, stop);
+        apply_drain_outcome(&client, stop, false);
 
         assert_eq!(
             stop,
@@ -8186,7 +8274,7 @@ mod tests {
         let transport = Arc::new(RefusingTransport);
         let obs = Observability::new(ObservabilityConfig::default());
         let stop = drain_streams_priority_ordered(&transport, &client, sid, &streams, &obs).await;
-        apply_drain_outcome(&client, stop);
+        apply_drain_outcome(&client, stop, false);
 
         let snap = client.bandwidth_snapshot();
         assert!(
