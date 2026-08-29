@@ -680,6 +680,34 @@ const INFLIGHT_HI_BETA: f64 = 0.7;
 /// probe phase — the phase whose entire job is to ask the path for a quarter
 /// more than the current estimate. A bound that squeezed below it would leave
 /// the probe unable to probe.
+///
+/// **The paragraph above is true only of a lossless path, and that qualifier
+/// is load-bearing.** Through a cap of `g × BDP` on a path dropping a fraction
+/// `p`, the best sample is `g × (1 - p) × btl_bw`, so the cap is absorbing
+/// whenever `g ≤ 1 / (1 - p)` — at 1.25 that is any loss over a fifth, not
+/// "at or below the BDP". Worse, the condition that fires first is not this one
+/// but Startup's: `g × (1 - p) < 1 + STARTUP_GROWTH_THRESHOLD`, and since that
+/// threshold is **the same 1.25**, a sender pinned at this floor fails the
+/// Startup growth test on the first round that loses anything at all. That is
+/// why the loss response is measured down from the target and lands at
+/// `INFLIGHT_HI_BETA × CWND_GAIN` — see [`INFLIGHT_HI_LEVEL_SUPPORTS_LOSS_TO`],
+/// which asserts the relation between the three constants — and it is why this
+/// floor is now the *lower* of the two levels that matter rather than the
+/// operating point. Do not read the two doctrines as alternatives: this one
+/// governs where the bound may not go, the other governs where it lands.
+///
+/// **Where it actually binds**, since that is not where it reads as though it
+/// would. Not in the loss branch: the level there is `INFLIGHT_HI_BETA ×
+/// CWND_GAIN`, which [`INFLIGHT_HI_LEVEL_SUPPORTS_LOSS_TO`]'s assertion keeps
+/// strictly above this, so deleting the clamp from that branch changes no test
+/// and no simulator figure. It binds in the **relax** branch, on the shape
+/// where a path stopped losing and then got faster while the bound stood still:
+/// the bound is a stale absolute number against a product several times larger,
+/// and multiplying by [`INFLIGHT_HI_RELAX_GAIN`] once per round trip would leave
+/// the sender under a window nothing is objecting to for as long as the climb
+/// takes. `a_bound_left_behind_by_a_faster_path_is_lifted_rather_than_crawling_back`
+/// is that shape; before it existed, removing this clamp altogether left the
+/// whole suite green.
 const INFLIGHT_HI_FLOOR_GAIN: f64 = 1.25;
 
 /// Multiplicative increase applied to [`BandwidthEstimator::inflight_hi`] on a
@@ -689,6 +717,64 @@ const INFLIGHT_HI_FLOOR_GAIN: f64 = 1.25;
 /// Without it the bound is a one-way ratchet and a connection that saw one bad
 /// minute carries the cap for the rest of its life.
 const INFLIGHT_HI_RELAX_GAIN: f64 = 1.25;
+
+/// The window gain in force wherever the loss response can be reached.
+///
+/// Named rather than repeated, because it is one of the three terms of the
+/// bound asserted below and a bare literal in five places is not something a
+/// reader can check against a constant. The five are the constructor, the
+/// ProbeBW arm of `update_state`, and three of `transition_to`'s four arms;
+/// the fourth, ProbeRTT, sets a different gain and is deliberately untouched.
+/// That exception is what makes the invariant hold rather than the call order:
+/// every state whose gain is not this one is a state `adapt_inflight_bound`
+/// returns from before it reaches the loss branch.
+const CWND_GAIN: f64 = 2.0;
+
+/// The steady loss rate this file's constants are chosen to keep working, and
+/// the reason they cannot be edited one at a time.
+///
+/// While `inflight_hi` binds, the window is `INFLIGHT_HI_BETA × CWND_GAIN ×
+/// BDP` and a round can deliver at most `(1 - p)` of it, so the estimate grows
+/// by at most `INFLIGHT_HI_BETA × CWND_GAIN × (1 - p)` per round. Startup ends
+/// after `STARTUP_ROUNDS_LIMIT` rounds that fail to beat the plateau by
+/// `STARTUP_GROWTH_THRESHOLD`. Below the loss rate where those two meet, a
+/// connection ramps; above it, Startup ends at whatever fraction of the link it
+/// had reached and the ProbeBW cycle has to climb the rest at a quarter per
+/// four round trips, the one gain of [`PROBE_BW_GAINS`] that probes upward —
+/// which is under a second a cycle on a 235 ms path and still fifteen seconds
+/// of gain cycling for a fortyfold climb, before any of it is spent on rounds
+/// that lose. A connection that leaves Startup low does not fail; it arrives
+/// late enough that a measurement window closes first.
+///
+/// Eight per cent is the worst the reference WAN path's own raw-UDP control
+/// reports at rates far below the ceiling it later establishes, so that is what
+/// this has to clear. The assertion below is what makes the three constants a
+/// set rather than three independent knobs: an edit to any one of them that
+/// drops the supported rate under this fails the build. It was added because a
+/// one-character change to `INFLIGHT_HI_BETA` — 0.7 to 0.635 — reverted the
+/// whole of that behaviour with every test in the crate still green.
+const INFLIGHT_HI_LEVEL_SUPPORTS_LOSS_TO: f64 = 0.08;
+
+const _: () = {
+    // `const` arithmetic on f64 is allowed; the comparison is the assertion.
+    let level = INFLIGHT_HI_BETA * CWND_GAIN;
+    let needed = (1.0 + STARTUP_GROWTH_THRESHOLD) / (1.0 - INFLIGHT_HI_LEVEL_SUPPORTS_LOSS_TO);
+    assert!(
+        level > needed,
+        "INFLIGHT_HI_BETA x CWND_GAIN no longer clears (1 + STARTUP_GROWTH_THRESHOLD) \
+         at INFLIGHT_HI_LEVEL_SUPPORTS_LOSS_TO: a sender on a path losing that much \
+         steadily will leave Startup at a fraction of the link and take a minute of \
+         ProbeBW cycles to climb back. Move the constants together or move the \
+         supported rate deliberately."
+    );
+    // And the level has to clear the floor, or `INFLIGHT_HI_BETA` is dead code
+    // and the reasoning above describes a branch that never decides anything.
+    assert!(
+        level > INFLIGHT_HI_FLOOR_GAIN,
+        "INFLIGHT_HI_BETA x CWND_GAIN has fallen to or under INFLIGHT_HI_FLOOR_GAIN, \
+         so every loss response now clamps to the floor and the beta is inert"
+    );
+};
 
 /// Turn a locally timed round trip and the peer's claimed acknowledgement delay
 /// into the RTT sample this endpoint is willing to believe.
@@ -1037,7 +1123,7 @@ impl BandwidthEstimator {
             delivered_bytes: 0,
             last_delivery: now,
             pacing_gain: STARTUP_PACING_GAIN,
-            cwnd_gain: 2.0,
+            cwnd_gain: CWND_GAIN,
             round_count: 0,
             next_round_delivered: 0,
             round_start: false,
@@ -1898,16 +1984,29 @@ impl BandwidthEstimator {
     /// losing a few percent the sender retransmits several times per round trip
     /// and so is permanently in the reacting condition, which conveys nothing.
     ///
-    /// **The response is a bound on the volume, not a change to the gain.** The
-    /// two are not interchangeable. A gain of 1.0 holds inflight at exactly the
-    /// bandwidth-delay product, and a sender holding a BDP delivers `btl_bw ×
-    /// min_rtt` bytes per round trip by construction — so every sample it takes
-    /// reports exactly the rate it already believes, and `btl_bw`, a maximum
-    /// filter, never moves. The connection stops being able to find out that
-    /// the path is faster than it thinks, and no amount of running gives it back:
-    /// growth needs headroom, and the back-off consumed the headroom. Capping
-    /// the *level* while leaving the gain alone backs the sender off without
-    /// taking away the instrument.
+    /// **The response is a bound on the volume, not a change to the gain** —
+    /// and the difference is *when it applies*, not what it computes. Since the
+    /// level is measured down from the target, a round under the bound holds
+    /// `bdp × cwnd_gain × INFLIGHT_HI_BETA`, which is arithmetically the same
+    /// window a gain of `cwnd_gain × INFLIGHT_HI_BETA` would give. Anyone
+    /// reading this claim as "these produce different numbers" is reading it
+    /// wrong, and an earlier version of this paragraph invited that.
+    ///
+    /// What the two do not share is their scope in time. A gain governs every
+    /// round; this bound exists only while a path is losing above the threshold
+    /// and is lifted, then dropped, by rounds that are not. A connection that
+    /// saw one bad minute goes back to `cwnd_gain` afterwards, where a retuned
+    /// gain would carry the penalty for the rest of its life. That is the whole
+    /// of the distinction and it is worth keeping.
+    ///
+    /// The reason *neither* may drop the window to one BDP is separate and
+    /// applies to both: a sender holding exactly a bandwidth-delay product
+    /// delivers `btl_bw × min_rtt` bytes per round trip by construction, so
+    /// every sample reports the rate it already believes and `btl_bw`, a maximum
+    /// filter, never moves. Growth needs headroom, and a back-off that consumes
+    /// the headroom takes away the instrument along with the rate. Both the
+    /// floor and [`INFLIGHT_HI_LEVEL_SUPPORTS_LOSS_TO`] exist to keep that from
+    /// happening.
     ///
     /// **The bound is floored above the BDP, and it relaxes.** The floor is
     /// [`INFLIGHT_HI_FLOOR_GAIN`] — strictly above one BDP, so the fixed point
@@ -1964,8 +2063,97 @@ impl BandwidthEstimator {
         let floor = (self.bdp() as f64 * INFLIGHT_HI_FLOOR_GAIN) as u64;
 
         if (round_lost as f64) > (round_total as f64) * LOSS_THRESH {
-            let base = self.inflight_hi.unwrap_or(target);
-            let reduced = (base as f64 * INFLIGHT_HI_BETA) as u64;
+            // Measured down from the *target*, not from the bound already in
+            // force, which on a path that keeps losing is the difference
+            // between two **levels** rather than between a walk and a hold.
+            // Read the previous bound and the sequence is `2.0 → 1.4 → 1.25`
+            // BDP and then flat, because `.max(floor)` catches it on the second
+            // step; read the target and it is `1.4` from the first losing round
+            // on. That is the whole behavioural delta: one level, twelve per
+            // cent apart. (An earlier version of this comment claimed the old
+            // form compounded to nothing — `0.7^5` — which the floor makes
+            // impossible. The gain is real; that account of it was not.)
+            //
+            // **Why twelve per cent of one level decides whether the connection
+            // works at all.** Startup is the only phase with exponential
+            // growth, and it ends after `STARTUP_ROUNDS_LIMIT` rounds that fail
+            // to beat the previous plateau by `STARTUP_GROWTH_THRESHOLD`. While
+            // this bound is engaged the window is `level × BDP`, so a round can
+            // deliver at most `level × (1 - p)` times the estimate that set it,
+            // where `p` is the fraction the path is dropping. Startup therefore
+            // survives exactly while
+            //
+            // ```text
+            //     level × (1 - p)  ≥  1 + STARTUP_GROWTH_THRESHOLD
+            // ```
+            //
+            // and `INFLIGHT_HI_FLOOR_GAIN` is **the same number** as
+            // `1 + STARTUP_GROWTH_THRESHOLD`. A sender held at the floor
+            // therefore fails that test on the first round that loses anything
+            // at all, leaves Startup at whatever fraction of the link it had
+            // reached, and is left with the ProbeBW gain cycle to climb the
+            // rest — a quarter more per four-round cycle, which on a 235 ms
+            // path is fifteen seconds of gain cycling for a fortyfold climb
+            // and longer than that for every round spent losing. At `1.4` the
+            // same arithmetic
+            // tolerates `p ≤ 10.7%`, which covers the reference WAN path's own
+            // raw-UDP control (one to eight per cent at rates far below the
+            // ceiling it later establishes) with about three points to spare.
+            //
+            // Measured, `bottleneck_sim -- noisy`, per cent of the link, and
+            // repeated across four different arrival patterns for the same
+            // rates (`PHANTOM_SIM_LOSS_SEED`) because evenly spaced loss is one
+            // draw and a controller is sensitive to which one it gets. What
+            // holds on all four: 2% gains two to seven points, 5% gains eight
+            // to eleven — and 5% reaches nine tenths of the link in about seven
+            // seconds where it used to take nineteen. Above that the spread
+            // between arrival patterns exceeds the effect: at 15% the evenly
+            // spaced run gains twenty points and one of the three random ones
+            // *loses* three, so no single figure from there is quotable. At 20%
+            // both builds are near zero for a reason this change does not
+            // address — the collision of constants above — and undoing that is
+            // a separate change with its own argument.
+            // `INFLIGHT_HI_LEVEL_SUPPORTS_LOSS_TO` states the bound this
+            // reasoning depends on so that a later edit to any of the three
+            // constants fails the build rather than the path.
+            //
+            // **What it costs.** The response no longer varies with anything: a
+            // round that lost 2.1% and a round that lost 99% set the same bound,
+            // and so does the thousandth losing round. Only `bdp` still moves
+            // it. Measured on `bottleneck_sim -- collapse` — capacity falling
+            // fourfold behind a one-BDP buffer, where every loss really is
+            // congestion — the cost is narrower than that reasoning suggests:
+            // goodput, the standing queue (72 672 B, 0.36 BDP) and the widest
+            // round trip (398 ms) are **identical** either way, and the whole
+            // difference is 5% more copies refused by the full buffer (21 118
+            // against 20 071). The buffer, not the window, is what binds on that
+            // shape. A path where the window binds instead would pay more, and
+            // this model has no such shape in it — which is a limit of the
+            // instrument and worth saying rather than reading as an absence.
+            //
+            // **What the peer gains.** `target` is `bdp × cwnd_gain` and `bdp`
+            // is `btl_bw × min_rtt`, both derived from arrival times the peer
+            // writes — so the level this sets is a function of a figure the peer
+            // can inflate, with the previous bound's one-round damping removed.
+            // In the other direction it is better: a peer synthesising loss by
+            // withholding acknowledgements now pins the sender at 1.4 BDP
+            // instead of walking it to the floor. Neither direction lets the
+            // peer move a *threshold* — `LOSS_THRESH` and the Startup test are
+            // untouched — and a peer that inflates `bdp` to widen our window is
+            // asking us to send it more data over a path it has told us is
+            // wider than it is, which costs it the same congestion it is faking.
+            //
+            // **Against BBRv2.** `BBRHandleInflightTooHigh` is
+            // `max(rs.tx_in_flight, BBRTargetInflight() × BBRBeta)`; only the
+            // second operand is implemented here, because `tx_in_flight` — the
+            // volume outstanding when the lost packet was sent — is not carried
+            // on a `DeliverySample` and adding it is a change to the sample, not
+            // to this line. Note also that the draft's `BBRTargetInflight()` is
+            // `min(bdp, cwnd)` at unit gain, so its modelled level is `0.7 ×
+            // BDP` — *below* this file's floor. Adopting the canonical number
+            // would clamp straight back to `INFLIGHT_HI_FLOOR_GAIN` and
+            // reinstate exactly the behaviour this change removes.
+            let reduced = (target as f64 * INFLIGHT_HI_BETA) as u64;
             self.inflight_hi = Some(reduced.max(floor));
         } else if let Some(hi) = self.inflight_hi {
             let relaxed = (hi as f64 * INFLIGHT_HI_RELAX_GAIN) as u64;
@@ -2129,7 +2317,7 @@ impl BandwidthEstimator {
                 // "advance" step is needed, and none may be added.
                 let cycle_idx = (self.round_count as usize) % PROBE_BW_GAINS.len();
                 self.pacing_gain = PROBE_BW_GAINS[cycle_idx];
-                self.cwnd_gain = 2.0;
+                self.cwnd_gain = CWND_GAIN;
             }
             BbrState::ProbeRTT => {
                 let Some(entered) = self.probe_rtt_entered else {
@@ -2184,15 +2372,15 @@ impl BandwidthEstimator {
                 // volume bound, and the volume bound is what decides how much a
                 // burst can be if pacing ever stops governing.
                 self.pacing_gain = STARTUP_PACING_GAIN;
-                self.cwnd_gain = 2.0;
+                self.cwnd_gain = CWND_GAIN;
             }
             BbrState::Drain => {
                 self.pacing_gain = 0.75;
-                self.cwnd_gain = 2.0;
+                self.cwnd_gain = CWND_GAIN;
             }
             BbrState::ProbeBW => {
                 self.pacing_gain = 1.0;
-                self.cwnd_gain = 2.0;
+                self.cwnd_gain = CWND_GAIN;
             }
             BbrState::ProbeRTT => {
                 self.pacing_gain = 1.0;
@@ -2565,6 +2753,296 @@ mod tests {
                 "above the loss threshold, attributing the same holes to {cause:?} \
                  changed a congestion decision"
             );
+        }
+    }
+
+    /// A volume bound set on a losing round must follow the estimate upward
+    /// while the losing continues.
+    ///
+    /// Some paths drop a steady few percent for reasons that have nothing to do
+    /// with how hard they are being driven — a radio's error rate, a middlebox
+    /// under someone else's load. Every round is then a losing round, so the
+    /// relax branch is never reached, and this bound is the only thing deciding
+    /// the window for the life of the connection. What it must not do is freeze:
+    /// the estimate can still climb (a probe phase takes a bigger sample
+    /// through), and a bound that ignores that pins the window to whatever the
+    /// path looked like in the first bad round.
+    ///
+    /// **What each assertion here actually catches**, which is not what an
+    /// earlier version of this paragraph claimed. The two rise assertions catch
+    /// an *unclamped* ratchet — a bound taken from the standing one with no
+    /// floor under it, which falls while the estimate climbs. They do **not**
+    /// catch the form this change replaced: that one was floored at
+    /// `bdp × INFLIGHT_HI_FLOOR_GAIN`, recomputed every call, so it rose with
+    /// the estimate exactly as this one does, one level lower. Run it and the
+    /// bounds are 107520, 108000, 135000, 169500, 211500, 264000, 328500 —
+    /// rising, monotone, both assertions green.
+    ///
+    /// What separates the two shipped forms is the **level**, and the only
+    /// assertion that reads it is the Startup-growth one at the end. The
+    /// fixture still has to make the estimate climb, for a different reason:
+    /// against a bound recomputed from a smaller product every round the level
+    /// reads low through no fault of the formula, which is what the plateau at
+    /// the end is for.
+    ///
+    /// Deliberately **not** asserted here: the level the bound settles at. That
+    /// is a relation between three constants, it is checked at compile time by
+    /// [`INFLIGHT_HI_LEVEL_SUPPORTS_LOSS_TO`], and asserting it here as well
+    /// would reject implementations that reach the same level by another route
+    /// — a floor raised to meet it, say — which behave identically on every
+    /// path the simulator can produce.
+    #[test]
+    fn a_bound_set_under_sustained_loss_follows_the_estimate_upward() {
+        const SEG: u64 = 1200;
+        /// Loss well above `LOSS_THRESH`, and inside what the reference WAN
+        /// path's own raw-UDP control reports at rates far below the ceiling it
+        /// later establishes. One hole per ten delivered.
+        const LOSS_DENOMINATOR: u32 = 10;
+        const RTT: Duration = Duration::from_millis(50);
+        const GROWING_ROUNDS: u32 = 8;
+        /// Rounds at the end during which the path stops opening up. The level
+        /// the bound settles at can only be read against a bandwidth-delay
+        /// product that has stopped moving: while the estimate is still
+        /// climbing, every bound was computed from a smaller one and reads low
+        /// against the current figure through no fault of the formula.
+        const PLATEAU_ROUNDS: u32 = 3;
+        const ROUNDS: u32 = GROWING_ROUNDS + PLATEAU_ROUNDS;
+        /// The path opens up round over round, which is what gives the estimate
+        /// somewhere to climb to. A quarter per round clears the bandwidth
+        /// filter's own admission comfortably.
+        const GROWTH_NUMERATOR: u32 = 5;
+        const GROWTH_DENOMINATOR: u32 = 4;
+
+        let mut est = BandwidthEstimator::new();
+        let mut now = Instant::now();
+        let mut segments = 64u32;
+        let mut bound_per_round: Vec<Option<u64>> = Vec::new();
+        let mut estimate_per_round: Vec<u64> = Vec::new();
+
+        for round in 0..ROUNDS {
+            let delivered_at_send = est.delivered_bytes();
+            for _ in 0..segments {
+                est.on_send(SEG);
+            }
+            // Not in the opening round: the first acknowledgement of a
+            // connection opens the first round with almost nothing delivered
+            // against it, so loss booked there is judged against a near-zero
+            // denominator whatever its true rate.
+            let holes = if round > 0 {
+                segments / LOSS_DENOMINATOR
+            } else {
+                0
+            };
+            for _ in 0..holes {
+                est.on_retransmit(SEG);
+                est.on_loss(SEG);
+            }
+            now += RTT;
+            for _ in 0..(segments - holes) {
+                est.on_ack(DeliverySample {
+                    delivered_bytes: delivered_at_send,
+                    delivered_at: est.delivered_time(),
+                    sent_at: now - RTT,
+                    acked_at: now,
+                    packet_bytes: SEG,
+                    is_app_limited: false,
+                    ack_delay_us: 0,
+                    rtt_sampled: round == 0,
+                });
+            }
+            bound_per_round.push(est.inflight_hi());
+            estimate_per_round.push(est.bottleneck_bandwidth());
+            if round < GROWING_ROUNDS {
+                segments = segments * GROWTH_NUMERATOR / GROWTH_DENOMINATOR;
+            }
+        }
+
+        // Preconditions. Without both of these the assertion below holds for
+        // reasons that have nothing to do with the bound.
+        let first = estimate_per_round.first().copied().unwrap_or(0);
+        let last = estimate_per_round.last().copied().unwrap_or(0);
+        assert!(
+            last > first * 2,
+            "precondition: the estimate has to climb for there to be anything for \
+             the bound to follow — it went {first} to {last} B/s over {ROUNDS} \
+             rounds"
+        );
+        let engaged: Vec<u64> = bound_per_round.iter().flatten().copied().collect();
+        assert!(
+            engaged.len() >= 4,
+            "precondition: one hole in {LOSS_DENOMINATOR} is well above the loss \
+             threshold and must engage the bound in most rounds; bounds were \
+             {bound_per_round:?}"
+        );
+
+        // The upward assertions read the growing stretch only; the plateau
+        // exists to hold the denominator still for the level assertion below.
+        let growing: Vec<u64> = bound_per_round
+            .iter()
+            .take(GROWING_ROUNDS as usize)
+            .flatten()
+            .copied()
+            .collect();
+        let (first_bound, last_bound) = (growing[0], growing[growing.len() - 1]);
+        assert!(
+            last_bound > first_bound,
+            "the estimate climbed from {first} to {last} B/s while the path kept \
+             losing, and the volume bound stayed at {first_bound} B — nothing is \
+             floored under it, so it is walking down from the bound already in \
+             force with no lower stop and the window is pinned to whatever the \
+             path looked like in the first bad round; full sequence \
+             {bound_per_round:?}"
+        );
+        for pair in growing.windows(2) {
+            assert!(
+                pair[1] >= pair[0],
+                "the bound fell from {} to {} across two rounds that lost the same \
+                 fraction of a growing path; full sequence {bound_per_round:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+
+        // And the level it holds has to leave the ramp somewhere to go.
+        //
+        // Following the estimate upward is not on its own enough: a bound
+        // recomputed as a *floor* multiple would do that too, and did — the
+        // pre-change behaviour rose with the bandwidth-delay product exactly
+        // like this one, one notch lower. What separates them is whether a round
+        // spent under the bound can still beat the Startup growth test, because
+        // Startup is the connection's only exponential phase and the ProbeBW
+        // cycle behind it climbs a quarter per four round trips.
+        //
+        // Stated as the property rather than as the constants: through a window
+        // of `held`, a path dropping `INFLIGHT_HI_LEVEL_SUPPORTS_LOSS_TO`
+        // delivers `held × (1 - p)`, and that has to clear `bdp × (1 +
+        // STARTUP_GROWTH_THRESHOLD)`. An implementation that reaches the same
+        // level by another route — a floor raised to meet it — passes, which is
+        // correct, because on every path the simulator can produce it behaves
+        // identically.
+        let held = *engaged.last().expect("the bound is engaged by this point");
+        let bdp = est.bdp().max(1);
+        let delivered_through = held as f64 * (1.0 - INFLIGHT_HI_LEVEL_SUPPORTS_LOSS_TO);
+        let startup_needs = bdp as f64 * (1.0 + STARTUP_GROWTH_THRESHOLD);
+        assert!(
+            delivered_through >= startup_needs,
+            "the bound settled at {held} B, {:.2} BDP. A path losing {:.0}% delivers \
+             {:.2} BDP through a window that size, against the {:.2} BDP a round has \
+             to beat for Startup to keep growing — so Startup ends on the first \
+             round that loses anything, at whatever fraction of the link the \
+             connection had reached, and the rest of the ramp is a quarter per \
+             four round trips",
+            held as f64 / bdp as f64,
+            100.0 * INFLIGHT_HI_LEVEL_SUPPORTS_LOSS_TO,
+            delivered_through / bdp as f64,
+            startup_needs / bdp as f64,
+        );
+    }
+
+    /// The floor is not decoration, and this is the only shape that shows it.
+    ///
+    /// `INFLIGHT_HI_FLOOR_GAIN` never binds while loss continues: the level set
+    /// there is `INFLIGHT_HI_BETA × CWND_GAIN`, which a compile-time assertion
+    /// keeps strictly above it. Deleting `.max(floor)` from that branch changes
+    /// no test and no simulator figure, and for a while that read as the floor
+    /// having become dead code.
+    ///
+    /// It has not. It binds in the *other* branch, on the shape where a path
+    /// stopped losing and got faster while the bound stood still. The bound is
+    /// then a stale absolute number against a bandwidth-delay product several
+    /// times larger, and the relax branch's `× INFLIGHT_HI_RELAX_GAIN` alone
+    /// would need a round trip per quarter to catch up — the connection would
+    /// spend that whole time held under a window the path stopped objecting to.
+    /// The floor is what makes recovery immediate: whatever the arithmetic
+    /// says, the bound may not sit under `INFLIGHT_HI_FLOOR_GAIN × BDP`.
+    ///
+    /// The test is written against the *rate of recovery*, not against the
+    /// constant, so an implementation that recovers by another route passes.
+    #[test]
+    fn a_bound_left_behind_by_a_faster_path_is_lifted_rather_than_crawling_back() {
+        const SEG: u64 = 1200;
+        const RTT: Duration = Duration::from_millis(50);
+        /// One round of loss to engage the bound, then none.
+        const SEGMENTS_SLOW: u32 = 40;
+        /// The path opens up sharply once the loss stops, so the bound is left
+        /// far under the new bandwidth-delay product.
+        const SEGMENTS_FAST: u32 = 400;
+
+        let mut est = BandwidthEstimator::new();
+        let mut now = Instant::now();
+
+        let round = |est: &mut BandwidthEstimator, now: &mut Instant, segments, holes| {
+            let delivered_at_send = est.delivered_bytes();
+            for _ in 0..segments {
+                est.on_send(SEG);
+            }
+            for _ in 0..holes {
+                est.on_retransmit(SEG);
+                est.on_loss(SEG);
+            }
+            *now += RTT;
+            for _ in 0..(segments - holes) {
+                est.on_ack(DeliverySample {
+                    delivered_bytes: delivered_at_send,
+                    delivered_at: est.delivered_time(),
+                    sent_at: *now - RTT,
+                    acked_at: *now,
+                    packet_bytes: SEG,
+                    is_app_limited: false,
+                    ack_delay_us: 0,
+                    rtt_sampled: true,
+                });
+            }
+        };
+
+        // Two slow rounds, the second of which loses a quarter — well above the
+        // threshold — so the bound is engaged against a small estimate.
+        round(&mut est, &mut now, SEGMENTS_SLOW, 0);
+        round(&mut est, &mut now, SEGMENTS_SLOW, SEGMENTS_SLOW / 4);
+        let engaged = est
+            .inflight_hi()
+            .expect("precondition: a round losing a quarter must engage the bound");
+
+        // Then the loss stops and the path opens up tenfold. Two rounds, not
+        // one: the bound is re-judged on a round boundary, so the first clean
+        // round is the one that *raises the estimate* and the second is the
+        // first whose judgement can see the raised figure. Asserting after one
+        // would be asking the controller to have acted on a measurement it had
+        // not taken yet.
+        round(&mut est, &mut now, SEGMENTS_FAST, 0);
+        round(&mut est, &mut now, SEGMENTS_FAST, 0);
+        let bdp_now = est.bdp();
+        assert!(
+            bdp_now > engaged * 3,
+            "precondition: the path has to outgrow the standing bound for there to \
+             be anything to catch up to — bound {engaged} B against a {bdp_now} B \
+             bandwidth-delay product"
+        );
+
+        // The property, stated without naming the constant that delivers it: a
+        // sender the path has stopped objecting to must not be left holding a
+        // window under one bandwidth-delay product. Under that, the best
+        // delivery sample it can take is smaller than the estimate that
+        // computed the window, so the estimate cannot rise and the window
+        // cannot follow — the absorbing state `INFLIGHT_HI_FLOOR_GAIN`'s own
+        // documentation describes. Multiplying by `INFLIGHT_HI_RELAX_GAIN` once
+        // a round trip does get there eventually, and "eventually" on a path
+        // that just grew tenfold is several round trips of a sender held under
+        // a ceiling nothing is asking for.
+        match est.inflight_hi() {
+            // Dropped entirely: the bound cleared the window the gains allow,
+            // which is the fastest possible recovery and unambiguously fine.
+            None => {}
+            Some(now_bound) => assert!(
+                now_bound >= bdp_now,
+                "the path stopped losing and grew to a {bdp_now} B bandwidth-delay \
+                 product, and the volume bound came out of it at {now_bound} B — \
+                 under one product, from {engaged} B. A window that small admits no \
+                 delivery sample larger than the estimate that set it, so nothing \
+                 the sender can do raises either, and the multiplicative relax is \
+                 left to climb a quarter per round trip out of a hole the path is \
+                 not asking it to be in"
+            ),
         }
     }
 
@@ -3196,8 +3674,11 @@ mod tests {
     /// drives the sample to 100 µs, wipes the filter, and pins the window on
     /// its 5600-byte floor for as long as it keeps reporting. A real WAN
     /// transfer that peaked near a 128 KB window fell to exactly that floor and
-    /// then sustained 4.7–7.6% of a link whose raw-socket control measured
-    /// 6.63 Mbit/s at zero loss.
+    /// then sustained roughly 0.3–0.5 Mbit/s from there. An earlier form of this
+    /// sentence gave that as a share of a raw-socket control reading
+    /// 6.63 Mbit/s; that control paced one datagram per timer tick and so
+    /// measured its own granularity rather than the route, and the share is
+    /// withdrawn. The absolute is locally observed and stands.
     ///
     /// The `Sack` rides inside the AEAD plaintext, so an on-path attacker
     /// cannot reach this — it needs the authenticated peer. That is less of a
@@ -4619,6 +5100,19 @@ mod tests {
             t += took;
         }
         let lossy_cwnd = est.cwnd();
+        // The bar and what actually happens are now close, and the reason is
+        // worth writing down rather than discovering next time it moves. Since
+        // the response is measured down from the target rather than from the
+        // bound in force, a sustained-loss window is `INFLIGHT_HI_BETA` of the
+        // clean one *by construction* — 0.70 against a bar of 0.75, where
+        // walking the bound down used to land near 0.62. So this assertion has
+        // become, in the steady state, a check that `INFLIGHT_HI_BETA` is under
+        // three quarters, and it would break outright at `INFLIGHT_HI_BETA >=
+        // 0.75` rather than reporting a defect. Left at 0.75 deliberately: the
+        // bar is what the *test* is willing to call "costing the sender
+        // something", and tightening it to hug 0.70 would make an ordinary
+        // retuning of the beta read as a regression here instead of at the
+        // const assertion, which is where the constants are actually governed.
         assert!(
             lossy_cwnd * 4 <= clean_cwnd * 3,
             "sustained loss left the window at {lossy_cwnd} B against {clean_cwnd} B \

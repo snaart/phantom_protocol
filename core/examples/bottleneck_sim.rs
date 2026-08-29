@@ -29,9 +29,16 @@
 //! cargo run --manifest-path core/Cargo.toml --release --example bottleneck_sim -- thin
 //! ```
 //!
-//! With no argument it runs all three scenarios. Each prints one block of
-//! labelled figures; to compare two revisions, run it on both and read the
-//! blocks side by side.
+//! With no argument it runs every scenario. Each prints one block of labelled
+//! figures; to compare two revisions, run it on both and read the blocks side
+//! by side.
+//!
+//! `PHANTOM_SIM_LOSS_SEED=n` re-runs the scenarios that lose (`noisy`,
+//! `collapse`) with independently drawn holes instead of evenly spaced ones.
+//! Even spacing is one arrival pattern out of many with the same mean and a
+//! controller is sensitive to which it gets, so a figure worth quoting is one
+//! that survives a few seeds. It is a check to run, not a default to change:
+//! switching it would make every before-and-after comparison noisier.
 //!
 //! # The scenarios
 //!
@@ -45,8 +52,24 @@
 //! - **`thin`** — a steep fall in capacity, held past one horizon, then
 //!   restored. This is the shape that engages the filters' length rules: a
 //!   falling run dominates nothing, so every sample is appended, and the deque
-//!   fills within a fraction of a second at these cadences. It is the only one
-//!   of the three that can see a length rule at all.
+//!   fills within a fraction of a second at these cadences. It is the only
+//!   scenario here that can see a length rule at all.
+//! - **`noisy`** — a link that drops a fixed fraction of what it carries no
+//!   matter how gently it is driven, swept from none to a fifth, against a
+//!   bounded queue. The other three lose nothing at all, so nothing in them
+//!   ever reaches the loss response; this is the only scenario that exercises
+//!   it. The shape is the reference WAN path's, whose raw-UDP control drops
+//!   between one and eight percent at rates far below the ceiling it later
+//!   establishes — loss that is a property of the path rather than a report on
+//!   the sender's rate. Read the rung's percentage of the link and the round
+//!   trip at which it reached nine tenths: a controller that ends a rung far
+//!   under the link, or never reaches it, is being held down by its own loss
+//!   response rather than by the path.
+//! - **`collapse`** — capacity falls fourfold behind a one-BDP buffer and stays
+//!   down. The opposite of `noisy` and the reason both exist: there the loss
+//!   says nothing about the sender's rate, here every loss is the queue
+//!   overflowing and says everything. A change that relaxes the loss response
+//!   has to be read against this before its improvement on `noisy` counts.
 //!
 //! # The instrument
 //!
@@ -82,6 +105,29 @@ const TICK: Duration = Duration::from_millis(1);
 /// range the reference WAN path measures.
 const PROPAGATION: Duration = Duration::from_millis(100);
 
+/// Which arrival pattern the noise term uses, for every phase in this run.
+///
+/// A process-wide reading of `PHANTOM_SIM_LOSS_SEED` rather than a per-scenario
+/// argument, because the question it answers is about a whole sweep: "does the
+/// figure I am about to quote survive a different draw of the same rate?". A
+/// seed makes every phase independent-with-that-seed; absent, everything is
+/// evenly spaced and the run is the reproducible one.
+fn loss_model() -> LossModel {
+    match std::env::var("PHANTOM_SIM_LOSS_SEED") {
+        Ok(v) => match v.trim().parse::<u64>() {
+            Ok(seed) => LossModel::Independent(seed),
+            Err(_) => {
+                eprintln!(
+                    "PHANTOM_SIM_LOSS_SEED={v:?} is not a number; using the even \
+                     spacing this run would have had without it"
+                );
+                LossModel::Even
+            }
+        },
+        Err(_) => LossModel::Even,
+    }
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let which = args.next();
@@ -90,14 +136,29 @@ fn main() {
             run_resume();
             run_degrade();
             run_thin();
+            run_noisy();
+            run_collapse();
         }
         Some("resume") => run_resume(),
         Some("degrade") => run_degrade(),
         Some("thin") => run_thin(),
+        Some("noisy") => run_noisy(),
+        Some("collapse") => run_collapse(),
         Some(other) => {
-            eprintln!("unknown scenario {other:?}; expected resume, degrade, thin or all");
+            eprintln!("unknown scenario {other:?}; expected resume, degrade, thin, noisy, collapse or all");
         }
     }
+}
+
+/// SplitMix64, so an `Independent` run is reproducible from its seed alone and
+/// this file still needs no dependency. The same generator the crate's own
+/// fault-injection harness uses, for the same reason.
+fn split_mix_64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 // ─── The model ──────────────────────────────────────────────────────────────
@@ -106,6 +167,12 @@ fn main() {
 struct InFlight {
     bytes: u64,
     sent_at: Instant,
+    /// This transmission repairs an earlier one. The congestion signal is
+    /// raised once per *hole*, so losing a repair must not raise it a second
+    /// time — the transport gates `on_packet_lost` on `seg.first_retransmit`
+    /// for exactly this reason, and `on_loss`'s own documentation says why:
+    /// counting copies reads a stalled path as a maximally congested one.
+    is_repair: bool,
     /// The connection's delivered counter as of this segment's send, and when
     /// it last advanced — the near end of the interval its acknowledgement
     /// measures a rate over. The transport stamps exactly these two.
@@ -119,6 +186,27 @@ struct InFlight {
 struct Returning {
     seg: InFlight,
     ack_at: Instant,
+    /// The link dropped this one. It still travels the return path, because a
+    /// sender learns of a hole from the acknowledgement that names its
+    /// successors — declaring the loss the instant the model drops the segment
+    /// would hand the controller knowledge no real one has until a round trip
+    /// has passed, and the whole question here is how the controller behaves
+    /// over round trips.
+    lost: bool,
+}
+
+/// How a phase's noise term decides which segments to drop.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LossModel {
+    /// Every `1/p`-th segment, remainder carried so the rate is exact. The
+    /// default: reproducible, and the harshest honest reading of a fixed rate
+    /// because it never clusters and so never hands the controller a quiet
+    /// stretch to recover in.
+    Even,
+    /// Independent draws at probability `p`, from a seeded generator. Same mean,
+    /// clustered arrivals, and a different answer — which is the point of
+    /// having it.
+    Independent(u64),
 }
 
 /// What the application wants to write, as a function of time.
@@ -138,6 +226,31 @@ struct Phase {
     link_start_bps: f64,
     link_end_bps: f64,
     demand: Demand,
+    /// Segments in a thousand the link drops for reasons that have nothing to
+    /// do with how hard it is being driven — a radio's error rate, a middlebox
+    /// under someone else's load. Dropped *after* the queue admits them, so the
+    /// fraction stays what it says it is at every offered rate, which is the
+    /// whole point: a loss that does not vary with the sender's rate carries no
+    /// information about where the knee is.
+    ///
+    /// Zero on every scenario that predates it, so their figures are unchanged.
+    loss_permille: u64,
+    /// Bytes the bottleneck will hold before it starts dropping. `None` is an
+    /// unbounded queue — which is what the first three scenarios ran against,
+    /// and keeping it lets their readings stay comparable across this change.
+    queue_limit_bytes: Option<u64>,
+    /// How the noise is spread over the segments it drops.
+    ///
+    /// Even spacing is the reproducible choice and the default, but it is *one*
+    /// arrival pattern out of many that share a mean, and a controller can be
+    /// sensitive to which one it gets — a burst of four consecutive drops and
+    /// four drops spread over four hundred segments are the same rate and not
+    /// the same event. `PHANTOM_SIM_LOSS_SEED=n` re-runs the sweep with
+    /// independent draws instead, so a figure can be checked for whether it
+    /// survives the choice. It is a check to run, not a default to change:
+    /// switching the default would make every before-and-after comparison
+    /// noisier for no gain.
+    loss_model: LossModel,
 }
 
 /// An unbounded windowed maximum, kept here so the estimator's reading has
@@ -205,6 +318,23 @@ struct Recorded {
     mean_fidelity: f64,
     /// The most candidates an unbounded filter held at once over the run.
     max_reference_entries: usize,
+    /// Segments the link dropped, and how many of those the queue dropped for
+    /// being full rather than the noise term dropping them. The split matters
+    /// because only the second kind is a signal about the sender's rate.
+    segments_dropped: u64,
+    segments_dropped_by_a_full_queue: u64,
+    /// Segments handed to the link, counting each copy of a repaired one.
+    segments_sent: u64,
+    /// Mean bytes standing in the bottleneck's queue over the final phase, and
+    /// the widest it got. This is what a loss response is *for*: a window held
+    /// above what the path can carry shows up here first and as latency second.
+    final_phase_queue_mean: f64,
+    final_phase_queue_max: u64,
+    /// The estimator's reading at the end of the run, and the window it implies
+    /// as a multiple of the bandwidth-delay product. A window pinned at exactly
+    /// `INFLIGHT_HI_FLOOR_GAIN` is the loss response holding it there.
+    final_btl_bw: u64,
+    final_cwnd_over_bdp: f64,
 }
 
 fn run(phases: &[Phase]) -> Recorded {
@@ -227,6 +357,23 @@ fn run(phases: &[Phase]) -> Recorded {
     let mut pace_credit = 0.0f64;
     // Outstanding application demand, bytes.
     let mut owed = 0u64;
+    // Segments whose loss has been declared and which are waiting to go out
+    // again. The model repairs everything it loses, exactly as the ARQ does;
+    // without that the flight arithmetic never gives the bytes back and the
+    // window closes on segments nobody is still waiting for.
+    let mut awaiting_repair = 0u64;
+    // Carries the remainder of the per-mille loss rate between segments, so the
+    // rung is the rate it says it is rather than the rate integer division
+    // rounds it to.
+    let mut noise_accumulator = 0u64;
+    // Generator state for `LossModel::Independent`, seeded per run.
+    let mut loss_rng = 0u64;
+    // Bytes queued at the bottleneck, tracked alongside the queue so a limit can
+    // be enforced without walking it.
+    let mut queued_bytes = 0u64;
+    // Time-average of that, over the final phase only.
+    let mut queue_sum = 0.0f64;
+    let mut queue_ticks = 0u64;
     // A trailing second of deliveries, for the time-to-ninety-percent reading.
     let mut recent: VecDeque<(Instant, u64)> = VecDeque::new();
 
@@ -258,6 +405,19 @@ fn run(phases: &[Phase]) -> Recorded {
                 let Some(r) = returning.pop_front() else {
                     break;
                 };
+                if r.lost {
+                    // A hole, learned about a round trip after the drop. The
+                    // copy that repairs it is sent from the loop below; the
+                    // congestion signal is raised only for a segment's *first*
+                    // transmission, matching the transport's own
+                    // `seg.first_retransmit` gate. A lost repair still has to be
+                    // repaired — it just is not counted as a second hole.
+                    if !r.seg.is_repair {
+                        est.on_loss(r.seg.bytes);
+                    }
+                    awaiting_repair += 1;
+                    continue;
+                }
                 let before = est.bottleneck_bandwidth();
                 let sample = DeliverySample {
                     delivered_bytes: r.seg.delivered_bytes,
@@ -336,29 +496,68 @@ fn run(phases: &[Phase]) -> Recorded {
             }
             let mut ran_dry = false;
             loop {
+                // A repair goes before new data, which is what the drain does:
+                // an unrepaired hole blocks the receiver's in-order delivery, so
+                // new bytes sent past it buy nothing until it is filled.
+                let repairing = awaiting_repair > 0;
+                // Repairs are exempt from the window, exactly as the transport
+                // has them: a copy replaces a transmission that is already
+                // counted against the window, so charging it again would let a
+                // closed window block the very send that reopens it. Modelling
+                // it the other way deadlocks — outstanding bytes that only a
+                // repair can retire, and a window too small to send one — and
+                // the deadlock is the model's, not the controller's.
                 let window_room = est.cwnd().saturating_sub(est.inflight_bytes()) >= SEGMENT;
-                if !window_room {
+                if !window_room && !repairing {
                     break;
                 }
                 if paced && pace_credit < SEGMENT as f64 {
                     break;
                 }
-                if owed < SEGMENT {
+                if !repairing && owed < SEGMENT {
                     ran_dry = true;
                     break;
                 }
-                owed -= SEGMENT;
+                if repairing {
+                    awaiting_repair -= 1;
+                } else {
+                    owed -= SEGMENT;
+                }
                 if paced {
                     pace_credit -= SEGMENT as f64;
                 }
                 est.on_send(SEGMENT);
-                queue.push_back(InFlight {
+                if repairing {
+                    // The copy's own `on_send` above added its bytes; the
+                    // transmission it replaces is no longer outstanding. The
+                    // congestion signal was raised when the hole was declared,
+                    // not here.
+                    est.on_retransmit(SEGMENT);
+                }
+                rec.segments_sent += 1;
+                let seg = InFlight {
                     bytes: SEGMENT,
                     sent_at: now,
+                    is_repair: repairing,
                     delivered_bytes: est.delivered_bytes(),
                     delivered_at: est.delivered_time(),
                     app_limited: est.is_app_limited(),
-                });
+                };
+                let queue_full = phase
+                    .queue_limit_bytes
+                    .is_some_and(|limit| queued_bytes + SEGMENT > limit);
+                if queue_full {
+                    rec.segments_dropped += 1;
+                    rec.segments_dropped_by_a_full_queue += 1;
+                    returning.push_back(Returning {
+                        seg,
+                        ack_at: now + PROPAGATION + PROPAGATION,
+                        lost: true,
+                    });
+                } else {
+                    queue.push_back(seg);
+                    queued_bytes += SEGMENT;
+                }
             }
             if ran_dry {
                 // The send pass ended with window to spare and nothing to give,
@@ -371,8 +570,51 @@ fn run(phases: &[Phase]) -> Recorded {
             while queue.front().is_some_and(|s| link_credit >= s.bytes as f64) {
                 let Some(seg) = queue.pop_front() else { break };
                 link_credit -= seg.bytes as f64;
+                queued_bytes = queued_bytes.saturating_sub(seg.bytes);
+                // Bresenham rather than a stride, so the rung runs at the rate
+                // it is labelled with. `admitted % (1000 / permille)` truncates
+                // the divisor — at 150 per mille that is one segment in six,
+                // 16.7%, under a heading that says 15% — and the difference
+                // moves the answer materially. The accumulator carries the
+                // remainder instead, reproducing any per-mille figure exactly.
+                //
+                // Still deterministic and still evenly spaced. Even spacing is
+                // not neutral: it is one draw from a distribution whose spread
+                // across arrival patterns is wide, so a rung's figure is a
+                // comparison between two builds and never a reading about a
+                // path.
+                let noise_dropped = match phase.loss_model {
+                    LossModel::Even => {
+                        noise_accumulator += phase.loss_permille;
+                        let hit = noise_accumulator >= 1000;
+                        if hit {
+                            noise_accumulator -= 1000;
+                        }
+                        hit
+                    }
+                    LossModel::Independent(seed) => {
+                        if loss_rng == 0 {
+                            // Only a zero state is degenerate for
+                            // SplitMix64, so that is the only value that needs
+                            // moving. Forcing the low bit instead would fold
+                            // every even seed onto its odd neighbour and leave
+                            // a sweep of 1..8 sampling four processes while
+                            // reporting eight.
+                            loss_rng = if seed == 0 { 1 } else { seed };
+                        }
+                        phase.loss_permille > 0
+                            && split_mix_64(&mut loss_rng) % 1000 < phase.loss_permille
+                    }
+                };
+                if noise_dropped {
+                    rec.segments_dropped += 1;
+                }
                 let ack_at = now + PROPAGATION + PROPAGATION;
-                returning.push_back(Returning { seg, ack_at });
+                returning.push_back(Returning {
+                    seg,
+                    ack_at,
+                    lost: noise_dropped,
+                });
             }
             // An idle link does not bank the capacity it went unused for. Left
             // to accumulate, the credit lets the next burst leave instantly and
@@ -391,6 +633,11 @@ fn run(phases: &[Phase]) -> Recorded {
                 recent.pop_front();
             }
             if index == final_index {
+                // Sampled once a tick, so the mean below is a time average of
+                // the standing queue rather than an average over arrivals.
+                queue_sum += queued_bytes as f64;
+                queue_ticks += 1;
+                rec.final_phase_queue_max = rec.final_phase_queue_max.max(queued_bytes);
                 let into_ms = into_phase.as_millis() as u64;
                 if into_ms == 1000 {
                     rec.first_second = phase_delivered;
@@ -435,6 +682,13 @@ fn run(phases: &[Phase]) -> Recorded {
         rec.delivered_per_phase.push(phase_delivered);
     }
 
+    rec.final_phase_queue_mean = if queue_ticks > 0 {
+        queue_sum / queue_ticks as f64
+    } else {
+        0.0
+    };
+    rec.final_btl_bw = est.bottleneck_bandwidth();
+    rec.final_cwnd_over_bdp = est.cwnd() as f64 / est.bdp().max(1) as f64;
     rec.mean_fidelity = if fidelity_n > 0 {
         fidelity_sum / fidelity_n as f64
     } else {
@@ -478,6 +732,18 @@ fn report(scenario: &str, phases: &[Phase], rec: &Recorded, link_at_resume_bps: 
          held up to {} candidates",
         rec.worst_fidelity, rec.mean_fidelity, rec.max_reference_entries
     );
+    if rec.segments_dropped > 0 {
+        println!(
+            "   link dropped {} of {} segments ({:.1}%), {} of them for a full queue; \
+             the run ended holding {} B/s with cwnd at {:.2} BDP",
+            rec.segments_dropped,
+            rec.segments_sent,
+            100.0 * rec.segments_dropped as f64 / rec.segments_sent.max(1) as f64,
+            rec.segments_dropped_by_a_full_queue,
+            rec.final_btl_bw,
+            rec.final_cwnd_over_bdp,
+        );
+    }
     println!();
 }
 
@@ -493,6 +759,9 @@ fn run_resume() {
             link_start_bps: MEGABYTE,
             link_end_bps: MEGABYTE,
             demand: Demand::Bulk,
+            loss_permille: 0,
+            queue_limit_bytes: None,
+            loss_model: loss_model(),
         },
         Phase {
             name: "request/response",
@@ -503,6 +772,9 @@ fn run_resume() {
                 bytes: 4096,
                 every: Duration::from_millis(200),
             },
+            loss_permille: 0,
+            queue_limit_bytes: None,
+            loss_model: loss_model(),
         },
         Phase {
             name: "bulk again",
@@ -510,6 +782,9 @@ fn run_resume() {
             link_start_bps: MEGABYTE,
             link_end_bps: MEGABYTE,
             demand: Demand::Bulk,
+            loss_permille: 0,
+            queue_limit_bytes: None,
+            loss_model: loss_model(),
         },
     ];
     let rec = run(&phases);
@@ -529,6 +804,9 @@ fn run_degrade() {
             link_start_bps: MEGABYTE,
             link_end_bps: MEGABYTE,
             demand: Demand::Bulk,
+            loss_permille: 0,
+            queue_limit_bytes: None,
+            loss_model: loss_model(),
         },
         Phase {
             name: "request/response",
@@ -539,6 +817,9 @@ fn run_degrade() {
                 bytes: 4096,
                 every: Duration::from_millis(200),
             },
+            loss_permille: 0,
+            queue_limit_bytes: None,
+            loss_model: loss_model(),
         },
         Phase {
             name: "bulk on a slower link",
@@ -546,6 +827,9 @@ fn run_degrade() {
             link_start_bps: 0.25 * MEGABYTE,
             link_end_bps: 0.25 * MEGABYTE,
             demand: Demand::Bulk,
+            loss_permille: 0,
+            queue_limit_bytes: None,
+            loss_model: loss_model(),
         },
     ];
     let rec = run(&phases);
@@ -557,6 +841,137 @@ fn run_degrade() {
     );
 }
 
+/// A link that drops a fixed fraction no matter how gently it is driven, swept
+/// from none to a fifth.
+///
+/// The shape comes from the reference WAN path, where the raw-UDP control drops
+/// between one and eight percent at rates far below the ceiling it later
+/// establishes — loss that is a property of the path rather than a report on
+/// the sender's rate. What a run has to answer is whether the controller finds
+/// the link's capacity anyway, and how long it takes: a rung that ends far
+/// under the link, or that never reaches it, is the loss response holding the
+/// window down rather than the path refusing to carry.
+///
+/// The queue is bounded here, unlike the first three scenarios, but **it does
+/// not bind and is not what makes this scenario work.** Every rung from one per
+/// mille upward reports zero queue-full drops, and depths from twenty
+/// milliseconds to four hundred give the same figures: a sender this bound is
+/// already holding below the link never fills the buffer. The limit is kept
+/// because a scenario about loss should not have an infinite queue hiding
+/// behind it, not because it is doing anything. Nor does it let the sweep tell a
+/// controller that ignores real congestion from one that handles it: there is no
+/// real congestion here to ignore. That job belongs to `collapse`, and that is
+/// why `collapse` exists.
+///
+/// **The top rung is degenerate.** At a fifth the estimate settles at a small
+/// multiple of `pacing_rate_floor` — four packets per minimum round trip, the
+/// bootstrap floor under the pacer — with the connection delivering a few dozen
+/// segments a second. Both builds report one per cent of the link there, and
+/// what the rung says is "this run fell into that attractor", not how the two
+/// compare. Read the two to ten per cent band, which is where the reference
+/// path's own control sits.
+fn run_noisy() {
+    const LINK: f64 = 4.0 * MEGABYTE;
+    for permille in [0u64, 10, 20, 50, 100, 150, 200] {
+        let phases = [Phase {
+            name: "bulk against a lossy link",
+            duration: Duration::from_secs(60),
+            link_start_bps: LINK,
+            link_end_bps: LINK,
+            demand: Demand::Bulk,
+            loss_permille: permille,
+            queue_limit_bytes: Some((LINK * 0.2) as u64),
+            loss_model: loss_model(),
+        }];
+        let rec = run(&phases);
+        let delivered = rec.delivered_per_phase.first().copied().unwrap_or(0);
+        let goodput = delivered as f64 / 60.0;
+        println!(
+            "── noisy {:>4.1}% ── goodput {:>9.0} B/s ({:>3.0}% of the link), \
+             estimate {:>9} B/s, cwnd {:.2} BDP, dropped {:>5} ({:>4.1}%, {} queue-full), \
+             reached 90% at {}",
+            permille as f64 / 10.0,
+            goodput,
+            100.0 * goodput / LINK,
+            rec.final_btl_bw,
+            rec.final_cwnd_over_bdp,
+            rec.segments_dropped,
+            100.0 * rec.segments_dropped as f64 / rec.segments_sent.max(1) as f64,
+            rec.segments_dropped_by_a_full_queue,
+            match rec.ms_to_ninety_percent {
+                Some(ms) => format!("{ms} ms"),
+                None => "never".to_string(),
+            }
+        );
+    }
+    println!();
+}
+
+/// Capacity falls fourfold behind a real buffer and stays down.
+///
+/// Every loss here is the queue overflowing, which makes this the opposite of
+/// `noisy` and the reason both have to exist: there the loss says nothing about
+/// the sender's rate, here it says everything. A loss response is bought to
+/// handle *this* shape, so any change that relaxes it has to be read against
+/// what this scenario reports — the standing queue over the low phase, and how
+/// many segments the buffer refused — before its improvement on `noisy` counts
+/// for anything.
+///
+/// The buffer is one bandwidth-delay product at the low rate, which is the
+/// conventional sizing and the depth at which a window held above the path
+/// shows up as loss rather than only as latency.
+fn run_collapse() {
+    const HIGH: f64 = 4.0 * MEGABYTE;
+    const LOW: f64 = MEGABYTE;
+    // One BDP at the low rate: 1 MB/s over the modelled 200 ms round trip.
+    const BUFFER: u64 = 200_000;
+    let phases = [
+        Phase {
+            name: "bulk at full rate",
+            duration: Duration::from_secs(6),
+            link_start_bps: HIGH,
+            link_end_bps: HIGH,
+            demand: Demand::Bulk,
+            loss_permille: 0,
+            queue_limit_bytes: Some(BUFFER),
+            loss_model: loss_model(),
+        },
+        Phase {
+            name: "capacity down fourfold",
+            duration: Duration::from_secs(40),
+            link_start_bps: LOW,
+            link_end_bps: LOW,
+            demand: Demand::Bulk,
+            loss_permille: 0,
+            queue_limit_bytes: Some(BUFFER),
+            loss_model: loss_model(),
+        },
+    ];
+    let rec = run(&phases);
+    let low_bdp = LOW * 0.2;
+    println!("── collapse: capacity falls fourfold behind a {BUFFER} B buffer ──");
+    println!(
+        "   low phase: delivered {} B ({:.0}% of the link), standing queue mean {:.0} B \
+         ({:.2} BDP), max {} B",
+        rec.delivered_per_phase.get(1).copied().unwrap_or(0),
+        100.0 * rec.delivered_per_phase.get(1).copied().unwrap_or(0) as f64 / (40.0 * LOW),
+        rec.final_phase_queue_mean,
+        rec.final_phase_queue_mean / low_bdp,
+        rec.final_phase_queue_max
+    );
+    println!(
+        "   the buffer refused {} of {} segments ({:.1}%); widest round trip {} ms; \
+         the run ended holding {} B/s with cwnd at {:.2} BDP",
+        rec.segments_dropped_by_a_full_queue,
+        rec.segments_sent,
+        100.0 * rec.segments_dropped_by_a_full_queue as f64 / rec.segments_sent.max(1) as f64,
+        rec.max_rtt_in_final_ms,
+        rec.final_btl_bw,
+        rec.final_cwnd_over_bdp
+    );
+    println!();
+}
+
 fn run_thin() {
     let phases = [
         Phase {
@@ -565,6 +980,9 @@ fn run_thin() {
             link_start_bps: 4.0 * MEGABYTE,
             link_end_bps: 4.0 * MEGABYTE,
             demand: Demand::Bulk,
+            loss_permille: 0,
+            queue_limit_bytes: None,
+            loss_model: loss_model(),
         },
         Phase {
             name: "capacity falling",
@@ -572,6 +990,9 @@ fn run_thin() {
             link_start_bps: 4.0 * MEGABYTE,
             link_end_bps: 0.4 * MEGABYTE,
             demand: Demand::Bulk,
+            loss_permille: 0,
+            queue_limit_bytes: None,
+            loss_model: loss_model(),
         },
         Phase {
             name: "held low",
@@ -579,6 +1000,9 @@ fn run_thin() {
             link_start_bps: 0.4 * MEGABYTE,
             link_end_bps: 0.4 * MEGABYTE,
             demand: Demand::Bulk,
+            loss_permille: 0,
+            queue_limit_bytes: None,
+            loss_model: loss_model(),
         },
         Phase {
             name: "capacity restored",
@@ -586,6 +1010,9 @@ fn run_thin() {
             link_start_bps: 4.0 * MEGABYTE,
             link_end_bps: 4.0 * MEGABYTE,
             demand: Demand::Bulk,
+            loss_permille: 0,
+            queue_limit_bytes: None,
+            loss_model: loss_model(),
         },
     ];
     let rec = run(&phases);
