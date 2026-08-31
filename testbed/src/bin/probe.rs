@@ -147,6 +147,19 @@ struct Args {
     #[arg(long)]
     bidir_mib: Option<u64>,
 
+    /// Override the wall-clock ceiling on a single bulk transfer, in seconds.
+    ///
+    /// The byte budgets above and this ceiling are two different ways for a
+    /// transfer to end, and whichever comes first is the one that decides.
+    /// Raising a budget without raising this does nothing at all on a path slow
+    /// enough for the clock to run out first — which is what happened to the
+    /// 26 August campaign, where both `download` and `bidir` were cut at 60
+    /// seconds having moved between half and a third of the bytes asked for.
+    /// Each scenario says so in its own notes, so the run was not silent about
+    /// it; but a budget that cannot take effect is worth being able to fix.
+    #[arg(long)]
+    transfer_cap_secs: Option<u64>,
+
     /// Override the application frame size used by `upload`, `download` and
     /// `bidir`, in bytes.
     ///
@@ -275,9 +288,14 @@ fn resolved_params(args: &Args) -> Result<Params> {
     if let Some(s) = args.upload_secs {
         anyhow::ensure!(s > 0, "--upload-secs must be at least 1");
         params.upload = Duration::from_secs(s);
-        // The wall-clock cap bounds every bulk transfer, so a longer upload
-        // than the cap would be silently cut back to it — an override that
-        // quietly does not take is worse than one that is refused.
+        // Widened to match, though on the current wiring it makes no
+        // difference: `transfer_cap` is passed only to `download` and `bidir`,
+        // while `upload` is bounded by the window above and never sees the cap.
+        // The line predates that being checked and is kept because it costs
+        // nothing and would be right again the day the cap does reach every
+        // bulk transfer — but it is not, today, protecting the upload from
+        // anything, and the comment that said it was has been removed rather
+        // than left to be believed.
         params.transfer_cap = params.transfer_cap.max(params.upload);
     }
     if let Some(m) = args.download_mib {
@@ -287,6 +305,20 @@ fn resolved_params(args: &Args) -> Result<Params> {
     if let Some(m) = args.bidir_mib {
         anyhow::ensure!(m > 0, "--bidir-mib must be at least 1");
         params.bidir_bytes = m * 1024 * 1024;
+    }
+    if let Some(s) = args.transfer_cap_secs {
+        anyhow::ensure!(s > 0, "--transfer-cap-secs must be at least 1");
+        // Deliberately **not** checked against `params.upload`, and the reason
+        // is worth stating because the neighbouring rule reads as though it
+        // should be. `transfer_cap` reaches exactly two scenarios — `download`
+        // and `bidir` — and `upload` is bounded by its own window, which the
+        // cap never sees. So a cap below the upload window cuts nothing, and
+        // refusing that combination would reject a perfectly sensible run: a
+        // long upload measured against a short receive.
+        //
+        // Applied after `--upload-secs`, so an explicit cap wins over the
+        // widening that flag performs.
+        params.transfer_cap = Duration::from_secs(s);
     }
     if let Some(f) = args.transfer_frame {
         // The sink message carries a length prefix, a verb and a sequence
@@ -413,6 +445,83 @@ mod tests {
         let only_down =
             resolved_params(&parse(&["--download-mib", "150"])).expect("override must apply");
         assert_eq!(only_down.bidir_bytes, base.bidir_bytes);
+    }
+
+    /// A byte budget and the wall-clock cap are two ways for one transfer to
+    /// end, and the smaller decides. Raising a budget on a path slow enough for
+    /// the clock to win first therefore changes nothing, which is what the 26
+    /// August campaign ran into: 150 and 120 mebibytes asked for, between a
+    /// third and a half of them moved, every scenario cut at sixty seconds.
+    #[test]
+    fn the_measurement_window_can_be_raised_alongside_the_byte_budgets() {
+        let base = resolved_params(&parse(&[])).expect("defaults");
+        let p = resolved_params(&parse(&["--transfer-cap-secs", "180"])).expect("override applies");
+        assert_eq!(p.transfer_cap, Duration::from_secs(180));
+        assert!(
+            p.transfer_cap > base.transfer_cap,
+            "the override has to actually widen the window it names"
+        );
+        // Raising the cap is not a reason to move anything else.
+        assert_eq!(p.download_bytes, base.download_bytes);
+        assert_eq!(p.upload, base.upload);
+
+        // An override has to be able to move its value in **both** directions,
+        // or it is a widening and should say so in its name. A `.max()` against
+        // the profile default would pass every assertion above and silently
+        // ignore any cap below sixty seconds.
+        let lowered =
+            resolved_params(&parse(&["--transfer-cap-secs", "30"])).expect("override applies");
+        assert_eq!(
+            lowered.transfer_cap,
+            Duration::from_secs(30),
+            "a cap below the profile's default has to take effect too, or the flag \
+             is a widening wearing the name of an override"
+        );
+
+        // The two clock overrides interact, and the rule is *not* the one it
+        // looks like: an explicit cap below the upload window is accepted,
+        // because `transfer_cap` reaches only `download` and `bidir` and cannot
+        // cut an upload short. A long upload measured against a short receive
+        // is a sensible run and refusing it would be the tool inventing a
+        // constraint the code does not have.
+        let both = resolved_params(&parse(&[
+            "--upload-secs",
+            "120",
+            "--transfer-cap-secs",
+            "60",
+        ]))
+        .expect("a cap under the upload window cuts nothing and must be accepted");
+        assert_eq!(both.upload, Duration::from_secs(120));
+        assert_eq!(both.transfer_cap, Duration::from_secs(60));
+
+        // Order matters between them: `--upload-secs` widens the cap, and an
+        // explicit cap is the more specific instruction, so it has to win
+        // regardless of the order the two are parsed in.
+        let widened_then_set = resolved_params(&parse(&[
+            "--upload-secs",
+            "300",
+            "--transfer-cap-secs",
+            "90",
+        ]))
+        .expect("override applies");
+        assert_eq!(
+            widened_then_set.transfer_cap,
+            Duration::from_secs(90),
+            "--upload-secs widened the cap to 300 s and the explicit --transfer-cap-secs \
+             did not override it"
+        );
+
+        // Zero is refused here rather than somewhere downstream. Asserting only
+        // `is_err()` would pass while a neighbouring guard did the refusing for
+        // an unrelated reason, so the message is checked too.
+        let zero = resolved_params(&parse(&["--transfer-cap-secs", "0"]));
+        let why = zero
+            .expect_err("a zero-second window measures nothing")
+            .to_string();
+        assert!(
+            why.contains("--transfer-cap-secs"),
+            "zero was refused by something other than this flag's own guard: {why}"
+        );
     }
 
     #[test]

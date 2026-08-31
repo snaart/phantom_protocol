@@ -1600,11 +1600,18 @@ pub async fn bidir(
     // measure full duplex — it would measure which direction starves the other,
     // and would never terminate on a fast path.
     let up_budget = total_bytes;
+    let started = Instant::now();
     let uploader = tokio::spawn(async move {
         let mut gen = PayloadGen::new(6);
         let payload = gen.fill(up_frame.saturating_sub(9));
         let mut seq = 0u64;
         let mut bytes = 0u64;
+        // When this side last actually put bytes on the wire — not when its
+        // loop exited. A sender parked inside `send_encoded` waiting for the
+        // window to open is not a second direction, however long it stays
+        // there, and timing the loop instead would report a stalled upload as
+        // duplex right up to the operation timeout.
+        let mut last_sent = Duration::ZERO;
         while !up_stop.load(Ordering::Relaxed) && bytes < up_budget {
             let wire = crate::framing::encode_framed(&Msg::Sink {
                 seq,
@@ -1615,11 +1622,15 @@ pub async fn bidir(
                 Ok(Ok(())) => {
                     bytes += n;
                     seq += 1;
+                    last_sent = started.elapsed();
                 }
                 _ => break,
             }
         }
-        (seq, bytes)
+        // The two halves carry the same byte budget but not the same rate, so
+        // the faster one finishes first and whatever is left of the window is
+        // not full duplex at all.
+        (seq, bytes, last_sent)
     });
 
     let mut down = WindowTracker::new(leg, "bidir_download");
@@ -1653,8 +1664,9 @@ pub async fn bidir(
         }
     }
 
+    let down_ran_for = started.elapsed();
     stop.store(true, Ordering::Relaxed);
-    let (up_frames, up_bytes) = uploader.await.unwrap_or((0, 0));
+    let (up_frames, up_bytes, up_ran_for) = uploader.await.unwrap_or((0, 0, Duration::ZERO));
     // Both halves of the exchange have stopped, so the transfer is over and the
     // rest is teardown; a series that keeps sampling through the drain reports
     // outstanding bytes collapsing as though the transfer had ended that way.
@@ -1668,9 +1680,10 @@ pub async fn bidir(
     }
     out.summary.throughput = Some(down_tp.clone());
     out.note(format!(
-        "full duplex: down {:.2} Mbit/s ({} B), up {} B in {} frames over the same interval",
+        "full duplex: down {:.2} Mbit/s ({} B), up {} B in {} frames",
         down_tp.megabits_per_sec, down_tp.bytes, up_bytes, up_frames
     ));
+    out.note(duplex_overlap_note(up_ran_for, down_ran_for));
 
     match sink_end_and_report(framed.as_ref(), up_frames, up_bytes).await {
         Ok((f, b, _, _)) => out.note(format!("server received {b} B in {f} upload frames")),
@@ -1684,6 +1697,55 @@ pub async fn bidir(
     out.mark(framed.as_ref(), "bidir:end").await;
     framed.close().await;
     out
+}
+
+/// How much of the duplex window actually had both directions running.
+///
+/// The scenario reports a download rate averaged over its whole window. The two
+/// directions carry the same byte budget but not the same rate, so the faster
+/// one finishes first, and from that moment the average is accumulating a
+/// **one-way** measurement under a duplex label. Compared against the one-way
+/// scenario — which is exactly what the comparison is for — a figure like that
+/// is a mixture being held up against one of its own ingredients, and the
+/// duplex penalty it reports is diluted by however much of the window was not
+/// duplex.
+///
+/// Reported rather than corrected. Trimming the average to the overlap would be
+/// arithmetic on a series this function cannot see, and the honest fix is to
+/// raise the budget of whichever direction finished first until the window is
+/// duplex throughout.
+fn duplex_overlap_note(up_ran_for: Duration, down_ran_for: Duration) -> String {
+    let overlap = up_ran_for.min(down_ran_for);
+    // A window of no length has no share to report, and dividing by it would
+    // manufacture one. Below a tenth of a second nothing here is a measurement
+    // anyway, so the two cases are answered together.
+    if down_ran_for < Duration::from_millis(100) {
+        return format!(
+            "the download window was {:.3} s, too short for the duplex share of it \
+             to mean anything",
+            down_ran_for.as_secs_f64()
+        );
+    }
+    let share = overlap.as_secs_f64() / down_ran_for.as_secs_f64();
+    if share >= 0.98 {
+        format!(
+            "both directions ran for effectively the whole window (upload {:.1} s, \
+             download {:.1} s), so the rate above is a duplex rate throughout",
+            up_ran_for.as_secs_f64(),
+            down_ran_for.as_secs_f64()
+        )
+    } else {
+        format!(
+            "the upload stopped after {:.1} s of a {:.1} s window, so only {:.0}% of \
+             the download's average had a second direction in it and the rest is a \
+             one-way measurement wearing a duplex label. Read it against the one-way \
+             scenario with that in mind, and raise the byte budget of whichever \
+             direction finished first if the whole window needs to be duplex",
+            up_ran_for.as_secs_f64(),
+            down_ran_for.as_secs_f64(),
+            100.0 * share
+        )
+    }
 }
 
 // ── 6b. send_ceiling ────────────────────────────────────────────────────────
@@ -6228,5 +6290,139 @@ mod tests {
             notes.contains("answered nothing"),
             "the reason for stopping has to be recorded: {notes}"
         );
+    }
+
+    /// The duplex figure is an average over the download's window, and the two
+    /// directions do not finish together. A reading that does not say how much
+    /// of that window was actually duplex invites the one comparison the
+    /// scenario exists to make — duplex against one-way — to be made between a
+    /// mixture and one of its own ingredients.
+    #[test]
+    fn the_duplex_note_says_how_much_of_the_window_had_two_directions() {
+        // Both directions ran the whole window.
+        let whole = duplex_overlap_note(Duration::from_secs(60), Duration::from_secs(60));
+        assert!(
+            whole.contains("duplex rate throughout"),
+            "a window with both directions running throughout must say so: {whole}"
+        );
+
+        // The upload finished at two thirds. The note must carry both the
+        // moment and the share, because the share alone does not say which
+        // direction to lengthen.
+        let partial = duplex_overlap_note(Duration::from_secs(40), Duration::from_secs(60));
+        assert!(
+            partial.contains("40.0 s") && partial.contains("67%"),
+            "a partially duplex window must report when the upload stopped and \
+             what share of the average that leaves: {partial}"
+        );
+        assert!(
+            !partial.contains("throughout"),
+            "a partially duplex window must not read as a whole one: {partial}"
+        );
+
+        // Just under the tolerance is still partial; just over is whole. The
+        // boundary has to be somewhere, and a reading that slid either way
+        // would let a one-way tail pass as duplex or flag rounding as a defect.
+        let near = duplex_overlap_note(Duration::from_millis(58_500), Duration::from_secs(60));
+        assert!(
+            !near.contains("throughout"),
+            "97.5% of a window is not the whole of it: {near}"
+        );
+        let nearer = duplex_overlap_note(Duration::from_millis(59_000), Duration::from_secs(60));
+        assert!(
+            nearer.contains("throughout"),
+            "98.3% is inside the tolerance and must read as whole: {nearer}"
+        );
+
+        // A window of no length has no share, and computing one would divide by
+        // zero and publish whatever came out.
+        let empty = duplex_overlap_note(Duration::ZERO, Duration::ZERO);
+        assert!(
+            empty.contains("too short"),
+            "a zero-length window must be reported as unmeasurable rather than \
+             given a share: {empty}"
+        );
+        assert!(
+            !empty.contains("NaN") && !empty.contains("inf"),
+            "the zero case must not reach the arithmetic at all: {empty}"
+        );
+    }
+
+    /// The duplex note has to be *wired in*, not merely present.
+    ///
+    /// The test above proves the function formats what it is given. It cannot
+    /// see the call site, and every way the call site can be wrong leaves it
+    /// green: delete the call and the artefact simply loses the note; swap the
+    /// two arguments and the share is computed against the wrong side; pass a
+    /// constant for either duration and the note reports a window nobody
+    /// measured. All four are silent — the run still completes, still writes an
+    /// artefact, still reports a duplex figure.
+    ///
+    /// Checking the wiring properly would need a full `bidir` against a live
+    /// daemon, which no unit test can have. Reading the source is the honest
+    /// second best, and it is the same instrument `framing.rs` uses to keep the
+    /// window columns from drifting: parse the call out of this file and assert
+    /// its shape.
+    #[test]
+    fn the_duplex_note_is_wired_into_the_scenario_with_its_arguments_in_order() {
+        const SRC: &str = include_str!("scenarios.rs");
+
+        // Two things are cut before anything is looked for, and both were
+        // learned by watching this gate pass mutations it was written to catch.
+        //
+        // The test module goes first. This file includes *itself*, so the
+        // needles below appear in it as string literals — every one of them
+        // matched against its own source and the gate reported wiring that had
+        // just been deleted.
+        //
+        // Then comments of both kinds, because a call that exists only inside
+        // one is not a call, and a gate satisfied by a commented-out line
+        // reports a wiring that is not there. Both kinds is the operative
+        // word: the first version of this removed `//` tails only, and a call
+        // moved into `/* … */` passed it.
+        let production_end = SRC
+            .find("\n#[cfg(test)]")
+            .expect("this file has a test module and the gate must exclude it");
+        let code = crate::framing::code_without_comments(&SRC[..production_end]);
+
+        let call = "out.note(duplex_overlap_note(up_ran_for, down_ran_for));";
+        assert!(
+            code.contains(call),
+            "the duplex scenario no longer calls `duplex_overlap_note(up_ran_for, \
+             down_ran_for)` and pushes the result into the run's notes. Either the \
+             call is gone — and every duplex figure the harness reports is once \
+             again silent about how much of its window had two directions in it — \
+             or the arguments have moved, which attributes the share to the wrong \
+             side of the exchange"
+        );
+
+        // And the two durations have to be measurements, not constants. The
+        // upload's is the moment of its last successful send; the download's is
+        // the elapsed time when its loop ended.
+        for (needle, why) in [
+            (
+                "let mut last_sent = Duration::ZERO;",
+                "the upload's end has to be tracked from its last successful send, \
+                 not from when its loop exited — a sender parked in backpressure is \
+                 not a second direction",
+            ),
+            (
+                "last_sent = started.elapsed();",
+                "nothing updates the upload's last-send stamp, so the note reports \
+                 an upload that stopped at zero",
+            ),
+            (
+                "(seq, bytes, last_sent)",
+                "the upload task no longer returns the stamp it kept, so whatever it \
+                 measured never reaches the note",
+            ),
+            (
+                "let down_ran_for = started.elapsed();",
+                "the download's window has to be the elapsed time at the moment its \
+                 loop ended, not a nominal cap",
+            ),
+        ] {
+            assert!(code.contains(needle), "{why}");
+        }
     }
 }

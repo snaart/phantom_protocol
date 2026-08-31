@@ -181,8 +181,8 @@ the longest scenario for almost no extra information.
 
 Useful flags: `--legs udp,tcp,mimic,quic,raw_tcp,raw_udp`,
 `--only rtt_sweep,upload`, `--rtt-sizes 64,1024,8192`, `--soak-secs`,
-`--concurrency`, `--upload-secs`, `--upload-converge`, `--transfer-frame`,
-`--capture-iface`, `--no-upload`.
+`--concurrency`, `--upload-secs`, `--upload-converge`, `--transfer-cap-secs`,
+`--transfer-frame`, `--capture-iface`, `--no-upload`.
 
 Three of those exist to settle questions the default matrix cannot, and all are
 described under "Reading a run" below, where the readings they answer live:
@@ -208,10 +208,21 @@ described under "Reading a run" below, where the readings they answer live:
   needs `clock_sync`, which measures the round trip, and a run that filters that
   out is refused rather than quietly falling back.
 - `--upload-secs` sets the window in seconds instead. It carries `transfer_cap`
-  upward with it, because an upload longer than the wall-clock cap that bounds
-  every transfer would otherwise be silently cut back to the cap. The two flags
-  are exclusive: they answer the same question differently and the loser would be
-  invisible.
+  upward with it. That widening protects nothing today — `transfer_cap` reaches
+  `download` and `bidir` and the upload is bounded by its own window — and it is
+  kept because it costs nothing and would be right again the day the cap does
+  bound every transfer. The two flags are exclusive: they answer the same
+  question differently and the loser would be invisible.
+- `--transfer-cap-secs` sets that wall-clock cap directly, in both directions.
+  A transfer ends at a byte budget or at the cap, whichever comes first, so
+  raising `--download-mib` or `--bidir-mib` on a path slow enough for the clock
+  to win changes nothing at all: a campaign asked for 150 and 120 mebibytes,
+  moved between a third and a half of them, and every scenario was cut at sixty
+  seconds. Each run says so in its own notes, which is how that was found.
+  Deliberately **not** refused below the upload window: the cap cannot cut an
+  upload short, so a long upload measured against a short receive is a sensible
+  run rather than a combination to reject. An explicit cap wins over the
+  widening `--upload-secs` performs, whichever order they are given in.
 - `--transfer-frame` changes the application frame size for `upload`, `download`
   and `bidir`. It is the only knob that moves the ARQ send buffer's byte ceiling
   — that bound is `MAX_PENDING_PACKETS` **segments**, so its byte figure scales

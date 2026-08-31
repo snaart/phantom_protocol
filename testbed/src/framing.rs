@@ -319,6 +319,58 @@ pub fn encode_framed(msg: &Msg) -> Vec<u8> {
 /// real path. Scripting the link is what makes them deterministic, and a shared
 /// double is what keeps the daemon's tests and the probe's tests agreeing on
 /// what a failing link looks like.
+/// A source region with both kinds of comment removed.
+///
+/// Two tests in this crate check a mechanism by looking for its call in the
+/// source text, because the alternative — a live daemon and a real transfer —
+/// is not something a unit test can have. A gate like that is satisfied by any
+/// occurrence of what it looks for, so a call that survives only inside a
+/// comment reports a wiring that is not there. The first version of both gates
+/// removed `//` tails and stopped, and a call moved into `/* … */` passed the
+/// gate written to catch exactly that. Nesting is legal in Rust, so the depth
+/// is counted rather than the delimiters matched in pairs.
+///
+/// A string literal holding either delimiter would confuse this. Neither region
+/// it is pointed at contains one, and both callers pass a bounded slice rather
+/// than a whole file, which is what keeps that true as the file grows.
+#[cfg(test)]
+pub(crate) fn code_without_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut chars = src.chars().peekable();
+    let mut depth = 0usize;
+    let mut line = false;
+    while let Some(c) = chars.next() {
+        if line {
+            if c == '\n' {
+                line = false;
+                out.push('\n');
+            }
+            continue;
+        }
+        if c == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            depth += 1;
+            continue;
+        }
+        if depth > 0 {
+            if c == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                depth -= 1;
+            } else if c == '\n' {
+                out.push('\n');
+            }
+            continue;
+        }
+        if c == '/' && chars.peek() == Some(&'/') {
+            chars.next();
+            line = true;
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
 #[cfg(test)]
 pub(crate) mod testing {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -756,6 +808,42 @@ mod tests {
     /// hardcoding a zero beside it left the name in view and the gate green. That
     /// is the exact shape of break this exists to catch, and it survived the first
     /// version of it.
+    /// The comment stripper is itself a gate, so it is checked by breaking it.
+    ///
+    /// Each case below fails against the version that removed `//` tails only —
+    /// the version that let a block-commented call pass as wiring.
+    #[test]
+    fn a_call_that_survives_only_inside_a_comment_is_not_a_call() {
+        let needle = "out.note(f(x, y));";
+
+        assert!(
+            !code_without_comments("let a = 1;\n/* out.note(f(x, y)); */\nlet b = 2;\n")
+                .contains(needle),
+            "a block comment must hide the call it contains"
+        );
+        assert!(
+            !code_without_comments("let a = 1;\n// out.note(f(x, y));\n").contains(needle),
+            "a line comment must hide the call it contains"
+        );
+        assert!(
+            !code_without_comments("/* many\nlines\nout.note(f(x, y));\n*/\n").contains(needle),
+            "a block comment spanning lines must hide a call on any of them"
+        );
+        assert!(
+            code_without_comments("    out.note(f(x, y));\n").contains(needle),
+            "real code must survive, or the gate refuses wiring that is present"
+        );
+        assert!(
+            code_without_comments("/* a /* b */ still a comment */ out.note(f(x, y));")
+                .contains(needle),
+            "nesting is legal in Rust, so the inner close must not end the outer comment"
+        );
+        assert!(
+            code_without_comments("/* x */\nout.note(f(x, y));\n").contains(needle),
+            "a closed block comment must not swallow the code after it"
+        );
+    }
+
     fn phantom_leg_constructor(src: &str) -> String {
         let anchor = "let bw = self.session.bandwidth_snapshot().await?;";
         let Some(start) = src.find(anchor) else {
@@ -763,13 +851,6 @@ mod tests {
         };
         let tail = &src[start..];
         let end = tail.find("\n        })").unwrap_or(tail.len());
-        tail[..end]
-            .lines()
-            .map(|l| match l.find("//") {
-                Some(i) => &l[..i],
-                None => l,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        code_without_comments(&tail[..end])
     }
 }
