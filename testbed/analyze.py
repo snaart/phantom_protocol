@@ -12,6 +12,7 @@ Only the standard library is used, so it runs anywhere the results land.
 """
 
 import argparse
+import builtins
 import json
 import math
 import pathlib
@@ -1098,6 +1099,118 @@ def app_limited_reading(rows):
         "stamped_share": stamped / total,
         "wall_clock_share": len(flagged) / len(rows) if rows else None,
     }
+
+
+def where_the_holes_came_from(rows):
+    """Split a run's holes between the two explanations still standing.
+
+    The campaigns left an open question with three candidates: the path itself,
+    the sender's own standing queue, and the shape of the sender's output.
+    Reordering was ruled out by a control from the same run, and RACK's share
+    was measured and turned out to be a minority. What the campaigns could not
+    do was separate the last two, because both were present in every window and
+    nothing recorded said which one a given window had.
+
+    The columns that separate them were added later and this reads them:
+
+    * **standing queue** — `smoothed_rtt_us` over `min_rtt_us`. Queue the sender
+      built is queue the sender can drain, and it is the one candidate whose
+      remedy is "send less".
+    * **bursty output** — drain passes that ended against a byte ceiling
+      (`dry_passes_against_a_full_buffer`, `dry_passes_with_no_peer_window`). A
+      sender that repeatedly fills, stops and releases presents the path with a
+      different arrival pattern than the even one a raw control produces, at the
+      same mean rate.
+
+    Windows are split at the medians of both quantities and the hole rate is
+    reported per bucket. Two buckets differing by little says the candidate does
+    not explain the holes; a large difference says it may. **This is a
+    correlation over a run's own windows and nothing more** — both quantities
+    rise with load, so a difference here is a lead and never a mechanism. It is
+    also blind by construction on a path that loses on its own, which is what
+    the August runs were: when the control reports the same loss rate, no split
+    of our own windows can attribute anything.
+
+    `None` when the columns are absent, when fewer than four windows carry
+    holes, or when a quantity has no spread to split on — each of which would
+    otherwise produce a bucket comparison with nothing in it.
+    """
+    usable = [
+        r
+        for r in rows
+        if r.get("loss_declarations") is not None and (r.get("min_rtt_us") or 0) > 0
+    ]
+    # Two rows is one step, which is the least this can be built from at all.
+    # The judgement about whether there is enough evidence to attribute anything
+    # is made on *steps* below — a row whose window delivered nothing is not a
+    # step — and stating it twice, once here on rows and once there, made the
+    # one below unreachable and therefore untestable.
+    if len(usable) < 2:
+        return None
+
+    # Holes and delivery are cumulative counters, so a window's own share is the
+    # difference against the previous window. The first row has no predecessor
+    # and is dropped rather than counted against zero.
+    steps = []
+    for prev, cur in zip(usable, usable[1:]):
+        holes = (cur.get("loss_declarations") or 0) - (prev.get("loss_declarations") or 0)
+        delivered = (cur.get("delivered_bytes") or 0) - (prev.get("delivered_bytes") or 0)
+        if delivered <= 0 or holes < 0:
+            continue
+        srtt = cur.get("smoothed_rtt_us")
+        floor = cur.get("min_rtt_us") or 0
+        queue_us = None if srtt is None else max(0, srtt - floor)
+        ceiling_passes = (cur.get("dry_passes_against_a_full_buffer") or 0) + (
+            cur.get("dry_passes_with_no_peer_window") or 0
+        )
+        steps.append(
+            {
+                "holes": holes,
+                "delivered": delivered,
+                "queue_us": queue_us,
+                "ceiling_passes": ceiling_passes,
+            }
+        )
+    if len(steps) < 4:
+        return None
+
+    def split(key):
+        # No count check here: how much evidence is enough is decided once, on
+        # steps, above. Repeating it made that decision unreachable — the two
+        # thresholds hid each other, so neither could be shown to be doing
+        # anything. What remains is the one condition that is local to a split:
+        # both buckets have to be non-empty, or there is nothing to compare.
+        vals = [s[key] for s in steps if s[key] is not None]
+        if not vals:
+            return None
+        # Nearest-rank, the same percentile the rest of this file and the Rust
+        # side use, so the split point is a value that actually occurred.
+        mid = pct(vals, 0.5)
+        low = [s for s in steps if s[key] is not None and s[key] <= mid]
+        high = [s for s in steps if s[key] is not None and s[key] > mid]
+        # No spread means no split: every window on one side of the median is
+        # every window, and a bucket against an empty one is not a comparison.
+        if not low or not high:
+            return None
+
+        def rate(bucket):
+            holes = sum(s["holes"] for s in bucket)
+            delivered = sum(s["delivered"] for s in bucket)
+            return holes / (delivered / 1028.0) if delivered else 0.0
+
+        return {
+            "median": mid,
+            "low_rate": rate(low),
+            "high_rate": rate(high),
+            "low_windows": len(low),
+            "high_windows": len(high),
+        }
+
+    queue = split("queue_us")
+    ceiling = split("ceiling_passes")
+    if queue is None and ceiling is None:
+        return None
+    return {"queue": queue, "ceiling": ceiling, "windows": len(steps)}
 
 
 def rto_margin_ms(rows):
@@ -2349,6 +2462,34 @@ def send_bound_series(f, scenario, phase, tag, rows):
             "flight already outstanding"
         )
 
+    origin = where_the_holes_came_from(rows)
+    if origin:
+        print(
+            f"{pad} where the holes fell, over {origin['windows']} window step(s) "
+            "— a correlation inside this run, never a mechanism:"
+        )
+        q = origin.get("queue")
+        if q:
+            print(
+                f"{pad} {'':2}by standing queue (median {q['median'] / 1000:.0f} ms "
+                f"over min_rtt): {q['low_rate']:.2%} of segments below it "
+                f"({q['low_windows']} windows), {q['high_rate']:.2%} above "
+                f"({q['high_windows']})"
+            )
+        c = origin.get("ceiling")
+        if c:
+            print(
+                f"{pad} {'':2}by passes against a byte ceiling (median "
+                f"{c['median']:.0f}): {c['low_rate']:.2%} below it "
+                f"({c['low_windows']} windows), {c['high_rate']:.2%} above "
+                f"({c['high_windows']})"
+            )
+        print(
+            f"{pad} {'':2}read against the raw control from the same run: where the "
+            "control loses the same fraction, neither split attributes anything, "
+            "because the path was losing on its own"
+        )
+
     timing = rto_margin_ms(rows)
     if timing:
         print(
@@ -3182,6 +3323,21 @@ def self_test():
     receiver's heading and disclosed it in a footnote — and dropping the row
     instead would turn every archived run into one whose uploads never happened.
     """
+
+    # Every check prints one `ok:`/`FAIL:` line, so the count of those lines *is*
+    # the number of checks. It used to be a hand-kept sum of `len(...)` terms
+    # with a bare `+ 7` on the end, and by the time anyone looked it was nine
+    # short of the truth: the suite printed 166 results and reported "157/157",
+    # which is a gate quietly under-counting itself in exactly the way this file
+    # exists to catch elsewhere.
+    checks_run = [0]
+
+    def print(*args, **kwargs):  # noqa: A001 — deliberate shadow, see above
+        text = " ".join(str(a) for a in args)
+        if text.lstrip().startswith(("ok:", "FAIL:")):
+            checks_run[0] += 1
+        builtins.print(*args, **kwargs)
+
     label_cases = [
         ([{"bw_filter_window_ms": 10000}] * 3, "filtered max over 10s horizon"),
         ([{"bw_filter_window_ms": 4500}] * 3, "filtered max over 4.5s horizon"),
@@ -4157,6 +4313,190 @@ def self_test():
         f"  {'ok' if ok else 'FAIL'}: retransmission_reading(across a migration) -> "
         f"{got} (want {want})"
     )
+    # ── where_the_holes_came_from ────────────────────────────────────────
+    #
+    # The reading exists to give the next campaign a way to separate the two
+    # candidates still standing. Its failure modes are all quiet: it can
+    # attribute on too few windows, it can compare a bucket against an empty
+    # one, and it can divide a cumulative counter as though it were a rate.
+    def _hole_row(ms, srtt_ms, ceiling, holes, delivered):
+        return {
+            "elapsed_ms": ms,
+            "loss_declarations": holes,
+            "delivered_bytes": delivered,
+            "min_rtt_us": 200_000,
+            "smoothed_rtt_us": srtt_ms * 1000,
+            "dry_passes_against_a_full_buffer": ceiling,
+            "dry_passes_with_no_peer_window": 0,
+        }
+
+    # Holes fall where the queue is deep. Six windows, cumulative counters: the
+    # three deep-queue steps carry ten holes each against the same delivery, the
+    # three shallow ones carry one.
+    # Seven rows are six steps: three shallow, three deep, so the median of the
+    # six lands between the two groups and each bucket gets three. Six rows
+    # would be five steps and the median would fall inside the larger group,
+    # leaving one bucket empty and the whole reading `None` — which is how the
+    # first version of this fixture silently tested nothing.
+    queue_rows = [
+        _hole_row(0, 205, 0, 0, 0),
+        _hole_row(1000, 205, 0, 1, 1_028_000),
+        _hole_row(2000, 205, 0, 2, 2_056_000),
+        _hole_row(3000, 205, 0, 3, 3_084_000),
+        _hole_row(4000, 265, 0, 13, 4_112_000),
+        _hole_row(5000, 265, 0, 23, 5_140_000),
+        _hole_row(6000, 265, 0, 33, 6_168_000),
+    ]
+    # The same shape against a byte ceiling instead of a queue.
+    ceiling_rows = [
+        _hole_row(0, 210, 0, 0, 0),
+        _hole_row(1000, 210, 0, 1, 1_028_000),
+        _hole_row(2000, 210, 0, 2, 2_056_000),
+        _hole_row(3000, 210, 0, 3, 3_084_000),
+        _hole_row(4000, 210, 50, 13, 4_112_000),
+        _hole_row(5000, 210, 50, 23, 5_140_000),
+        _hole_row(6000, 210, 50, 33, 6_168_000),
+    ]
+    # Flat everywhere: no spread to split on, so no attribution may be made.
+    flat_rows = [_hole_row(i * 1000, 210, 5, i * 2, i * 1_028_000) for i in range(7)]
+    origin_cases = [
+        ("holes track the standing queue", queue_rows, "queue"),
+        ("holes track the byte ceiling", ceiling_rows, "ceiling"),
+    ]
+    for name, rows_c, which in origin_cases:
+        got = where_the_holes_came_from(rows_c)
+        split = (got or {}).get(which)
+        ok = split is not None and split["high_rate"] > split["low_rate"] * 3
+        failures += 0 if ok else 1
+        print(
+            f"  {'ok' if ok else 'FAIL'}: where_the_holes_came_from({name}) -> "
+            f"{split}"
+        )
+    got = where_the_holes_came_from(flat_rows)
+    flat_queue = (got or {}).get("queue")
+    ok = got is None or flat_queue is None or (
+        abs(flat_queue["high_rate"] - flat_queue["low_rate"]) < flat_queue["low_rate"]
+    )
+    failures += 0 if ok else 1
+    print(
+        f"  {'ok' if ok else 'FAIL'}: where_the_holes_came_from(no spread) -> "
+        f"{flat_queue} (a flat run must not attribute)"
+    )
+    # A run whose round trip floor moves — a migration, a route change — and
+    # whose *queue* therefore has to be read as the excess over that floor
+    # rather than as the round trip itself. Here the deep-queue windows have the
+    # smaller absolute round trip, so a reading that skipped the subtraction
+    # would attribute the holes to the wrong bucket.
+    moving_floor = [
+        {
+            "elapsed_ms": ms,
+            "loss_declarations": holes,
+            "delivered_bytes": delivered,
+            "min_rtt_us": floor_us,
+            "smoothed_rtt_us": floor_us + queue_us,
+            "dry_passes_against_a_full_buffer": 0,
+            "dry_passes_with_no_peer_window": 0,
+        }
+        for ms, floor_us, queue_us, holes, delivered in [
+            (0, 400_000, 2_000, 0, 0),
+            (1000, 400_000, 2_000, 1, 1_028_000),
+            (2000, 400_000, 2_000, 2, 2_056_000),
+            (3000, 400_000, 2_000, 3, 3_084_000),
+            (4000, 100_000, 80_000, 13, 4_112_000),
+            (5000, 100_000, 80_000, 23, 5_140_000),
+            (6000, 100_000, 80_000, 33, 6_168_000),
+        ]
+    ]
+    got = where_the_holes_came_from(moving_floor)
+    split = (got or {}).get("queue")
+    ok = split is not None and split["high_rate"] > split["low_rate"] * 3
+    failures += 0 if ok else 1
+    print(
+        f"  {'ok' if ok else 'FAIL'}: where_the_holes_came_from(round-trip floor "
+        f"moves) -> {split} (the queue is the excess over min_rtt, not the round "
+        "trip)"
+    )
+    # Windows carrying very different volumes. The deep-queue windows here have
+    # more holes in absolute terms and *fewer* per segment, so a bucket
+    # comparison that counted holes instead of hole rate would invert.
+    uneven_volume = [
+        _hole_row(0, 205, 0, 0, 0),
+        _hole_row(1000, 205, 0, 5, 100_000),
+        _hole_row(2000, 205, 0, 10, 200_000),
+        _hole_row(3000, 205, 0, 15, 300_000),
+        _hole_row(4000, 265, 0, 25, 5_300_000),
+        _hole_row(5000, 265, 0, 35, 10_300_000),
+        _hole_row(6000, 265, 0, 45, 15_300_000),
+    ]
+    got = where_the_holes_came_from(uneven_volume)
+    split = (got or {}).get("queue")
+    ok = split is not None and split["low_rate"] > split["high_rate"] * 3
+    failures += 0 if ok else 1
+    print(
+        f"  {'ok' if ok else 'FAIL'}: where_the_holes_came_from(uneven volumes) -> "
+        f"{split} (a bucket is a rate per segment, not a count of holes)"
+    )
+    # Three steps with a genuine spread: enough to split, not enough to mean
+    # anything. The floor is four, and without it this shape would be attributed.
+    # Two shallow steps and one deep, so the median falls *between* them and
+    # both buckets are non-empty: without the four-step floor this shape would
+    # produce an attribution. An earlier version put the median inside the
+    # larger group, which returned `None` for that reason instead of for the
+    # floor, and the case passed while testing nothing.
+    three_with_spread = [
+        _hole_row(0, 205, 0, 0, 0),
+        _hole_row(1000, 205, 0, 1, 1_028_000),
+        _hole_row(2000, 205, 0, 2, 2_056_000),
+        _hole_row(3000, 265, 0, 22, 3_084_000),
+    ]
+    got = where_the_holes_came_from(three_with_spread)
+    ok = got is None
+    failures += 0 if ok else 1
+    print(
+        f"  {'ok' if ok else 'FAIL'}: where_the_holes_came_from(three steps with a "
+        f"spread) -> {got} (want None — three buckets' worth of evidence is not a "
+        "finding)"
+    )
+    # Too few windows to say anything, and a run recorded before the columns.
+    short = where_the_holes_came_from(queue_rows[:3])
+    ok = short is None
+    failures += 0 if ok else 1
+    print(
+        f"  {'ok' if ok else 'FAIL'}: where_the_holes_came_from(three windows) -> "
+        f"{short} (want None — four steps is the floor for a bucket comparison)"
+    )
+    legacy = [
+        {"elapsed_ms": i * 1000, "delivered_bytes": i * 1_028_000} for i in range(6)
+    ]
+    ok = where_the_holes_came_from(legacy) is None
+    failures += 0 if ok else 1
+    print(
+        f"  {'ok' if ok else 'FAIL'}: where_the_holes_came_from(pre-column artifact) "
+        f"-> {where_the_holes_came_from(legacy)} (want None)"
+    )
+    # A cumulative counter read as a rate: the last window would carry every
+    # hole the run ever declared. The fixture below declares all of its holes in
+    # the first step and none after, so a reading that differenced correctly
+    # attributes them to the *shallow* bucket, and one that did not would put
+    # them in the deep one.
+    cumulative_trap = [
+        _hole_row(0, 205, 0, 0, 0),
+        _hole_row(1000, 205, 0, 30, 1_028_000),
+        _hole_row(2000, 205, 0, 30, 2_056_000),
+        _hole_row(3000, 205, 0, 30, 3_084_000),
+        _hole_row(4000, 265, 0, 30, 4_112_000),
+        _hole_row(5000, 265, 0, 30, 5_140_000),
+        _hole_row(6000, 265, 0, 30, 6_168_000),
+    ]
+    got = where_the_holes_came_from(cumulative_trap)
+    trap = (got or {}).get("queue")
+    ok = trap is not None and trap["low_rate"] > trap["high_rate"]
+    failures += 0 if ok else 1
+    print(
+        f"  {'ok' if ok else 'FAIL'}: where_the_holes_came_from(holes all in the "
+        f"first step) -> {trap} (want the shallow bucket to carry them)"
+    )
+
     for name, rows_c, want in app_limited_cases:
         got = app_limited_reading(rows_c)
         if want is None:
@@ -4310,34 +4650,8 @@ def self_test():
     failures += 0 if ok else 1
     print(f"  {'ok' if ok else 'FAIL'}: frame_bytes_of narrows to one series where the file holds several")
 
-    extra = (
-        len(side_cases)
-        + 1  # the migration-spanning attribution read
-        + len(rto_margin_cases)
-        + len(drain_census_cases)
-        + len(app_limited_cases)
-        + len(dry_split_cases)
-        + len(dry_sentence_cases)
-        + len(arm_cases)
-        + len(retransmit_cases)
-        + (0 if skipped else 1)  # the window-sample column gate, when it could run
-        + 1  # the run that predates the loss columns
-        + len(ceiling_split_cases)
-        + len(startup_cases)
-        + len(shape_cases)
-        + len(sweep_cases)
-        + len(reorder_cases)
-        + len(role_cases)
-        + len(mean_cases)
-        + len(tail_cases)
-        + len(observed_cases)
-        + len(rate_cases)
-        + len(inversion_cases)
-        + len(no_control_cases)
-        + len(broken_cases)
-        + len(driven_cases)
-        + 7
-    )
+    # (The hand-kept `extra` sum that used to live here is gone: `total` is now
+    # the number of results actually printed, so it cannot drift from them.)
 
     for rows, want in label_cases:
         got = filtered_max_label(rows)
@@ -4375,14 +4689,7 @@ def self_test():
         if got != want:
             failures += 1
         print(f"  {status}: ladder_verdict({len(rows)} rung(s)) -> {got!r} (want {want!r})")
-    total = (
-        extra
-        + len(label_cases)
-        + len(ceiling_cases)
-        + len(repair_cases)
-        + len(reading_cases)
-        + len(ladder_cases)
-    )
+    total = checks_run[0]
     for why in skipped:
         print(f"  skipped: {why}")
     print(f"{total - failures}/{total} ok" + (f", {len(skipped)} skipped" if skipped else ""))
