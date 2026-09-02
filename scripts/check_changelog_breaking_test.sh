@@ -45,6 +45,13 @@ run_gate() {
     set -e
 }
 
+run_structure_gate() {
+    set +e
+    OUT="$(python3 "${UNDER_TEST}" --structure-only --changelog "$1" 2>&1)"
+    RC=$?
+    set -e
+}
+
 # A report carrying one finding of each shape the tool emits, so a case can pick
 # the one it needs. The trailing verdict line is what makes it a completed run.
 write_report() {
@@ -390,6 +397,136 @@ LOG
     rm -rf "${dir}"
 }
 
+case_duplicate_heading_in_unreleased_is_rejected() {
+    local dir
+    dir="$(mktemp -d)"
+    cat > "${dir}/CHANGELOG.md" <<'LOG'
+# Changelog
+
+## [Unreleased]
+
+### Documented
+
+- The first branch wrote a note here.
+
+### Fixed
+
+- Something in between, so the two blocks are not adjacent.
+
+### Documented
+
+- The second branch opened its own section, and no diff called it a conflict.
+LOG
+    run_structure_gate "${dir}/CHANGELOG.md"
+    if [ "${RC}" -eq 0 ]; then
+        fail "two '### Documented' blocks under [Unreleased] were accepted"
+    elif echo "${OUT}" | grep -q "Documented" && echo "${OUT}" | grep -q "line"; then
+        pass "a duplicated heading in [Unreleased] is rejected, with both lines named"
+    else
+        fail "the duplicate was rejected for some other reason"
+    fi
+    rm -rf "${dir}"
+}
+
+case_released_duplicate_is_a_note_not_a_failure() {
+    local dir
+    dir="$(mktemp -d)"
+    cat > "${dir}/CHANGELOG.md" <<'LOG'
+# Changelog
+
+## [Unreleased]
+
+### Fixed
+
+- One heading, no duplicate.
+
+## [0.2.0] - 2026-06-20
+
+### Changed
+
+- A shipped release note.
+
+### Security
+
+- Another shipped one.
+
+### Changed
+
+- And the duplicate that shipped with it.
+LOG
+    run_structure_gate "${dir}/CHANGELOG.md"
+    if [ "${RC}" -ne 0 ]; then
+        fail "a duplicate in an already-released section failed the gate"
+    elif echo "${OUT}" | grep -q "note, not a failure"; then
+        pass "a released-section duplicate is reported without failing"
+    else
+        fail "the released duplicate passed but was not reported at all"
+    fi
+    rm -rf "${dir}"
+}
+
+case_structure_only_needs_no_report() {
+    local dir
+    dir="$(mktemp -d)"
+    cat > "${dir}/CHANGELOG.md" <<'LOG'
+# Changelog
+
+## [Unreleased]
+
+### Fixed
+
+- One heading.
+LOG
+    run_structure_gate "${dir}/CHANGELOG.md"
+    if [ "${RC}" -eq 0 ]; then
+        pass "--structure-only runs without a semver report"
+    else
+        fail "--structure-only demanded a report it does not need"
+    fi
+    # ...and the report is still required without that flag, or the release path
+    # would silently stop checking what it was built for.
+    set +e
+    OUT="$(python3 "${UNDER_TEST}" --changelog "${dir}/CHANGELOG.md" 2>&1)"
+    RC=$?
+    set -e
+    if [ "${RC}" -eq 2 ] && echo "${OUT}" | grep -q "report"; then
+        pass "--report stays required when --structure-only is absent"
+    else
+        fail "the gate ran its report check without a report"
+    fi
+    rm -rf "${dir}"
+}
+
+case_structure_is_checked_in_report_mode_too() {
+    local dir
+    dir="$(mktemp -d)"
+    write_report "${dir}/report.txt"
+    cat > "${dir}/CHANGELOG.md" <<'LOG'
+# Changelog
+
+## [Unreleased]
+
+### Changed
+
+- `BandwidthSnapshot` gained `delivered_time`; construct it with the new field.
+- `PhantomConfig` lost `auto_fallback`; drop it from struct literals.
+- `Stream::local_recv_window` is now `advertised_recv_window`; rename the call.
+
+### Changed
+
+- A second block that would split the section the report check reads.
+LOG
+    run_gate "${dir}/report.txt" "${dir}/CHANGELOG.md"
+    if [ "${RC}" -eq 0 ]; then
+        fail "the release path accepted a changelog whose section was split in two"
+    elif echo "${OUT}" | grep -q "2 times"; then
+        pass "the structure check runs on the release path as well"
+    else
+        fail "the release path rejected it for some other reason"
+    fi
+    rm -rf "${dir}"
+}
+
 case_complete_record_is_accepted
 case_missing_symbol_is_rejected
 case_owner_must_be_named_too
@@ -401,6 +538,10 @@ case_report_without_verdict_is_an_error
 case_clean_verdict_passes
 case_unreadable_entry_is_an_error
 case_older_section_does_not_count
+case_duplicate_heading_in_unreleased_is_rejected
+case_released_duplicate_is_a_note_not_a_failure
+case_structure_only_needs_no_report
+case_structure_is_checked_in_report_mode_too
 
 if [ "${failures}" -ne 0 ]; then
     echo ""

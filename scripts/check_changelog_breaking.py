@@ -202,6 +202,46 @@ def unreleased_section(changelog: str) -> str:
     return "\n".join(lines[start:])
 
 
+def duplicate_subheadings(changelog: str) -> list[tuple[str, str, list[int]]]:
+    """Every `###` heading that appears more than once under one `##` release.
+
+    Keep a Changelog gives each release one heading per change type, and readers
+    use that: "what was removed in this version" is a heading, not a search. Two
+    `### Documented` blocks a thousand lines apart under one release is not a
+    formatting quibble — the second is invisible to anyone who found the first,
+    and entries land in whichever one the author's cursor was nearest.
+
+    It happens by merge, not by carelessness: two branches each add a section,
+    both are correct in isolation, and the union has a duplicate that no diff
+    shows as a conflict. That is exactly the shape a gate catches and review does
+    not, and this one had already happened once before it was gated.
+
+    Returns `(release, heading, [1-based line numbers])` per duplicate, so the
+    message can point at both places rather than announce that a duplicate exists
+    somewhere in three thousand lines.
+    """
+    duplicates: list[tuple[str, str, list[int]]] = []
+    release = None
+    seen: dict[str, list[int]] = {}
+
+    def flush() -> None:
+        if release is None:
+            return
+        for heading, lines in seen.items():
+            if len(lines) > 1:
+                duplicates.append((release, heading, lines))
+
+    for index, line in enumerate(changelog.splitlines(), start=1):
+        if line.startswith("## "):
+            flush()
+            release = line[3:].strip()
+            seen = {}
+        elif line.startswith("### ") and release is not None:
+            seen.setdefault(line[4:].strip(), []).append(index)
+    flush()
+    return duplicates
+
+
 def mentions(section: str, name: str) -> bool:
     """Whole-word match, so `delivered_time` does not answer for
     `delivered_time_at_send`: `_` is a word character, which makes two field
@@ -216,9 +256,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--report",
-        required=True,
         type=Path,
-        help="path to the report written by scripts/semver_report.sh",
+        help="path to the report written by scripts/semver_report.sh; omit it with "
+        "--structure-only",
+    )
+    parser.add_argument(
+        "--structure-only",
+        action="store_true",
+        help="run only the checks that need no semver report, so this can gate every "
+        "pull request rather than only a release",
     )
     parser.add_argument(
         "--changelog",
@@ -228,15 +274,60 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    try:
-        report_text = args.report.read_text(encoding="utf-8")
-    except OSError as exc:
-        print(f"check_changelog_breaking: cannot read report: {exc}", file=sys.stderr)
+    if args.report is None and not args.structure_only:
+        print(
+            "check_changelog_breaking: --report is required unless --structure-only "
+            "is given",
+            file=sys.stderr,
+        )
         return 2
+
     try:
         changelog_text = args.changelog.read_text(encoding="utf-8")
     except OSError as exc:
         print(f"check_changelog_breaking: cannot read changelog: {exc}", file=sys.stderr)
+        return 2
+
+    # Structure first, and in both modes. It needs no report, and a changelog whose
+    # headings are duplicated is one where the section the report check reads may not
+    # be the section an author was writing into.
+    #
+    # Only `[Unreleased]` fails. The released sections below it carry the same defect
+    # — 0.2.0 has three `### Changed` — and they are deliberately not gated: a shipped
+    # release note is a record of what was said at the time, and a gate that goes red
+    # on history nobody may edit is a gate that gets switched off. They are printed, so
+    # the knowledge is not lost, and fixing them stays an editorial decision.
+    duplicates = duplicate_subheadings(changelog_text)
+    unreleased = [d for d in duplicates if d[0].startswith("[Unreleased]")]
+    released = [d for d in duplicates if not d[0].startswith("[Unreleased]")]
+
+    def describe(release: str, heading: str, lines: list[int]) -> str:
+        where = ", ".join(f"line {n}" for n in lines)
+        return f"'## {release}' has '### {heading}' {len(lines)} times ({where})"
+
+    for release, heading, lines in released:
+        print(
+            f"check_changelog_breaking: note, not a failure: "
+            f"{describe(release, heading, lines)} — a shipped section, left as written"
+        )
+    if unreleased:
+        for release, heading, lines in unreleased:
+            print(
+                f"check_changelog_breaking: {describe(release, heading, lines)}. "
+                "One heading per change type per release: a second block is invisible "
+                "to a reader who found the first, and entries land in whichever one is "
+                "nearest.",
+                file=sys.stderr,
+            )
+        return 1
+    if args.structure_only:
+        print("check_changelog_breaking: [Unreleased] has no duplicated headings")
+        return 0
+
+    try:
+        report_text = args.report.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"check_changelog_breaking: cannot read report: {exc}", file=sys.stderr)
         return 2
 
     try:

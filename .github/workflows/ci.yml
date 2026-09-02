@@ -279,6 +279,26 @@ jobs:
       - run: scripts/check_memory_arithmetic_test.py
       - run: scripts/check_memory_arithmetic.py
 
+  changelog-structure:
+    # `[Unreleased]` had two `### Documented` sections a thousand lines apart.
+    # Neither branch was wrong on its own — each added a heading that did not yet
+    # exist in its branch — and the union has a duplicate that no diff shows as
+    # a conflict, which is exactly the failure a merge produces and review does
+    # not catch. The second block is invisible to a reader who found the first,
+    # and after that entries land in whichever one the author's cursor was near.
+    #
+    # The same script gates the release path (`check_changelog_breaking.py` in
+    # release.yml, which needs a semver report); this runs its report-free half
+    # on every pull request, which is where a merge actually lands. Released
+    # sections are reported and deliberately not failed — see the script.
+    name: changelog structure
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      # The script's own cases first, for the reason given in the job above.
+      - run: scripts/check_changelog_breaking_test.sh
+      - run: python3 scripts/check_changelog_breaking.py --structure-only
+
   deny:
     name: cargo deny
     runs-on: ubuntu-latest
@@ -578,6 +598,16 @@ jobs:
       # release-only break — an overflow check, a profile-gated dependency —
       # reach the VPS and be discovered as a bad measurement.
       - run: cargo build --manifest-path testbed/Cargo.toml --release
+      # `analyze.py` is the other half of this instrument: every reading the
+      # campaign publishes is a sentence this script composed out of the
+      # artefact. It carries its own suite — a hundred and fifty-odd cases
+      # covering the arithmetic, the admissibility rules and the wording that
+      # decides what a figure is allowed to claim — and that suite ran in no
+      # workflow at all, which is exactly how the fictitious `refuted` column
+      # (a percentage computed from a field nothing ever writes) survived being
+      # printed under real measurements. Pure Python against fixtures it builds
+      # itself: no network, no artefact, no daemon.
+      - run: python3 testbed/analyze.py --self-test
 
   integration:
     # NOTE: this `name:` is a pinned branch-protection **required status check**

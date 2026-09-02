@@ -78,6 +78,17 @@ repos:
         files: ^(server/src/config\.rs|core/src/transport/stream\.rs|core/src/api/session\.rs|core/tests/security_invariants\.rs|CHANGELOG\.md|docs/security/threat-model\.md|docs/operations/deployment\.md|docs/operations/kubernetes\.md|docs/operations/helm/phantom-protocol/values\.yaml|\.env\.example|server/README\.md)$
         pass_filenames: false
 
+      - id: check-changelog-structure
+        name: CHANGELOG [Unreleased] has one heading per change type
+        # Two branches each add a `### Documented` that did not exist in the
+        # other; the merge has both, and no diff calls that a conflict.
+        # The second block is then invisible to anyone who found the first.
+        # Report-free half of the release-path gate, so it costs nothing here.
+        entry: python3 scripts/check_changelog_breaking.py --structure-only
+        language: system
+        files: ^CHANGELOG\.md$
+        pass_filenames: false
+
       # ── Landing-page copy that ships inside the crate ─────────────────
       - id: sync-readme
         name: core/README.md mirrors README.md
