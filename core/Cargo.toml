@@ -301,7 +301,7 @@ time = { version = "0.3", optional = true }
 # --- FFI ---
 uniffi = { version = "0.31", optional = true, features = ["tokio"] }
 zeroize = { version = "1.8.2", optional = true, features = ["derive"] }
-argon2 = { version = "0.5.3", optional = true }
+argon2 = { version = "0.6.0", optional = true }
 crossbeam-queue = { version = "0.3.12", optional = true }
 crossbeam-utils = { version = "0.8", optional = true }  # CachePadded for observability hot-path atomics
 
