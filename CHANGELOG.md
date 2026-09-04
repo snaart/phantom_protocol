@@ -576,6 +576,52 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Added
 
+- **`phantom-probe --transfer-cap-secs`, and the duplex scenario now reports how much of its
+  window was duplex.** A bulk transfer ends at a byte budget or at a wall-clock cap,
+  whichever comes first, so raising the budget on a path slow enough for the clock to win
+  changes nothing: a campaign asked for 150 and 120 mebibytes, moved between a third and a
+  half of them, and had every scenario cut at sixty seconds. The cap is a flag now.
+  `--upload-secs` still widens it and an explicit cap overrides that widening in both
+  directions, including below the upload window — the cap reaches `download` and `bidir`
+  only, so it cannot cut an upload short and a long upload measured against a short receive
+  is a sensible run rather than a combination to refuse. Separately, `bidir`'s two directions
+  carry the same byte budget at different rates, so the faster finishes first and the rest of
+  the window is a one-way measurement under a duplex label; the scenario now records the
+  share of the window in which both directions were sending, timed from the upload's last
+  successful send rather than from its loop's exit.
+
+- **Two scenarios in `bottleneck_sim` that lose packets, and a seed for the arrival
+  pattern.** `noisy` drops a fixed fraction regardless of how hard the link is driven,
+  against a bounded queue; `collapse` drops capacity fourfold behind a one-BDP buffer, where
+  every loss is genuine congestion. Neither shape existed before, which is why nothing
+  exercised the loss response. `PHANTOM_SIM_LOSS_SEED=n` redraws the holes independently
+  instead of spacing them evenly, because even spacing is one arrival pattern out of many
+  with the same mean and a controller is sensitive to which it gets. The fraction is applied
+  through a remainder accumulator rather than integer division — a rung labelled fifteen per
+  cent used to run at 16.7 — and the model now raises its loss report only for a segment's
+  first transmission, as the shipped sender does.
+
+- **`analyze.py` splits a run's windows by standing queue and by byte-bound dry passes.** For
+  each sending series it divides the windows at the median of `smoothed_rtt − min_rtt` and at
+  the median count of drain passes that ended against a byte bound, and prints the share of
+  holes per bucket. A difference between buckets is a lead and not a mechanism — both
+  quantities grow with load — and the reading is blind by construction wherever the path
+  loses on its own: when the same run's raw control shows the same share, no split of our own
+  windows attributes anything, and the output says so rather than leaving the reader to.
+
+- **`CHANGELOG.md` is gated for one heading per change type per release, and `analyze.py`'s
+  own suite now runs in CI.** `[Unreleased]` had two `### Documented` sections a thousand
+  lines apart, each added on a branch in which that heading did not yet exist; the merge
+  carried both and no diff called it a conflict, which leaves the second invisible to anyone
+  who found the first. `scripts/check_changelog_breaking.py --structure-only` runs the
+  report-free half of the release gate on every pull request and as a pre-commit hook;
+  released sections carrying the same defect are reported rather than failed, because a gate
+  that goes red on history nobody may edit is a gate that gets switched off. Alongside it,
+  `testbed/analyze.py --self-test` — a hundred and sixty-odd cases over the arithmetic, the
+  admissibility rules and the wording that decides what a figure may claim — ran in no
+  workflow at all, which is how a column computed from a field nothing ever writes survived
+  being printed under real measurements.
+
 - **The artifact records what the sender's retransmission cost.** Until now no artifact
   carried any loss quantity at all: the window row held the
   congestion window, bytes outstanding, the bandwidth estimate, the minimum round trip, the
@@ -972,92 +1018,62 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   `aead_failure_total`. Nothing about what is counted changes; the counters were always there,
   only unreadable.
 
-### Documented
-
-- **Nine places where a peer built strictly to `INTEROP.md` and `PROTOCOL.md` would not
-  interoperate.** An audit of the clean-room guide against the source asked one question —
-  would a second implementation following these two documents produce the same bytes — and
-  the answer was no in nine places. Only one was a contradiction anyone could have caught by
-  reading; the rest were silences, which is the harder kind, because nothing in a document
-  points at what it never mentions. Nothing on the wire moved, no fixture changed and no
-  version was bumped: the corrections are in the specification.
-
-  **The error.** § 3 wrote the hybrid-KEM combiner as
-  `HKDF-SHA-256(classical_secret ‖ kyber_secret)`. It is a full Extract-then-Expand over
-  **four** concatenated inputs — the two raw shared secrets, then the classical ciphertext
-  (the sender's ephemeral classical public key), then the recipient's classical public key
-  — 128 bytes of IKM on the default build rather than 64, under
-  `info = b"HybridKEM_X25519_Kyber768"` (`b"HybridKEM_P256_Kyber768"`, and 194 bytes, under
-  fips). The row was also missing from both lists of the Extract-vs-Expand inventory
-  immediately below it. This was the highest-severity item in the set because of where the
-  failure lands: the transcript signature does not depend on the shared secret, so a peer
-  built to the old sentence verifies the signature, adopts the `session_id` the
-  `ServerHello` carries, reports an established session — and then fails every packet in
-  both directions. That is precisely the failure § 1 of the guide warns about, arrived at by
-  following § 3.
-
-  **The one where the document moved instead of the code.** § 4.10 told an implementer it
-  could pick any chunk size and interoperate. The receive path drops any inbound frame over
-  `MAX_RECV_FRAME` = 1335 bytes before header protection and before the AEAD, on every leg
-  and after PhantomUDP reassembly — 1300 application bytes reliable, 1304 unreliable. The
-  ceiling ships in a released version and lowering a receiver's tolerance afterwards is not
-  something a peer can detect, so the section now states it: as a limit of *this
-  implementation's receive path*, with the constant named, the minimum a sender may rely on
-  given, and the note that a future revision may raise it and offers no way to discover that
-  it has. A refused frame is dropped rather than answered, so the symptom is a stream that
-  stops with no error at either end.
-
-  **The seven silences**, each verified against the source before it was written down:
-  § 2, the AEAD suite is resolved from the peer's *target* and cannot be overridden by any
-  API — AES-256-GCM only where the CPU reports the AES extension on `x86`/`x86_64`/`aarch64`,
-  ChaCha20-Poly1305 unconditionally everywhere else, `wasm32` included, so a browser client
-  and an `x86_64` server are both conformant and cannot exchange a byte; § 4.5, the reliable
-  `stream_offset` is a frame counter starting at 0 rather than a byte position, and closing a
-  stream is a zero-length `RELIABLE | FIN` segment that consumes one; § 6.1, nothing under
-  the handshake is reliable on PhantomUDP — the client re-sends its whole flight on a bounded
-  stop-and-wait schedule and the server never retransmits, so a lost `HelloRetryRequest` is
-  repaired and a lost `ServerHello` is not; § 6.2, there is no client authentication at all
-  and `ClientHello.client_verify_key` is carried, transcript-covered and verified by nobody;
-  § 6.6, resumption transmits nothing — both ends derive the secret from the previous
-  session's shared secret and reuse its `session_id`, so there is no ticket message to look
-  for; § 6.8, the cookie round is unconditional on first contact, a resumption ticket
-  bypasses it on the byte-pipe legs *only* (over PhantomUDP the stateless demux pre-gate
-  reads nothing but the cookie), and the retried hello is the first hello with only `cookie`
-  and `pow_solution` replaced; and § 12.1, a path challenge and its echo are byte-identical
-  frames whose reading follows from the receiver's own path-registry state, so a peer that
-  echoes unconditionally never terminates the exchange.
-
-  `INTEROP.md` gained the corresponding pointers — the suite-resolution rule in § 1, the four
-  properties of the handshake exchange that no single-message fixture can show in Rung 2, the
-  key schedule in Rung 4, the two per-stream counters and the frame ceiling in Rung 4b, the
-  challenge-versus-echo rule in Rung 5 — and six new conformance-checklist items.
-  `docs/operations/deployment.md`'s configuration table had the suite as "AES-256-GCM is
-  pinned for every session", which is true only under `--features fips`; it now carries the
-  same per-target rule.
-
-- **Phantom over TCP is a compatibility leg, not a fast one, and it now says so.** Its
-  reliability layer — ARQ, SACK loss detection, congestion control — is transport-independent
-  and runs unchanged on every leg. Over a datagram socket it is the only such layer, which is
-  what it was designed for; over TCP it is the second, stacked on a kernel that already
-  retransmits and already has a congestion window, with no visibility into it. The two loops
-  then interact only through the queue between them, and that queue is inside the round-trip
-  figure our side measures. The WAN harness has observed **min-RTT up to 4112 ms** on this
-  leg — queueing under our own sender rather than any property of the route — against
-  application throughput spanning **0.75–4.33 Mbit/s** across campaign runs; in run
-  `20260822-062705`, both ends built from `8f710f69`, the server received 4.83 Mbit/s over
-  this leg while raw UDP echo on the same path in the same run measured 13.26 Mbit/s
-  round-trip.
-
-  Recorded as what the leg is for rather than as a defect awaiting a fix. Disabling the ARQ
-  on byte-pipe transports is a large change to `run_data_pump` on a leg that is not the
-  production transport, and it is not being made now. So `README.md`,
-  `docs/operations/deployment.md` and the leg's own module documentation now say the same
-  thing: use this leg for reach — a network that blocks or throttles UDP, a proxy, a browser
-  sandbox — use PhantomUDP wherever you have the choice, and expect worse latency under load
-  here. Correctness and security are untouched: the inner wire, the pinning, the AEAD and the
-  replay window are identical on every transport.
-
 ### Fixed
+
+- **The loss response was measured down from the bound already in force rather than from
+  the target, which on a path that keeps losing held the sender one level too low — at
+  exactly the level where Startup's growth test cannot be passed.** When a round loses more
+  than `LOSS_THRESH`, `adapt_inflight_bound` caps the bytes in flight at `INFLIGHT_HI_BETA`
+  of a base, floored at `INFLIGHT_HI_FLOOR_GAIN × BDP`. The base was the standing bound
+  where one existed, so the sequence was `2.0 → 1.4 → 1.25` BDP and then flat, the floor
+  catching the walk on its second step. The whole behavioural difference from measuring off
+  the target is that one level, twelve per cent — and twelve per cent decides whether the
+  connection ramps at all. Through a window of `level × BDP` a path dropping a fraction `p`
+  delivers at most `level × (1 − p)` of the estimate that set it, and Startup ends after
+  `STARTUP_ROUNDS_LIMIT` rounds that fail to beat the previous plateau by
+  `STARTUP_GROWTH_THRESHOLD`. `INFLIGHT_HI_FLOOR_GAIN` and `1 + STARTUP_GROWTH_THRESHOLD`
+  are the same number, 1.25, so a sender held at the floor failed the growth test on the
+  first round that lost anything, left Startup at whatever fraction of the link it had
+  reached, and was left to the ProbeBW gain cycle for the rest — a quarter per four round
+  trips, which is fifteen seconds of pure cycling for a fortyfold climb on a 235 ms path and
+  longer for every round that loses.
+
+  What ships is one line: the bound is `target × INFLIGHT_HI_BETA`, floored as before, so a
+  losing round holds 1.4 BDP from the first one on and the same arithmetic tolerates a steady
+  10.7%, covering the reference route's own raw-UDP control — one to eight per cent at rates
+  far below the ceiling it later establishes — with three points to spare. The three
+  constants are now a set rather than three independent knobs: a compile-time assertion
+  (`INFLIGHT_HI_LEVEL_SUPPORTS_LOSS_TO`, eight per cent) fails the build if an edit to
+  `INFLIGHT_HI_BETA`, `CWND_GAIN` or `STARTUP_GROWTH_THRESHOLD` drops the supported rate
+  under it, and a second keeps the level strictly above the floor so the beta cannot quietly
+  become inert. Both were added because a one-character change to the beta, 0.7 to 0.635,
+  reverted the whole behaviour with every test in the crate still green.
+
+  Measured on `core/examples/bottleneck_sim.rs`, which gained two scenarios for the purpose
+  because the three it had lost not one byte between them and the loss response was covered
+  by nothing at all. On `noisy` — a link dropping a fixed fraction however gently it is
+  driven — the share of the link goes 78% to 85% at two per cent of loss and 67% to 78% at
+  five, the latter reaching nine tenths of the link in 6.6 s where it took 18.9; zero and one
+  per cent do not move. Those are the evenly spaced draws, and `PHANTOM_SIM_LOSS_SEED=n`
+  re-runs the sweep with independent ones: across three seeds the two- and five-per-cent
+  rungs gain on every one, by two to seven and eight to eleven points, while at fifteen the
+  spread between draws exceeds the effect and no single figure from there is quotable. Above
+  roughly 10.7% the connection still leaves Startup early, for the same collision of
+  constants; undoing that is a separate change with its own argument. On `collapse` —
+  capacity falling fourfold behind a one-BDP buffer, where every loss is congestion — the
+  goodput, the standing queue and the widest round trip are identical either way and the
+  whole cost is five per cent more copies refused by the full buffer: on that shape the
+  buffer binds, not the window.
+
+  The response no longer varies with anything but the estimate: a round that lost two per
+  cent and a round that lost ninety-nine set the same bound. Both forms are `bdp × constant`
+  in the steady state, so the peer's lever — `bdp`, a product of two figures derived from
+  acknowledgement arrival times — is the one it already had, moved by twelve per cent; the
+  peer moves no *threshold*, since `LOSS_THRESH` and the Startup test are untouched. In the
+  other direction the new form is better: a peer synthesising loss by withholding
+  acknowledgements now pins the sender at 1.4 BDP instead of walking it to the floor.
+  **Sender-local accounting only: no wire-format, handshake or key-schedule change, and old
+  and new peers interoperate unchanged.**
 
 - **One dropped segment could be charged to congestion control several times over, and a
   loss report could be switched off by a peer that simply stopped answering.** Both are the
@@ -1895,7 +1911,9 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   `cwnd = 2 × btl_bw × min_rtt` the window then sat on its 5600-byte floor for as long
   as the peer kept reporting. The same collapse signature was measured in the field: a
   WAN transfer that peaked near a 128 KB window fell to exactly 5600 bytes and sustained
-  4.7-7.6% of a link whose raw-socket control measured 6.63 Mbit/s at 0.0% loss.
+  roughly 0.3-0.5 Mbit/s from there. (No share of the link is given: the raw-socket
+  control on that path paced one datagram per `tokio::time::sleep` and so measured its
+  own timer rather than the route. The absolute figure is locally observed.)
   The `Sack` rides inside the AEAD plaintext, so this was never reachable by an on-path
   attacker — it required the authenticated peer. That is a smaller mitigation than it
   sounds: **a malicious or merely defective server could pin every client's congestion
@@ -1965,8 +1983,9 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   renewed it, so it never did. Since `cwnd = 2 × btl_bw × min_rtt`, the window then sat
   on its 5600-byte floor. Measured over a ~200 ms WAN path: the window grew to a ~128 KB
   peak and collapsed back to exactly 5600 bytes, averaging 7.7 KB in flight where
-  filling the pipe needs ~165 KB, and sustaining 4.7-7.6% of a link whose raw-socket
-  control measured 6.63 Mbit/s at 0.0% loss.
+  filling the pipe needs ~165 KB, and sustaining roughly 0.3-0.5 Mbit/s. (As above, no share
+  of a raw-socket control is given, since that control was measuring its own pacing
+  timer; the window and inflight figures are locally observed.)
   Karn's condition was already computed and already threaded to the call site, but only
   the observability RTT gauge consulted it; it is now carried on the delivery sample and
   gates the filter as well. The delivery-rate half of the sample is deliberately left
@@ -1977,22 +1996,25 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   old and new peers interoperate unchanged.**
 
 - **BBR read a burst of acknowledgements as a whole window delivered inside one packet's
-  round trip, overestimating the path by an order of magnitude.** The delivery-rate
-  sample counted the bytes the connection delivered while a packet was in flight, but
-  divided them only by that packet's own send-to-ack time. Acknowledgements do not
-  arrive spread out the way data was sent — receivers batch them and one cumulative SACK
-  retires everything it covers at once — so the last packet of a burst contributed the
-  entire window's bytes against its own short flight time. Measured over a 200 ms WAN
-  path: a peak estimate of 63.51 Mbit/s against a link demonstrating 6.63 Mbit/s of UDP
-  echo at 0.0% loss, 9.6x the real ceiling; over TCP, 25.71 Mbit/s against 4.22. The
-  window grew to ~128 KB on that estimate, overshot, took loss and collapsed, ending one
-  upload in `fast_recovery` and sustaining 4.7-7.6% of the path.
-  The sample interval is now bounded by the acknowledgement interval as well as the send
-  interval (`max(send_elapsed, ack_elapsed)`, canonical BBR). Each outgoing segment is
-  stamped with *when* the connection's delivered counter last advanced alongside the
-  counter value it was already carrying, so both ends of the interval the sample
-  measures are known and the numerator is no longer divided by a shorter span than it
-  was accumulated over.
+  round trip, overestimating the path.** The delivery-rate sample counted the bytes the
+  connection delivered while a packet was in flight, but divided them only by that
+  packet's own send-to-ack time. Acknowledgements do not arrive spread out the way data
+  was sent — receivers batch them and one cumulative SACK retires everything it covers at
+  once — so the last packet of a burst contributed the entire window's bytes against its
+  own short flight time. Measured over a 200 ms WAN path: a peak estimate of 63.51 Mbit/s,
+  and 25.71 Mbit/s over TCP. The window grew to ~128 KB on that estimate, overshot, took
+  loss and collapsed, ending one upload in `fast_recovery`. That the estimate exceeded the
+  path is settled by the arithmetic and by the overshoot-then-collapse it produced; **by
+  how much is not established here.** The raw-socket control on that path cannot say:
+  it paced one datagram per `tokio::time::sleep`, so at millisecond granularity it
+  measured the timer rather than the route — roughly 9.6 Mbit/s whatever the link
+  underneath — and a ratio taken against an instrument's own floor describes the
+  instrument. The sample interval is now bounded by the acknowledgement
+  interval as well as the send interval (`max(send_elapsed, ack_elapsed)`, canonical BBR).
+  Each outgoing segment is stamped with *when* the connection's delivered counter last
+  advanced alongside the counter value it was already carrying, so both ends of the
+  interval the sample measures are known and the numerator is no longer divided by a
+  shorter span than it was accumulated over.
   **Sender-local accounting only: no wire-format, handshake or key-schedule change, and
   old and new peers interoperate unchanged.**
 
@@ -2148,6 +2170,89 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   as the `panic-sites` CI job. No behaviour changed; the four new comments are comments.
 
 ### Documented
+
+- **Nine places where a peer built strictly to `INTEROP.md` and `PROTOCOL.md` would not
+  interoperate.** An audit of the clean-room guide against the source asked one question —
+  would a second implementation following these two documents produce the same bytes — and
+  the answer was no in nine places. Only one was a contradiction anyone could have caught by
+  reading; the rest were silences, which is the harder kind, because nothing in a document
+  points at what it never mentions. Nothing on the wire moved, no fixture changed and no
+  version was bumped: the corrections are in the specification.
+
+  **The error.** § 3 wrote the hybrid-KEM combiner as
+  `HKDF-SHA-256(classical_secret ‖ kyber_secret)`. It is a full Extract-then-Expand over
+  **four** concatenated inputs — the two raw shared secrets, then the classical ciphertext
+  (the sender's ephemeral classical public key), then the recipient's classical public key
+  — 128 bytes of IKM on the default build rather than 64, under
+  `info = b"HybridKEM_X25519_Kyber768"` (`b"HybridKEM_P256_Kyber768"`, and 194 bytes, under
+  fips). The row was also missing from both lists of the Extract-vs-Expand inventory
+  immediately below it. This was the highest-severity item in the set because of where the
+  failure lands: the transcript signature does not depend on the shared secret, so a peer
+  built to the old sentence verifies the signature, adopts the `session_id` the
+  `ServerHello` carries, reports an established session — and then fails every packet in
+  both directions. That is precisely the failure § 1 of the guide warns about, arrived at by
+  following § 3.
+
+  **The one where the document moved instead of the code.** § 4.10 told an implementer it
+  could pick any chunk size and interoperate. The receive path drops any inbound frame over
+  `MAX_RECV_FRAME` = 1335 bytes before header protection and before the AEAD, on every leg
+  and after PhantomUDP reassembly — 1300 application bytes reliable, 1304 unreliable. The
+  ceiling ships in a released version and lowering a receiver's tolerance afterwards is not
+  something a peer can detect, so the section now states it: as a limit of *this
+  implementation's receive path*, with the constant named, the minimum a sender may rely on
+  given, and the note that a future revision may raise it and offers no way to discover that
+  it has. A refused frame is dropped rather than answered, so the symptom is a stream that
+  stops with no error at either end.
+
+  **The seven silences**, each verified against the source before it was written down:
+  § 2, the AEAD suite is resolved from the peer's *target* and cannot be overridden by any
+  API — AES-256-GCM only where the CPU reports the AES extension on `x86`/`x86_64`/`aarch64`,
+  ChaCha20-Poly1305 unconditionally everywhere else, `wasm32` included, so a browser client
+  and an `x86_64` server are both conformant and cannot exchange a byte; § 4.5, the reliable
+  `stream_offset` is a frame counter starting at 0 rather than a byte position, and closing a
+  stream is a zero-length `RELIABLE | FIN` segment that consumes one; § 6.1, nothing under
+  the handshake is reliable on PhantomUDP — the client re-sends its whole flight on a bounded
+  stop-and-wait schedule and the server never retransmits, so a lost `HelloRetryRequest` is
+  repaired and a lost `ServerHello` is not; § 6.2, there is no client authentication at all
+  and `ClientHello.client_verify_key` is carried, transcript-covered and verified by nobody;
+  § 6.6, resumption transmits nothing — both ends derive the secret from the previous
+  session's shared secret and reuse its `session_id`, so there is no ticket message to look
+  for; § 6.8, the cookie round is unconditional on first contact, a resumption ticket
+  bypasses it on the byte-pipe legs *only* (over PhantomUDP the stateless demux pre-gate
+  reads nothing but the cookie), and the retried hello is the first hello with only `cookie`
+  and `pow_solution` replaced; and § 12.1, a path challenge and its echo are byte-identical
+  frames whose reading follows from the receiver's own path-registry state, so a peer that
+  echoes unconditionally never terminates the exchange.
+
+  `INTEROP.md` gained the corresponding pointers — the suite-resolution rule in § 1, the four
+  properties of the handshake exchange that no single-message fixture can show in Rung 2, the
+  key schedule in Rung 4, the two per-stream counters and the frame ceiling in Rung 4b, the
+  challenge-versus-echo rule in Rung 5 — and six new conformance-checklist items.
+  `docs/operations/deployment.md`'s configuration table had the suite as "AES-256-GCM is
+  pinned for every session", which is true only under `--features fips`; it now carries the
+  same per-target rule.
+
+- **Phantom over TCP is a compatibility leg, not a fast one, and it now says so.** Its
+  reliability layer — ARQ, SACK loss detection, congestion control — is transport-independent
+  and runs unchanged on every leg. Over a datagram socket it is the only such layer, which is
+  what it was designed for; over TCP it is the second, stacked on a kernel that already
+  retransmits and already has a congestion window, with no visibility into it. The two loops
+  then interact only through the queue between them, and that queue is inside the round-trip
+  figure our side measures. The WAN harness has observed **min-RTT up to 4112 ms** on this
+  leg — queueing under our own sender rather than any property of the route — against
+  application throughput spanning **0.75–4.33 Mbit/s** across campaign runs; in run
+  `20260822-062705`, both ends built from `8f710f69`, the server received 4.83 Mbit/s over
+  this leg while raw UDP echo on the same path in the same run measured 13.26 Mbit/s
+  round-trip.
+
+  Recorded as what the leg is for rather than as a defect awaiting a fix. Disabling the ARQ
+  on byte-pipe transports is a large change to `run_data_pump` on a leg that is not the
+  production transport, and it is not being made now. So `README.md`,
+  `docs/operations/deployment.md` and the leg's own module documentation now say the same
+  thing: use this leg for reach — a network that blocks or throttles UDP, a proxy, a browser
+  sandbox — use PhantomUDP wherever you have the choice, and expect worse latency under load
+  here. Correctness and security are untouched: the inner wire, the pinning, the AEAD and the
+  replay window are identical on every transport.
 
 - **`connect_pinned*` returns before the handshake completes.** The returned session is
   in `Connecting` state with the handshake running on a background task, so callers must
