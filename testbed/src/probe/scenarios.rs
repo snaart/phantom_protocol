@@ -1606,12 +1606,22 @@ pub async fn bidir(
         let payload = gen.fill(up_frame.saturating_sub(9));
         let mut seq = 0u64;
         let mut bytes = 0u64;
-        // When this side last actually put bytes on the wire — not when its
-        // loop exited. A sender parked inside `send_encoded` waiting for the
-        // window to open is not a second direction, however long it stays
-        // there, and timing the loop instead would report a stalled upload as
-        // duplex right up to the operation timeout.
+        // When this side last got a frame *accepted by the session* — bytes
+        // queued, not bytes on the wire. On the Phantom leg `send_encoded` is
+        // `PhantomSession::send`, which returns once the command is queued, so
+        // this is the last moment the uploader is known to have handed work
+        // over. The queued tail drains after it, bounded by the command channel
+        // and the ARQ send buffer, so the share computed below is a **lower
+        // bound** on how much of the window was duplex. (An earlier comment
+        // here argued the opposite — that a call blocked inside `send_encoded`
+        // is not a second direction. It blocks because the pump is saturated,
+        // which is the moment the wire is most duplex.)
         let mut last_sent = Duration::ZERO;
+        // Why the loop ended, which the note below has to say and could not.
+        // The two failure arms used to be one `_ => break` that swallowed a
+        // send error and a ten-second timeout alike, and the note then advised
+        // raising a byte budget — the wrong remedy for an upload that died.
+        let mut ended: Option<UploadEnd> = None;
         while !up_stop.load(Ordering::Relaxed) && bytes < up_budget {
             let wire = crate::framing::encode_framed(&Msg::Sink {
                 seq,
@@ -1624,13 +1634,25 @@ pub async fn bidir(
                     seq += 1;
                     last_sent = started.elapsed();
                 }
-                _ => break,
+                Ok(Err(e)) => {
+                    ended = Some(UploadEnd::Failed(e, started.elapsed()));
+                    break;
+                }
+                Err(_) => {
+                    ended = Some(UploadEnd::TimedOut(started.elapsed()));
+                    break;
+                }
             }
         }
         // The two halves carry the same byte budget but not the same rate, so
         // the faster one finishes first and whatever is left of the window is
         // not full duplex at all.
-        (seq, bytes, last_sent)
+        let ended = ended.unwrap_or(if bytes >= up_budget {
+            UploadEnd::Budget
+        } else {
+            UploadEnd::Stopped
+        });
+        (seq, bytes, last_sent, ended)
     });
 
     let mut down = WindowTracker::new(leg, "bidir_download");
@@ -1666,7 +1688,22 @@ pub async fn bidir(
 
     let down_ran_for = started.elapsed();
     stop.store(true, Ordering::Relaxed);
-    let (up_frames, up_bytes, up_ran_for) = uploader.await.unwrap_or((0, 0, Duration::ZERO));
+    let (up_frames, up_bytes, up_ran_for, up_end) =
+        uploader
+            .await
+            .unwrap_or((0, 0, Duration::ZERO, UploadEnd::Stopped));
+    // A half that died is a fact about the run, not merely a shorter window.
+    match &up_end {
+        UploadEnd::Failed(e, took) => {
+            let ns = took.as_nanos().min(u128::from(u64::MAX)) as u64;
+            out.error_lasting(leg, "bidir", "upload", e, ns);
+        }
+        UploadEnd::TimedOut(took) => {
+            let ns = took.as_nanos().min(u128::from(u64::MAX)) as u64;
+            out.error_lasting(leg, "bidir", "upload", &CoreError::Timeout, ns);
+        }
+        UploadEnd::Budget | UploadEnd::Stopped => {}
+    }
     // Both halves of the exchange have stopped, so the transfer is over and the
     // rest is teardown; a series that keeps sampling through the drain reports
     // outstanding bytes collapsing as though the transfer had ended that way.
@@ -1683,7 +1720,7 @@ pub async fn bidir(
         "full duplex: down {:.2} Mbit/s ({} B), up {} B in {} frames",
         down_tp.megabits_per_sec, down_tp.bytes, up_bytes, up_frames
     ));
-    out.note(duplex_overlap_note(up_ran_for, down_ran_for));
+    out.note(duplex_overlap_note(up_ran_for, down_ran_for, &up_end));
 
     match sink_end_and_report(framed.as_ref(), up_frames, up_bytes).await {
         Ok((f, b, _, _)) => out.note(format!("server received {b} B in {f} upload frames")),
@@ -1713,8 +1750,10 @@ pub async fn bidir(
 /// Reported rather than corrected. Trimming the average to the overlap would be
 /// arithmetic on a series this function cannot see, and the honest fix is to
 /// raise the budget of whichever direction finished first until the window is
-/// duplex throughout.
-fn duplex_overlap_note(up_ran_for: Duration, down_ran_for: Duration) -> String {
+/// duplex throughout — **when the upload finished at all**. It may instead have
+/// failed or timed out, which asks for the opposite of a larger budget, so the
+/// reason is carried in rather than assumed.
+fn duplex_overlap_note(up_ran_for: Duration, down_ran_for: Duration, end: &UploadEnd) -> String {
     let overlap = up_ran_for.min(down_ran_for);
     // A window of no length has no share to report, and dividing by it would
     // manufacture one. Below a tenth of a second nothing here is a measurement
@@ -1735,17 +1774,51 @@ fn duplex_overlap_note(up_ran_for: Duration, down_ran_for: Duration) -> String {
             down_ran_for.as_secs_f64()
         )
     } else {
+        let remedy = match end {
+            UploadEnd::Failed(e, _) => format!(
+                "the upload half did not complete — it failed with {e} — so the \
+                 remainder is a one-way measurement and the figure above is not a \
+                 duplex rate. A larger budget is not the remedy for this"
+            ),
+            UploadEnd::TimedOut(_) => "the upload half did not complete — a send \
+                 exceeded the operation timeout — so the remainder is a one-way \
+                 measurement and the figure above is not a duplex rate. A larger \
+                 budget is not the remedy for this"
+                .to_string(),
+            UploadEnd::Budget | UploadEnd::Stopped => "raise the byte budget of \
+                 whichever direction finished first if the whole window needs to be \
+                 duplex"
+                .to_string(),
+        };
         format!(
             "the upload stopped after {:.1} s of a {:.1} s window, so only {:.0}% of \
              the download's average had a second direction in it and the rest is a \
              one-way measurement wearing a duplex label. Read it against the one-way \
-             scenario with that in mind, and raise the byte budget of whichever \
-             direction finished first if the whole window needs to be duplex",
+             scenario with that in mind; {remedy}",
             up_ran_for.as_secs_f64(),
             down_ran_for.as_secs_f64(),
             100.0 * share
         )
     }
+}
+
+/// Why the duplex scenario's upload half stopped.
+///
+/// The note the scenario prints advises the operator, and the advice differs: a
+/// half that met its budget asks for a larger one, and a half that died asks for
+/// the failure to be looked at. Before this existed both failure arms of the
+/// send were one `_ => break`, so a dead upload and a finished one were the same
+/// observation and the note gave the finished one's advice to both.
+#[derive(Debug)]
+enum UploadEnd {
+    /// Sent everything it was asked for.
+    Budget,
+    /// The download half finished first and set the stop flag.
+    Stopped,
+    /// A send returned an error, with how long the half had run.
+    Failed(CoreError, Duration),
+    /// A send exceeded `OP_TIMEOUT`, with how long the half had run.
+    TimedOut(Duration),
 }
 
 // ── 6b. send_ceiling ────────────────────────────────────────────────────────
@@ -6300,7 +6373,11 @@ mod tests {
     #[test]
     fn the_duplex_note_says_how_much_of_the_window_had_two_directions() {
         // Both directions ran the whole window.
-        let whole = duplex_overlap_note(Duration::from_secs(60), Duration::from_secs(60));
+        let whole = duplex_overlap_note(
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            &UploadEnd::Budget,
+        );
         assert!(
             whole.contains("duplex rate throughout"),
             "a window with both directions running throughout must say so: {whole}"
@@ -6309,7 +6386,11 @@ mod tests {
         // The upload finished at two thirds. The note must carry both the
         // moment and the share, because the share alone does not say which
         // direction to lengthen.
-        let partial = duplex_overlap_note(Duration::from_secs(40), Duration::from_secs(60));
+        let partial = duplex_overlap_note(
+            Duration::from_secs(40),
+            Duration::from_secs(60),
+            &UploadEnd::Budget,
+        );
         assert!(
             partial.contains("40.0 s") && partial.contains("67%"),
             "a partially duplex window must report when the upload stopped and \
@@ -6323,12 +6404,20 @@ mod tests {
         // Just under the tolerance is still partial; just over is whole. The
         // boundary has to be somewhere, and a reading that slid either way
         // would let a one-way tail pass as duplex or flag rounding as a defect.
-        let near = duplex_overlap_note(Duration::from_millis(58_500), Duration::from_secs(60));
+        let near = duplex_overlap_note(
+            Duration::from_millis(58_500),
+            Duration::from_secs(60),
+            &UploadEnd::Budget,
+        );
         assert!(
             !near.contains("throughout"),
             "97.5% of a window is not the whole of it: {near}"
         );
-        let nearer = duplex_overlap_note(Duration::from_millis(59_000), Duration::from_secs(60));
+        let nearer = duplex_overlap_note(
+            Duration::from_millis(59_000),
+            Duration::from_secs(60),
+            &UploadEnd::Budget,
+        );
         assert!(
             nearer.contains("throughout"),
             "98.3% is inside the tolerance and must read as whole: {nearer}"
@@ -6336,7 +6425,7 @@ mod tests {
 
         // A window of no length has no share, and computing one would divide by
         // zero and publish whatever came out.
-        let empty = duplex_overlap_note(Duration::ZERO, Duration::ZERO);
+        let empty = duplex_overlap_note(Duration::ZERO, Duration::ZERO, &UploadEnd::Budget);
         assert!(
             empty.contains("too short"),
             "a zero-length window must be reported as unmeasurable rather than \
@@ -6385,7 +6474,7 @@ mod tests {
             .expect("this file has a test module and the gate must exclude it");
         let code = crate::framing::code_without_comments(&SRC[..production_end]);
 
-        let call = "out.note(duplex_overlap_note(up_ran_for, down_ran_for));";
+        let call = "out.note(duplex_overlap_note(up_ran_for, down_ran_for, &up_end));";
         assert!(
             code.contains(call),
             "the duplex scenario no longer calls `duplex_overlap_note(up_ran_for, \
@@ -6412,7 +6501,7 @@ mod tests {
                  an upload that stopped at zero",
             ),
             (
-                "(seq, bytes, last_sent)",
+                "(seq, bytes, last_sent, ended)",
                 "the upload task no longer returns the stamp it kept, so whatever it \
                  measured never reaches the note",
             ),

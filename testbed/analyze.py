@@ -3334,10 +3334,11 @@ def self_test():
 
     # Every check prints one `ok:`/`FAIL:` line, so the count of those lines *is*
     # the number of checks. It used to be a hand-kept sum of `len(...)` terms
-    # with a bare `+ 7` on the end, and by the time anyone looked it was nine
-    # short of the truth: the suite printed 166 results and reported "157/157",
-    # which is a gate quietly under-counting itself in exactly the way this file
-    # exists to catch elsewhere.
+    # with a bare `+ 7` on the end, which has to be edited by hand to match
+    # whenever a case is added — a step nothing enforces, and one a change
+    # adding nine cases at once missed. Counting the printed lines removes the
+    # step. A sum that drifts is a gate quietly under-counting itself in
+    # exactly the way this file exists to catch elsewhere.
     checks_run = [0]
 
     def print(*args, **kwargs):  # noqa: A001 — deliberate shadow, see above

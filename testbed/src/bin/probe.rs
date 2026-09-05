@@ -288,15 +288,13 @@ fn resolved_params(args: &Args) -> Result<Params> {
     if let Some(s) = args.upload_secs {
         anyhow::ensure!(s > 0, "--upload-secs must be at least 1");
         params.upload = Duration::from_secs(s);
-        // Widened to match, though on the current wiring it makes no
-        // difference: `transfer_cap` is passed only to `download` and `bidir`,
-        // while `upload` is bounded by the window above and never sees the cap.
-        // The line predates that being checked and is kept because it costs
-        // nothing and would be right again the day the cap does reach every
-        // bulk transfer — but it is not, today, protecting the upload from
-        // anything, and the comment that said it was has been removed rather
-        // than left to be believed.
-        params.transfer_cap = params.transfer_cap.max(params.upload);
+        // Nothing is widened here any more. `transfer_cap` reaches exactly
+        // `download` and `bidir`; `upload` is bounded by the window above and
+        // never sees it. So carrying the cap up with the upload window did not
+        // protect the upload from anything — it silently lengthened the
+        // measurement window of two scenarios the flag has nothing to do with,
+        // which is the opposite of costing nothing. `--transfer-cap-secs` sets
+        // that window directly now, so the two clocks are independent.
     }
     if let Some(m) = args.download_mib {
         anyhow::ensure!(m > 0, "--download-mib must be at least 1");
@@ -394,18 +392,23 @@ mod tests {
     }
 
     #[test]
-    fn a_longer_upload_carries_the_wall_clock_cap_that_bounds_it_upward() {
-        // `smoke` runs a 10 s upload under a 60 s cap. Asking for 180 s without
-        // moving the cap would run 60 and record it as if it had run 180 — the
+    fn the_upload_window_does_not_move_the_download_and_duplex_window() {
+        // These were one field for a while: `--upload-secs` carried the cap up
+        // with it, on the reasoning that a cap under the upload window would
+        // silently truncate the window that was asked for. It would not — the
+        // cap reaches `download` and `bidir` and the upload is bounded by its
+        // own window — so all the coupling did was lengthen the measurement
+        // window of two scenarios the flag has nothing to do with, which is the
         // shape of override that is invisible in the artifact it produced.
+        // `--transfer-cap-secs` moves that window deliberately now.
+        let base = Params::for_profile(Profile::Smoke).transfer_cap;
         let p = resolved_params(&parse(&["--upload-secs", "180"])).expect("override must apply");
         assert_eq!(p.upload, Duration::from_secs(180));
-        assert!(
-            p.transfer_cap >= p.upload,
-            "the cap must not silently truncate the window that was asked for: \
-             cap {:?} < upload {:?}",
-            p.transfer_cap,
-            p.upload
+        assert_eq!(
+            p.transfer_cap, base,
+            "asking for a longer upload moved the download and duplex window, which \
+             this flag does not bound: cap {:?}, profile default {base:?}",
+            p.transfer_cap
         );
     }
 
@@ -494,22 +497,26 @@ mod tests {
         assert_eq!(both.upload, Duration::from_secs(120));
         assert_eq!(both.transfer_cap, Duration::from_secs(60));
 
-        // Order matters between them: `--upload-secs` widens the cap, and an
-        // explicit cap is the more specific instruction, so it has to win
-        // regardless of the order the two are parsed in.
-        let widened_then_set = resolved_params(&parse(&[
+        // The two clocks are independent: the cap bounds `download` and `bidir`,
+        // the upload window bounds the upload, and neither moves the other.
+        // `--upload-secs` used to carry the cap up with it, which lengthened two
+        // scenarios it has nothing to do with.
+        let long_upload = resolved_params(&parse(&["--upload-secs", "300"])).expect("applies");
+        assert_eq!(
+            long_upload.transfer_cap, base.transfer_cap,
+            "--upload-secs moved the download and duplex window, which it does not bound"
+        );
+        assert_eq!(long_upload.upload, Duration::from_secs(300));
+
+        let both_set = resolved_params(&parse(&[
             "--upload-secs",
             "300",
             "--transfer-cap-secs",
             "90",
         ]))
         .expect("override applies");
-        assert_eq!(
-            widened_then_set.transfer_cap,
-            Duration::from_secs(90),
-            "--upload-secs widened the cap to 300 s and the explicit --transfer-cap-secs \
-             did not override it"
-        );
+        assert_eq!(both_set.transfer_cap, Duration::from_secs(90));
+        assert_eq!(both_set.upload, Duration::from_secs(300));
 
         // Zero is refused here rather than somewhere downstream. Asserting only
         // `is_err()` would pass while a neighbouring guard did the refusing for
