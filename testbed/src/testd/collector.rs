@@ -204,6 +204,7 @@ mod tests {
                 label: "x".into(),
             }],
             close_reason: "bye".into(),
+            transport_note: None,
         }
     }
 

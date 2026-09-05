@@ -136,6 +136,11 @@ pub async fn run(link: Arc<dyn MsgLink>, ctx: Arc<SessionCtx>, collector: Collec
         window_samples_skipped: c.window_samples_skipped.load(Ordering::Relaxed),
         marks,
         close_reason: close_reason.clone(),
+        // Taken at close, so it covers the whole session rather than an instant
+        // inside it. A leg that reports nothing leaves it absent rather than
+        // writing an empty string, which keeps "this leg has no such counters"
+        // distinct from "it had them and they were empty".
+        transport_note: link.transport_note(),
     });
     collector.event(
         &ctx.listener,

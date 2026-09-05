@@ -1264,6 +1264,20 @@ pub struct SessionRecord {
     pub window_samples_skipped: u64,
     pub marks: Vec<MarkRecord>,
     pub close_reason: String,
+    /// What the transport under this session says about its own path, as the
+    /// *server* saw it, or `None` for a leg that reports nothing.
+    ///
+    /// This exists because its absence made a whole direction unreadable. On a
+    /// download the server is the sender, so the only endpoint that can say why
+    /// a transfer was slow is the daemon — and until now only the client's note
+    /// reached an artifact. A campaign measured the reference leg's download at
+    /// 0.70 Mbit/s against 28 to 66 upward on the same connection, with the
+    /// client's note reporting zero loss and zero congestion events, because the
+    /// client is the receiver there and its note describes its acknowledgements.
+    /// The sender's own counters were never written down, so the question could
+    /// not be asked of the archive at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
