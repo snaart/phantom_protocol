@@ -182,11 +182,13 @@ fn crypto_comparison_bench(c: &mut Criterion) {
 
     // Classical: Ed25519 only
     use ed25519_dalek::{Signer, SigningKey, Verifier};
-    use rand::rngs::OsRng;
+    // The benchmark needs an infallible CryptoRng; `rand::rng()` is the thread
+    // generator, seeded from the system source. `SysRng` is fallible and the dalek
+    // 3 generators will not take it.
 
     group.bench_function("keygen_ed25519", |b| {
         b.iter(|| {
-            let sk = SigningKey::generate(&mut OsRng);
+            let sk = SigningKey::generate(&mut rand::rng());
             black_box(sk)
         })
     });
@@ -214,7 +216,7 @@ fn crypto_comparison_bench(c: &mut Criterion) {
 
     group.bench_function("keygen_x25519", |b| {
         b.iter(|| {
-            let sk = StaticSecret::random_from_rng(OsRng);
+            let sk = StaticSecret::random_from_rng(&mut rand::rng());
             let pk = X25519PublicKey::from(&sk);
             black_box((sk, pk))
         })
@@ -243,7 +245,7 @@ fn crypto_comparison_bench(c: &mut Criterion) {
     // === Signing ===
     let message = b"Benchmark message for signing operations - this is a typical message length";
 
-    let ed_sk = SigningKey::generate(&mut OsRng);
+    let ed_sk = SigningKey::generate(&mut rand::rng());
     group.bench_function("sign_ed25519", |b| {
         b.iter(|| {
             let sig = ed_sk.sign(message);
