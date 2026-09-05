@@ -385,8 +385,8 @@ typedef struct PhantomMetricsSnapshotFfi {
  * Five UniFFI-exported objects:
  *
  *   PhantomListener     — TCP server. 3 constructors + 7 methods.
- *   PhantomUdpListener  — UDP server. 3 constructors + 6 methods.
- *   PhantomSession      — connection. Constructor + 23 methods.
+ *   PhantomUdpListener  — UDP server. 3 constructors + 7 methods.
+ *   PhantomSession      — connection. Constructor + 20 methods.
  *   PhantomStream       — substream. 6 methods (no public constructor —
  *                         obtained via PhantomSession::open_stream or
  *                         PhantomSession::accept_stream).

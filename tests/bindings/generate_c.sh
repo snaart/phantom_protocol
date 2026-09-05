@@ -123,12 +123,41 @@ HEADER_COUNT=$(wc -l < "$HEADER_SYMS" | tr -d ' ')
 echo "==> $HEADER_COUNT distinct UniFFI/FFI symbols mentioned in header"
 
 echo
+MISSING="$(comm -23 "$SYMBOLS_FILE" "$HEADER_SYMS" | grep -E '^uniffi_phantom_protocol_fn_' || true)"
+STALE="$(comm -13 "$SYMBOLS_FILE" "$HEADER_SYMS" | grep -E '^uniffi_phantom_protocol_fn_' || true)"
+
 echo "==> Symbols in dylib but NOT mentioned in header:"
 comm -23 "$SYMBOLS_FILE" "$HEADER_SYMS" | sed 's/^/    /' || true
 
 echo
 echo "==> Symbols mentioned in header but NOT in dylib (potential stale decls):"
 comm -13 "$SYMBOLS_FILE" "$HEADER_SYMS" | sed 's/^/    /' || true
+
+# Both directions are failures, and only one of them used to be. A symbol the
+# cdylib exports and the header omits is an API a C consumer cannot reach; a
+# symbol the header declares and the cdylib no longer exports is worse, because
+# it links against nothing and the consumer finds out at run time. The second
+# case had no gate at all, so a removed or renamed export left a stale extern
+# shipping to C with a green tree — including, at the limit, one naming a method
+# the contract requires to stay off the FFI surface entirely.
+#
+# The comparison is narrowed to the `_fn_` family on purpose. The
+# `ffi_phantom_protocol_*` and `uniffi_phantom_protocol_checksum_*` families are
+# deliberately not enumerated in the header — it documents their shape in prose
+# instead — so counting them would make this permanently red.
+FAILED=0
+if [[ -n "$MISSING" ]]; then
+    echo
+    echo "ERROR: the header is missing API symbols the cdylib exports:" >&2
+    echo "$MISSING" | sed 's/^/    /' >&2
+    FAILED=1
+fi
+if [[ -n "$STALE" ]]; then
+    echo
+    echo "ERROR: the header declares API symbols the cdylib does not export:" >&2
+    echo "$STALE" | sed 's/^/    /' >&2
+    FAILED=1
+fi
 
 # ---------------------------------------------------------------------
 # Optionally refresh the cbindgen-derived constant block.
@@ -168,5 +197,22 @@ EOF
     echo "    phantom_protocol.h SECTION 2."
 fi
 
+# The header's prose names a constructor and method count per object, and a C
+# integrator checks their own `nm` output against it. Nothing derived those
+# numbers, so two of the five had drifted. Printing them here makes the next
+# edit a copy rather than a recount; they are still prose and still hand-kept,
+# because a header comment is not something this script may rewrite.
 echo
+echo "==> Per-object counts, for the prose block in phantom_protocol.h SECTION 1:"
+for obj in phantomlistener phantomudplistener phantomsession phantomstream acceptoutcome; do
+    ctors=$(grep -cE "^uniffi_phantom_protocol_fn_constructor_${obj}_" "$SYMBOLS_FILE" || true)
+    methods=$(grep -cE "^uniffi_phantom_protocol_fn_method_${obj}_" "$SYMBOLS_FILE" || true)
+    printf '    %-20s %s constructor(s) + %s method(s)\n' "$obj" "$ctors" "$methods"
+done
+
+echo
+if [[ $FAILED -ne 0 ]]; then
+    echo "==> FAILED: the header and the cdylib disagree (see the two lists above)." >&2
+    exit 1
+fi
 echo "==> Done."

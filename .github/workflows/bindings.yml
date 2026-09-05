@@ -35,19 +35,13 @@ jobs:
           tests/bindings/generate_swift.sh
           tests/bindings/generate_kotlin.sh
           tests/bindings/generate_python.sh
-      - name: Verify the C header carries every API symbol
-        run: |
-          C_OUT="$(tests/bindings/generate_c.sh --release --skip-build 2>&1)"
-          echo "$C_OUT"
-          MISSING="$(echo "$C_OUT" \
-            | sed -n '/in dylib but NOT mentioned/,/mentioned in header but NOT/p' \
-            | grep -oE 'uniffi_phantom_protocol_fn_[A-Za-z0-9_]+' \
-            | sort -u || true)"
-          if [ -n "$MISSING" ]; then
-            echo "::error::tests/bindings/c/phantom_protocol.h is missing API symbols:"
-            echo "$MISSING"
-            exit 1
-          fi
+      # Both directions are the script's own business now, and its exit status
+      # is the verdict. This step used to scrape one of the two lists out of the
+      # script's stdout and fail on that alone, which left the other direction —
+      # a header declaring a symbol the cdylib no longer exports — with no gate:
+      # a stale extern shipped to C consumers and linked against nothing.
+      - name: Verify the C header and the cdylib agree, in both directions
+        run: tests/bindings/generate_c.sh --release --skip-build
       # The drift check is itself a gate, so it gets a gate: each case builds a
       # throwaway tree and asserts the script accepts an aligned one and
       # rejects a drifted one, per manifest. Dropping an entry from the
