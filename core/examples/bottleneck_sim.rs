@@ -338,8 +338,16 @@ struct Recorded {
 }
 
 fn run(phases: &[Phase]) -> Recorded {
-    let start = Instant::now();
     let mut est = BandwidthEstimator::new();
+    // One clock read for the whole model, taken from the estimator rather than
+    // beside it. Two reads put a sub-microsecond gap between the two origins,
+    // and that gap is not inert: it lands in the first segments' delivery
+    // timestamps, enters the first rate samples through the interval those
+    // samples divide by, and perturbs the trajectory from there. Three
+    // consecutive runs of one binary produced three different outputs. A model
+    // whose own documentation calls the unseeded run the reproducible one has
+    // to be reproducible, and this is the whole of what it took.
+    let start = est.delivered_time();
     let mut queue: VecDeque<InFlight> = VecDeque::new();
     let mut returning: VecDeque<Returning> = VecDeque::new();
     let mut reference = WindowedMax::new(BW_FILTER_WINDOW);

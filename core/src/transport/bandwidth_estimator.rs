@@ -763,9 +763,25 @@ const _: () = {
         level > needed,
         "INFLIGHT_HI_BETA x CWND_GAIN no longer clears (1 + STARTUP_GROWTH_THRESHOLD) \
          at INFLIGHT_HI_LEVEL_SUPPORTS_LOSS_TO: a sender on a path losing that much \
-         steadily will leave Startup at a fraction of the link and take a minute of \
-         ProbeBW cycles to climb back. Move the constants together or move the \
-         supported rate deliberately."
+         steadily will leave Startup at a fraction of the link and be left to the \
+         ProbeBW cycle to climb back a quarter per four round trips. Move the \
+         constants together or move the supported rate deliberately."
+    );
+    // And the floor itself has a bottom. Everything above leans on
+    // `INFLIGHT_HI_FLOOR_GAIN` being at least `1 + STARTUP_GROWTH_THRESHOLD` —
+    // that is what makes a round spent at the floor able to beat the growth
+    // test on a path that is not losing, and it is stated as an identity in
+    // the loss branch's own reasoning. Nothing asserted it, and at a gain of
+    // 1.0 the relax branch parks the bound at exactly one bandwidth-delay
+    // product, the absorbing point this file's own documentation warns about,
+    // with every library test still green.
+    assert!(
+        INFLIGHT_HI_FLOOR_GAIN >= 1.0 + STARTUP_GROWTH_THRESHOLD,
+        "INFLIGHT_HI_FLOOR_GAIN has fallen under (1 + STARTUP_GROWTH_THRESHOLD), so a \
+         round held at the floor can no longer beat the Startup growth test even on a \
+         path that is losing nothing, and a bound relaxed onto the floor sits at or \
+         under one bandwidth-delay product, where no sample can raise the estimate that \
+         set it"
     );
     // And the level has to clear the floor, or `INFLIGHT_HI_BETA` is dead code
     // and the reasoning above describes a branch that never decides anything.
@@ -3034,9 +3050,9 @@ mod tests {
             // which is the fastest possible recovery and unambiguously fine.
             None => {}
             Some(now_bound) => assert!(
-                now_bound >= bdp_now,
+                now_bound > bdp_now,
                 "the path stopped losing and grew to a {bdp_now} B bandwidth-delay \
-                 product, and the volume bound came out of it at {now_bound} B — \
+                 product, and the volume bound came out of it at {now_bound} B — at or \
                  under one product, from {engaged} B. A window that small admits no \
                  delivery sample larger than the estimate that set it, so nothing \
                  the sender can do raises either, and the multiplicative relax is \
