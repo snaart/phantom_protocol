@@ -199,10 +199,14 @@ pub enum ConnectionState {
 /// shaping is opt-in** — the default (and the field defaults here) is no shaping,
 /// so a session pays nothing unless an embedder enables it.
 ///
-/// Currently carries the size-padding policy; the timing-jitter
-/// and cover-traffic knobs will be added as further fields in later
-/// phases. Padding hides the datagram *size*; it costs bounded (≈ ≤12% worst-case)
-/// extra bandwidth.
+/// Carries all three knobs: the size-padding policy, the send-timing jitter
+/// ceiling and the cover-traffic interval, each documented on its own field
+/// below and each wired to the send path.
+///
+/// Padding hides the datagram *size* at a bounded cost (≈ ≤12% worst case);
+/// jitter hides the *timing* at a cost of up to its own ceiling in latency;
+/// cover traffic hides the *presence* of application data at the cost of the
+/// bandwidth it spends.
 #[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TrafficShapingConfig {
@@ -286,6 +290,17 @@ impl ConnectionState {
 /// server it was negotiated against: the `resumption_secret` is
 /// server-pinned, and reusing a hint across servers is a configuration
 /// bug.
+///
+/// **Never log this value.** `resumption_secret` is the proof-of-possession
+/// input a resuming handshake proves it holds, so a copy in a log is a
+/// credential in a log. The warning sits on the type rather than only on the
+/// field because that is what reaches every language: the Python binding
+/// carries type documentation and not field documentation, and Python is the
+/// one binding whose generated record stringifies its fields — `print(hint)`,
+/// an f-string or `logging.info("%s", hint)` writes the secret out in full
+/// there. Swift and Kotlin render the byte array's identity instead and do not
+/// leak it. The Rust `Debug` below redacts the secret, but UniFFI never calls
+/// it.
 #[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 #[derive(Clone)]
 #[non_exhaustive]
@@ -293,6 +308,15 @@ pub struct ResumptionHint {
     /// The negotiated session id (32 bytes).
     pub session_id: Vec<u8>,
     /// The resumption secret (32 bytes) — sensitive; treat like a key.
+    ///
+    /// **Never log this record, and in Python never `print`, `format` or `%s` it.**
+    /// This is the proof-of-possession input a resuming handshake proves it holds
+    /// (Security Invariant 9), so a copy in a log is a credential in a log. The
+    /// Rust `Debug` below redacts it, but that impl is Rust-only: UniFFI never
+    /// calls it, and the generated Python record carries a `__str__` that formats
+    /// both fields, so `print(hint)`, an f-string or `logging.info("%s", hint)`
+    /// writes the secret out in full. Swift and Kotlin render the byte array's
+    /// identity rather than its contents and do not leak it.
     pub resumption_secret: Vec<u8>,
 }
 
@@ -312,10 +336,19 @@ impl ResumptionHint {
     }
 }
 
-// INFOLEAK-1: hand-written redacting `Debug` (not derived) so a mobile/FFI
-// consumer that logs the hint with `{:?}` cannot leak the 0-RTT `resumption_secret`
-// — the one secret-bearing type that crosses the FFI boundary. Mirrors the
-// REDACTED `Debug` on `HybridSigningKey` / `HybridSecretKey`.
+// INFOLEAK-1: hand-written redacting `Debug` (not derived) so a **Rust** caller
+// that logs the hint with `{:?}` cannot leak the 0-RTT `resumption_secret`.
+// Mirrors the REDACTED `Debug` on `HybridSigningKey` / `HybridSecretKey`.
+//
+// It does not reach the FFI and protects no mobile/FFI consumer. UniFFI turns
+// this type into a plain record in each target language and generates that
+// language's own stringifier; it never calls this impl. The Python one formats
+// every field, so the secret is one `print` away there. The warning that has to
+// travel is therefore on the field's doc comment, which UniFFI *does* copy into
+// every binding. Removing the leak rather than documenting it means making this
+// a `uniffi::Object` with accessors instead of a record — objects get no
+// field-dumping stringifier — which is an FFI-breaking change to the four
+// `*_with_resumption` entry points, deferred to a release that can take it.
 impl std::fmt::Debug for ResumptionHint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResumptionHint")
@@ -845,6 +878,12 @@ impl PhantomSession {
         let (incoming_stream_tx, incoming_stream_rx) = mpsc::channel(128);
 
         let state = Arc::new(AtomicU8::new(ConnectionState::Connected as u8));
+        // Shared with the pump below rather than created inside the session
+        // literal: an accepted session never runs a client handshake, but it can
+        // still be reaped by the liveness timer, and that is a cause the handle
+        // has to be able to report.
+        let terminal_error: Arc<parking_lot::Mutex<Option<CoreError>>> =
+            Arc::new(parking_lot::Mutex::new(None));
         let send_queue = Arc::new(Mutex::new(Vec::new()));
         // Server allocates even stream ids (2, 4, 6, …) — QUIC-style role split so
         // concurrent open_stream() on both ends never collides.
@@ -935,6 +974,7 @@ impl PhantomSession {
             incoming_stream_tx,
             stream_gauge,
             recv_tuning_for_pump,
+            terminal_error,
         )));
 
         session
@@ -1140,6 +1180,7 @@ impl PhantomSession {
             incoming_stream_tx,
             stream_gauge,
             recv_tuning,
+            terminal_error,
         )
         .await;
     }
@@ -1813,6 +1854,10 @@ async fn run_data_pump<T: SessionTransport>(
     // raw stream and each peer-initiated one — draws on this handle, which is what makes
     // the session-wide bound hold rather than merely be intended.
     recv_tuning: Arc<SharedRecvTuning>,
+    // Where a terminal cause is recorded, shared with the `PhantomSession` handle so
+    // `last_error()`, `await_ready()` and `recv()` can report it. The pump writes into
+    // it at the one place it ends a session of its own accord: the liveness timer.
+    terminal_error: Arc<parking_lot::Mutex<Option<CoreError>>>,
 ) {
     // Session is now established and active — bump the active-session gauge.
     // The matching `session_closed` at teardown (below) lets the gauge fall,
@@ -2356,6 +2401,19 @@ async fn run_data_pump<T: SessionTransport>(
                 // evaluate inbound silence vs. outstanding data and surface
                 // Migrating / recover / Dead. A `Dead` verdict ends the pump.
                 if apply_liveness(&crypto_session, &state, &mut migrating_since) {
+                    // A death decided here has no failing call site to carry a
+                    // cause, so it is recorded now, before anyone can read the
+                    // state. `Timeout` is the honest variant: the session went
+                    // unanswered for the whole configured window and was reaped,
+                    // which is a deadline elapsing rather than a transport
+                    // error. Written only if the slot is empty — an earlier,
+                    // more specific failure is the better answer.
+                    {
+                        let mut slot = terminal_error.lock();
+                        if slot.is_none() {
+                            *slot = Some(CoreError::Timeout);
+                        }
+                    }
                     died = true;
                     break;
                 }
@@ -5520,9 +5578,17 @@ impl PhantomSession {
             })
     }
 
-    /// Apply an anti-fingerprint traffic-shaping configuration to the established
-    /// session (WIRE v6). Returns `false` if the session is still
-    /// connecting. All shaping is opt-in (default: none); enabling size padding
+    /// Apply an anti-fingerprint traffic-shaping configuration (WIRE v6).
+    ///
+    /// **Accepted at any point in a session's life, including before the
+    /// handshake has run.** The configuration is stored and applied when the
+    /// session is installed, so an embedder that wants shaping on from the first
+    /// byte sets it immediately after connecting rather than waiting for
+    /// readiness. The return is always `true` and carries no information; it
+    /// survives because removing it is an FFI-breaking change. Do not branch on
+    /// it.
+    ///
+    /// All shaping is opt-in (default: none); enabling size padding
     /// ([`PaddingPolicy::Padme`]) makes outbound packets pad up to a PADÉ bucket so
     /// the datagram size no longer tracks the payload size, at a bounded (≈ ≤12%
     /// worst-case) bandwidth cost. FFI-exported so mobile / other embedders can
@@ -6437,10 +6503,22 @@ impl<T> SessionBuilder<T> {
 }
 
 impl<T: SessionTransport> SessionBuilder<T> {
-    /// Perform the handshake and return the established session.
+    /// Start the session and return it **before the handshake has run**.
     ///
-    /// Returns `Err(CoreError::ConfigError(...))` if no pinned key was supplied via
-    /// `.pinned_key(...)`. The transport must have been supplied via `.transport(...)`.
+    /// This is the same contract as the `connect_pinned*` free functions and it
+    /// is the one thing about this entry point worth reading twice: the returned
+    /// session is in [`ConnectionState::Connecting`], the handshake proceeds on a
+    /// background task, and the pinned-key check that Security Invariant 1 exists
+    /// to guarantee has **not happened yet**. So `send()` returns `Ok` for bytes
+    /// that are only queued, and a wrong pin surfaces later through
+    /// [`PhantomSession::await_ready`] or [`PhantomSession::last_error`] rather
+    /// than here. Call `await_ready()` immediately unless you have a reason not
+    /// to.
+    ///
+    /// What *is* checked before any I/O: `Err(CoreError::ConfigError(...))` if no
+    /// pinned key was supplied via `.pinned_key(...)`, and the shape of a
+    /// resumption hint if one was. The transport must have been supplied via
+    /// `.transport(...)`, which the type state enforces at compile time.
     pub async fn connect(self) -> Result<Arc<PhantomSession>, CoreError> {
         let pinned_key = self.pinned_key.ok_or_else(|| {
             CoreError::ConfigError("SessionBuilder: pinned_key is required".into())

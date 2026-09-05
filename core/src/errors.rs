@@ -41,9 +41,6 @@ pub enum CoreError {
     #[cfg_attr(feature = "std", error("Serialization Error: {0}"))]
     SerializationError(String),
 
-    #[cfg_attr(feature = "std", error("System Busy"))]
-    Busy,
-
     #[cfg_attr(feature = "std", error("Invalid Configuration: {0}"))]
     ConfigError(String),
 
@@ -52,9 +49,6 @@ pub enum CoreError {
 
     #[cfg_attr(feature = "std", error("Validation Error: {0}"))]
     ValidationError(String),
-
-    #[cfg_attr(feature = "std", error("Runtime initialization failed: {0}"))]
-    RuntimeError(String),
 
     #[cfg_attr(feature = "std", error("Key derivation failed"))]
     KeyDerivationError,
@@ -70,9 +64,6 @@ pub enum CoreError {
 
     #[cfg_attr(feature = "std", error("Stream error: {0}"))]
     StreamError(String),
-
-    #[cfg_attr(feature = "std", error("Session not found: {0}"))]
-    SessionNotFound(String),
 
     #[cfg_attr(feature = "std", error("Connection closed"))]
     ConnectionClosed,
@@ -214,3 +205,81 @@ impl core::fmt::Display for CoreError {
 // embedded subset's error-propagation needs — there is no `?`-into-`dyn Error`
 // boundary in that build. (`core::error::Error` would be available at the
 // current 1.93 MSRV, but wiring it up buys the embedded path nothing.)
+
+#[cfg(test)]
+mod variant_discipline {
+    /// Every variant this enum offers is one some production path constructs.
+    ///
+    /// The reasoning is the sibling of `every_connection_state_has_a_production_writer`
+    /// in `api::session`, and the reason it is worth repeating here is that
+    /// `CoreError` crosses the FFI: UniFFI turns each variant into an arm a
+    /// foreign embedder writes in an exhaustive Kotlin `when` or Swift `switch`.
+    /// A variant nobody constructs is therefore worse than a missing one — it is
+    /// a branch someone maintains forever against an event that cannot happen.
+    /// Three of them shipped that way (`Busy`, `RuntimeError`, `SessionNotFound`,
+    /// zero construction sites between them) until this test existed.
+    ///
+    /// It reads the source rather than the type, because Rust offers no way to
+    /// enumerate the variants of a foreign-facing enum and no way to ask which
+    /// are constructed. The search is deliberately loose — any `CoreError::V`
+    /// outside this file counts, including inside a test — so the test stays a
+    /// gate on *dead* variants and never on where a variant is used.
+    #[test]
+    fn every_variant_has_a_construction_site() {
+        const ERRORS: &str = include_str!("errors.rs");
+        const SESSION: &str = include_str!("api/session.rs");
+        const LIB: &str = include_str!("lib.rs");
+
+        // The declarations, taken from this file's own enum body rather than
+        // from a hand-kept list that would drift the moment one is added.
+        let body = ERRORS
+            .split_once("pub enum CoreError {")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .expect("the enum's body has to be findable for this to check anything");
+        let declared: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|l| {
+                l.chars().next().is_some_and(char::is_uppercase)
+                    && !l.starts_with("///")
+                    && !l.starts_with("#[")
+            })
+            .map(|l| l.split(['(', ',', ' ']).next().unwrap_or(l))
+            .collect();
+        assert!(
+            declared.len() > 10,
+            "the variant parse found only {declared:?}, so its silence about dead \
+             variants would mean nothing"
+        );
+
+        // Where a variant may be constructed. `errors.rs` itself is excluded on
+        // purpose: a `From` impl inside this file is plumbing, not a production
+        // path that decides to raise the error.
+        let haystack = format!("{SESSION}{LIB}");
+        let dead: Vec<&&str> = declared
+            .iter()
+            .filter(|v| !haystack.contains(&format!("CoreError::{v}")))
+            .collect();
+
+        // A variant constructed elsewhere in the crate is fine; this test can
+        // only see two files, so it names what it could not find rather than
+        // failing on it. The gate is the `expect` below, which is what catches a
+        // variant with no construction site anywhere.
+        for v in &dead {
+            let found = std::process::Command::new("grep")
+                .args(["-rl", &format!("CoreError::{v}"), "src"])
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .output()
+                .map(|o| !o.stdout.is_empty())
+                .unwrap_or(true);
+            assert!(
+                found,
+                "CoreError::{v} is declared and constructed nowhere in the crate. \
+                 It still crosses the FFI, so an embedder writing an exhaustive \
+                 match maintains an arm for an event that cannot happen. Either \
+                 construct it or remove it."
+            );
+        }
+    }
+}

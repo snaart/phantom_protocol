@@ -11,6 +11,7 @@ use phantom_protocol::api::session::PhantomSession;
 use phantom_protocol::api::udp_listener::PhantomUdpListener;
 use phantom_protocol::api::udp_transport::UdpClientTransport;
 use phantom_protocol::crypto::hybrid_sign::HybridVerifyingKey;
+use phantom_protocol::CoreError;
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -740,6 +741,27 @@ async fn udp_liveness_dead_path_surfaces_migrating_then_dead() {
         "recv() must error on a dead session (got {r:?})"
     );
 
+    // And the cause has to be recorded, because that is what `last_error()`
+    // promises: "the terminal error from a failed handshake **or a dead
+    // session**". A death decided by the liveness timer has no failing call site
+    // to carry a cause, so before this the slot stayed empty and the accessor
+    // answered `None` to a caller its own documentation had told to read it.
+    // `Timeout` is the variant: a deadline elapsed on a session that stopped
+    // answering.
+    let cause = client.last_error().await;
+    assert!(
+        matches!(cause, Some(CoreError::Timeout)),
+        "a session reaped by the liveness timer must record why it died; \
+         last_error() gave {cause:?}"
+    );
+    // `await_ready()` reads the same slot, so it has to tell the same story
+    // rather than a second, vaguer one about the same event.
+    let ready = client.await_ready().await;
+    assert!(
+        matches!(ready, Err(CoreError::Timeout)),
+        "await_ready() on a dead session must surface the recorded cause; got {ready:?}"
+    );
+
     server.abort();
 }
 
@@ -855,6 +877,27 @@ async fn udp_keepalive_download_only_path_detects_dead_downstream() {
     assert!(
         matches!(r, Ok(Err(_))),
         "recv() must error on a dead session (got {r:?})"
+    );
+
+    // And the cause has to be recorded, because that is what `last_error()`
+    // promises: "the terminal error from a failed handshake **or a dead
+    // session**". A death decided by the liveness timer has no failing call site
+    // to carry a cause, so before this the slot stayed empty and the accessor
+    // answered `None` to a caller its own documentation had told to read it.
+    // `Timeout` is the variant: a deadline elapsed on a session that stopped
+    // answering.
+    let cause = client.last_error().await;
+    assert!(
+        matches!(cause, Some(CoreError::Timeout)),
+        "a session reaped by the liveness timer must record why it died; \
+         last_error() gave {cause:?}"
+    );
+    // `await_ready()` reads the same slot, so it has to tell the same story
+    // rather than a second, vaguer one about the same event.
+    let ready = client.await_ready().await;
+    assert!(
+        matches!(ready, Err(CoreError::Timeout)),
+        "await_ready() on a dead session must surface the recorded cause; got {ready:?}"
     );
 
     server.abort();
