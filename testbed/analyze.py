@@ -1101,7 +1101,7 @@ def app_limited_reading(rows):
     }
 
 
-def where_the_holes_came_from(rows):
+def where_the_holes_came_from(rows, segment_bytes):
     """Split a run's holes between the two explanations still standing.
 
     The campaigns left an open question with three candidates: the path itself,
@@ -1194,9 +1194,17 @@ def where_the_holes_came_from(rows):
             return None
 
         def rate(bucket):
+            # Holes per segment delivered, and the segment size comes from the
+            # run rather than from a literal here. The same output block prints
+            # a frame size derived from the artifact two lines below this
+            # figure, and on the reference runs the two disagreed: 1007 B
+            # derived against 1028 B assumed. A run driven at another frame size
+            # would have been off by the ratio, silently, because a constant
+            # scale cancels in the bucket comparison and shows up only in the
+            # absolute the line is labelled with.
             holes = sum(s["holes"] for s in bucket)
             delivered = sum(s["delivered"] for s in bucket)
-            return holes / (delivered / 1028.0) if delivered else 0.0
+            return holes / (delivered / float(segment_bytes)) if delivered else 0.0
 
         return {
             "median": mid,
@@ -2462,7 +2470,7 @@ def send_bound_series(f, scenario, phase, tag, rows):
             "flight already outstanding"
         )
 
-    origin = where_the_holes_came_from(rows)
+    origin = where_the_holes_came_from(rows, frame)
     if origin:
         print(
             f"{pad} where the holes fell, over {origin['windows']} window step(s) "
@@ -4364,7 +4372,7 @@ def self_test():
         ("holes track the byte ceiling", ceiling_rows, "ceiling"),
     ]
     for name, rows_c, which in origin_cases:
-        got = where_the_holes_came_from(rows_c)
+        got = where_the_holes_came_from(rows_c, 1028)
         split = (got or {}).get(which)
         ok = split is not None and split["high_rate"] > split["low_rate"] * 3
         failures += 0 if ok else 1
@@ -4372,7 +4380,7 @@ def self_test():
             f"  {'ok' if ok else 'FAIL'}: where_the_holes_came_from({name}) -> "
             f"{split}"
         )
-    got = where_the_holes_came_from(flat_rows)
+    got = where_the_holes_came_from(flat_rows, 1028)
     flat_queue = (got or {}).get("queue")
     ok = got is None or flat_queue is None or (
         abs(flat_queue["high_rate"] - flat_queue["low_rate"]) < flat_queue["low_rate"]
@@ -4407,7 +4415,7 @@ def self_test():
             (6000, 100_000, 80_000, 33, 6_168_000),
         ]
     ]
-    got = where_the_holes_came_from(moving_floor)
+    got = where_the_holes_came_from(moving_floor, 1028)
     split = (got or {}).get("queue")
     ok = split is not None and split["high_rate"] > split["low_rate"] * 3
     failures += 0 if ok else 1
@@ -4428,7 +4436,7 @@ def self_test():
         _hole_row(5000, 265, 0, 35, 10_300_000),
         _hole_row(6000, 265, 0, 45, 15_300_000),
     ]
-    got = where_the_holes_came_from(uneven_volume)
+    got = where_the_holes_came_from(uneven_volume, 1028)
     split = (got or {}).get("queue")
     ok = split is not None and split["low_rate"] > split["high_rate"] * 3
     failures += 0 if ok else 1
@@ -4449,7 +4457,7 @@ def self_test():
         _hole_row(2000, 205, 0, 2, 2_056_000),
         _hole_row(3000, 265, 0, 22, 3_084_000),
     ]
-    got = where_the_holes_came_from(three_with_spread)
+    got = where_the_holes_came_from(three_with_spread, 1028)
     ok = got is None
     failures += 0 if ok else 1
     print(
@@ -4458,7 +4466,7 @@ def self_test():
         "finding)"
     )
     # Too few windows to say anything, and a run recorded before the columns.
-    short = where_the_holes_came_from(queue_rows[:3])
+    short = where_the_holes_came_from(queue_rows[:3], 1028)
     ok = short is None
     failures += 0 if ok else 1
     print(
@@ -4468,17 +4476,19 @@ def self_test():
     legacy = [
         {"elapsed_ms": i * 1000, "delivered_bytes": i * 1_028_000} for i in range(6)
     ]
-    ok = where_the_holes_came_from(legacy) is None
+    ok = where_the_holes_came_from(legacy, 1028) is None
     failures += 0 if ok else 1
     print(
         f"  {'ok' if ok else 'FAIL'}: where_the_holes_came_from(pre-column artifact) "
-        f"-> {where_the_holes_came_from(legacy)} (want None)"
+        f"-> {where_the_holes_came_from(legacy, 1028)} (want None)"
     )
     # A cumulative counter read as a rate: the last window would carry every
     # hole the run ever declared. The fixture below declares all of its holes in
     # the first step and none after, so a reading that differenced correctly
-    # attributes them to the *shallow* bucket, and one that did not would put
-    # them in the deep one.
+    # attributes them to the *shallow* bucket. Read raw instead of differenced
+    # it gives {'low_rate': 0.015, 'high_rate': 0.006}, the same ordering, so
+    # on its own it does not catch a missing differencing step; the fixture
+    # after it does.
     cumulative_trap = [
         _hole_row(0, 205, 0, 0, 0),
         _hole_row(1000, 205, 0, 30, 1_028_000),
@@ -4488,13 +4498,59 @@ def self_test():
         _hole_row(5000, 265, 0, 30, 5_140_000),
         _hole_row(6000, 265, 0, 30, 6_168_000),
     ]
-    got = where_the_holes_came_from(cumulative_trap)
+    got = where_the_holes_came_from(cumulative_trap, 1028)
     trap = (got or {}).get("queue")
     ok = trap is not None and trap["low_rate"] > trap["high_rate"]
     failures += 0 if ok else 1
     print(
         f"  {'ok' if ok else 'FAIL'}: where_the_holes_came_from(holes all in the "
         f"first step) -> {trap} (want the shallow bucket to carry them)"
+    )
+
+    # The one shape the two readings genuinely disagree about is a run whose
+    # *first* row already carries a backlog: the shipped code drops row zero's
+    # absolute counts, and a cumulative reading smears them across every later
+    # row. Here the backlog is 300 declarations against no delivery, and the
+    # holes that follow all fall in the deep-queue steps.
+    opening_backlog = [
+        _hole_row(0, 205, 0, 300, 0),
+        _hole_row(1000, 205, 0, 300, 1_028_000),
+        _hole_row(2000, 205, 0, 300, 2_056_000),
+        _hole_row(3000, 205, 0, 300, 3_084_000),
+        _hole_row(4000, 265, 0, 320, 4_112_000),
+        _hole_row(5000, 265, 0, 340, 5_140_000),
+        _hole_row(6000, 265, 0, 360, 6_168_000),
+    ]
+    # The segment size only shows up in the absolute each bucket is labelled
+    # with — it cancels in the comparison between them — so doubling it has to
+    # double both rates and change no verdict. The direction is the one the
+    # figure means: holes per *segment*, and the same bytes carried in larger
+    # segments are fewer segments. Without this the size was a bare literal no
+    # case could see, and a run at another frame size was mislabelled by the
+    # ratio.
+    doubled = where_the_holes_came_from(queue_rows, 2056)
+    single = where_the_holes_came_from(queue_rows, 1028)
+    ok = (
+        doubled is not None
+        and single is not None
+        and abs(doubled["queue"]["high_rate"] - single["queue"]["high_rate"] * 2) < 1e-9
+        and abs(doubled["queue"]["low_rate"] - single["queue"]["low_rate"] * 2) < 1e-9
+    )
+    failures += 0 if ok else 1
+    print(
+        f"  {'ok' if ok else 'FAIL'}: where_the_holes_came_from scales with the "
+        f"segment size ({single['queue']['high_rate']:.6f} at 1028 B vs "
+        f"{doubled['queue']['high_rate']:.6f} at 2056 B)"
+    )
+
+    got = where_the_holes_came_from(opening_backlog, 1028)
+    backlog = (got or {}).get("queue")
+    ok = backlog is not None and backlog["high_rate"] > backlog["low_rate"] * 3
+    failures += 0 if ok else 1
+    print(
+        f"  {'ok' if ok else 'FAIL'}: where_the_holes_came_from(a backlog in the "
+        f"opening row) -> {backlog} (want the deep bucket; a reading that took "
+        f"the counters raw would put them in the shallow one)"
     )
 
     for name, rows_c, want in app_limited_cases:

@@ -428,6 +428,42 @@ LOG
     rm -rf "${dir}"
 }
 
+case_a_trailing_space_does_not_hide_a_duplicate() {
+    # The heading is keyed on its text, and an editor that does not trim leaves
+    # a trailing space no diff shows. Without stripping it, `### Fixed ` and
+    # `### Fixed` are two headings and a genuine duplicate walks through. The
+    # stripping was there from the start and nothing held it: removing it left
+    # the whole suite green.
+    local dir
+    dir="$(mktemp -d)"
+    printf '%s\n' \
+        '# Changelog' \
+        '' \
+        '## [Unreleased]' \
+        '' \
+        '### Fixed ' \
+        '' \
+        '- The first block, whose heading carries one trailing space.' \
+        '' \
+        '### Added' \
+        '' \
+        '- Something in between, so the two blocks are not adjacent.' \
+        '' \
+        '### Fixed' \
+        '' \
+        '- The second block, whose heading does not.' \
+        > "${dir}/CHANGELOG.md"
+    run_structure_gate "${dir}/CHANGELOG.md"
+    if [ "${RC}" -eq 0 ]; then
+        fail "'### Fixed ' and '### Fixed' were treated as different headings"
+    elif echo "${OUT}" | grep -q "Fixed"; then
+        pass "trailing whitespace does not hide a duplicated heading"
+    else
+        fail "the duplicate was rejected for some other reason"
+    fi
+    rm -rf "${dir}"
+}
+
 case_released_duplicate_is_a_note_not_a_failure() {
     local dir
     dir="$(mktemp -d)"
@@ -539,6 +575,7 @@ case_clean_verdict_passes
 case_unreadable_entry_is_an_error
 case_older_section_does_not_count
 case_duplicate_heading_in_unreleased_is_rejected
+case_a_trailing_space_does_not_hide_a_duplicate
 case_released_duplicate_is_a_note_not_a_failure
 case_structure_only_needs_no_report
 case_structure_is_checked_in_report_mode_too
