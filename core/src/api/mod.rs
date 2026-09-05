@@ -3,8 +3,16 @@
 //! Transport session facade for the SDK.
 //! - [`session::PhantomSession`] — Client-first transport session (all targets)
 //! - [`stream::PhantomStream`] — Multiplexed reliable stream (all targets)
-//! - [`listener::PhantomListener`] — Server socket listener (native only)
+//! - [`identity`] — Signing-key generation and the verifying key to pin (all targets)
+//! - [`udp_listener::PhantomUdpListener`] — **PhantomUDP server, the production
+//!   transport** (native only)
+//! - [`udp_transport`] — The PhantomUDP client and server `SessionTransport`
+//!   implementations, the only migration-capable ones (native only)
+//! - [`listener::PhantomListener`] — TCP server socket listener (native only)
 //! - [`tcp_transport::TcpSessionTransport`] — Length-prefixed framing over TCP (native only)
+//!
+//! The two TCP entries are a compatibility leg. Where the choice exists, the
+//! PhantomUDP pair above is what to reach for; see the crate README for why.
 //!
 //! On `wasm32-unknown-unknown` (browser) targets the TCP-based building
 //! blocks are absent; use `WebSocketLeg` as

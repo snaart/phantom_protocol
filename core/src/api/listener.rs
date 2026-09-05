@@ -292,6 +292,21 @@ impl PhantomListener {
 
 #[cfg_attr(feature = "bindings", uniffi::export(async_runtime = "tokio"))]
 impl PhantomListener {
+    /// Bind a TCP listener with a **freshly generated** hybrid signing identity.
+    ///
+    /// The identity lives and dies with the process. Every client pins the
+    /// server's verifying key, so a restart invalidates every pin that was ever
+    /// handed out and each of those clients then fails with
+    /// [`CoreError::ServerIdentityMismatch`] — not with a reconnect. That is
+    /// correct behaviour for a pinned protocol and a footgun in production, which
+    /// is why it is said here rather than left to be discovered: for anything that
+    /// outlives one process, use
+    /// [`bind_with_signing_key_bytes`](Self::bind_with_signing_key_bytes) with a
+    /// seed you persist, or the builder's `.signing_key(...)`.
+    ///
+    /// This is the TCP entry point. PhantomUDP — the production transport — is
+    /// [`PhantomUdpListener::bind_udp`](crate::api::udp_listener::PhantomUdpListener::bind_udp),
+    /// whose contract is the same.
     #[cfg_attr(feature = "bindings", uniffi::constructor)]
     #[tracing::instrument(name = "phantom.listener.bind", skip_all, fields(addr = %addr))]
     pub async fn bind(addr: String) -> Result<Arc<Self>, CoreError> {

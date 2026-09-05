@@ -10,11 +10,23 @@ use std::time::Duration;
 /// - `session_ticket_lifetime` → `SessionCache` ticket lifetime (server-only; client ignores)
 ///
 /// **Note:** `session_cache_capacity` and `session_ticket_lifetime` are consumed only on the
-/// server path (`PhantomListener`); client `connect_*` entry points read only
-/// `keepalive_interval` and `session_timeout` from this struct.
+/// server path — by **both** listeners, [`PhantomListener`] over TCP and
+/// [`PhantomUdpListener`] over PhantomUDP, which is the production
+/// transport. Client `connect_*` entry points read only `keepalive_interval` and
+/// `session_timeout` from this struct and silently ignore the other two.
 ///
-/// Build via `mobile()` / `server()` / `iot()` / `default()` then mutate fields;
-/// `#[non_exhaustive]` lets future tunables be added without a breaking change.
+/// **Constructing one.** From Rust: `PhantomConfig::default()` — which is
+/// `mobile()` — or one of the `server()` / `iot()` presets, then mutate the
+/// fields. From a foreign binding there are **no presets**: UniFFI exports this
+/// as a plain record with no associated functions and no field defaults, so a
+/// Python, Swift or Kotlin caller builds the record itself and supplies every
+/// field. The values `default()` uses are named on each field below so that
+/// caller has something to copy. `#[non_exhaustive]` lets future tunables be
+/// added without a breaking change to Rust callers; a foreign binding
+/// regenerates instead.
+///
+/// [`PhantomListener`]: crate::api::listener::PhantomListener
+/// [`PhantomUdpListener`]: crate::api::udp_listener::PhantomUdpListener
 #[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -23,6 +35,8 @@ pub struct PhantomConfig {
     /// When the session is `Connected` and has been idle this long with nothing in flight,
     /// the data pump emits a small encrypted KEEPALIVE packet so a download-only path can
     /// detect a silently-dead peer via the same probe-timeout sweep.
+    ///
+    /// Defaults: 30 s (`mobile`, and so `default`), 60 s (`server`), 120 s (`iot`).
     pub keepalive_interval: Duration,
     /// Liveness reap window (maps to `LivenessConfig.idle_timeout`).
     ///
@@ -30,29 +44,42 @@ pub struct PhantomConfig {
     /// Keep-alive PINGs keep a `Connected` session alive indefinitely; this bounds how long
     /// a session that has gone unresponsive (entered `Migrating`) is retried before being
     /// declared `Dead`.
+    ///
+    /// Defaults: 3600 s (`mobile`), 7200 s (`server`), 1800 s (`iot`).
     pub session_timeout: Duration,
     /// Maximum 0-RTT resumption tickets the server keeps in memory.
     ///
-    /// **SERVER-SIDE ONLY.** This field is consumed only by [`PhantomListener`] (via
+    /// **SERVER-SIDE ONLY.** This field is consumed by the listeners — both
+    /// [`PhantomListener`] over TCP and [`PhantomUdpListener`] over
+    /// PhantomUDP, the production transport (via
     /// `PhantomListener::bind_with_config_bytes` or equivalent). When a
     /// [`PhantomConfig`] is passed to any `connect_*` client entry point, this field
     /// is silently ignored — the client does not own a session cache.
     ///
     /// Maps to [`SessionCache`] capacity; excess entries are evicted LRU.
     ///
+    /// Defaults: 32 (`mobile`), 1024 (`server`), 4 (`iot`). Consumed by both
+    /// listeners, not only the TCP one.
+    ///
     /// [`PhantomListener`]: crate::api::listener::PhantomListener
     /// [`SessionCache`]: crate::transport::session_cache::SessionCache
+    /// [`PhantomUdpListener`]: crate::api::udp_listener::PhantomUdpListener
     pub session_cache_capacity: u32,
     /// Lifetime of 0-RTT resumption tickets on the server.
     ///
-    /// **SERVER-SIDE ONLY.** This field is consumed only by [`PhantomListener`]. When
+    /// **SERVER-SIDE ONLY.** This field is consumed by the listeners — both
+    /// [`PhantomListener`] and [`PhantomUdpListener`]. When
     /// a [`PhantomConfig`] is passed to any `connect_*` client entry point, this field
     /// is silently ignored — the client does not own a session cache.
     ///
     /// Maps to [`SessionCache`] ticket lifetime.
     ///
+    /// Defaults: 86400 s (`mobile`), 604800 s (`server`), 3600 s (`iot`).
+    /// Consumed by both listeners, not only the TCP one.
+    ///
     /// [`PhantomListener`]: crate::api::listener::PhantomListener
     /// [`SessionCache`]: crate::transport::session_cache::SessionCache
+    /// [`PhantomUdpListener`]: crate::api::udp_listener::PhantomUdpListener
     pub session_ticket_lifetime: Duration,
 }
 

@@ -228,6 +228,10 @@ async fn main() -> Result<(), phantom_protocol::CoreError> {
         server_addr.parse::<std::net::SocketAddr>().unwrap().port(),
         pinned_key,
     ).await?;
+    // Same rule as the UDP form above: `connect_pinned` returns before the
+    // handshake has run, so this is where the pinned-key check surfaces. Without
+    // it a wrong key looks like a successful connect.
+    session.await_ready().await?;
     session.send(b"ping".to_vec()).await?;
     let _reply = session.recv().await?;
     Ok(())
