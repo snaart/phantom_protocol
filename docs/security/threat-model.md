@@ -259,7 +259,7 @@ compliant peer and nobody else.
 | link | bound | enforced by | enforced? |
 | --- | --- | --- | --- |
 | streams | `MAX_STREAMS` = 256 | `handle_packet` refuses the segment that would create the 257th; unrecorded, so it is not SACKed either | **yes** |
-| inbound frame | `MAX_RECV_FRAME` = 1191 B, i.e. `MAX_RECV_PAYLOAD` = 1160 B of plaintext | the pump's reader drops a larger frame before decrypting it | **yes** |
+| inbound frame | `MAX_RECV_FRAME` = 1335 B, i.e. `MAX_RECV_PAYLOAD` = 1304 B of plaintext | the pump's reader drops a larger frame before decrypting it | **yes** |
 | advertised window | `MAX_RECV_WINDOW` = 1 MiB per stream | *nothing* — the receive path admits in-order data without consulting it | **no — observed** |
 | window growth | one session-wide `SESSION_RECV_WINDOW_GROWTH_BUDGET` = 8 MiB over the 64 KiB every stream starts with | `SharedRecvTuning` draws every doubling from the one allowance | **yes** |
 | reorder buffer | `MAX_RECV_REORDER` = 2048 entries and `Stream::recv_reorder_byte_limit` bytes, per stream; ~128 B of structure per entry, which the byte budget does not count | `Stream::accept_in_order` refuses the segment (not SACKed → the sender retransmits) | **yes, on out-of-order segments only** |
