@@ -46,11 +46,18 @@ default = ["compression-zstd", "std", "bindings", "classical-crypto"]
 bindings = ["std", "dep:uniffi"]
 
 # `uniffi-cli` (SUPPLY-01): the codegen-only surface. Adds uniffi's `cli`
-# feature (which drags in `clap` / `cargo_metadata` / `tempfile`) and is the
-# `required-features` for the `uniffi-bindgen` binary. Kept OUT of `bindings`
-# so a normal lib / server / mobile build links the FFI scaffolding WITHOUT the
-# build-time CLI dependency tree. The `tests/bindings/generate_*.sh` scripts
-# enable it when they regenerate the language bindings.
+# feature and is the `required-features` for the `uniffi-bindgen` binary, kept
+# OUT of `bindings` so a normal lib / server / mobile build does not link the
+# codegen CLI. The `tests/bindings/generate_*.sh` scripts enable it when they
+# regenerate the language bindings.
+#
+# What that actually buys, checked with `cargo tree -i <crate> -e normal` rather
+# than assumed: **`clap` only.** An earlier version of this comment named
+# `clap` / `cargo_metadata` / `tempfile` together as the tree this feature keeps
+# out; two of the three are in a default build regardless, because `uniffi`
+# itself depends on `cargo_metadata` and its `uniffi_pipeline` on `tempfile`
+# outside the `cli` feature. Narrowing supply-chain surface here means moving
+# them upstream or dropping `uniffi`, not toggling this flag.
 uniffi-cli = ["bindings", "uniffi/cli"]
 
 # `std` (Phase 3.6): the standard "everything on" build. Pulls every std-bound

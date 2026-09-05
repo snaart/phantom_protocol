@@ -92,6 +92,11 @@ jobs:
         with:
           workspaces: "."
       - run: cargo test --manifest-path core/Cargo.toml --lib
+      # The only gate on the code fences in the README — which is the docs.rs
+      # landing page — and on the compiled `# Example` blocks across the exported
+      # API. It ran in no workflow and no hook, so every one of them could rot to
+      # non-compiling with a fully green tree, on the page a new user reads first.
+      - run: cargo test --manifest-path core/Cargo.toml --doc
       # Formal negative-security tests pinning the documented invariants (server
       # pinning, AEAD/AAD binding, replay, rekey, flow-control, and the PhantomUDP
       # pre-auth DoS bounds). Always-on; a regression surfaces as a hard red here.
