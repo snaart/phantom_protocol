@@ -428,6 +428,87 @@ LOG
     rm -rf "${dir}"
 }
 
+case_a_heading_repeated_under_a_different_release_is_not_a_duplicate() {
+    # `seen` is reset at every `## ` boundary, which is what makes the check
+    # per-release rather than per-file. Nothing pinned the reset: without it,
+    # `### Fixed` under `[Unreleased]` and `### Fixed` under a shipped version
+    # collide and the gate refuses a changelog that is correct. This also pins
+    # the line numbers, which are 1-based and named in the message — an
+    # off-by-one there sends a reader to the wrong place in three thousand lines.
+    local dir
+    dir="$(mktemp -d)"
+    printf '%s\n' \
+        '# Changelog' \
+        '' \
+        '## [Unreleased]' \
+        '' \
+        '### Fixed' \
+        '' \
+        '- One block, under the unreleased heading.' \
+        '' \
+        '## [0.1.0] - 2026-01-01' \
+        '' \
+        '### Fixed' \
+        '' \
+        '- A different release, the same heading, and not a duplicate.' \
+        > "${dir}/CHANGELOG.md"
+    run_structure_gate "${dir}/CHANGELOG.md"
+    # Exit status alone does not pin this. Without the reset the two headings
+    # collide inside the *second* release, which is a shipped one and therefore
+    # reported rather than failed — so the gate still exits 0 while saying
+    # something false. What pins it is that nothing is reported at all: a run
+    # over a correct changelog has no duplicate to name.
+    if [ "${RC}" -ne 0 ]; then
+        fail "the same heading under two different releases was called a duplicate"
+    elif echo "${OUT}" | grep -q "times"; then
+        fail "a duplicate was reported across a release boundary: ${OUT}"
+    else
+        pass "a heading repeated under another release is neither failed nor reported"
+    fi
+    rm -rf "${dir}"
+}
+
+case_every_duplicated_heading_is_reported_with_its_lines() {
+    # Two distinct duplicated headings, so a gate that stopped at the first
+    # would leave the second for whoever edits next. The fixture puts the
+    # colliding pairs at known 1-based lines, which is what the message quotes.
+    local dir
+    dir="$(mktemp -d)"
+    printf '%s\n' \
+        '# Changelog' \
+        '' \
+        '## [Unreleased]' \
+        '' \
+        '### Fixed' \
+        '' \
+        '- first' \
+        '' \
+        '### Added' \
+        '' \
+        '- second' \
+        '' \
+        '### Fixed' \
+        '' \
+        '- third' \
+        '' \
+        '### Added' \
+        '' \
+        '- fourth' \
+        > "${dir}/CHANGELOG.md"
+    run_structure_gate "${dir}/CHANGELOG.md"
+    if [ "${RC}" -eq 0 ]; then
+        fail "two duplicated headings under [Unreleased] were accepted"
+    elif echo "${OUT}" | grep -q "Fixed" \
+        && echo "${OUT}" | grep -q "Added" \
+        && echo "${OUT}" | grep -q "line 5" \
+        && echo "${OUT}" | grep -q "line 13"; then
+        pass "every duplicated heading is reported, with its 1-based lines"
+    else
+        fail "not both duplicates were named, or the line numbers were wrong: ${OUT}"
+    fi
+    rm -rf "${dir}"
+}
+
 case_a_trailing_space_does_not_hide_a_duplicate() {
     # The heading is keyed on its text, and an editor that does not trim leaves
     # a trailing space no diff shows. Without stripping it, `### Fixed ` and
@@ -575,6 +656,8 @@ case_clean_verdict_passes
 case_unreadable_entry_is_an_error
 case_older_section_does_not_count
 case_duplicate_heading_in_unreleased_is_rejected
+case_a_heading_repeated_under_a_different_release_is_not_a_duplicate
+case_every_duplicated_heading_is_reported_with_its_lines
 case_a_trailing_space_does_not_hide_a_duplicate
 case_released_duplicate_is_a_note_not_a_failure
 case_structure_only_needs_no_report

@@ -3340,11 +3340,20 @@ def self_test():
     # step. A sum that drifts is a gate quietly under-counting itself in
     # exactly the way this file exists to catch elsewhere.
     checks_run = [0]
+    fails_printed = [0]
 
     def print(*args, **kwargs):  # noqa: A001 — deliberate shadow, see above
         text = " ".join(str(a) for a in args)
         if text.lstrip().startswith(("ok:", "FAIL:")):
             checks_run[0] += 1
+        # A case that prints `FAIL:` and forgets its `failures += 1` used to
+        # exit 0 and report N/N ok — a suite reporting a pass over its own
+        # printed failure. Every case is a hand-written pair of a verdict and a
+        # counter increment, so the two can disagree, and nothing noticed. This
+        # sees the prefix already, so counting it costs a line and the two are
+        # reconciled before the summary.
+        if text.lstrip().startswith("FAIL:"):
+            fails_printed[0] += 1
         builtins.print(*args, **kwargs)
 
     label_cases = [
@@ -4749,6 +4758,17 @@ def self_test():
     total = checks_run[0]
     for why in skipped:
         print(f"  skipped: {why}")
+    # The counted failures and the printed ones have to agree. They are kept by
+    # different hands — one by each case's own `failures += 1`, the other by the
+    # shim above — so a disagreement means a case printed a verdict it did not
+    # count, in either direction, and the summary below would be a fiction.
+    if fails_printed[0] != failures:
+        builtins.print(
+            f"  FAIL: {failures} failure(s) counted against {fails_printed[0]} printed — "
+            "a case printed a verdict it did not count, so the summary cannot be trusted"
+        )
+        failures = max(failures, fails_printed[0])
+        total += 1
     print(f"{total - failures}/{total} ok" + (f", {len(skipped)} skipped" if skipped else ""))
     return 1 if failures else 0
 
