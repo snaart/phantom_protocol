@@ -303,7 +303,10 @@ struct Recorded {
     first_second: u64,
     second_second: u64,
     /// Milliseconds from the final phase opening to the first tick whose
-    /// trailing-second delivery rate reached nine tenths of the link's.
+    /// trailing-second delivery rate reached nine tenths of what the phase can
+    /// deliver — the link scaled by `1 - loss`, because a rung dropping a fifth
+    /// cannot reach nine tenths of the link however well the sender behaves,
+    /// and an absolute bar there reports arithmetic as a controller property.
     ms_to_ninety_percent: Option<u64>,
     /// The estimator's reading and window at the instant the final phase opened.
     btl_bw_at_resume: u64,
@@ -557,11 +560,43 @@ fn run(phases: &[Phase]) -> Recorded {
                 if queue_full {
                     rec.segments_dropped += 1;
                     rec.segments_dropped_by_a_full_queue += 1;
-                    returning.push_back(Returning {
-                        seg,
-                        ack_at: now + PROPAGATION + PROPAGATION,
-                        lost: true,
-                    });
+                    // A tail drop is not observed when it happens. The sender
+                    // learns of it from the acknowledgement of a later segment,
+                    // and that segment has to cross the queue that was full —
+                    // so the signal is a queueing delay behind the drop, not at
+                    // the instant a segment sent into an empty queue would have
+                    // been answered. Timed from the send instant, as this was,
+                    // the congestion signal arrived a whole standing queue
+                    // early, which on the one scenario where every loss really
+                    // is congestion is the difference between reacting to a
+                    // collapse and reacting ahead of it. A delivered segment
+                    // already carries the delay, because it is stamped from its
+                    // dequeue; this is what puts the two on the same clock.
+                    let drain_secs = if link_bps > 0.0 {
+                        queued_bytes as f64 / link_bps
+                    } else {
+                        0.0
+                    };
+                    let ack_at = now
+                        + Duration::from_secs_f64(drain_secs.clamp(0.0, 60.0))
+                        + PROPAGATION
+                        + PROPAGATION;
+                    // The deque is drained from the front against a rising
+                    // `now`, so it has to stay sorted. Every other push lands at
+                    // `now + 2 × PROPAGATION` with `now` nondecreasing and is in
+                    // order by construction; this one carries an extra delay
+                    // that moves with the queue, so it is placed rather than
+                    // appended. An unordered push would not look wrong — it
+                    // would quietly hold every later acknowledgement behind it.
+                    let at = returning.partition_point(|r| r.ack_at <= ack_at);
+                    returning.insert(
+                        at,
+                        Returning {
+                            seg,
+                            ack_at,
+                            lost: true,
+                        },
+                    );
                 } else {
                     queue.push_back(seg);
                     queued_bytes += SEGMENT;
@@ -655,7 +690,17 @@ fn run(phases: &[Phase]) -> Recorded {
                 }
                 if rec.ms_to_ninety_percent.is_none() && into_phase >= Duration::from_secs(1) {
                     let trailing: u64 = recent.iter().map(|&(_, b)| b).sum();
-                    if trailing as f64 >= 0.9 * link_bps {
+                    // Ninety per cent of what this rung can *deliver*, not of
+                    // the link. A path dropping a fraction `p` passes at most
+                    // `1 - p` of what it carries, so an absolute bar is
+                    // arithmetically out of reach above a tenth of loss: every
+                    // rung from there up reported "never" whatever the
+                    // controller did, while the scenario's own documentation
+                    // asks the reader to read that as the loss response holding
+                    // the sender down. Scaled, the column says what it claims.
+                    let deliverable =
+                        link_bps * (1000 - phase.loss_permille.min(1000)) as f64 / 1000.0;
+                    if trailing as f64 >= 0.9 * deliverable {
                         rec.ms_to_ninety_percent = Some(into_ms);
                     }
                 }
@@ -860,11 +905,15 @@ fn run_degrade() {
 /// under the link, or that never reaches it, is the loss response holding the
 /// window down rather than the path refusing to carry.
 ///
-/// The queue is bounded here, unlike the first three scenarios, but **it does
-/// not bind and is not what makes this scenario work.** Every rung from one per
-/// mille upward reports zero queue-full drops, and depths from twenty
-/// milliseconds to four hundred give the same figures: a sender this bound is
-/// already holding below the link never fills the buffer. The limit is kept
+/// The queue is bounded here, unlike the first three scenarios, but **at the
+/// depth this scenario ships it does not bind and is not what makes the
+/// scenario work.** Every rung from one per mille upward reports zero
+/// queue-full drops, and the shipped depth of one bandwidth-delay product and
+/// twice it give identical figures: a sender this bound is already holding
+/// below the link never fills that much buffer. The claim is bounded
+/// deliberately — below roughly half the shipped depth the buffer does begin to
+/// bind and the low rungs move, so a reading taken at a shallower depth is a
+/// different experiment and not a check on this one. The limit is kept
 /// because a scenario about loss should not have an infinite queue hiding
 /// behind it, not because it is doing anything. Nor does it let the sweep tell a
 /// controller that ignores real congestion from one that handles it: there is no
