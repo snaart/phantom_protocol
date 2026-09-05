@@ -386,6 +386,27 @@ The capture is kept at `samples/<leg>/wire_capture.pcap` alongside the record,
 and the record carries the `tcpdump` command line that produced it, so the whole
 result can be re-derived by hand.
 
+**It has been run on the reference path.** Run `20260905-145037`, both ends built
+from `b63909a1`, PhantomUDP over a 239 ms route: verdict `pass` over 149 frames,
+all 149 decoded and none undecodable, 13 of them before the session was
+established and 136 after. The 32 payloads the probe generated appear in none of
+them across 64 needles, and the positive control appears in 2 — so the search was
+capable of finding something. Entropy over the 66 established payloads large
+enough for the figure to mean anything: 7.78 to 7.86 bits per byte. Counters over
+the same exchange: no replay rejections, no AEAD failures, no unencrypted
+post-handshake packets refused.
+
+**What that run does not cover**, and the distinction is the same one that
+governs every other reading here. The exchange lost nothing — 32 messages, 32
+echoed, 68 packets out and 65 in — so no retransmission, no fragment, no path
+validation and no migration occurred in it. Those are code paths that *build
+packets*, and a leak confined to one of them is as invisible in this capture as
+it is on loopback. What the real path adds over `phantom-wirecheck` is the rest
+of the stack being real: the route's own MTU and encapsulation, a genuine round
+trip, a daemon rather than an in-process listener, and a capture taken by the
+kernel rather than written by a relay. Covering the repair paths needs a run that
+provokes them and a capture across it.
+
 ### `phantom-wirecheck`: the same question on one machine, without root
 
 The scenario above needs a daemon on the far end of a real path and the right to
