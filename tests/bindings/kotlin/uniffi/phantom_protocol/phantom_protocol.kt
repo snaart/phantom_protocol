@@ -1144,7 +1144,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_send() != 55912) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 41675) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 9439) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_supports_migration() != 60201) {
@@ -1192,7 +1192,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_verifying_key_bytes() != 25697) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind() != 60148) {
+    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind() != 49830) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_config_bytes() != 10908) {
@@ -2473,6 +2473,23 @@ open class PhantomListener: Disposable, AutoCloseable, PhantomListenerInterface
     
     companion object {
         
+    /**
+     * Bind a TCP listener with a **freshly generated** hybrid signing identity.
+     *
+     * The identity lives and dies with the process. Every client pins the
+     * server's verifying key, so a restart invalidates every pin that was ever
+     * handed out and each of those clients then fails with
+     * [`CoreError::ServerIdentityMismatch`] — not with a reconnect. That is
+     * correct behaviour for a pinned protocol and a footgun in production, which
+     * is why it is said here rather than left to be discovered: for anything that
+     * outlives one process, use
+     * [`bind_with_signing_key_bytes`](Self::bind_with_signing_key_bytes) with a
+     * seed you persist, or the builder's `.signing_key(...)`.
+     *
+     * This is the TCP entry point. PhantomUDP — the production transport — is
+     * [`PhantomUdpListener::bind_udp`](crate::api::udp_listener::PhantomUdpListener::bind_udp),
+     * whose contract is the same.
+     */
     @Throws(CoreException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
      suspend fun `bind`(`addr`: kotlin.String) : PhantomListener {
@@ -2999,9 +3016,17 @@ public interface PhantomSessionInterface {
     suspend fun `send`(`data`: kotlin.ByteArray)
     
     /**
-     * Apply an anti-fingerprint traffic-shaping configuration to the established
-     * session (WIRE v6). Returns `false` if the session is still
-     * connecting. All shaping is opt-in (default: none); enabling size padding
+     * Apply an anti-fingerprint traffic-shaping configuration (WIRE v6).
+     *
+     * **Accepted at any point in a session's life, including before the
+     * handshake has run.** The configuration is stored and applied when the
+     * session is installed, so an embedder that wants shaping on from the first
+     * byte sets it immediately after connecting rather than waiting for
+     * readiness. The return is always `true` and carries no information; it
+     * survives because removing it is an FFI-breaking change. Do not branch on
+     * it.
+     *
+     * All shaping is opt-in (default: none); enabling size padding
      * ([`PaddingPolicy::Padme`]) makes outbound packets pad up to a PADÉ bucket so
      * the datagram size no longer tracks the payload size, at a bounded (≈ ≤12%
      * worst-case) bandwidth cost. FFI-exported so mobile / other embedders can
@@ -3742,9 +3767,17 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
 
     
     /**
-     * Apply an anti-fingerprint traffic-shaping configuration to the established
-     * session (WIRE v6). Returns `false` if the session is still
-     * connecting. All shaping is opt-in (default: none); enabling size padding
+     * Apply an anti-fingerprint traffic-shaping configuration (WIRE v6).
+     *
+     * **Accepted at any point in a session's life, including before the
+     * handshake has run.** The configuration is stored and applied when the
+     * session is installed, so an embedder that wants shaping on from the first
+     * byte sets it immediately after connecting rather than waiting for
+     * readiness. The return is always `true` and carries no information; it
+     * survives because removing it is an FFI-breaking change. Do not branch on
+     * it.
+     *
+     * All shaping is opt-in (default: none); enabling size padding
      * ([`PaddingPolicy::Padme`]) makes outbound packets pad up to a PADÉ bucket so
      * the datagram size no longer tracks the payload size, at a bounded (≈ ≤12%
      * worst-case) bandwidth cost. FFI-exported so mobile / other embedders can
@@ -5278,11 +5311,23 @@ public object FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer<Metrics
  * - `session_ticket_lifetime` → `SessionCache` ticket lifetime (server-only; client ignores)
  *
  * **Note:** `session_cache_capacity` and `session_ticket_lifetime` are consumed only on the
- * server path (`PhantomListener`); client `connect_*` entry points read only
- * `keepalive_interval` and `session_timeout` from this struct.
+ * server path — by **both** listeners, [`PhantomListener`] over TCP and
+ * [`PhantomUdpListener`] over PhantomUDP, which is the production
+ * transport. Client `connect_*` entry points read only `keepalive_interval` and
+ * `session_timeout` from this struct and silently ignore the other two.
  *
- * Build via `mobile()` / `server()` / `iot()` / `default()` then mutate fields;
- * `#[non_exhaustive]` lets future tunables be added without a breaking change.
+ * **Constructing one.** From Rust: `PhantomConfig::default()` — which is
+ * `mobile()` — or one of the `server()` / `iot()` presets, then mutate the
+ * fields. From a foreign binding there are **no presets**: UniFFI exports this
+ * as a plain record with no associated functions and no field defaults, so a
+ * Python, Swift or Kotlin caller builds the record itself and supplies every
+ * field. The values `default()` uses are named on each field below so that
+ * caller has something to copy. `#[non_exhaustive]` lets future tunables be
+ * added without a breaking change to Rust callers; a foreign binding
+ * regenerates instead.
+ *
+ * [`PhantomListener`]: crate::api::listener::PhantomListener
+ * [`PhantomUdpListener`]: crate::api::udp_listener::PhantomUdpListener
  */
 data class PhantomConfig (
     /**
@@ -5290,6 +5335,8 @@ data class PhantomConfig (
      * When the session is `Connected` and has been idle this long with nothing in flight,
      * the data pump emits a small encrypted KEEPALIVE packet so a download-only path can
      * detect a silently-dead peer via the same probe-timeout sweep.
+     *
+     * Defaults: 30 s (`mobile`, and so `default`), 60 s (`server`), 120 s (`iot`).
      */
     var `keepaliveInterval`: java.time.Duration
     , 
@@ -5300,35 +5347,48 @@ data class PhantomConfig (
      * Keep-alive PINGs keep a `Connected` session alive indefinitely; this bounds how long
      * a session that has gone unresponsive (entered `Migrating`) is retried before being
      * declared `Dead`.
+     *
+     * Defaults: 3600 s (`mobile`), 7200 s (`server`), 1800 s (`iot`).
      */
     var `sessionTimeout`: java.time.Duration
     , 
     /**
      * Maximum 0-RTT resumption tickets the server keeps in memory.
      *
-     * **SERVER-SIDE ONLY.** This field is consumed only by [`PhantomListener`] (via
+     * **SERVER-SIDE ONLY.** This field is consumed by the listeners — both
+     * [`PhantomListener`] over TCP and [`PhantomUdpListener`] over
+     * PhantomUDP, the production transport (via
      * `PhantomListener::bind_with_config_bytes` or equivalent). When a
      * [`PhantomConfig`] is passed to any `connect_*` client entry point, this field
      * is silently ignored — the client does not own a session cache.
      *
      * Maps to [`SessionCache`] capacity; excess entries are evicted LRU.
      *
+     * Defaults: 32 (`mobile`), 1024 (`server`), 4 (`iot`). Consumed by both
+     * listeners, not only the TCP one.
+     *
      * [`PhantomListener`]: crate::api::listener::PhantomListener
      * [`SessionCache`]: crate::transport::session_cache::SessionCache
+     * [`PhantomUdpListener`]: crate::api::udp_listener::PhantomUdpListener
      */
     var `sessionCacheCapacity`: kotlin.UInt
     , 
     /**
      * Lifetime of 0-RTT resumption tickets on the server.
      *
-     * **SERVER-SIDE ONLY.** This field is consumed only by [`PhantomListener`]. When
+     * **SERVER-SIDE ONLY.** This field is consumed by the listeners — both
+     * [`PhantomListener`] and [`PhantomUdpListener`]. When
      * a [`PhantomConfig`] is passed to any `connect_*` client entry point, this field
      * is silently ignored — the client does not own a session cache.
      *
      * Maps to [`SessionCache`] ticket lifetime.
      *
+     * Defaults: 86400 s (`mobile`), 604800 s (`server`), 3600 s (`iot`).
+     * Consumed by both listeners, not only the TCP one.
+     *
      * [`PhantomListener`]: crate::api::listener::PhantomListener
      * [`SessionCache`]: crate::transport::session_cache::SessionCache
+     * [`PhantomUdpListener`]: crate::api::udp_listener::PhantomUdpListener
      */
     var `sessionTicketLifetime`: java.time.Duration
     
@@ -5388,6 +5448,17 @@ public object FfiConverterTypePhantomConfig: FfiConverterRustBuffer<PhantomConfi
  * server it was negotiated against: the `resumption_secret` is
  * server-pinned, and reusing a hint across servers is a configuration
  * bug.
+ *
+ * **Never log this value.** `resumption_secret` is the proof-of-possession
+ * input a resuming handshake proves it holds, so a copy in a log is a
+ * credential in a log. The warning sits on the type rather than only on the
+ * field because that is what reaches every language: the Python binding
+ * carries type documentation and not field documentation, and Python is the
+ * one binding whose generated record stringifies its fields — `print(hint)`,
+ * an f-string or `logging.info("%s", hint)` writes the secret out in full
+ * there. Swift and Kotlin render the byte array's identity instead and do not
+ * leak it. The Rust `Debug` below redacts the secret, but UniFFI never calls
+ * it.
  */
 data class ResumptionHint (
     /**
@@ -5397,6 +5468,15 @@ data class ResumptionHint (
     , 
     /**
      * The resumption secret (32 bytes) — sensitive; treat like a key.
+     *
+     * **Never log this record, and in Python never `print`, `format` or `%s` it.**
+     * This is the proof-of-possession input a resuming handshake proves it holds
+     * (Security Invariant 9), so a copy in a log is a credential in a log. The
+     * Rust `Debug` below redacts it, but that impl is Rust-only: UniFFI never
+     * calls it, and the generated Python record carries a `__str__` that formats
+     * both fields, so `print(hint)`, an f-string or `logging.info("%s", hint)`
+     * writes the secret out in full. Swift and Kotlin render the byte array's
+     * identity rather than its contents and do not leak it.
      */
     var `resumptionSecret`: kotlin.ByteArray
     
@@ -5439,10 +5519,14 @@ public object FfiConverterTypeResumptionHint: FfiConverterRustBuffer<ResumptionH
  * shaping is opt-in** — the default (and the field defaults here) is no shaping,
  * so a session pays nothing unless an embedder enables it.
  *
- * Currently carries the size-padding policy; the timing-jitter
- * and cover-traffic knobs will be added as further fields in later
- * phases. Padding hides the datagram *size*; it costs bounded (≈ ≤12% worst-case)
- * extra bandwidth.
+ * Carries all three knobs: the size-padding policy, the send-timing jitter
+ * ceiling and the cover-traffic interval, each documented on its own field
+ * below and each wired to the send path.
+ *
+ * Padding hides the datagram *size* at a bounded cost (≈ ≤12% worst case);
+ * jitter hides the *timing* at a cost of up to its own ceiling in latency;
+ * cover traffic hides the *presence* of application data at the cost of the
+ * bandwidth it spends.
  */
 data class TrafficShapingConfig (
     /**
@@ -5639,12 +5723,6 @@ sealed class CoreException: kotlin.Exception() {
             get() = "v1=${ v1 }"
     }
     
-    class Busy(
-        ) : CoreException() {
-        override val message
-            get() = ""
-    }
-    
     class ConfigException(
         
         val v1: kotlin.String
@@ -5662,14 +5740,6 @@ sealed class CoreException: kotlin.Exception() {
     }
     
     class ValidationException(
-        
-        val v1: kotlin.String
-        ) : CoreException() {
-        override val message
-            get() = "v1=${ v1 }"
-    }
-    
-    class RuntimeException(
         
         val v1: kotlin.String
         ) : CoreException() {
@@ -5708,14 +5778,6 @@ sealed class CoreException: kotlin.Exception() {
     }
     
     class StreamException(
-        
-        val v1: kotlin.String
-        ) : CoreException() {
-        override val message
-            get() = "v1=${ v1 }"
-    }
-    
-    class SessionNotFound(
         
         val v1: kotlin.String
         ) : CoreException() {
@@ -5842,48 +5904,41 @@ public object FfiConverterTypeCoreError : FfiConverterRustBuffer<CoreException> 
             2 -> CoreException.SerializationException(
                 FfiConverterString.read(buf),
                 )
-            3 -> CoreException.Busy()
-            4 -> CoreException.ConfigException(
+            3 -> CoreException.ConfigException(
                 FfiConverterString.read(buf),
                 )
-            5 -> CoreException.CryptoException(
+            4 -> CoreException.CryptoException(
                 FfiConverterString.read(buf),
                 )
-            6 -> CoreException.ValidationException(
+            5 -> CoreException.ValidationException(
                 FfiConverterString.read(buf),
                 )
-            7 -> CoreException.RuntimeException(
+            6 -> CoreException.KeyDerivationException()
+            7 -> CoreException.RngException(
                 FfiConverterString.read(buf),
                 )
-            8 -> CoreException.KeyDerivationException()
-            9 -> CoreException.RngException(
+            8 -> CoreException.InternalException(
                 FfiConverterString.read(buf),
                 )
-            10 -> CoreException.InternalException(
+            9 -> CoreException.HandshakeException(
                 FfiConverterString.read(buf),
                 )
-            11 -> CoreException.HandshakeException(
+            10 -> CoreException.StreamException(
                 FfiConverterString.read(buf),
                 )
-            12 -> CoreException.StreamException(
+            11 -> CoreException.ConnectionClosed()
+            12 -> CoreException.Timeout()
+            13 -> CoreException.ReplayDetected(
                 FfiConverterString.read(buf),
                 )
-            13 -> CoreException.SessionNotFound(
+            14 -> CoreException.CipherSuiteUnavailable(
                 FfiConverterString.read(buf),
                 )
-            14 -> CoreException.ConnectionClosed()
-            15 -> CoreException.Timeout()
-            16 -> CoreException.ReplayDetected(
+            15 -> CoreException.ServerIdentityMismatch()
+            16 -> CoreException.ProtocolRejected(
                 FfiConverterString.read(buf),
                 )
-            17 -> CoreException.CipherSuiteUnavailable(
-                FfiConverterString.read(buf),
-                )
-            18 -> CoreException.ServerIdentityMismatch()
-            19 -> CoreException.ProtocolRejected(
-                FfiConverterString.read(buf),
-                )
-            20 -> CoreException.Unsupported(
+            17 -> CoreException.Unsupported(
                 FfiConverterString.read(buf),
                 )
             else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
@@ -5902,10 +5957,6 @@ public object FfiConverterTypeCoreError : FfiConverterRustBuffer<CoreException> 
                 4UL
                 + FfiConverterString.allocationSize(value.v1)
             )
-            is CoreException.Busy -> (
-                // Add the size for the Int that specifies the variant plus the size needed for all fields
-                4UL
-            )
             is CoreException.ConfigException -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
                 4UL
@@ -5917,11 +5968,6 @@ public object FfiConverterTypeCoreError : FfiConverterRustBuffer<CoreException> 
                 + FfiConverterString.allocationSize(value.v1)
             )
             is CoreException.ValidationException -> (
-                // Add the size for the Int that specifies the variant plus the size needed for all fields
-                4UL
-                + FfiConverterString.allocationSize(value.v1)
-            )
-            is CoreException.RuntimeException -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
                 4UL
                 + FfiConverterString.allocationSize(value.v1)
@@ -5946,11 +5992,6 @@ public object FfiConverterTypeCoreError : FfiConverterRustBuffer<CoreException> 
                 + FfiConverterString.allocationSize(value.v1)
             )
             is CoreException.StreamException -> (
-                // Add the size for the Int that specifies the variant plus the size needed for all fields
-                4UL
-                + FfiConverterString.allocationSize(value.v1)
-            )
-            is CoreException.SessionNotFound -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
                 4UL
                 + FfiConverterString.allocationSize(value.v1)
@@ -6002,88 +6043,74 @@ public object FfiConverterTypeCoreError : FfiConverterRustBuffer<CoreException> 
                 FfiConverterString.write(value.v1, buf)
                 Unit
             }
-            is CoreException.Busy -> {
-                buf.putInt(3)
-                Unit
-            }
             is CoreException.ConfigException -> {
-                buf.putInt(4)
+                buf.putInt(3)
                 FfiConverterString.write(value.v1, buf)
                 Unit
             }
             is CoreException.CryptoException -> {
-                buf.putInt(5)
+                buf.putInt(4)
                 FfiConverterString.write(value.v1, buf)
                 Unit
             }
             is CoreException.ValidationException -> {
-                buf.putInt(6)
-                FfiConverterString.write(value.v1, buf)
-                Unit
-            }
-            is CoreException.RuntimeException -> {
-                buf.putInt(7)
+                buf.putInt(5)
                 FfiConverterString.write(value.v1, buf)
                 Unit
             }
             is CoreException.KeyDerivationException -> {
-                buf.putInt(8)
+                buf.putInt(6)
                 Unit
             }
             is CoreException.RngException -> {
-                buf.putInt(9)
+                buf.putInt(7)
                 FfiConverterString.write(value.v1, buf)
                 Unit
             }
             is CoreException.InternalException -> {
-                buf.putInt(10)
+                buf.putInt(8)
                 FfiConverterString.write(value.v1, buf)
                 Unit
             }
             is CoreException.HandshakeException -> {
-                buf.putInt(11)
+                buf.putInt(9)
                 FfiConverterString.write(value.v1, buf)
                 Unit
             }
             is CoreException.StreamException -> {
-                buf.putInt(12)
-                FfiConverterString.write(value.v1, buf)
-                Unit
-            }
-            is CoreException.SessionNotFound -> {
-                buf.putInt(13)
+                buf.putInt(10)
                 FfiConverterString.write(value.v1, buf)
                 Unit
             }
             is CoreException.ConnectionClosed -> {
-                buf.putInt(14)
+                buf.putInt(11)
                 Unit
             }
             is CoreException.Timeout -> {
-                buf.putInt(15)
+                buf.putInt(12)
                 Unit
             }
             is CoreException.ReplayDetected -> {
-                buf.putInt(16)
+                buf.putInt(13)
                 FfiConverterString.write(value.v1, buf)
                 Unit
             }
             is CoreException.CipherSuiteUnavailable -> {
-                buf.putInt(17)
+                buf.putInt(14)
                 FfiConverterString.write(value.v1, buf)
                 Unit
             }
             is CoreException.ServerIdentityMismatch -> {
-                buf.putInt(18)
+                buf.putInt(15)
                 Unit
             }
             is CoreException.ProtocolRejected -> {
-                buf.putInt(19)
+                buf.putInt(16)
                 FfiConverterString.write(value.v1, buf)
                 Unit
             }
             is CoreException.Unsupported -> {
-                buf.putInt(20)
+                buf.putInt(17)
                 FfiConverterString.write(value.v1, buf)
                 Unit
             }

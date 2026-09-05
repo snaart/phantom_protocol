@@ -503,7 +503,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_take_early_data() != 27328:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind() != 60148:
+    if lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind() != 49830:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_config_bytes() != 10908:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -559,7 +559,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_send() != 55912:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 41675:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 9439:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_supports_migration() != 60201:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -1714,11 +1714,23 @@ class PhantomConfig:
     - `session_ticket_lifetime` → `SessionCache` ticket lifetime (server-only; client ignores)
 
     **Note:** `session_cache_capacity` and `session_ticket_lifetime` are consumed only on the
-    server path (`PhantomListener`); client `connect_*` entry points read only
-    `keepalive_interval` and `session_timeout` from this struct.
+    server path — by **both** listeners, [`PhantomListener`] over TCP and
+    [`PhantomUdpListener`] over PhantomUDP, which is the production
+    transport. Client `connect_*` entry points read only `keepalive_interval` and
+    `session_timeout` from this struct and silently ignore the other two.
 
-    Build via `mobile()` / `server()` / `iot()` / `default()` then mutate fields;
-    `#[non_exhaustive]` lets future tunables be added without a breaking change.
+    **Constructing one.** From Rust: `PhantomConfig::default()` — which is
+    `mobile()` — or one of the `server()` / `iot()` presets, then mutate the
+    fields. From a foreign binding there are **no presets**: UniFFI exports this
+    as a plain record with no associated functions and no field defaults, so a
+    Python, Swift or Kotlin caller builds the record itself and supplies every
+    field. The values `default()` uses are named on each field below so that
+    caller has something to copy. `#[non_exhaustive]` lets future tunables be
+    added without a breaking change to Rust callers; a foreign binding
+    regenerates instead.
+
+    [`PhantomListener`]: crate::api::listener::PhantomListener
+    [`PhantomUdpListener`]: crate::api::udp_listener::PhantomUdpListener
 """
     def __init__(self, *, keepalive_interval:Duration, session_timeout:Duration, session_cache_capacity:int, session_ticket_lifetime:Duration):
         self.keepalive_interval = keepalive_interval
@@ -1805,6 +1817,17 @@ class ResumptionHint:
     server it was negotiated against: the `resumption_secret` is
     server-pinned, and reusing a hint across servers is a configuration
     bug.
+
+    **Never log this value.** `resumption_secret` is the proof-of-possession
+    input a resuming handshake proves it holds, so a copy in a log is a
+    credential in a log. The warning sits on the type rather than only on the
+    field because that is what reaches every language: the Python binding
+    carries type documentation and not field documentation, and Python is the
+    one binding whose generated record stringifies its fields — `print(hint)`,
+    an f-string or `logging.info("%s", hint)` writes the secret out in full
+    there. Swift and Kotlin render the byte array's identity instead and do not
+    leak it. The Rust `Debug` below redacts the secret, but UniFFI never calls
+    it.
 """
     def __init__(self, *, session_id:bytes, resumption_secret:bytes):
         self.session_id = session_id
@@ -1897,10 +1920,14 @@ class TrafficShapingConfig:
     shaping is opt-in** — the default (and the field defaults here) is no shaping,
     so a session pays nothing unless an embedder enables it.
 
-    Currently carries the size-padding policy; the timing-jitter
-    and cover-traffic knobs will be added as further fields in later
-    phases. Padding hides the datagram *size*; it costs bounded (≈ ≤12% worst-case)
-    extra bandwidth.
+    Carries all three knobs: the size-padding policy, the send-timing jitter
+    ceiling and the cover-traffic interval, each documented on its own field
+    below and each wired to the send path.
+
+    Padding hides the datagram *size* at a bounded cost (≈ ≤12% worst case);
+    jitter hides the *timing* at a cost of up to its own ceiling in latency;
+    cover traffic hides the *presence* of application data at the cost of the
+    bandwidth it spends.
 """
     def __init__(self, *, padding:PaddingPolicy, jitter_ms:int, cover_interval_ms:int):
         self.padding = padding
@@ -2195,14 +2222,6 @@ class CoreError:  # type: ignore
         def __repr__(self):
             return "CoreError.SerializationError({})".format(str(self))
     _UniffiTempCoreError.SerializationError = SerializationError # type: ignore
-    class Busy(_UniffiTempCoreError):
-        
-        def __init__(self):
-            pass
-
-        def __repr__(self):
-            return "CoreError.Busy({})".format(str(self))
-    _UniffiTempCoreError.Busy = Busy # type: ignore
     class ConfigError(_UniffiTempCoreError):
         
         def __init__(self, *values):
@@ -2251,22 +2270,6 @@ class CoreError:  # type: ignore
         def __repr__(self):
             return "CoreError.ValidationError({})".format(str(self))
     _UniffiTempCoreError.ValidationError = ValidationError # type: ignore
-    class RuntimeError(_UniffiTempCoreError):
-        
-        def __init__(self, *values):
-            if len(values) != 1:
-                raise TypeError(f"Expected 1 arguments, found {len(values)}")
-            if not isinstance(values[0], str):
-                raise TypeError(f"unexpected type for tuple element 0 - expected 'str', got '{type(values[0])}'")
-            super().__init__(", ".join(map(repr, values)))
-            self._values = values
-
-        def __getitem__(self, index):
-            return self._values[index]
-
-        def __repr__(self):
-            return "CoreError.RuntimeError({})".format(str(self))
-    _UniffiTempCoreError.RuntimeError = RuntimeError # type: ignore
     class KeyDerivationError(_UniffiTempCoreError):
         
         def __init__(self):
@@ -2339,22 +2342,6 @@ class CoreError:  # type: ignore
         def __repr__(self):
             return "CoreError.StreamError({})".format(str(self))
     _UniffiTempCoreError.StreamError = StreamError # type: ignore
-    class SessionNotFound(_UniffiTempCoreError):
-        
-        def __init__(self, *values):
-            if len(values) != 1:
-                raise TypeError(f"Expected 1 arguments, found {len(values)}")
-            if not isinstance(values[0], str):
-                raise TypeError(f"unexpected type for tuple element 0 - expected 'str', got '{type(values[0])}'")
-            super().__init__(", ".join(map(repr, values)))
-            self._values = values
-
-        def __getitem__(self, index):
-            return self._values[index]
-
-        def __repr__(self):
-            return "CoreError.SessionNotFound({})".format(str(self))
-    _UniffiTempCoreError.SessionNotFound = SessionNotFound # type: ignore
     class ConnectionClosed(_UniffiTempCoreError):
         
         def __init__(self):
@@ -2505,69 +2492,58 @@ class _UniffiFfiConverterTypeCoreError(_UniffiConverterRustBuffer):
                 _UniffiFfiConverterString.read(buf),
             )
         if variant == 3:
-            return CoreError.Busy(
-            )
-        if variant == 4:
             return CoreError.ConfigError(
                 _UniffiFfiConverterString.read(buf),
             )
-        if variant == 5:
+        if variant == 4:
             return CoreError.CryptoError(
                 _UniffiFfiConverterString.read(buf),
             )
-        if variant == 6:
+        if variant == 5:
             return CoreError.ValidationError(
                 _UniffiFfiConverterString.read(buf),
             )
-        if variant == 7:
-            return CoreError.RuntimeError(
-                _UniffiFfiConverterString.read(buf),
-            )
-        if variant == 8:
+        if variant == 6:
             return CoreError.KeyDerivationError(
             )
-        if variant == 9:
+        if variant == 7:
             return CoreError.RngError(
                 _UniffiFfiConverterString.read(buf),
             )
-        if variant == 10:
+        if variant == 8:
             return CoreError.InternalError(
                 _UniffiFfiConverterString.read(buf),
             )
-        if variant == 11:
+        if variant == 9:
             return CoreError.HandshakeError(
                 _UniffiFfiConverterString.read(buf),
             )
-        if variant == 12:
+        if variant == 10:
             return CoreError.StreamError(
                 _UniffiFfiConverterString.read(buf),
             )
-        if variant == 13:
-            return CoreError.SessionNotFound(
-                _UniffiFfiConverterString.read(buf),
-            )
-        if variant == 14:
+        if variant == 11:
             return CoreError.ConnectionClosed(
             )
-        if variant == 15:
+        if variant == 12:
             return CoreError.Timeout(
             )
-        if variant == 16:
+        if variant == 13:
             return CoreError.ReplayDetected(
                 _UniffiFfiConverterString.read(buf),
             )
-        if variant == 17:
+        if variant == 14:
             return CoreError.CipherSuiteUnavailable(
                 _UniffiFfiConverterString.read(buf),
             )
-        if variant == 18:
+        if variant == 15:
             return CoreError.ServerIdentityMismatch(
             )
-        if variant == 19:
+        if variant == 16:
             return CoreError.ProtocolRejected(
                 _UniffiFfiConverterString.read(buf),
             )
-        if variant == 20:
+        if variant == 17:
             return CoreError.Unsupported(
                 _UniffiFfiConverterString.read(buf),
             )
@@ -2581,8 +2557,6 @@ class _UniffiFfiConverterTypeCoreError(_UniffiConverterRustBuffer):
         if isinstance(value, CoreError.SerializationError):
             _UniffiFfiConverterString.check_lower(value._values[0])
             return
-        if isinstance(value, CoreError.Busy):
-            return
         if isinstance(value, CoreError.ConfigError):
             _UniffiFfiConverterString.check_lower(value._values[0])
             return
@@ -2590,9 +2564,6 @@ class _UniffiFfiConverterTypeCoreError(_UniffiConverterRustBuffer):
             _UniffiFfiConverterString.check_lower(value._values[0])
             return
         if isinstance(value, CoreError.ValidationError):
-            _UniffiFfiConverterString.check_lower(value._values[0])
-            return
-        if isinstance(value, CoreError.RuntimeError):
             _UniffiFfiConverterString.check_lower(value._values[0])
             return
         if isinstance(value, CoreError.KeyDerivationError):
@@ -2607,9 +2578,6 @@ class _UniffiFfiConverterTypeCoreError(_UniffiConverterRustBuffer):
             _UniffiFfiConverterString.check_lower(value._values[0])
             return
         if isinstance(value, CoreError.StreamError):
-            _UniffiFfiConverterString.check_lower(value._values[0])
-            return
-        if isinstance(value, CoreError.SessionNotFound):
             _UniffiFfiConverterString.check_lower(value._values[0])
             return
         if isinstance(value, CoreError.ConnectionClosed):
@@ -2639,54 +2607,46 @@ class _UniffiFfiConverterTypeCoreError(_UniffiConverterRustBuffer):
         if isinstance(value, CoreError.SerializationError):
             buf.write_i32(2)
             _UniffiFfiConverterString.write(value._values[0], buf)
-        if isinstance(value, CoreError.Busy):
-            buf.write_i32(3)
         if isinstance(value, CoreError.ConfigError):
-            buf.write_i32(4)
+            buf.write_i32(3)
             _UniffiFfiConverterString.write(value._values[0], buf)
         if isinstance(value, CoreError.CryptoError):
-            buf.write_i32(5)
+            buf.write_i32(4)
             _UniffiFfiConverterString.write(value._values[0], buf)
         if isinstance(value, CoreError.ValidationError):
-            buf.write_i32(6)
-            _UniffiFfiConverterString.write(value._values[0], buf)
-        if isinstance(value, CoreError.RuntimeError):
-            buf.write_i32(7)
+            buf.write_i32(5)
             _UniffiFfiConverterString.write(value._values[0], buf)
         if isinstance(value, CoreError.KeyDerivationError):
-            buf.write_i32(8)
+            buf.write_i32(6)
         if isinstance(value, CoreError.RngError):
-            buf.write_i32(9)
+            buf.write_i32(7)
             _UniffiFfiConverterString.write(value._values[0], buf)
         if isinstance(value, CoreError.InternalError):
-            buf.write_i32(10)
+            buf.write_i32(8)
             _UniffiFfiConverterString.write(value._values[0], buf)
         if isinstance(value, CoreError.HandshakeError):
-            buf.write_i32(11)
+            buf.write_i32(9)
             _UniffiFfiConverterString.write(value._values[0], buf)
         if isinstance(value, CoreError.StreamError):
-            buf.write_i32(12)
-            _UniffiFfiConverterString.write(value._values[0], buf)
-        if isinstance(value, CoreError.SessionNotFound):
-            buf.write_i32(13)
+            buf.write_i32(10)
             _UniffiFfiConverterString.write(value._values[0], buf)
         if isinstance(value, CoreError.ConnectionClosed):
-            buf.write_i32(14)
+            buf.write_i32(11)
         if isinstance(value, CoreError.Timeout):
-            buf.write_i32(15)
+            buf.write_i32(12)
         if isinstance(value, CoreError.ReplayDetected):
-            buf.write_i32(16)
+            buf.write_i32(13)
             _UniffiFfiConverterString.write(value._values[0], buf)
         if isinstance(value, CoreError.CipherSuiteUnavailable):
-            buf.write_i32(17)
+            buf.write_i32(14)
             _UniffiFfiConverterString.write(value._values[0], buf)
         if isinstance(value, CoreError.ServerIdentityMismatch):
-            buf.write_i32(18)
+            buf.write_i32(15)
         if isinstance(value, CoreError.ProtocolRejected):
-            buf.write_i32(19)
+            buf.write_i32(16)
             _UniffiFfiConverterString.write(value._values[0], buf)
         if isinstance(value, CoreError.Unsupported):
-            buf.write_i32(20)
+            buf.write_i32(17)
             _UniffiFfiConverterString.write(value._values[0], buf)
 
 class _UniffiFfiConverterBoolean:
@@ -3509,9 +3469,17 @@ class PhantomSessionProtocol(typing.Protocol):
         raise NotImplementedError
     async def set_traffic_shaping(self, config: TrafficShapingConfig) -> bool:
         """
-        Apply an anti-fingerprint traffic-shaping configuration to the established
-        session (WIRE v6). Returns `false` if the session is still
-        connecting. All shaping is opt-in (default: none); enabling size padding
+        Apply an anti-fingerprint traffic-shaping configuration (WIRE v6).
+
+        **Accepted at any point in a session's life, including before the
+        handshake has run.** The configuration is stored and applied when the
+        session is installed, so an embedder that wants shaping on from the first
+        byte sets it immediately after connecting rather than waiting for
+        readiness. The return is always `true` and carries no information; it
+        survives because removing it is an FFI-breaking change. Do not branch on
+        it.
+
+        All shaping is opt-in (default: none); enabling size padding
         ([`PaddingPolicy::Padme`]) makes outbound packets pad up to a PADÉ bucket so
         the datagram size no longer tracks the payload size, at a bounded (≈ ≤12%
         worst-case) bandwidth cost. FFI-exported so mobile / other embedders can
@@ -4156,9 +4124,17 @@ class PhantomSession(PhantomSessionProtocol):
         )
     async def set_traffic_shaping(self, config: TrafficShapingConfig) -> bool:
         """
-        Apply an anti-fingerprint traffic-shaping configuration to the established
-        session (WIRE v6). Returns `false` if the session is still
-        connecting. All shaping is opt-in (default: none); enabling size padding
+        Apply an anti-fingerprint traffic-shaping configuration (WIRE v6).
+
+        **Accepted at any point in a session's life, including before the
+        handshake has run.** The configuration is stored and applied when the
+        session is installed, so an embedder that wants shaping on from the first
+        byte sets it immediately after connecting rather than waiting for
+        readiness. The return is always `true` and carries no information; it
+        survives because removing it is an FFI-breaking change. Do not branch on
+        it.
+
+        All shaping is opt-in (default: none); enabling size padding
         ([`PaddingPolicy::Padme`]) makes outbound packets pad up to a PADÉ bucket so
         the datagram size no longer tracks the payload size, at a bounded (≈ ≤12%
         worst-case) bandwidth cost. FFI-exported so mobile / other embedders can
@@ -4559,6 +4535,23 @@ class PhantomListener(PhantomListenerProtocol):
     _handle: ctypes.c_uint64
     @classmethod
     async def bind(cls, addr: str) -> PhantomListener:
+        """
+        Bind a TCP listener with a **freshly generated** hybrid signing identity.
+
+        The identity lives and dies with the process. Every client pins the
+        server's verifying key, so a restart invalidates every pin that was ever
+        handed out and each of those clients then fails with
+        [`CoreError::ServerIdentityMismatch`] — not with a reconnect. That is
+        correct behaviour for a pinned protocol and a footgun in production, which
+        is why it is said here rather than left to be discovered: for anything that
+        outlives one process, use
+        [`bind_with_signing_key_bytes`](Self::bind_with_signing_key_bytes) with a
+        seed you persist, or the builder's `.signing_key(...)`.
+
+        This is the TCP entry point. PhantomUDP — the production transport — is
+        [`PhantomUdpListener::bind_udp`](crate::api::udp_listener::PhantomUdpListener::bind_udp),
+        whose contract is the same.
+"""
         
         _UniffiFfiConverterString.check_lower(addr)
         _uniffi_lowered_args = (

@@ -984,6 +984,23 @@ open class PhantomListener: PhantomListenerProtocol, @unchecked Sendable {
     }
 
     
+    /**
+     * Bind a TCP listener with a **freshly generated** hybrid signing identity.
+     *
+     * The identity lives and dies with the process. Every client pins the
+     * server's verifying key, so a restart invalidates every pin that was ever
+     * handed out and each of those clients then fails with
+     * [`CoreError::ServerIdentityMismatch`] — not with a reconnect. That is
+     * correct behaviour for a pinned protocol and a footgun in production, which
+     * is why it is said here rather than left to be discovered: for anything that
+     * outlives one process, use
+     * [`bind_with_signing_key_bytes`](Self::bind_with_signing_key_bytes) with a
+     * seed you persist, or the builder's `.signing_key(...)`.
+     *
+     * This is the TCP entry point. PhantomUDP — the production transport — is
+     * [`PhantomUdpListener::bind_udp`](crate::api::udp_listener::PhantomUdpListener::bind_udp),
+     * whose contract is the same.
+     */
 public static func bind(addr: String)async throws  -> PhantomListener  {
     return
         try  await uniffiRustCallAsync(
@@ -1544,9 +1561,17 @@ public protocol PhantomSessionProtocol: AnyObject, Sendable {
     func send(data: Data) async throws 
     
     /**
-     * Apply an anti-fingerprint traffic-shaping configuration to the established
-     * session (WIRE v6). Returns `false` if the session is still
-     * connecting. All shaping is opt-in (default: none); enabling size padding
+     * Apply an anti-fingerprint traffic-shaping configuration (WIRE v6).
+     *
+     * **Accepted at any point in a session's life, including before the
+     * handshake has run.** The configuration is stored and applied when the
+     * session is installed, so an embedder that wants shaping on from the first
+     * byte sets it immediately after connecting rather than waiting for
+     * readiness. The return is always `true` and carries no information; it
+     * survives because removing it is an FFI-breaking change. Do not branch on
+     * it.
+     *
+     * All shaping is opt-in (default: none); enabling size padding
      * ([`PaddingPolicy::Padme`]) makes outbound packets pad up to a PADÉ bucket so
      * the datagram size no longer tracks the payload size, at a bounded (≈ ≤12%
      * worst-case) bandwidth cost. FFI-exported so mobile / other embedders can
@@ -2220,9 +2245,17 @@ open func send(data: Data)async throws   {
 }
     
     /**
-     * Apply an anti-fingerprint traffic-shaping configuration to the established
-     * session (WIRE v6). Returns `false` if the session is still
-     * connecting. All shaping is opt-in (default: none); enabling size padding
+     * Apply an anti-fingerprint traffic-shaping configuration (WIRE v6).
+     *
+     * **Accepted at any point in a session's life, including before the
+     * handshake has run.** The configuration is stored and applied when the
+     * session is installed, so an embedder that wants shaping on from the first
+     * byte sets it immediately after connecting rather than waiting for
+     * readiness. The return is always `true` and carries no information; it
+     * survives because removing it is an FFI-breaking change. Do not branch on
+     * it.
+     *
+     * All shaping is opt-in (default: none); enabling size padding
      * ([`PaddingPolicy::Padme`]) makes outbound packets pad up to a PADÉ bucket so
      * the datagram size no longer tracks the payload size, at a bounded (≈ ≤12%
      * worst-case) bandwidth cost. FFI-exported so mobile / other embedders can
@@ -3474,11 +3507,23 @@ public func FfiConverterTypeMetricsSnapshotFfi_lower(_ value: MetricsSnapshotFfi
  * - `session_ticket_lifetime` → `SessionCache` ticket lifetime (server-only; client ignores)
  *
  * **Note:** `session_cache_capacity` and `session_ticket_lifetime` are consumed only on the
- * server path (`PhantomListener`); client `connect_*` entry points read only
- * `keepalive_interval` and `session_timeout` from this struct.
+ * server path — by **both** listeners, [`PhantomListener`] over TCP and
+ * [`PhantomUdpListener`] over PhantomUDP, which is the production
+ * transport. Client `connect_*` entry points read only `keepalive_interval` and
+ * `session_timeout` from this struct and silently ignore the other two.
  *
- * Build via `mobile()` / `server()` / `iot()` / `default()` then mutate fields;
- * `#[non_exhaustive]` lets future tunables be added without a breaking change.
+ * **Constructing one.** From Rust: `PhantomConfig::default()` — which is
+ * `mobile()` — or one of the `server()` / `iot()` presets, then mutate the
+ * fields. From a foreign binding there are **no presets**: UniFFI exports this
+ * as a plain record with no associated functions and no field defaults, so a
+ * Python, Swift or Kotlin caller builds the record itself and supplies every
+ * field. The values `default()` uses are named on each field below so that
+ * caller has something to copy. `#[non_exhaustive]` lets future tunables be
+ * added without a breaking change to Rust callers; a foreign binding
+ * regenerates instead.
+ *
+ * [`PhantomListener`]: crate::api::listener::PhantomListener
+ * [`PhantomUdpListener`]: crate::api::udp_listener::PhantomUdpListener
  */
 public struct PhantomConfig: Equatable, Hashable {
     /**
@@ -3486,6 +3531,8 @@ public struct PhantomConfig: Equatable, Hashable {
      * When the session is `Connected` and has been idle this long with nothing in flight,
      * the data pump emits a small encrypted KEEPALIVE packet so a download-only path can
      * detect a silently-dead peer via the same probe-timeout sweep.
+     *
+     * Defaults: 30 s (`mobile`, and so `default`), 60 s (`server`), 120 s (`iot`).
      */
     public var keepaliveInterval: TimeInterval
     /**
@@ -3495,33 +3542,46 @@ public struct PhantomConfig: Equatable, Hashable {
      * Keep-alive PINGs keep a `Connected` session alive indefinitely; this bounds how long
      * a session that has gone unresponsive (entered `Migrating`) is retried before being
      * declared `Dead`.
+     *
+     * Defaults: 3600 s (`mobile`), 7200 s (`server`), 1800 s (`iot`).
      */
     public var sessionTimeout: TimeInterval
     /**
      * Maximum 0-RTT resumption tickets the server keeps in memory.
      *
-     * **SERVER-SIDE ONLY.** This field is consumed only by [`PhantomListener`] (via
+     * **SERVER-SIDE ONLY.** This field is consumed by the listeners — both
+     * [`PhantomListener`] over TCP and [`PhantomUdpListener`] over
+     * PhantomUDP, the production transport (via
      * `PhantomListener::bind_with_config_bytes` or equivalent). When a
      * [`PhantomConfig`] is passed to any `connect_*` client entry point, this field
      * is silently ignored — the client does not own a session cache.
      *
      * Maps to [`SessionCache`] capacity; excess entries are evicted LRU.
      *
+     * Defaults: 32 (`mobile`), 1024 (`server`), 4 (`iot`). Consumed by both
+     * listeners, not only the TCP one.
+     *
      * [`PhantomListener`]: crate::api::listener::PhantomListener
      * [`SessionCache`]: crate::transport::session_cache::SessionCache
+     * [`PhantomUdpListener`]: crate::api::udp_listener::PhantomUdpListener
      */
     public var sessionCacheCapacity: UInt32
     /**
      * Lifetime of 0-RTT resumption tickets on the server.
      *
-     * **SERVER-SIDE ONLY.** This field is consumed only by [`PhantomListener`]. When
+     * **SERVER-SIDE ONLY.** This field is consumed by the listeners — both
+     * [`PhantomListener`] and [`PhantomUdpListener`]. When
      * a [`PhantomConfig`] is passed to any `connect_*` client entry point, this field
      * is silently ignored — the client does not own a session cache.
      *
      * Maps to [`SessionCache`] ticket lifetime.
      *
+     * Defaults: 86400 s (`mobile`), 604800 s (`server`), 3600 s (`iot`).
+     * Consumed by both listeners, not only the TCP one.
+     *
      * [`PhantomListener`]: crate::api::listener::PhantomListener
      * [`SessionCache`]: crate::transport::session_cache::SessionCache
+     * [`PhantomUdpListener`]: crate::api::udp_listener::PhantomUdpListener
      */
     public var sessionTicketLifetime: TimeInterval
 
@@ -3533,6 +3593,8 @@ public struct PhantomConfig: Equatable, Hashable {
          * When the session is `Connected` and has been idle this long with nothing in flight,
          * the data pump emits a small encrypted KEEPALIVE packet so a download-only path can
          * detect a silently-dead peer via the same probe-timeout sweep.
+         *
+         * Defaults: 30 s (`mobile`, and so `default`), 60 s (`server`), 120 s (`iot`).
          */keepaliveInterval: TimeInterval, 
         /**
          * Liveness reap window (maps to `LivenessConfig.idle_timeout`).
@@ -3541,31 +3603,44 @@ public struct PhantomConfig: Equatable, Hashable {
          * Keep-alive PINGs keep a `Connected` session alive indefinitely; this bounds how long
          * a session that has gone unresponsive (entered `Migrating`) is retried before being
          * declared `Dead`.
+         *
+         * Defaults: 3600 s (`mobile`), 7200 s (`server`), 1800 s (`iot`).
          */sessionTimeout: TimeInterval, 
         /**
          * Maximum 0-RTT resumption tickets the server keeps in memory.
          *
-         * **SERVER-SIDE ONLY.** This field is consumed only by [`PhantomListener`] (via
+         * **SERVER-SIDE ONLY.** This field is consumed by the listeners — both
+         * [`PhantomListener`] over TCP and [`PhantomUdpListener`] over
+         * PhantomUDP, the production transport (via
          * `PhantomListener::bind_with_config_bytes` or equivalent). When a
          * [`PhantomConfig`] is passed to any `connect_*` client entry point, this field
          * is silently ignored — the client does not own a session cache.
          *
          * Maps to [`SessionCache`] capacity; excess entries are evicted LRU.
          *
+         * Defaults: 32 (`mobile`), 1024 (`server`), 4 (`iot`). Consumed by both
+         * listeners, not only the TCP one.
+         *
          * [`PhantomListener`]: crate::api::listener::PhantomListener
          * [`SessionCache`]: crate::transport::session_cache::SessionCache
+         * [`PhantomUdpListener`]: crate::api::udp_listener::PhantomUdpListener
          */sessionCacheCapacity: UInt32, 
         /**
          * Lifetime of 0-RTT resumption tickets on the server.
          *
-         * **SERVER-SIDE ONLY.** This field is consumed only by [`PhantomListener`]. When
+         * **SERVER-SIDE ONLY.** This field is consumed by the listeners — both
+         * [`PhantomListener`] and [`PhantomUdpListener`]. When
          * a [`PhantomConfig`] is passed to any `connect_*` client entry point, this field
          * is silently ignored — the client does not own a session cache.
          *
          * Maps to [`SessionCache`] ticket lifetime.
          *
+         * Defaults: 86400 s (`mobile`), 604800 s (`server`), 3600 s (`iot`).
+         * Consumed by both listeners, not only the TCP one.
+         *
          * [`PhantomListener`]: crate::api::listener::PhantomListener
          * [`SessionCache`]: crate::transport::session_cache::SessionCache
+         * [`PhantomUdpListener`]: crate::api::udp_listener::PhantomUdpListener
          */sessionTicketLifetime: TimeInterval) {
         self.keepaliveInterval = keepaliveInterval
         self.sessionTimeout = sessionTimeout
@@ -3637,6 +3712,17 @@ public func FfiConverterTypePhantomConfig_lower(_ value: PhantomConfig) -> RustB
  * server it was negotiated against: the `resumption_secret` is
  * server-pinned, and reusing a hint across servers is a configuration
  * bug.
+ *
+ * **Never log this value.** `resumption_secret` is the proof-of-possession
+ * input a resuming handshake proves it holds, so a copy in a log is a
+ * credential in a log. The warning sits on the type rather than only on the
+ * field because that is what reaches every language: the Python binding
+ * carries type documentation and not field documentation, and Python is the
+ * one binding whose generated record stringifies its fields — `print(hint)`,
+ * an f-string or `logging.info("%s", hint)` writes the secret out in full
+ * there. Swift and Kotlin render the byte array's identity instead and do not
+ * leak it. The Rust `Debug` below redacts the secret, but UniFFI never calls
+ * it.
  */
 public struct ResumptionHint: Equatable, Hashable {
     /**
@@ -3645,6 +3731,15 @@ public struct ResumptionHint: Equatable, Hashable {
     public var sessionId: Data
     /**
      * The resumption secret (32 bytes) — sensitive; treat like a key.
+     *
+     * **Never log this record, and in Python never `print`, `format` or `%s` it.**
+     * This is the proof-of-possession input a resuming handshake proves it holds
+     * (Security Invariant 9), so a copy in a log is a credential in a log. The
+     * Rust `Debug` below redacts it, but that impl is Rust-only: UniFFI never
+     * calls it, and the generated Python record carries a `__str__` that formats
+     * both fields, so `print(hint)`, an f-string or `logging.info("%s", hint)`
+     * writes the secret out in full. Swift and Kotlin render the byte array's
+     * identity rather than its contents and do not leak it.
      */
     public var resumptionSecret: Data
 
@@ -3656,6 +3751,15 @@ public struct ResumptionHint: Equatable, Hashable {
          */sessionId: Data, 
         /**
          * The resumption secret (32 bytes) — sensitive; treat like a key.
+         *
+         * **Never log this record, and in Python never `print`, `format` or `%s` it.**
+         * This is the proof-of-possession input a resuming handshake proves it holds
+         * (Security Invariant 9), so a copy in a log is a credential in a log. The
+         * Rust `Debug` below redacts it, but that impl is Rust-only: UniFFI never
+         * calls it, and the generated Python record carries a `__str__` that formats
+         * both fields, so `print(hint)`, an f-string or `logging.info("%s", hint)`
+         * writes the secret out in full. Swift and Kotlin render the byte array's
+         * identity rather than its contents and do not leak it.
          */resumptionSecret: Data) {
         self.sessionId = sessionId
         self.resumptionSecret = resumptionSecret
@@ -3710,10 +3814,14 @@ public func FfiConverterTypeResumptionHint_lower(_ value: ResumptionHint) -> Rus
  * shaping is opt-in** — the default (and the field defaults here) is no shaping,
  * so a session pays nothing unless an embedder enables it.
  *
- * Currently carries the size-padding policy; the timing-jitter
- * and cover-traffic knobs will be added as further fields in later
- * phases. Padding hides the datagram *size*; it costs bounded (≈ ≤12% worst-case)
- * extra bandwidth.
+ * Carries all three knobs: the size-padding policy, the send-timing jitter
+ * ceiling and the cover-traffic interval, each documented on its own field
+ * below and each wired to the send path.
+ *
+ * Padding hides the datagram *size* at a bounded cost (≈ ≤12% worst case);
+ * jitter hides the *timing* at a cost of up to its own ceiling in latency;
+ * cover traffic hides the *presence* of application data at the cost of the
+ * bandwidth it spends.
  */
 public struct TrafficShapingConfig: Equatable, Hashable {
     /**
@@ -3994,14 +4102,11 @@ public enum CoreError: Swift.Error, Equatable, Hashable, Foundation.LocalizedErr
     )
     case SerializationError(String
     )
-    case Busy
     case ConfigError(String
     )
     case CryptoError(String
     )
     case ValidationError(String
-    )
-    case RuntimeError(String
     )
     case KeyDerivationError
     case RngError(String
@@ -4011,8 +4116,6 @@ public enum CoreError: Swift.Error, Equatable, Hashable, Foundation.LocalizedErr
     case HandshakeError(String
     )
     case StreamError(String
-    )
-    case SessionNotFound(String
     )
     case ConnectionClosed
     case Timeout
@@ -4104,48 +4207,41 @@ public struct FfiConverterTypeCoreError: FfiConverterRustBuffer {
         case 2: return .SerializationError(
             try FfiConverterString.read(from: &buf)
             )
-        case 3: return .Busy
-        case 4: return .ConfigError(
+        case 3: return .ConfigError(
             try FfiConverterString.read(from: &buf)
             )
-        case 5: return .CryptoError(
+        case 4: return .CryptoError(
             try FfiConverterString.read(from: &buf)
             )
-        case 6: return .ValidationError(
+        case 5: return .ValidationError(
             try FfiConverterString.read(from: &buf)
             )
-        case 7: return .RuntimeError(
+        case 6: return .KeyDerivationError
+        case 7: return .RngError(
             try FfiConverterString.read(from: &buf)
             )
-        case 8: return .KeyDerivationError
-        case 9: return .RngError(
+        case 8: return .InternalError(
             try FfiConverterString.read(from: &buf)
             )
-        case 10: return .InternalError(
+        case 9: return .HandshakeError(
             try FfiConverterString.read(from: &buf)
             )
-        case 11: return .HandshakeError(
+        case 10: return .StreamError(
             try FfiConverterString.read(from: &buf)
             )
-        case 12: return .StreamError(
+        case 11: return .ConnectionClosed
+        case 12: return .Timeout
+        case 13: return .ReplayDetected(
             try FfiConverterString.read(from: &buf)
             )
-        case 13: return .SessionNotFound(
+        case 14: return .CipherSuiteUnavailable(
             try FfiConverterString.read(from: &buf)
             )
-        case 14: return .ConnectionClosed
-        case 15: return .Timeout
-        case 16: return .ReplayDetected(
+        case 15: return .ServerIdentityMismatch
+        case 16: return .ProtocolRejected(
             try FfiConverterString.read(from: &buf)
             )
-        case 17: return .CipherSuiteUnavailable(
-            try FfiConverterString.read(from: &buf)
-            )
-        case 18: return .ServerIdentityMismatch
-        case 19: return .ProtocolRejected(
-            try FfiConverterString.read(from: &buf)
-            )
-        case 20: return .Unsupported(
+        case 17: return .Unsupported(
             try FfiConverterString.read(from: &buf)
             )
 
@@ -4170,88 +4266,74 @@ public struct FfiConverterTypeCoreError: FfiConverterRustBuffer {
             FfiConverterString.write(v1, into: &buf)
             
         
-        case .Busy:
-            writeInt(&buf, Int32(3))
-        
-        
         case let .ConfigError(v1):
-            writeInt(&buf, Int32(4))
+            writeInt(&buf, Int32(3))
             FfiConverterString.write(v1, into: &buf)
             
         
         case let .CryptoError(v1):
-            writeInt(&buf, Int32(5))
+            writeInt(&buf, Int32(4))
             FfiConverterString.write(v1, into: &buf)
             
         
         case let .ValidationError(v1):
-            writeInt(&buf, Int32(6))
-            FfiConverterString.write(v1, into: &buf)
-            
-        
-        case let .RuntimeError(v1):
-            writeInt(&buf, Int32(7))
+            writeInt(&buf, Int32(5))
             FfiConverterString.write(v1, into: &buf)
             
         
         case .KeyDerivationError:
-            writeInt(&buf, Int32(8))
+            writeInt(&buf, Int32(6))
         
         
         case let .RngError(v1):
-            writeInt(&buf, Int32(9))
+            writeInt(&buf, Int32(7))
             FfiConverterString.write(v1, into: &buf)
             
         
         case let .InternalError(v1):
-            writeInt(&buf, Int32(10))
+            writeInt(&buf, Int32(8))
             FfiConverterString.write(v1, into: &buf)
             
         
         case let .HandshakeError(v1):
-            writeInt(&buf, Int32(11))
+            writeInt(&buf, Int32(9))
             FfiConverterString.write(v1, into: &buf)
             
         
         case let .StreamError(v1):
-            writeInt(&buf, Int32(12))
-            FfiConverterString.write(v1, into: &buf)
-            
-        
-        case let .SessionNotFound(v1):
-            writeInt(&buf, Int32(13))
+            writeInt(&buf, Int32(10))
             FfiConverterString.write(v1, into: &buf)
             
         
         case .ConnectionClosed:
-            writeInt(&buf, Int32(14))
+            writeInt(&buf, Int32(11))
         
         
         case .Timeout:
-            writeInt(&buf, Int32(15))
+            writeInt(&buf, Int32(12))
         
         
         case let .ReplayDetected(v1):
-            writeInt(&buf, Int32(16))
+            writeInt(&buf, Int32(13))
             FfiConverterString.write(v1, into: &buf)
             
         
         case let .CipherSuiteUnavailable(v1):
-            writeInt(&buf, Int32(17))
+            writeInt(&buf, Int32(14))
             FfiConverterString.write(v1, into: &buf)
             
         
         case .ServerIdentityMismatch:
-            writeInt(&buf, Int32(18))
+            writeInt(&buf, Int32(15))
         
         
         case let .ProtocolRejected(v1):
-            writeInt(&buf, Int32(19))
+            writeInt(&buf, Int32(16))
             FfiConverterString.write(v1, into: &buf)
             
         
         case let .Unsupported(v1):
-            writeInt(&buf, Int32(20))
+            writeInt(&buf, Int32(17))
             FfiConverterString.write(v1, into: &buf)
             
         }
@@ -5009,7 +5091,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_method_phantomsession_send() != 55912) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 41675) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 9439) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomsession_supports_migration() != 60201) {
@@ -5057,7 +5139,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_method_phantomudplistener_verifying_key_bytes() != 25697) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind() != 60148) {
+    if (uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind() != 49830) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_config_bytes() != 10908) {
