@@ -110,12 +110,17 @@ struct ContentView: View {
 
     private var bannerColor: Color {
         switch viewModel.state {
-        case .connected, .pqcReady:
+        case .connected:
             return .green
-        case .classicalReady, .pqcUpgrading, .connecting:
+        case .connecting:
             return .yellow
         case .migrating:
             return .orange
+        // The peer has announced its close and the pump is draining what is
+        // already in flight. Reads still land; writes are refused. Amber says
+        // "ending", which is what it is.
+        case .draining:
+            return .yellow
         case .failed, .dead:
             return .red
         case .closed:

@@ -534,33 +534,42 @@ class PhantomClient(
     }
 
     /**
-     * Data-ready ("ESTABLISHED") states: the handshake has progressed far enough
-     * that the session has negotiated a resumption secret, so [resumptionHint]
-     * can return a usable ticket. CONNECTED is the fully-established state;
-     * PQC_READY / CLASSICAL_READY are data-ready intermediate states.
+     * Data-ready ("ESTABLISHED") state: the handshake has completed, so the
+     * session has negotiated a resumption secret and [resumptionHint] can
+     * return a usable ticket.
+     *
+     * There is exactly one such state: values 1..=3 of the enum are holes left
+     * by a staged classical-then-PQC upgrade the protocol never shipped, so
+     * there are no data-ready intermediates. DRAINING is deliberately not
+     * established: the peer has announced its close, so a hint harvested there
+     * describes a session that is already ending.
      */
     private fun isEstablished(state: ConnectionState): Boolean = when (state) {
-        ConnectionState.CLASSICAL_READY,
-        ConnectionState.PQC_READY,
-        ConnectionState.CONNECTED,
-        -> true
+        ConnectionState.CONNECTED -> true
 
         ConnectionState.CONNECTING,
-        ConnectionState.PQC_UPGRADING,
         ConnectionState.MIGRATING,
+        ConnectionState.DRAINING,
         ConnectionState.FAILED,
         ConnectionState.CLOSED,
         ConnectionState.DEAD,
         -> false
     }
 
+    /**
+     * Whether the session is still worth holding on to.
+     *
+     * DRAINING counts as live: reads still land while the pump works through
+     * what was already in flight, and tearing down on the peer's close would
+     * discard bytes whose sender's `send()` had already returned success.
+     * Writes are refused there, which the send path surfaces as an error rather
+     * than something this predicate has to encode.
+     */
     private fun isLive(state: ConnectionState): Boolean = when (state) {
         ConnectionState.CONNECTING,
-        ConnectionState.CLASSICAL_READY,
-        ConnectionState.PQC_UPGRADING,
-        ConnectionState.PQC_READY,
         ConnectionState.CONNECTED,
         ConnectionState.MIGRATING,
+        ConnectionState.DRAINING,
         -> true
 
         ConnectionState.FAILED,

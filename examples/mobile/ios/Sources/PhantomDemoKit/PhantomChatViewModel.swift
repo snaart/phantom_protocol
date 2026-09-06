@@ -440,7 +440,7 @@ public final class PhantomChatViewModel: ObservableObject {
 
     /// Harvests and persists a resumption hint exactly once per session, the
     /// first time the session is observed in an established, data-ready state
-    /// (`.connected` / `.pqcReady` / `.classicalReady`). This is where 0-RTT
+    /// (`.connected`). This is where 0-RTT
     /// for the next launch is actually made to work: `connectPinned*` returns
     /// before the background handshake finishes, so `resumptionHint()` only
     /// yields a real ticket once the session is up. Guarded by
@@ -450,7 +450,7 @@ public final class PhantomChatViewModel: ObservableObject {
                                      from session: PhantomSession) async {
         guard !hasHarvestedHint, !isHarvestingHint else { return }
         switch live {
-        case .connected, .pqcReady, .classicalReady:
+        case .connected:
             // In-flight guard so a concurrent poll cannot also enter the harvest
             // across the await (the main actor serialises these, but the await
             // is a suspension point). The success flag is only set if a hint was
@@ -553,13 +553,11 @@ public final class PhantomChatViewModel: ObservableObject {
     private func statusLine(for state: ConnectionState) -> String {
         switch state {
         case .connecting: return "Connecting…"
-        case .classicalReady: return "Classical channel ready"
-        case .pqcUpgrading: return "Upgrading to PQC…"
-        case .pqcReady: return "PQC ready (hybrid)"
         case .connected: return "Connected (hybrid PQC)"
         case .failed: return "Connection failed"
         case .closed: return "Disconnected"
         case .migrating: return "Migrating — path silent"
+        case .draining: return "Peer closed — draining"
         case .dead: return "Session dead"
         }
     }

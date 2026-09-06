@@ -169,7 +169,7 @@ the network-change recovery path; **Disconnect** for a graceful close.
   stops the service.
 
 The colored banner reflects `session.connectionState()` (polled lock-free):
-amber during the handshake, green when `PQC_READY`/`CONNECTED`, blue while
+amber during the handshake and while draining, green when `CONNECTED`, blue while
 `MIGRATING`, red on `FAILED`/`DEAD`, grey when `CLOSED`. `MIGRATING`/`DEAD` are
 surfaced in the UI and also drive an automatic 0-RTT reconnect.
 

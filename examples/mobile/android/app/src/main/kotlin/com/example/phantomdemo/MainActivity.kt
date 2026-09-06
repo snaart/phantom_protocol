@@ -272,16 +272,16 @@ private fun StateBanner(ui: UiState) {
 }
 
 private fun bannerColor(state: ConnectionState): Color = when (state) {
-    ConnectionState.CONNECTING,
-    ConnectionState.CLASSICAL_READY,
-    ConnectionState.PQC_UPGRADING,
-    -> Color(0xFFB58900) // amber: handshake in progress
+    ConnectionState.CONNECTING -> Color(0xFFB58900) // amber: handshake in progress
 
-    ConnectionState.PQC_READY,
-    ConnectionState.CONNECTED,
-    -> Color(0xFF2E7D32) // green: fully secure
+    ConnectionState.CONNECTED -> Color(0xFF2E7D32) // green: fully secure
 
     ConnectionState.MIGRATING -> Color(0xFF1565C0) // blue: path moving
+
+    // The peer announced its close and the pump is draining what is already in
+    // flight: reads still land, writes are refused. Amber rather than grey,
+    // because the session is ending rather than ended.
+    ConnectionState.DRAINING -> Color(0xFFB58900)
 
     ConnectionState.FAILED,
     ConnectionState.DEAD,
