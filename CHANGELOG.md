@@ -461,6 +461,77 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
     it rather than widening `on_loss` is what keeps the two populations from sharing a
     denominator they do not share.
 
+- **`ResumptionHint` is a `uniffi::Object` rather than a `uniffi::Record`, because as a
+  record it printed the 0-RTT resumption secret.** UniFFI lowers a record into a plain
+  struct in each target language and generates that language's own stringifier for it. The
+  Python one formats every field, so `print(hint)`, an f-string, or
+  `logging.info("%s", hint)` wrote the 32-byte `resumption_secret` — the proof-of-possession
+  input a resuming handshake proves it holds, Security Invariant 9 — into the log in full.
+  The redacting Rust `Debug` on the type never prevented that: UniFFI does not call it, and
+  a comment on that impl used to claim it protected "a mobile/FFI consumer", which it never
+  did. Swift and Kotlin rendered the byte array's identity rather than its contents and did
+  not leak, so this was one language, not four — but it was the language the loopback smoke
+  test is written in.
+
+  The previous release documented the leak. This one removes it: an object crosses the FFI
+  as an opaque handle and gets no field-dumping stringifier in any of the four languages.
+  Checked by running it, not by reading the generator — `str(hint)` now returns
+  `<phantom_protocol.ResumptionHint object at 0x…>`.
+
+  **What a consumer changes.** The constructor survives verbatim in all three high-level
+  languages, because UniFFI treats a constructor named `new` as the *primary* one and gives
+  it a plain `__init__` / `init(sessionId:resumptionSecret:)` / Kotlin primary constructor.
+  What changes is reading the values:
+
+  | | before | after |
+  |---|---|---|
+  | Python | `hint.session_id` | `hint.session_id()` |
+  | Swift | `hint.sessionId` | `hint.sessionId()` |
+  | Kotlin | `hint.sessionId` | `hint.sessionId()` |
+  | Rust | `hint.session_id` | `hint.session_id()` |
+  | C | `PhantomRustBuffer hint` | `void *hint` from `_fn_constructor_resumptionhint_new` |
+
+  Three consequences that are not a rename, and each will surface as a compile error or a
+  leak rather than as a wrong value:
+
+  - **Swift loses `Equatable` and `Hashable`.** The type is now a `class`, not a `struct`:
+    `==`, `XCTAssertEqual` between two hints, and use as a `Set` member or dictionary key
+    stop compiling. Compare the accessor bytes instead.
+  - **Kotlin gains `AutoCloseable`.** Every hint — from `resumptionHint()` or from the
+    constructor — now owns a native allocation with a lifetime the caller can end, which a
+    record had nothing of. Closing it (`hint.use { … }`) releases the Rust-side handle at a
+    point the code chooses; not closing it hands that decision to the JVM, because the
+    generated class registers a `Cleaner` in its constructor. So the cost of forgetting is
+    a handle held until a collection runs, not an unbounded leak — worth stating precisely,
+    since a leak on every harvest would have been a reason to treat the change as urgent
+    rather than as ordinary hygiene.
+  - **C changes the parameter type** of `connect_pinned_with_resumption` and
+    `connect_pinned_udp_with_resumption` from a lowered record to an object handle, and
+    `resumption_hint()`'s future now yields a lowered `Option<handle>`. A parser written
+    against the old two-length-prefixed-buffers shape reads garbage rather than failing, so
+    this one does not announce itself — it is the reason the change is called out here
+    rather than left to the diff. Five new symbols accompany it
+    (`_fn_constructor_resumptionhint_new`, `_fn_method_resumptionhint_session_id`,
+    `_fn_method_resumptionhint_resumption_secret`, `_fn_clone_resumptionhint`,
+    `_fn_free_resumptionhint`), hand-added to the curated header.
+
+  In Rust the fields are private, `ResumptionHint::new` returns `Arc<Self>`, `Clone` and
+  `#[non_exhaustive]` are gone (private fields already prevent the struct literal), and
+  `connect_pinned_with_resumption` / `connect_pinned_udp_with_resumption` /
+  `SessionBuilder::resumption` take `Arc<ResumptionHint>` while
+  `PhantomSession::resumption_hint()` returns `Option<Arc<ResumptionHint>>`.
+
+  **The property is now gated, and the gate was proved by breaking it.** A `--lib` test
+  asserts the type is still declared `uniffi::Object` and that no stringifying trait is
+  exported for it. The form it guards against is `#[uniffi::export(Debug)]` **on the
+  struct** — the one shape that both compiles and regenerates Python's `__repr__`; a test
+  that looked only for `#[uniffi::export]` above `impl Debug` would guard a form that
+  does not compile and therefore needs no gate. Applying the real mutation fails the test
+  with a message naming the consequence; the same string placed inside a `/* */` comment
+  does not, because the check strips block comments as well as line comments. The Python
+  loopback smoke test carries the other half, asserting on the rendered hint itself — the
+  leak lives in a generated file that no Rust test can see.
+
 - **Eight direct dependencies moved a major version, and one of them breaks every
   generated binding.** `base64` 0.22 → 0.23, `lz4_flex` 0.13 → 0.14, `zstd` 0.13 → 0.14,
   `argon2` 0.5 → 0.6, `ed25519-dalek` 2 → 3 and `x25519-dalek` 2 → 3 (which brings

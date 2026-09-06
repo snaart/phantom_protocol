@@ -173,11 +173,23 @@ rotates only when the listener is rebound.
   any later handshake failure, so a corrupted resuming hello cannot burn a
   victim's ticket. `try_resume` survives on the type but is exercised only
   by tests.
-- Client-side: the `(session_id, resumption_secret)` record is surfaced via
-  `PhantomSession::resumption_hint()` for a later
+- Client-side: the `(session_id, resumption_secret)` pair is surfaced via
+  `PhantomSession::resumption_hint() -> Option<Arc<ResumptionHint>>` for a later
   `SessionBuilder::resumption(hint, early_data)` (Rust) or
   `connect_pinned_with_resumption` / `connect_pinned_udp_with_resumption`
-  (FFI).
+  (FFI). `ResumptionHint` is a `uniffi::Object` with private fields and
+  `session_id()` / `resumption_secret()` accessors, **not** a record: UniFFI
+  generates a stringifier for every record in every language, and the Python one
+  printed both fields, so `print(hint)` wrote the 32-byte resumption secret out
+  in full. A Rust caller is covered separately by the type's hand-written
+  redacting `Debug`. Being an object also changes what a `ZeroizeOnDrop` on the
+  type would be worth. A record is lowered by value at the boundary: the Rust
+  struct is a transient that dies as the call returns, and the caller's language
+  holds its own copy of the bytes, which Rust cannot reach — so a wipe on drop
+  there would clear something nobody was reading. An object is the Rust value
+  the caller holds, through a handle, until the last one is released, so a wipe
+  on its drop would clear the copy actually in use. **There is none today**: the
+  client-side secret is not zeroized.
 - The early-data key is derived from the resumption secret via
   `crypto::kdf::derive_early_data_keying` (HKDF-SHA-256). On the wire the
   early-data is folded into `ClientHello.early_data`, and the server reports
@@ -196,6 +208,7 @@ drop; see Security Invariant 9 for the one-shot anti-replay discipline).
 | `HandshakeServer.master_secret` | inline `[u8; 32]` | ✅ derive |
 | `HandshakeClient.nonce` | inline `[u8; 32]` | ✅ derive |
 | `Session.resumption_secret` | `RwLock<Option<[u8; 32]>>` | ✅ manual `impl Drop for Session` (also zeroed on replace in `set_resumption_secret`) |
+| `ResumptionHint` (client-held 0-RTT hint) | heap (`Vec<u8>` ×2, behind an `Arc`) | ❌ — not zeroized. It became a `uniffi::Object` to close an FFI stringifier leak, and that is also what would make a `ZeroizeOnDrop` mean anything: as a record the Rust value was a boundary transient while the caller kept its own copy; as an object it is the copy the caller holds. Nothing is wired to that drop yet. Its `Debug` is redacting, which is a different property. |
 
 ## Storage at rest
 

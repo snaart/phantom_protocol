@@ -103,9 +103,11 @@ server signing key requires a wasm rebuild and redeploy.
 ## Session resumption via IndexedDB
 
 After a session establishes, `PhantomSession::resumption_hint()` returns
-`Option<ResumptionHint>` — a record with 32-byte `session_id` and
-`resumption_secret` fields. Persist it in IndexedDB for 0-RTT resumption
-on subsequent page loads.
+`Option<Arc<ResumptionHint>>` — an object whose `session_id()` and
+`resumption_secret()` accessors each return 32 bytes. It is an object rather
+than a record because UniFFI generates a field-printing stringifier for every
+record, which put the resumption secret one `print` away from a log. Persist the
+two values in IndexedDB for 0-RTT resumption on subsequent page loads.
 
 **Recommended JSON shape** (keyed by server hostname):
 
@@ -118,15 +120,16 @@ on subsequent page loads.
 
 **Resuming.** The native `connect_pinned_with_resumption` shim is
 `cfg(not(wasm32))`; browser builds resume through the type-state builder,
-which takes a `ResumptionHint` (32-byte `session_id` + `resumption_secret`)
-and an early-data `Vec<u8>` (≤ 16 KiB):
+which takes an `Arc<ResumptionHint>` (a 32-byte `session_id` plus a 32-byte
+`resumption_secret`) and an early-data `Vec<u8>` (≤ 16 KiB):
 
 ```rust
 let session = PhantomSession::builder("wss://phantom.example.com")
     .pinned_key(pinned)
     .transport(leg)
     .resumption(
-        // ResumptionHint is #[non_exhaustive] — construct it via `new`.
+        // The fields are private, so `new` is the only way to build one; it
+        // hands back the `Arc<ResumptionHint>` the builder takes.
         ResumptionHint::new(sid.to_vec(), secret.to_vec()),  // 32 bytes each, hex-decoded from IndexedDB
         Vec::new(),           // early_data: Vec<u8>, max 16 KiB
     )

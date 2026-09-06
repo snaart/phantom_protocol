@@ -276,79 +276,115 @@ impl ConnectionState {
 
 /// 0-RTT resumption material extracted from a completed session.
 ///
-/// Produced by [`PhantomSession::resumption_hint`] after a handshake
-/// completes, and fed back into [`connect_pinned_with_resumption`] to
-/// attempt a 0-RTT reconnect to the same server.
+/// Produced by [`PhantomSession::resumption_hint`] after a handshake completes,
+/// and fed back into [`connect_pinned_with_resumption`] (or
+/// [`PhantomSession::builder`] + `.resumption()`) to attempt a 0-RTT reconnect
+/// to the same server.
 ///
-/// Both fields are exactly 32 bytes — this record is the
-/// UniFFI-representable surface for the internal `(session_id,
-/// resumption_secret)` tuple. The fields are `Vec<u8>` because UniFFI
-/// has no fixed-size-array type, so the length is a runtime invariant
-/// checked when the hint is used.
+/// # Why this is an object and not a record
 ///
-/// Store the hint alongside the pinned `HybridVerifyingKey` of the
-/// server it was negotiated against: the `resumption_secret` is
-/// server-pinned, and reusing a hint across servers is a configuration
-/// bug.
+/// UniFFI lowers a record into a plain struct in each target language and
+/// generates that language's own stringifier for it. The Python one formats
+/// every field, so `print(hint)`, an f-string or `logging.info("%s", hint)`
+/// wrote the 32-byte resumption secret out in full — and the redacting Rust
+/// [`Debug`] below never prevented that, because UniFFI does not call it. An
+/// object crosses the FFI as an opaque handle instead: the generated classes
+/// carry no field-dumping `__str__` / `toString()` / `description`, and the
+/// bytes leave only through [`session_id`](Self::session_id) and
+/// [`resumption_secret`](Self::resumption_secret), where the caller asked for
+/// them by name. That removes the leak rather than documenting it.
 ///
-/// **Never log this value.** `resumption_secret` is the proof-of-possession
-/// input a resuming handshake proves it holds, so a copy in a log is a
-/// credential in a log. The warning sits on the type rather than only on the
-/// field because that is what reaches every language: the Python binding
-/// carries type documentation and not field documentation, and Python is the
-/// one binding whose generated record stringifies its fields — `print(hint)`,
-/// an f-string or `logging.info("%s", hint)` writes the secret out in full
-/// there. Swift and Kotlin render the byte array's identity instead and do not
-/// leak it. The Rust `Debug` below redacts the secret, but UniFFI never calls
-/// it.
-#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
-#[derive(Clone)]
-#[non_exhaustive]
+/// Both byte strings are exactly 32 bytes. The length is checked where the hint
+/// is *used* — the `connect_pinned_*_with_resumption` free functions and the
+/// builder's `.resumption()`, each before any I/O — and deliberately not in the
+/// constructor, so a stored blob of the wrong size surfaces as a clean
+/// `CoreError::ValidationError` on the connect path rather than as a failure a
+/// persistence layer has to handle on load.
+///
+/// Store the hint alongside the pinned `HybridVerifyingKey` of the server it
+/// was negotiated against: the resumption secret is server-pinned, and reusing
+/// a hint across servers is a configuration bug.
+#[cfg_attr(feature = "bindings", derive(uniffi::Object))]
 pub struct ResumptionHint {
-    /// The negotiated session id (32 bytes).
-    pub session_id: Vec<u8>,
-    /// The resumption secret (32 bytes) — sensitive; treat like a key.
-    ///
-    /// **Never log this record, and in Python never `print`, `format` or `%s` it.**
-    /// This is the proof-of-possession input a resuming handshake proves it holds
-    /// (Security Invariant 9), so a copy in a log is a credential in a log. The
-    /// Rust `Debug` below redacts it, but that impl is Rust-only: UniFFI never
-    /// calls it, and the generated Python record carries a `__str__` that formats
-    /// both fields, so `print(hint)`, an f-string or `logging.info("%s", hint)`
-    /// writes the secret out in full. Swift and Kotlin render the byte array's
-    /// identity rather than its contents and do not leak it.
-    pub resumption_secret: Vec<u8>,
+    session_id: Vec<u8>,
+    resumption_secret: Vec<u8>,
 }
 
+// The exported surface. `uniffi::export` exports **every** method of the block,
+// so nothing may be added here that should stay Rust-only — the borrowing
+// accessors live in the second, unannotated `impl` below, the same discipline
+// `PhantomSession` uses. **Do not add `Debug` or `Display` to this block:**
+// UniFFI generates `__str__` / `__repr__` from exactly those traits, so
+// exporting either puts back the leak this type became an object to remove.
+#[cfg_attr(feature = "bindings", uniffi::export)]
 impl ResumptionHint {
-    /// Construct a `ResumptionHint` from raw byte vectors.
+    /// Construct a hint from stored bytes.
     ///
-    /// Both `session_id` and `resumption_secret` must be 32 bytes; validation is
-    /// deferred to the caller (the `connect_pinned_*_with_resumption` free functions
-    /// or [`PhantomSession::builder`] + `.resumption()`). The constructor is provided so
-    /// external crates (integration tests, FFI consumers) can build a hint from
-    /// stored bytes without hitting the `#[non_exhaustive]` restriction.
-    pub fn new(session_id: Vec<u8>, resumption_secret: Vec<u8>) -> Self {
-        Self {
+    /// The name `new` is load-bearing. UniFFI treats a constructor called `new`
+    /// as the *primary* one, and only a primary constructor becomes a plain
+    /// Python `__init__`, a Swift `init(sessionId:resumptionSecret:)` and a
+    /// Kotlin primary constructor rather than a static factory. Renaming it
+    /// would silently change the call shape in all three languages.
+    ///
+    /// Returns `Arc<Self>` so a Rust caller keeps the previous one-liner: the
+    /// entry points take `Arc<ResumptionHint>`, so `ResumptionHint::new(sid,
+    /// secret)` still drops straight into the call with no wrapper.
+    #[cfg_attr(feature = "bindings", uniffi::constructor)]
+    pub fn new(session_id: Vec<u8>, resumption_secret: Vec<u8>) -> Arc<Self> {
+        Arc::new(Self {
             session_id,
             resumption_secret,
-        }
+        })
+    }
+
+    /// The negotiated session id (32 bytes).
+    ///
+    /// Not secret on its own — a resuming `ClientHello` carries it in the clear
+    /// as `resume_session_id` — and useless without the secret below, which is
+    /// what a resuming handshake actually proves possession of.
+    pub fn session_id(&self) -> Vec<u8> {
+        self.session_id.clone()
+    }
+
+    /// The resumption secret (32 bytes) — sensitive; treat it like a key.
+    ///
+    /// **Never log this value.** It is the proof-of-possession input a resuming
+    /// handshake proves it holds (Security Invariant 9), so a copy in a log is
+    /// a credential in a log. The warning sits on the accessor because that is
+    /// what reaches every language: UniFFI copies a method's documentation into
+    /// all four bindings, where it carries no record field's.
+    ///
+    /// Persist it the way a private key is persisted — the iOS sample uses the
+    /// Keychain, the Android one `EncryptedSharedPreferences`.
+    pub fn resumption_secret(&self) -> Vec<u8> {
+        self.resumption_secret.clone()
     }
 }
 
-// INFOLEAK-1: hand-written redacting `Debug` (not derived) so a **Rust** caller
-// that logs the hint with `{:?}` cannot leak the 0-RTT `resumption_secret`.
-// Mirrors the REDACTED `Debug` on `HybridSigningKey` / `HybridSecretKey`.
+// Rust-only borrowing accessors, deliberately in a second, unannotated `impl`
+// so they stay off the bindings. The exported pair above returns owned copies
+// because that is what crosses an FFI boundary; the in-crate validation paths
+// read the bytes once and would otherwise clone 32 bytes twice per connect for
+// nothing.
+impl ResumptionHint {
+    pub(crate) fn session_id_ref(&self) -> &[u8] {
+        &self.session_id
+    }
+
+    pub(crate) fn resumption_secret_ref(&self) -> &[u8] {
+        &self.resumption_secret
+    }
+}
+
+// INFOLEAK-1: hand-written redacting `Debug` (not derived), so a **Rust**
+// caller that logs the hint with `{:?}` cannot leak the 0-RTT resumption
+// secret. Mirrors the REDACTED `Debug` on `HybridSigningKey` /
+// `HybridSecretKey`.
 //
-// It does not reach the FFI and protects no mobile/FFI consumer. UniFFI turns
-// this type into a plain record in each target language and generates that
-// language's own stringifier; it never calls this impl. The Python one formats
-// every field, so the secret is one `print` away there. The warning that has to
-// travel is therefore on the field's doc comment, which UniFFI *does* copy into
-// every binding. Removing the leak rather than documenting it means making this
-// a `uniffi::Object` with accessors instead of a record — objects get no
-// field-dumping stringifier — which is an FFI-breaking change to the four
-// `*_with_resumption` entry points, deferred to a release that can take it.
+// It protects Rust callers and nothing else — UniFFI does not call it — and it
+// is deliberately not in the exported block above, because exporting `Debug` is
+// precisely how UniFFI is asked to generate a field-printing `__str__`. The
+// foreign-language half of this problem is solved by the type being an object.
 impl std::fmt::Debug for ResumptionHint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResumptionHint")
@@ -5567,14 +5603,13 @@ impl PhantomSession {
     /// [`connect_pinned_with_resumption`]. Reusing a hint across
     /// servers is a configuration bug — the `resumption_secret` is
     /// server-pinned.
-    pub async fn resumption_hint(&self) -> Option<ResumptionHint> {
+    pub async fn resumption_hint(&self) -> Option<Arc<ResumptionHint>> {
         let guard = self.inner_session.lock().await;
         guard
             .as_ref()
             .and_then(|s| s.resumption_hint())
-            .map(|(session_id, resumption_secret)| ResumptionHint {
-                session_id: session_id.to_vec(),
-                resumption_secret: resumption_secret.to_vec(),
+            .map(|(session_id, resumption_secret)| {
+                ResumptionHint::new(session_id.to_vec(), resumption_secret.to_vec())
             })
     }
 
@@ -6099,7 +6134,7 @@ pub async fn connect_pinned_mimic(
 /// # #[tokio::main]
 /// # async fn main() {
 /// # let pinned_key: Vec<u8> = vec![];
-/// # let hint: phantom_protocol::api::session::ResumptionHint = unimplemented!();
+/// # let hint: std::sync::Arc<phantom_protocol::api::session::ResumptionHint> = unimplemented!();
 /// let session = phantom_protocol::connect_pinned_with_resumption(
 ///     "host".into(), 4242, pinned_key, hint, b"GET /".to_vec(),
 /// )
@@ -6133,7 +6168,7 @@ pub async fn connect_pinned_with_resumption(
     host: String,
     port: u16,
     pinned_key: Vec<u8>,
-    hint: ResumptionHint,
+    hint: Arc<ResumptionHint>,
     early_data: Vec<u8>,
 ) -> Result<Arc<PhantomSession>, CoreError> {
     // fips bootstrap POST gate (same policy as
@@ -6150,19 +6185,18 @@ pub async fn connect_pinned_with_resumption(
     // `ResumptionHint` fields are `Vec<u8>` (UniFFI has no fixed-size
     // array type) — enforce the 32-byte invariant here, before any
     // socket is opened, so a caller bug never becomes a network call.
-    let session_id: [u8; 32] = hint.session_id.as_slice().try_into().map_err(|_| {
+    let session_id: [u8; 32] = hint.session_id_ref().try_into().map_err(|_| {
         CoreError::ValidationError(format!(
             "resumption hint session_id must be 32 bytes, got {}",
-            hint.session_id.len()
+            hint.session_id_ref().len()
         ))
     })?;
-    let resumption_secret: [u8; 32] =
-        hint.resumption_secret.as_slice().try_into().map_err(|_| {
-            CoreError::ValidationError(format!(
-                "resumption hint resumption_secret must be 32 bytes, got {}",
-                hint.resumption_secret.len()
-            ))
-        })?;
+    let resumption_secret: [u8; 32] = hint.resumption_secret_ref().try_into().map_err(|_| {
+        CoreError::ValidationError(format!(
+            "resumption hint resumption_secret must be 32 bytes, got {}",
+            hint.resumption_secret_ref().len()
+        ))
+    })?;
 
     // APIFFI-03: reject oversized early-data BEFORE opening a socket, so a caller
     // bug (or oversized blob) never wastes a TCP connection establishment.
@@ -6342,7 +6376,7 @@ pub async fn connect_pinned_udp_with_config(
 /// # #[tokio::main]
 /// # async fn main() {
 /// # let pinned_key: Vec<u8> = vec![];
-/// # let hint: phantom_protocol::api::session::ResumptionHint = unimplemented!();
+/// # let hint: std::sync::Arc<phantom_protocol::api::session::ResumptionHint> = unimplemented!();
 /// let session = phantom_protocol::connect_pinned_udp_with_resumption(
 ///     "host".into(), 4242, pinned_key, hint, b"GET /".to_vec(),
 /// )
@@ -6372,7 +6406,7 @@ pub async fn connect_pinned_udp_with_resumption(
     host: String,
     port: u16,
     pinned_key: Vec<u8>,
-    hint: ResumptionHint,
+    hint: Arc<ResumptionHint>,
     early_data: Vec<u8>,
 ) -> Result<Arc<PhantomSession>, CoreError> {
     #[cfg(feature = "fips")]
@@ -6382,19 +6416,18 @@ pub async fn connect_pinned_udp_with_resumption(
     let expected_server_key = HybridVerifyingKey::from_bytes(&pinned_key)
         .map_err(|e| CoreError::CryptoError(format!("invalid pinned key: {}", e)))?;
 
-    let session_id: [u8; 32] = hint.session_id.as_slice().try_into().map_err(|_| {
+    let session_id: [u8; 32] = hint.session_id_ref().try_into().map_err(|_| {
         CoreError::ValidationError(format!(
             "resumption hint session_id must be 32 bytes, got {}",
-            hint.session_id.len()
+            hint.session_id_ref().len()
         ))
     })?;
-    let resumption_secret: [u8; 32] =
-        hint.resumption_secret.as_slice().try_into().map_err(|_| {
-            CoreError::ValidationError(format!(
-                "resumption hint resumption_secret must be 32 bytes, got {}",
-                hint.resumption_secret.len()
-            ))
-        })?;
+    let resumption_secret: [u8; 32] = hint.resumption_secret_ref().try_into().map_err(|_| {
+        CoreError::ValidationError(format!(
+            "resumption hint resumption_secret must be 32 bytes, got {}",
+            hint.resumption_secret_ref().len()
+        ))
+    })?;
 
     if early_data.len() > EARLY_DATA_MAX_LEN {
         return Err(CoreError::ValidationError(format!(
@@ -6452,7 +6485,7 @@ pub struct SessionBuilder<T = NoTransport> {
     peer_addr: String,
     transport: Option<T>,
     pinned_key: Option<HybridVerifyingKey>,
-    resumption: Option<(ResumptionHint, Vec<u8>)>,
+    resumption: Option<(Arc<ResumptionHint>, Vec<u8>)>,
     config: Option<crate::config::PhantomConfig>,
     runtime: Option<Arc<dyn Runtime>>,
 }
@@ -6466,9 +6499,10 @@ impl<T> SessionBuilder<T> {
 
     /// Attach a [`ResumptionHint`] for 0-RTT resumption.
     ///
-    /// Both `hint.session_id` and `hint.resumption_secret` must be exactly 32 bytes;
-    /// oversized `early_data` (> [`EARLY_DATA_MAX_LEN`]) is rejected at `.connect()` time.
-    pub fn resumption(mut self, hint: ResumptionHint, early_data: Vec<u8>) -> Self {
+    /// Both values behind the hint — `hint.session_id()` and
+    /// `hint.resumption_secret()` — must be exactly 32 bytes; oversized
+    /// `early_data` (> [`EARLY_DATA_MAX_LEN`]) is rejected at `.connect()` time.
+    pub fn resumption(mut self, hint: Arc<ResumptionHint>, early_data: Vec<u8>) -> Self {
         // Stored raw; the exact-32-byte length is validated at `.connect()` time
         // (matching the strict FFI `connect_pinned_*_with_resumption` path), so a
         // malformed hint is a clean `ValidationError` rather than a silent truncation.
@@ -6539,17 +6573,17 @@ impl<T: SessionTransport> SessionBuilder<T> {
                         EARLY_DATA_MAX_LEN
                     )));
                 }
-                let session_id: [u8; 32] = hint.session_id.as_slice().try_into().map_err(|_| {
+                let session_id: [u8; 32] = hint.session_id_ref().try_into().map_err(|_| {
                     CoreError::ValidationError(format!(
                         "resumption hint session_id must be 32 bytes, got {}",
-                        hint.session_id.len()
+                        hint.session_id_ref().len()
                     ))
                 })?;
                 let resumption_secret: [u8; 32] =
-                    hint.resumption_secret.as_slice().try_into().map_err(|_| {
+                    hint.resumption_secret_ref().try_into().map_err(|_| {
                         CoreError::ValidationError(format!(
                             "resumption hint resumption_secret must be 32 bytes, got {}",
-                            hint.resumption_secret.len()
+                            hint.resumption_secret_ref().len()
                         ))
                     })?;
                 Some((session_id, resumption_secret, early_data))
@@ -6991,14 +7025,17 @@ mod tests {
     }
 
     /// **INFOLEAK-1.** `ResumptionHint`'s `Debug` must redact the 0-RTT
-    /// `resumption_secret` — a mobile/FFI consumer logging it with `{:?}` must
-    /// not leak the key material.
+    /// resumption secret, so a **Rust** caller logging it with `{:?}` does not
+    /// put key material in a log.
+    ///
+    /// This covers Rust callers only, and saying so is the point: UniFFI never
+    /// calls this impl, so it protects no foreign-language consumer. The
+    /// foreign-language half is covered by
+    /// `resumption_hint_is_an_object_so_no_binding_can_stringify_its_fields`
+    /// below, and by the type being a `uniffi::Object` at all.
     #[test]
     fn resumption_hint_debug_redacts_secret() {
-        let hint = ResumptionHint {
-            session_id: vec![0xAB; 32],
-            resumption_secret: vec![0xCD; 32],
-        };
+        let hint = ResumptionHint::new(vec![0xAB; 32], vec![0xCD; 32]);
         let dbg = format!("{hint:?}");
         assert!(dbg.contains("REDACTED"), "secret must be redacted: {dbg}");
         // No representation of the secret bytes (0xCD) leaks — neither hex nor
@@ -7011,6 +7048,103 @@ mod tests {
             !dbg.to_lowercase().contains("cd, cd"),
             "no hex secret bytes: {dbg}"
         );
+    }
+
+    /// The accessors return exactly the bytes the constructor was given, and
+    /// the borrowing pair used on the connect path agrees with the owned pair
+    /// the bindings call.
+    ///
+    /// Trivial as an assertion, and it is here for what it pins rather than
+    /// what it checks: turning `ResumptionHint` from a record into an object
+    /// moved two public fields behind four methods, and a hint whose accessors
+    /// disagreed with its storage would fail as a handshake that cannot
+    /// succeed — a network-level symptom for a data-level bug.
+    #[test]
+    fn resumption_hint_accessors_round_trip_the_bytes_they_were_given() {
+        let sid: Vec<u8> = (0u8..32).collect();
+        let secret: Vec<u8> = (32u8..64).collect();
+        let hint = ResumptionHint::new(sid.clone(), secret.clone());
+
+        assert_eq!(hint.session_id(), sid);
+        assert_eq!(hint.resumption_secret(), secret);
+        assert_eq!(hint.session_id_ref(), sid.as_slice());
+        assert_eq!(hint.resumption_secret_ref(), secret.as_slice());
+    }
+
+    /// The type must stay a `uniffi::Object` with no exported `Debug` or
+    /// `Display`, because that pair is exactly what UniFFI turns into a
+    /// field-printing `__str__`.
+    ///
+    /// **This reads its own source**, which is worth stating plainly: the leak
+    /// it guards lives in generated files under `tests/bindings/`, which no
+    /// Rust test can see. What can be checked from here is the declaration that
+    /// produces them. The check strips block comments as well as line comments
+    /// — a gate in this repository once accepted a call it was meant to reject
+    /// because the text sat inside `/* */`.
+    #[test]
+    fn resumption_hint_is_an_object_so_no_binding_can_stringify_its_fields() {
+        let src = include_str!("session.rs");
+        let decl = src
+            .split("pub struct ResumptionHint {")
+            .next()
+            .expect("the type declaration must be in this file");
+        // Everything from the doc-comment header down to the struct keyword,
+        // with comments removed so prose about records cannot satisfy or fail
+        // this.
+        let tail = &decl[decl.len().saturating_sub(4000)..];
+        let stripped = strip_comments(tail);
+        assert!(
+            stripped.contains("derive(uniffi::Object)"),
+            "ResumptionHint must stay a uniffi::Object: a Record gets a \
+             generated stringifier that prints every field, and the Python one \
+             writes the resumption secret out in full"
+        );
+        assert!(
+            !stripped.contains("derive(uniffi::Record)"),
+            "ResumptionHint must not be a uniffi::Record"
+        );
+
+        // And no stringifying trait is exported for it. The form that matters
+        // is `#[uniffi::export(Debug)]` **on the struct** — UniFFI parses that
+        // attribute's arguments as trait discriminants and generates Python's
+        // `__repr__` from `Debug` and `__str__` from `Display`. Writing
+        // `#[uniffi::export]` above `impl std::fmt::Debug` does not compile, so
+        // it is not the shape to guard against; this one does compile, and an
+        // earlier version of this test looked only for the shape that does not.
+        for trait_name in ["Debug", "Display", "Eq", "Hash", "Ord"] {
+            let bad = format!("uniffi::export({trait_name})");
+            assert!(
+                !stripped.contains(&bad),
+                "`#[uniffi::export({trait_name})]` on ResumptionHint makes UniFFI \
+                 generate a stringifier (or a comparator) from that trait, which \
+                 is what printed the resumption secret when this type was a record"
+            );
+        }
+    }
+
+    /// Strip `//` line comments and `/* */` block comments, so a source-reading
+    /// test cannot be satisfied — or defeated — by prose.
+    fn strip_comments(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let bytes = src.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i..].starts_with(b"//") {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            } else if bytes[i..].starts_with(b"/*") {
+                i += 2;
+                while i < bytes.len() && !bytes[i..].starts_with(b"*/") {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+            } else {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+        out
     }
 
     #[tokio::test]
@@ -12143,10 +12277,8 @@ mod tests {
         let server_hs = HandshakeServer::new().unwrap();
         let pinned = server_hs.verifying_key().to_bytes();
 
-        let bad_hint = ResumptionHint {
-            session_id: vec![0u8; 5], // not 32 bytes
-            resumption_secret: vec![0u8; 32],
-        };
+        // 5 bytes, not 32.
+        let bad_hint = ResumptionHint::new(vec![0u8; 5], vec![0u8; 32]);
 
         let err = connect_pinned_with_resumption(
             "127.0.0.1".to_string(),

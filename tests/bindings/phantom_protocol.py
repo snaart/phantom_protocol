@@ -531,11 +531,11 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_config() != 35502:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption() != 4302:
+    if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption() != 52312:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_config() != 23760:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 33992:
+    if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 25404:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_func_generate_signing_key() != 39294:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -599,7 +599,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_recv() != 6660:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_resumption_hint() != 42828:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_resumption_hint() != 62628:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_send() != 6054:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -609,7 +609,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping() != 60362:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_constructor_phantomsession_connect() != 59507:
+    if lib.uniffi_phantom_protocol_checksum_constructor_phantomsession_connect() != 43760:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 65158:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -642,6 +642,12 @@ def _uniffi_check_api_checksums(lib):
     if lib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp_with_config_bytes() != 45423:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp_with_signing_key_bytes() != 47318:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_protocol_checksum_method_resumptionhint_resumption_secret() != 61611:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_protocol_checksum_method_resumptionhint_session_id() != 23596:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_protocol_checksum_constructor_resumptionhint_new() != 30264:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
 
 # A ctypes library to expose the extern-C FFI definitions.
@@ -849,6 +855,15 @@ _UniffiLib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_
 _UniffiLib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp_with_signing_key_bytes.argtypes = (
 )
 _UniffiLib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp_with_signing_key_bytes.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_resumptionhint_resumption_secret.argtypes = (
+)
+_UniffiLib.uniffi_phantom_protocol_checksum_method_resumptionhint_resumption_secret.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_resumptionhint_session_id.argtypes = (
+)
+_UniffiLib.uniffi_phantom_protocol_checksum_method_resumptionhint_session_id.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_constructor_resumptionhint_new.argtypes = (
+)
+_UniffiLib.uniffi_phantom_protocol_checksum_constructor_resumptionhint_new.restype = ctypes.c_uint16
 _UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned.argtypes = (
     _UniffiRustBuffer,
     ctypes.c_uint16,
@@ -872,7 +887,7 @@ _UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_resumption.ar
     _UniffiRustBuffer,
     ctypes.c_uint16,
     _UniffiRustBuffer,
-    _UniffiRustBuffer,
+    ctypes.c_uint64,
     _UniffiRustBuffer,
 )
 _UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_resumption.restype = ctypes.c_uint64
@@ -887,7 +902,7 @@ _UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_with_resumption.argtyp
     _UniffiRustBuffer,
     ctypes.c_uint16,
     _UniffiRustBuffer,
-    _UniffiRustBuffer,
+    ctypes.c_uint64,
     _UniffiRustBuffer,
 )
 _UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_with_resumption.restype = ctypes.c_uint64
@@ -1143,6 +1158,22 @@ _UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp_wi
     _UniffiRustBuffer,
 )
 _UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp_with_signing_key_bytes.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_method_resumptionhint_resumption_secret.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_protocol_fn_method_resumptionhint_resumption_secret.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_phantom_protocol_fn_method_resumptionhint_session_id.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_protocol_fn_method_resumptionhint_session_id.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_phantom_protocol_fn_constructor_resumptionhint_new.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_protocol_fn_constructor_resumptionhint_new.restype = ctypes.c_uint64
 _UniffiLib.uniffi_phantom_protocol_fn_clone_acceptoutcome.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -1193,6 +1224,16 @@ _UniffiLib.uniffi_phantom_protocol_fn_free_phantomudplistener.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_phantom_protocol_fn_free_phantomudplistener.restype = None
+_UniffiLib.uniffi_phantom_protocol_fn_clone_resumptionhint.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_protocol_fn_clone_resumptionhint.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_free_resumptionhint.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_protocol_fn_free_resumptionhint.restype = None
 _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK = ctypes.CFUNCTYPE(None,ctypes.c_uint64,ctypes.c_int8,
 )
 _UniffiLib.ffi_phantom_protocol_rust_future_poll_u8.argtypes = (
@@ -1816,91 +1857,6 @@ class _UniffiFfiConverterTypePhantomConfig(_UniffiConverterRustBuffer):
         _UniffiFfiConverterDuration.write(value.session_timeout, buf)
         _UniffiFfiConverterUInt32.write(value.session_cache_capacity, buf)
         _UniffiFfiConverterDuration.write(value.session_ticket_lifetime, buf)
-
-class _UniffiFfiConverterBytes(_UniffiConverterRustBuffer):
-    @staticmethod
-    def read(buf):
-        size = buf.read_i32()
-        if size < 0:
-            raise InternalError("Unexpected negative byte string length")
-        return buf.read(size)
-
-    @staticmethod
-    def check_lower(value):
-        try:
-            memoryview(value)
-        except TypeError:
-            raise TypeError("a bytes-like object is required, not {!r}".format(type(value).__name__))
-
-    @staticmethod
-    def write(value, buf):
-        buf.write_i32(len(value))
-        buf.write(value)
-
-@dataclass
-class ResumptionHint:
-    """
-    0-RTT resumption material extracted from a completed session.
-
-    Produced by [`PhantomSession::resumption_hint`] after a handshake
-    completes, and fed back into [`connect_pinned_with_resumption`] to
-    attempt a 0-RTT reconnect to the same server.
-
-    Both fields are exactly 32 bytes — this record is the
-    UniFFI-representable surface for the internal `(session_id,
-    resumption_secret)` tuple. The fields are `Vec<u8>` because UniFFI
-    has no fixed-size-array type, so the length is a runtime invariant
-    checked when the hint is used.
-
-    Store the hint alongside the pinned `HybridVerifyingKey` of the
-    server it was negotiated against: the `resumption_secret` is
-    server-pinned, and reusing a hint across servers is a configuration
-    bug.
-
-    **Never log this value.** `resumption_secret` is the proof-of-possession
-    input a resuming handshake proves it holds, so a copy in a log is a
-    credential in a log. The warning sits on the type rather than only on the
-    field because that is what reaches every language: the Python binding
-    carries type documentation and not field documentation, and Python is the
-    one binding whose generated record stringifies its fields — `print(hint)`,
-    an f-string or `logging.info("%s", hint)` writes the secret out in full
-    there. Swift and Kotlin render the byte array's identity instead and do not
-    leak it. The Rust `Debug` below redacts the secret, but UniFFI never calls
-    it.
-"""
-    def __init__(self, *, session_id:bytes, resumption_secret:bytes):
-        self.session_id = session_id
-        self.resumption_secret = resumption_secret
-        
-        
-
-    
-    def __str__(self):
-        return "ResumptionHint(session_id={}, resumption_secret={})".format(self.session_id, self.resumption_secret)
-    def __eq__(self, other):
-        if self.session_id != other.session_id:
-            return False
-        if self.resumption_secret != other.resumption_secret:
-            return False
-        return True
-
-class _UniffiFfiConverterTypeResumptionHint(_UniffiConverterRustBuffer):
-    @staticmethod
-    def read(buf):
-        return ResumptionHint(
-            session_id=_UniffiFfiConverterBytes.read(buf),
-            resumption_secret=_UniffiFfiConverterBytes.read(buf),
-        )
-
-    @staticmethod
-    def check_lower(value):
-        _UniffiFfiConverterBytes.check_lower(value.session_id)
-        _UniffiFfiConverterBytes.check_lower(value.resumption_secret)
-
-    @staticmethod
-    def write(value, buf):
-        _UniffiFfiConverterBytes.write(value.session_id, buf)
-        _UniffiFfiConverterBytes.write(value.resumption_secret, buf)
 
 
 
@@ -2709,6 +2665,26 @@ class _UniffiFfiConverterBoolean:
     def write(cls, value, buf):
         buf.write_u8(value)
 
+class _UniffiFfiConverterBytes(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        size = buf.read_i32()
+        if size < 0:
+            raise InternalError("Unexpected negative byte string length")
+        return buf.read(size)
+
+    @staticmethod
+    def check_lower(value):
+        try:
+            memoryview(value)
+        except TypeError:
+            raise TypeError("a bytes-like object is required, not {!r}".format(type(value).__name__))
+
+    @staticmethod
+    def write(value, buf):
+        buf.write_i32(len(value))
+        buf.write(value)
+
 class _UniffiFfiConverterOptionalBytes(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, value):
@@ -3114,6 +3090,221 @@ class _UniffiFfiConverterOptionalTypeCoreError(_UniffiConverterRustBuffer):
             return _UniffiFfiConverterTypeCoreError.read(buf)
         else:
             raise InternalError("Unexpected flag byte for optional type")
+
+
+class ResumptionHintProtocol(typing.Protocol):
+    """
+    0-RTT resumption material extracted from a completed session.
+
+    Produced by [`PhantomSession::resumption_hint`] after a handshake completes,
+    and fed back into [`connect_pinned_with_resumption`] (or
+    [`PhantomSession::builder`] + `.resumption()`) to attempt a 0-RTT reconnect
+    to the same server.
+
+    # Why this is an object and not a record
+
+    UniFFI lowers a record into a plain struct in each target language and
+    generates that language's own stringifier for it. The Python one formats
+    every field, so `print(hint)`, an f-string or `logging.info("%s", hint)`
+    wrote the 32-byte resumption secret out in full — and the redacting Rust
+    [`Debug`] below never prevented that, because UniFFI does not call it. An
+    object crosses the FFI as an opaque handle instead: the generated classes
+    carry no field-dumping `__str__` / `toString()` / `description`, and the
+    bytes leave only through [`session_id`](Self::session_id) and
+    [`resumption_secret`](Self::resumption_secret), where the caller asked for
+    them by name. That removes the leak rather than documenting it.
+
+    Both byte strings are exactly 32 bytes. The length is checked where the hint
+    is *used* — the `connect_pinned_*_with_resumption` free functions and the
+    builder's `.resumption()`, each before any I/O — and deliberately not in the
+    constructor, so a stored blob of the wrong size surfaces as a clean
+    `CoreError::ValidationError` on the connect path rather than as a failure a
+    persistence layer has to handle on load.
+
+    Store the hint alongside the pinned `HybridVerifyingKey` of the server it
+    was negotiated against: the resumption secret is server-pinned, and reusing
+    a hint across servers is a configuration bug.
+"""
+    
+    def resumption_secret(self, ) -> bytes:
+        """
+        The resumption secret (32 bytes) — sensitive; treat it like a key.
+
+        **Never log this value.** It is the proof-of-possession input a resuming
+        handshake proves it holds (Security Invariant 9), so a copy in a log is
+        a credential in a log. The warning sits on the accessor because that is
+        what reaches every language: UniFFI copies a method's documentation into
+        all four bindings, where it carries no record field's.
+
+        Persist it the way a private key is persisted — the iOS sample uses the
+        Keychain, the Android one `EncryptedSharedPreferences`.
+"""
+        raise NotImplementedError
+    def session_id(self, ) -> bytes:
+        """
+        The negotiated session id (32 bytes).
+
+        Not secret on its own — a resuming `ClientHello` carries it in the clear
+        as `resume_session_id` — and useless without the secret below, which is
+        what a resuming handshake actually proves possession of.
+"""
+        raise NotImplementedError
+
+class ResumptionHint(ResumptionHintProtocol):
+    """
+    0-RTT resumption material extracted from a completed session.
+
+    Produced by [`PhantomSession::resumption_hint`] after a handshake completes,
+    and fed back into [`connect_pinned_with_resumption`] (or
+    [`PhantomSession::builder`] + `.resumption()`) to attempt a 0-RTT reconnect
+    to the same server.
+
+    # Why this is an object and not a record
+
+    UniFFI lowers a record into a plain struct in each target language and
+    generates that language's own stringifier for it. The Python one formats
+    every field, so `print(hint)`, an f-string or `logging.info("%s", hint)`
+    wrote the 32-byte resumption secret out in full — and the redacting Rust
+    [`Debug`] below never prevented that, because UniFFI does not call it. An
+    object crosses the FFI as an opaque handle instead: the generated classes
+    carry no field-dumping `__str__` / `toString()` / `description`, and the
+    bytes leave only through [`session_id`](Self::session_id) and
+    [`resumption_secret`](Self::resumption_secret), where the caller asked for
+    them by name. That removes the leak rather than documenting it.
+
+    Both byte strings are exactly 32 bytes. The length is checked where the hint
+    is *used* — the `connect_pinned_*_with_resumption` free functions and the
+    builder's `.resumption()`, each before any I/O — and deliberately not in the
+    constructor, so a stored blob of the wrong size surfaces as a clean
+    `CoreError::ValidationError` on the connect path rather than as a failure a
+    persistence layer has to handle on load.
+
+    Store the hint alongside the pinned `HybridVerifyingKey` of the server it
+    was negotiated against: the resumption secret is server-pinned, and reusing
+    a hint across servers is a configuration bug.
+"""
+    
+    _handle: ctypes.c_uint64
+    def __init__(self, session_id: bytes,resumption_secret: bytes):
+        """
+        Construct a hint from stored bytes.
+
+        The name `new` is load-bearing. UniFFI treats a constructor called `new`
+        as the *primary* one, and only a primary constructor becomes a plain
+        Python `__init__`, a Swift `init(sessionId:resumptionSecret:)` and a
+        Kotlin primary constructor rather than a static factory. Renaming it
+        would silently change the call shape in all three languages.
+
+        Returns `Arc<Self>` so a Rust caller keeps the previous one-liner: the
+        entry points take `Arc<ResumptionHint>`, so `ResumptionHint::new(sid,
+        secret)` still drops straight into the call with no wrapper.
+"""
+        
+        _UniffiFfiConverterBytes.check_lower(session_id)
+
+        _UniffiFfiConverterBytes.check_lower(resumption_secret)
+        _uniffi_lowered_args = (
+            _UniffiFfiConverterBytes.lower(session_id),
+            _UniffiFfiConverterBytes.lower(resumption_secret),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeResumptionHint.lift
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_phantom_protocol_fn_constructor_resumptionhint_new,
+            *_uniffi_lowered_args,
+        )
+        self._handle = _uniffi_ffi_result
+
+    def __del__(self):
+        # In case of partial initialization of instances.
+        handle = getattr(self, "_handle", None)
+        if handle is not None:
+            _uniffi_rust_call(_UniffiLib.uniffi_phantom_protocol_fn_free_resumptionhint, handle)
+
+    def _uniffi_clone_handle(self):
+        return _uniffi_rust_call(_UniffiLib.uniffi_phantom_protocol_fn_clone_resumptionhint, self._handle)
+
+    # Used by alternative constructors or any methods which return this type.
+    @classmethod
+    def _uniffi_make_instance(cls, handle):
+        # Lightly yucky way to bypass the usual __init__ logic
+        # and just create a new instance with the required handle.
+        inst = cls.__new__(cls)
+        inst._handle = handle
+        return inst
+    def resumption_secret(self, ) -> bytes:
+        """
+        The resumption secret (32 bytes) — sensitive; treat it like a key.
+
+        **Never log this value.** It is the proof-of-possession input a resuming
+        handshake proves it holds (Security Invariant 9), so a copy in a log is
+        a credential in a log. The warning sits on the accessor because that is
+        what reaches every language: UniFFI copies a method's documentation into
+        all four bindings, where it carries no record field's.
+
+        Persist it the way a private key is persisted — the iOS sample uses the
+        Keychain, the Android one `EncryptedSharedPreferences`.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterBytes.lift
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_resumptionhint_resumption_secret,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def session_id(self, ) -> bytes:
+        """
+        The negotiated session id (32 bytes).
+
+        Not secret on its own — a resuming `ClientHello` carries it in the clear
+        as `resume_session_id` — and useless without the secret below, which is
+        what a resuming handshake actually proves possession of.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterBytes.lift
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_resumptionhint_session_id,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+
+
+
+
+
+class _UniffiFfiConverterTypeResumptionHint:
+    @staticmethod
+    def lift(value: int) -> ResumptionHint:
+        return ResumptionHint._uniffi_make_instance(value)
+
+    @staticmethod
+    def check_lower(value: ResumptionHint):
+        if not isinstance(value, ResumptionHint):
+            raise TypeError("Expected ResumptionHint instance, {} found".format(type(value).__name__))
+
+    @staticmethod
+    def lower(value: ResumptionHint) -> ctypes.c_uint64:
+        return value._uniffi_clone_handle()
+
+    @classmethod
+    def read(cls, buf: _UniffiRustBuffer) -> ResumptionHint:
+        ptr = buf.read_u64()
+        if ptr == 0:
+            raise InternalError("Raw handle value was null")
+        return cls.lift(ptr)
+
+    @classmethod
+    def write(cls, value: ResumptionHint, buf: _UniffiRustBuffer):
+        buf.write_u64(cls.lower(value))
 
 class _UniffiFfiConverterOptionalTypeResumptionHint(_UniffiConverterRustBuffer):
     @classmethod
@@ -3643,7 +3834,7 @@ class PhantomSession(PhantomSessionProtocol):
 
         A `#[deprecated]` attribute would be the natural way to flag this, but it
         **cannot** be applied here: this constructor is `#[uniffi::constructor]`,
-        and UniFFI 0.31 emits FFI scaffolding that calls `Self::connect()` from
+        and UniFFI 0.32 emits FFI scaffolding that calls `Self::connect()` from
         generated code in this same crate. That generated call would trip the
         `deprecated` lint, which CI promotes to a hard error under
         `clippy --lib -D warnings` — and no item-scoped `#[allow(deprecated)]`
@@ -5494,7 +5685,7 @@ async def connect_pinned_udp_with_resumption(host: str,port: int,pinned_key: byt
     # #[tokio::main]
     # async fn main() {
     # let pinned_key: Vec<u8> = vec![];
-    # let hint: phantom_protocol::api::session::ResumptionHint = unimplemented!();
+    # let hint: std::sync::Arc<phantom_protocol::api::session::ResumptionHint> = unimplemented!();
     let session = phantom_protocol::connect_pinned_udp_with_resumption(
     "host".into(), 4242, pinned_key, hint, b"GET /".to_vec(),
     )
@@ -5613,7 +5804,7 @@ async def connect_pinned_with_resumption(host: str,port: int,pinned_key: bytes,h
     # #[tokio::main]
     # async fn main() {
     # let pinned_key: Vec<u8> = vec![];
-    # let hint: phantom_protocol::api::session::ResumptionHint = unimplemented!();
+    # let hint: std::sync::Arc<phantom_protocol::api::session::ResumptionHint> = unimplemented!();
     let session = phantom_protocol::connect_pinned_with_resumption(
     "host".into(), 4242, pinned_key, hint, b"GET /".to_vec(),
     )
@@ -5721,7 +5912,6 @@ __all__ = [
     "CoreError",
     "MetricsSnapshotFfi",
     "PhantomConfig",
-    "ResumptionHint",
     "TrafficShapingConfig",
     "connect_pinned",
     "connect_pinned_udp",
@@ -5733,6 +5923,8 @@ __all__ = [
     "verifying_key_from_signing_key",
     "PhantomStream",
     "PhantomStreamProtocol",
+    "ResumptionHint",
+    "ResumptionHintProtocol",
     "PhantomSession",
     "PhantomSessionProtocol",
     "AcceptOutcome",

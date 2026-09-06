@@ -62,7 +62,13 @@ final class PhantomDemoKitTests: XCTestCase {
         let blob = try KeychainStore.encode(hint, createdAt: created)
         let (decoded, decodedDate) = try KeychainStore.decode(blob)
 
-        XCTAssertEqual(decoded, hint)
+        // `ResumptionHint` is a UniFFI object, so it is a reference type and
+        // carries no `Equatable`: `XCTAssertEqual(decoded, hint)` would not
+        // compile, and a reference comparison would be the wrong question
+        // anyway — what this test is about is that the bytes survive the round
+        // trip. Compare the two fields the accessors hand back.
+        XCTAssertEqual(decoded.sessionId(), hint.sessionId())
+        XCTAssertEqual(decoded.resumptionSecret(), hint.resumptionSecret())
         XCTAssertEqual(decodedDate.timeIntervalSince1970, created.timeIntervalSince1970, accuracy: 0.001)
     }
 

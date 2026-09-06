@@ -221,7 +221,12 @@ This sample app was built on the **TCP** path, so it demonstrates the
 **reconnect-with-0-RTT resumption** recovery pattern:
 
 1. While connected, the app harvests a fresh `ResumptionHint`
-   (`session.resumptionHint()`) and persists it to the Keychain.
+   (`session.resumptionHint()`) and persists it to the Keychain. The hint is an
+   FFI object, not a struct: its two 32-byte fields come out through
+   `sessionId()` / `resumptionSecret()` — which is what removed the generated
+   stringifier that used to print the resumption secret — and it is a reference
+   type with no `Equatable`, so tests compare the accessor bytes rather than the
+   hints themselves. ARC frees the handle; there is nothing to close by hand.
 2. On a network change (`NetworkPathMonitor`) — or when the poller/recv-loop
    observes `.migrating` / `.dead` — the app harvests one more hint, tears the
    old session down, and calls `connect()` again.

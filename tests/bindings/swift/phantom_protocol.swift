@@ -1798,7 +1798,7 @@ open class PhantomSession: PhantomSessionProtocol, @unchecked Sendable {
      *
      * A `#[deprecated]` attribute would be the natural way to flag this, but it
      * **cannot** be applied here: this constructor is `#[uniffi::constructor]`,
-     * and UniFFI 0.31 emits FFI scaffolding that calls `Self::connect()` from
+     * and UniFFI 0.32 emits FFI scaffolding that calls `Self::connect()` from
      * generated code in this same crate. That generated call would trip the
      * `deprecated` lint, which CI promotes to a hard error under
      * `clippy --lib -D warnings` — and no item-scoped `#[allow(deprecated)]`
@@ -3202,6 +3202,259 @@ public func FfiConverterTypePhantomUdpListener_lower(_ value: PhantomUdpListener
 
 
 
+
+
+/**
+ * 0-RTT resumption material extracted from a completed session.
+ *
+ * Produced by [`PhantomSession::resumption_hint`] after a handshake completes,
+ * and fed back into [`connect_pinned_with_resumption`] (or
+ * [`PhantomSession::builder`] + `.resumption()`) to attempt a 0-RTT reconnect
+ * to the same server.
+ *
+ * # Why this is an object and not a record
+ *
+ * UniFFI lowers a record into a plain struct in each target language and
+ * generates that language's own stringifier for it. The Python one formats
+ * every field, so `print(hint)`, an f-string or `logging.info("%s", hint)`
+ * wrote the 32-byte resumption secret out in full — and the redacting Rust
+ * [`Debug`] below never prevented that, because UniFFI does not call it. An
+ * object crosses the FFI as an opaque handle instead: the generated classes
+ * carry no field-dumping `__str__` / `toString()` / `description`, and the
+ * bytes leave only through [`session_id`](Self::session_id) and
+ * [`resumption_secret`](Self::resumption_secret), where the caller asked for
+ * them by name. That removes the leak rather than documenting it.
+ *
+ * Both byte strings are exactly 32 bytes. The length is checked where the hint
+ * is *used* — the `connect_pinned_*_with_resumption` free functions and the
+ * builder's `.resumption()`, each before any I/O — and deliberately not in the
+ * constructor, so a stored blob of the wrong size surfaces as a clean
+ * `CoreError::ValidationError` on the connect path rather than as a failure a
+ * persistence layer has to handle on load.
+ *
+ * Store the hint alongside the pinned `HybridVerifyingKey` of the server it
+ * was negotiated against: the resumption secret is server-pinned, and reusing
+ * a hint across servers is a configuration bug.
+ */
+public protocol ResumptionHintProtocol: AnyObject, Sendable {
+    
+    /**
+     * The resumption secret (32 bytes) — sensitive; treat it like a key.
+     *
+     * **Never log this value.** It is the proof-of-possession input a resuming
+     * handshake proves it holds (Security Invariant 9), so a copy in a log is
+     * a credential in a log. The warning sits on the accessor because that is
+     * what reaches every language: UniFFI copies a method's documentation into
+     * all four bindings, where it carries no record field's.
+     *
+     * Persist it the way a private key is persisted — the iOS sample uses the
+     * Keychain, the Android one `EncryptedSharedPreferences`.
+     */
+    func resumptionSecret()  -> Data
+    
+    /**
+     * The negotiated session id (32 bytes).
+     *
+     * Not secret on its own — a resuming `ClientHello` carries it in the clear
+     * as `resume_session_id` — and useless without the secret below, which is
+     * what a resuming handshake actually proves possession of.
+     */
+    func sessionId()  -> Data
+    
+}
+/**
+ * 0-RTT resumption material extracted from a completed session.
+ *
+ * Produced by [`PhantomSession::resumption_hint`] after a handshake completes,
+ * and fed back into [`connect_pinned_with_resumption`] (or
+ * [`PhantomSession::builder`] + `.resumption()`) to attempt a 0-RTT reconnect
+ * to the same server.
+ *
+ * # Why this is an object and not a record
+ *
+ * UniFFI lowers a record into a plain struct in each target language and
+ * generates that language's own stringifier for it. The Python one formats
+ * every field, so `print(hint)`, an f-string or `logging.info("%s", hint)`
+ * wrote the 32-byte resumption secret out in full — and the redacting Rust
+ * [`Debug`] below never prevented that, because UniFFI does not call it. An
+ * object crosses the FFI as an opaque handle instead: the generated classes
+ * carry no field-dumping `__str__` / `toString()` / `description`, and the
+ * bytes leave only through [`session_id`](Self::session_id) and
+ * [`resumption_secret`](Self::resumption_secret), where the caller asked for
+ * them by name. That removes the leak rather than documenting it.
+ *
+ * Both byte strings are exactly 32 bytes. The length is checked where the hint
+ * is *used* — the `connect_pinned_*_with_resumption` free functions and the
+ * builder's `.resumption()`, each before any I/O — and deliberately not in the
+ * constructor, so a stored blob of the wrong size surfaces as a clean
+ * `CoreError::ValidationError` on the connect path rather than as a failure a
+ * persistence layer has to handle on load.
+ *
+ * Store the hint alongside the pinned `HybridVerifyingKey` of the server it
+ * was negotiated against: the resumption secret is server-pinned, and reusing
+ * a hint across servers is a configuration bug.
+ */
+open class ResumptionHint: ResumptionHintProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_phantom_protocol_fn_clone_resumptionhint(self.handle, $0) }
+    }
+    /**
+     * Construct a hint from stored bytes.
+     *
+     * The name `new` is load-bearing. UniFFI treats a constructor called `new`
+     * as the *primary* one, and only a primary constructor becomes a plain
+     * Python `__init__`, a Swift `init(sessionId:resumptionSecret:)` and a
+     * Kotlin primary constructor rather than a static factory. Renaming it
+     * would silently change the call shape in all three languages.
+     *
+     * Returns `Arc<Self>` so a Rust caller keeps the previous one-liner: the
+     * entry points take `Arc<ResumptionHint>`, so `ResumptionHint::new(sid,
+     * secret)` still drops straight into the call with no wrapper.
+     */
+public convenience init(sessionId: Data, resumptionSecret: Data) {
+    let handle =
+        try! rustCall() {
+        uniffiCallStatus in
+    uniffi_phantom_protocol_fn_constructor_resumptionhint_new(
+        FfiConverterData.lower(sessionId),
+        FfiConverterData.lower(resumptionSecret),uniffiCallStatus
+    )
+}
+    self.init(unsafeFromHandle: handle)
+}
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_phantom_protocol_fn_free_resumptionhint(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * The resumption secret (32 bytes) — sensitive; treat it like a key.
+     *
+     * **Never log this value.** It is the proof-of-possession input a resuming
+     * handshake proves it holds (Security Invariant 9), so a copy in a log is
+     * a credential in a log. The warning sits on the accessor because that is
+     * what reaches every language: UniFFI copies a method's documentation into
+     * all four bindings, where it carries no record field's.
+     *
+     * Persist it the way a private key is persisted — the iOS sample uses the
+     * Keychain, the Android one `EncryptedSharedPreferences`.
+     */
+open func resumptionSecret() -> Data  {
+    return try!  FfiConverterData.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_phantom_protocol_fn_method_resumptionhint_resumption_secret(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * The negotiated session id (32 bytes).
+     *
+     * Not secret on its own — a resuming `ClientHello` carries it in the clear
+     * as `resume_session_id` — and useless without the secret below, which is
+     * what a resuming handshake actually proves possession of.
+     */
+open func sessionId() -> Data  {
+    return try!  FfiConverterData.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_phantom_protocol_fn_method_resumptionhint_session_id(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeResumptionHint: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = ResumptionHint
+
+    public static func lift(_ handle: UInt64) throws -> ResumptionHint {
+        return ResumptionHint(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: ResumptionHint) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ResumptionHint {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: ResumptionHint, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeResumptionHint_lift(_ handle: UInt64) throws -> ResumptionHint {
+    return try FfiConverterTypeResumptionHint.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeResumptionHint_lower(_ value: ResumptionHint) -> UInt64 {
+    return FfiConverterTypeResumptionHint.lower(value)
+}
+
+
+
+
 /**
  * Flat, UniFFI-representable subset of [`MetricsSnapshot`].
  *
@@ -3743,119 +3996,6 @@ public func FfiConverterTypePhantomConfig_lift(_ buf: RustBuffer) throws -> Phan
 #endif
 public func FfiConverterTypePhantomConfig_lower(_ value: PhantomConfig) -> RustBuffer {
     return FfiConverterTypePhantomConfig.lower(value)
-}
-
-
-/**
- * 0-RTT resumption material extracted from a completed session.
- *
- * Produced by [`PhantomSession::resumption_hint`] after a handshake
- * completes, and fed back into [`connect_pinned_with_resumption`] to
- * attempt a 0-RTT reconnect to the same server.
- *
- * Both fields are exactly 32 bytes — this record is the
- * UniFFI-representable surface for the internal `(session_id,
- * resumption_secret)` tuple. The fields are `Vec<u8>` because UniFFI
- * has no fixed-size-array type, so the length is a runtime invariant
- * checked when the hint is used.
- *
- * Store the hint alongside the pinned `HybridVerifyingKey` of the
- * server it was negotiated against: the `resumption_secret` is
- * server-pinned, and reusing a hint across servers is a configuration
- * bug.
- *
- * **Never log this value.** `resumption_secret` is the proof-of-possession
- * input a resuming handshake proves it holds, so a copy in a log is a
- * credential in a log. The warning sits on the type rather than only on the
- * field because that is what reaches every language: the Python binding
- * carries type documentation and not field documentation, and Python is the
- * one binding whose generated record stringifies its fields — `print(hint)`,
- * an f-string or `logging.info("%s", hint)` writes the secret out in full
- * there. Swift and Kotlin render the byte array's identity instead and do not
- * leak it. The Rust `Debug` below redacts the secret, but UniFFI never calls
- * it.
- */
-public struct ResumptionHint: Equatable, Hashable {
-    /**
-     * The negotiated session id (32 bytes).
-     */
-    public var sessionId: Data
-    /**
-     * The resumption secret (32 bytes) — sensitive; treat like a key.
-     *
-     * **Never log this record, and in Python never `print`, `format` or `%s` it.**
-     * This is the proof-of-possession input a resuming handshake proves it holds
-     * (Security Invariant 9), so a copy in a log is a credential in a log. The
-     * Rust `Debug` below redacts it, but that impl is Rust-only: UniFFI never
-     * calls it, and the generated Python record carries a `__str__` that formats
-     * both fields, so `print(hint)`, an f-string or `logging.info("%s", hint)`
-     * writes the secret out in full. Swift and Kotlin render the byte array's
-     * identity rather than its contents and do not leak it.
-     */
-    public var resumptionSecret: Data
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(
-        /**
-         * The negotiated session id (32 bytes).
-         */sessionId: Data, 
-        /**
-         * The resumption secret (32 bytes) — sensitive; treat like a key.
-         *
-         * **Never log this record, and in Python never `print`, `format` or `%s` it.**
-         * This is the proof-of-possession input a resuming handshake proves it holds
-         * (Security Invariant 9), so a copy in a log is a credential in a log. The
-         * Rust `Debug` below redacts it, but that impl is Rust-only: UniFFI never
-         * calls it, and the generated Python record carries a `__str__` that formats
-         * both fields, so `print(hint)`, an f-string or `logging.info("%s", hint)`
-         * writes the secret out in full. Swift and Kotlin render the byte array's
-         * identity rather than its contents and do not leak it.
-         */resumptionSecret: Data) {
-        self.sessionId = sessionId
-        self.resumptionSecret = resumptionSecret
-    }
-
-    
-
-    
-}
-
-#if compiler(>=6)
-extension ResumptionHint: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeResumptionHint: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ResumptionHint {
-        return
-            try ResumptionHint(
-                sessionId: FfiConverterData.read(from: &buf), 
-                resumptionSecret: FfiConverterData.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: ResumptionHint, into buf: inout [UInt8]) {
-        FfiConverterData.write(value.sessionId, into: &buf)
-        FfiConverterData.write(value.resumptionSecret, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeResumptionHint_lift(_ buf: RustBuffer) throws -> ResumptionHint {
-    return try FfiConverterTypeResumptionHint.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeResumptionHint_lower(_ value: ResumptionHint) -> RustBuffer {
-    return FfiConverterTypeResumptionHint.lower(value)
 }
 
 
@@ -4882,7 +5022,7 @@ public func connectPinnedUdpWithConfig(host: String, port: UInt16, pinnedKey: Da
  * # #[tokio::main]
  * # async fn main() {
  * # let pinned_key: Vec<u8> = vec![];
- * # let hint: phantom_protocol::api::session::ResumptionHint = unimplemented!();
+ * # let hint: std::sync::Arc<phantom_protocol::api::session::ResumptionHint> = unimplemented!();
  * let session = phantom_protocol::connect_pinned_udp_with_resumption(
  * "host".into(), 4242, pinned_key, hint, b"GET /".to_vec(),
  * )
@@ -4976,7 +5116,7 @@ public func connectPinnedWithConfig(host: String, port: UInt16, pinnedKey: Data,
  * # #[tokio::main]
  * # async fn main() {
  * # let pinned_key: Vec<u8> = vec![];
- * # let hint: phantom_protocol::api::session::ResumptionHint = unimplemented!();
+ * # let hint: std::sync::Arc<phantom_protocol::api::session::ResumptionHint> = unimplemented!();
  * let session = phantom_protocol::connect_pinned_with_resumption(
  * "host".into(), 4242, pinned_key, hint, b"GET /".to_vec(),
  * )
@@ -5050,13 +5190,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_config() != 35502) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption() != 4302) {
+    if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption() != 52312) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_func_connect_pinned_with_config() != 23760) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 33992) {
+    if (uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 25404) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_acceptoutcome_has_early_data() != 35020) {
@@ -5137,7 +5277,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_method_phantomsession_recv() != 6660) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_resumption_hint() != 42828) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_resumption_hint() != 62628) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomsession_send() != 6054) {
@@ -5150,6 +5290,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping() != 60362) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_phantom_protocol_checksum_method_resumptionhint_resumption_secret() != 61611) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_phantom_protocol_checksum_method_resumptionhint_session_id() != 23596) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 65158) {
@@ -5200,7 +5346,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_signing_key_bytes() != 31864) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_constructor_phantomsession_connect() != 59507) {
+    if (uniffi_phantom_protocol_checksum_constructor_phantomsession_connect() != 43760) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_phantom_protocol_checksum_constructor_resumptionhint_new() != 30264) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp() != 5261) {

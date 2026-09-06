@@ -173,6 +173,30 @@ amber during the handshake, green when `PQC_READY`/`CONNECTED`, blue while
 `MIGRATING`, red on `FAILED`/`DEAD`, grey when `CLOSED`. `MIGRATING`/`DEAD` are
 surfaced in the UI and also drive an automatic 0-RTT reconnect.
 
+## The resumption ticket is an object, and it has to be closed
+
+`ResumptionHint` crosses the FFI as an object rather than a data class. Two
+consequences show up in this app's code:
+
+- The two 32-byte fields are accessor calls — `hint.sessionId()`,
+  `hint.resumptionSecret()` — and there is no `copy()`, no destructuring, and no
+  data-class `equals`/`hashCode`/`toString()`. The missing `toString()` is the
+  point of the change: the generated one printed the resumption secret in full,
+  so anything that logged a hint logged a credential.
+- Every instance implements `Disposable`/`AutoCloseable` over a Rust-side
+  handle. `ResumptionStore.load()` hands ownership to the caller and
+  `PhantomClient` closes it in a `finally` once the connect attempt is over; the
+  harvest path does the same after `save()`. Skipping either is not a permanent
+  leak — the generated class registers a cleaner at construction, so an
+  unreachable hint is freed once a GC collects the wrapper — but nothing in the
+  app decides when that happens, and the allocation stays live until it does.
+  This app takes a hint on every established session, every reconnect and every
+  teardown, so the uncollected ones accumulate. Closing puts the release at a
+  point the code picks rather than one the collector does.
+
+`ResumptionStore.save()` only reads the two fields and leaves the handle to its
+caller.
+
 ## Migration vs. reconnect, in one paragraph
 
 Phantom's seamless connection migration (keep the keys + connection id, move to

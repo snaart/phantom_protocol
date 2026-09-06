@@ -15,7 +15,11 @@ Both demonstrate the same client lifecycle against a running
 2. **0-RTT resumption** — harvest a `ResumptionHint` after the first connect, persist
    it to platform secure storage (iOS Keychain / Android `EncryptedSharedPreferences`),
    and reconnect via `connectPinnedWithResumption(...)`, folding the first request into
-   the `ClientHello`.
+   the `ClientHello`. The hint crosses the FFI as an opaque object, so its two 32-byte
+   fields are accessor calls (`sessionId()` / `resumptionSecret()`) and no generated
+   stringifier can print the secret — the reason it is an object and not a record. On
+   Kotlin that also makes each hint an `AutoCloseable` native handle the sample closes
+   once it has been stored or used; ARC handles the same lifetime on Swift.
 3. **Encrypted send/recv** — a chat UI over `session.send` / `session.recv`.
 4. **Connection-state surfacing** — `connectionState()` polled lock-free, including the
    `Migrating` / `Dead` liveness states.

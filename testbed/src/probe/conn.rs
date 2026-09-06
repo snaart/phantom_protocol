@@ -276,7 +276,7 @@ pub async fn connect_leg_resumed(
     leg: Leg,
     ep: &Endpoints,
     pin: &[u8],
-    hint: ResumptionHint,
+    hint: Arc<ResumptionHint>,
     early_data: Vec<u8>,
 ) -> Result<Arc<PhantomSession>, CoreError> {
     let session = connect_leg_resumed_unready(leg, ep, pin, hint, early_data).await?;
@@ -290,7 +290,7 @@ async fn connect_leg_resumed_unready(
     leg: Leg,
     ep: &Endpoints,
     pin: &[u8],
-    hint: ResumptionHint,
+    hint: Arc<ResumptionHint>,
     early_data: Vec<u8>,
 ) -> Result<Arc<PhantomSession>, CoreError> {
     let fut = async move {

@@ -93,13 +93,22 @@ async def main() -> int:
     if hint is None:
         print("FAIL: phase-1 produced no resumption hint within 5s")
         return 1
-    if len(hint.session_id) != 32 or len(hint.resumption_secret) != 32:
+    if len(hint.session_id()) != 32 or len(hint.resumption_secret()) != 32:
         print(
-            f"FAIL: hint has wrong sizes — session_id={len(hint.session_id)}, "
-            f"resumption_secret={len(hint.resumption_secret)}"
+            f"FAIL: hint has wrong sizes — session_id={len(hint.session_id())}, "
+            f"resumption_secret={len(hint.resumption_secret())}"
         )
         return 1
-    print("OK: phase-1 pinned round-trip + resumption hint")
+    # The hint is a UniFFI *object*, not a record, and this asserts the reason:
+    # a record's generated `__str__` printed every field, so `print(hint)` wrote
+    # the resumption secret into the log in full. An object has no such method.
+    # This is the only place the property can be checked at all — it lives in a
+    # generated file that no Rust test can see.
+    rendered = f"{hint}"
+    if hint.resumption_secret().hex() in rendered or "resumption_secret=" in rendered:
+        print(f"FAIL: the hint stringifies its fields, leaking the secret: {rendered}")
+        return 1
+    print("OK: phase-1 pinned round-trip + resumption hint (opaque, no field dump)")
 
     # 4. Phase 2: 0-RTT resumption — connect_pinned_with_resumption + early-data.
     s2 = await phantom_protocol.connect_pinned_with_resumption(

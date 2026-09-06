@@ -171,6 +171,12 @@ class PhantomClient(
             // stored hint to attempt a resume, consume it locally too (clear the
             // store before the attempt) to guarantee it is never retried on a
             // later connect, where it would only be rejected.
+            //
+            // The loaded hint is an FFI object holding a native handle. The
+            // connect call below clones the handle for its own use, so this one
+            // is ours to release the moment the attempt is over — on the failure
+            // path as much as on the success path, which is what the `finally`
+            // is for.
             val storedHint = resumptionStore.load()
             if (storedHint != null) {
                 resumptionStore.clear()
@@ -202,6 +208,8 @@ class PhantomClient(
                 publishStatus("Connect failed: ${describe(e)}", ConnectionState.FAILED)
                 appendSystem("Connect failed: ${describe(e)}")
                 throw e
+            } finally {
+                storedHint?.close()
             }
 
             sessionMutex.withLock { session = newSession }
@@ -470,11 +478,24 @@ class PhantomClient(
         }
     }
 
+    /**
+     * Harvest one resumption ticket from [active] and persist it.
+     *
+     * A [ResumptionHint] is an FFI object, so the value handed back here holds a
+     * Rust-side allocation. `close()` releases it at a known point; dropping it
+     * leaves the release to the cleaner the generated class registers, which
+     * runs whenever a GC gets to the wrapper. This path runs on every
+     * established session, on every reconnect and on every teardown, so the
+     * dropped ones would accumulate rather than show up once; the ticket is
+     * copied into the store and the handle released in the same breath.
+     */
     private suspend fun harvestResumptionHint(active: PhantomSession) {
-        val hint = runCatchingCore { active.resumptionHint() }
-        if (hint != null) {
+        val hint = runCatchingCore { active.resumptionHint() } ?: return
+        try {
             resumptionStore.save(hint)
             appendSystem("Harvested a resumption ticket for the next 0-RTT reconnect.")
+        } finally {
+            hint.close()
         }
     }
 

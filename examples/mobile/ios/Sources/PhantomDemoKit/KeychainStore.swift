@@ -4,12 +4,19 @@
 // Keychain so a backgrounded or relaunched app can attempt a 0-RTT resume via
 // `connectPinnedWithResumption`.
 //
-// The stored blob holds the two 32-byte fields (sessionId + resumptionSecret)
-// and a creation timestamp. `load()` returns nil for hints older than the
-// server's SessionCache TTL (1 hour) so an expired ticket transparently falls
-// back to a 1-RTT connect. The resumptionSecret is key-grade material; the item
-// is stored under kSecAttrAccessibleAfterFirstUnlock so it is unavailable before
-// the device's first unlock after boot.
+// `ResumptionHint` crosses the FFI as an opaque object, not a struct: its two
+// 32-byte fields are read through the `sessionId()` / `resumptionSecret()`
+// accessors. That is deliberate — a UniFFI record gets a generated stringifier
+// in every target language, and the one for a hint printed the resumption
+// secret in full. An object has no such method, so the bytes leave only where a
+// caller asked for them by name, as they do here.
+//
+// The stored blob holds those two fields and a creation timestamp. `load()`
+// returns nil for hints older than the server's SessionCache TTL (1 hour) so an
+// expired ticket transparently falls back to a 1-RTT connect. The resumption
+// secret is key-grade material; the item is stored under
+// kSecAttrAccessibleAfterFirstUnlock so it is unavailable before the device's
+// first unlock after boot.
 
 import Foundation
 import Security
@@ -139,9 +146,10 @@ public final class KeychainStore {
     }
 
     static func encode(_ hint: ResumptionHint, createdAt: Date) throws -> Data {
+        // Accessor calls, not stored properties: the hint is an FFI object.
         let record = Record(
-            sessionId: hint.sessionId,
-            resumptionSecret: hint.resumptionSecret,
+            sessionId: hint.sessionId(),
+            resumptionSecret: hint.resumptionSecret(),
             createdAt: createdAt
         )
         let encoder = PropertyListEncoder()

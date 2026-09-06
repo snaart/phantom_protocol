@@ -1853,12 +1853,16 @@ holds:
 So a resumption "ticket" is an agreement neither side transmitted: the server
 stores `(session_id → resumption_secret)` in a bounded LRU
 (`transport/session_cache.rs`) and the client keeps the same pair — exposed as
-`ResumptionHint { session_id, resumption_secret }`, two 32-byte values, both of
-which the client must persist itself if resumption is to survive a restart. The
-secret is key material and is treated as such (`ZeroizeOnDrop` on the server
-side, a redacting `Debug` on the client's). A second implementation that derives
-it with the wrong Extract/Expand split (§ 3) produces a binder the server refuses,
-which reads as an unknown ticket and silently falls back to 1-RTT.
+the `ResumptionHint` object, whose `session_id()` and `resumption_secret()`
+accessors each return 32 bytes, both of which the client must persist itself if
+resumption is to survive a restart. The secret is key material and is treated as
+such (`ZeroizeOnDrop` on the server side, a redacting `Debug` on the client's;
+the type is an object and not a record because UniFFI gives every record a
+generated stringifier in each language, and the Python one printed both fields,
+so one `print` of the hint put the secret in a log). A second implementation
+that derives it with the wrong Extract/Expand split (§ 3) produces a binder the
+server refuses, which reads as an unknown ticket and silently falls back to
+1-RTT.
 
 **Keying.** Both peers derive identical AEAD material from the prior session's
 `resumption_secret` and *this* connect's `client_nonce`
@@ -1947,7 +1951,8 @@ PhantomSession::builder(addr)
 ```
 Client (native FFI): `connect_pinned_with_resumption` / `connect_pinned_udp_with_resumption`.
 The `resumption_hint` comes from a prior session's
-`resumption_hint().await -> Option<ResumptionHint>` (each field 32 bytes).
+`resumption_hint().await -> Option<Arc<ResumptionHint>>`; each accessor
+(`session_id()`, `resumption_secret()`) returns 32 bytes.
 Server: `PhantomListener::accept()` returns `Arc<AcceptOutcome>` (`api/listener.rs`):
 
 ```rust

@@ -758,6 +758,10 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping(
     ): Int
+    external fun uniffi_phantom_protocol_checksum_method_resumptionhint_resumption_secret(
+    ): Int
+    external fun uniffi_phantom_protocol_checksum_method_resumptionhint_session_id(
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomstream_disconnect(
     ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomstream_recv(
@@ -791,6 +795,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_signing_key_bytes(
     ): Int
     external fun uniffi_phantom_protocol_checksum_constructor_phantomsession_connect(
+    ): Int
+    external fun uniffi_phantom_protocol_checksum_constructor_resumptionhint_new(
     ): Int
     external fun uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp(
     ): Int
@@ -898,6 +904,16 @@ internal object UniffiLib {
     ): Byte
     external fun uniffi_phantom_protocol_fn_method_phantomsession_traffic_shaping(`ptr`: Long,
     ): Long
+    external fun uniffi_phantom_protocol_fn_clone_resumptionhint(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Long
+    external fun uniffi_phantom_protocol_fn_free_resumptionhint(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_phantom_protocol_fn_constructor_resumptionhint_new(`sessionId`: RustBuffer.ByValue,`resumptionSecret`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Long
+    external fun uniffi_phantom_protocol_fn_method_resumptionhint_resumption_secret(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_phantom_protocol_fn_method_resumptionhint_session_id(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_phantom_protocol_fn_clone_phantomstream(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
     external fun uniffi_phantom_protocol_fn_free_phantomstream(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -948,11 +964,11 @@ internal object UniffiLib {
     ): Long
     external fun uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_config(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,`config`: RustBuffer.ByValue,
     ): Long
-    external fun uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_resumption(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,`hint`: RustBuffer.ByValue,`earlyData`: RustBuffer.ByValue,
+    external fun uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_resumption(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,`hint`: Long,`earlyData`: RustBuffer.ByValue,
     ): Long
     external fun uniffi_phantom_protocol_fn_func_connect_pinned_with_config(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,`config`: RustBuffer.ByValue,
     ): Long
-    external fun uniffi_phantom_protocol_fn_func_connect_pinned_with_resumption(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,`hint`: RustBuffer.ByValue,`earlyData`: RustBuffer.ByValue,
+    external fun uniffi_phantom_protocol_fn_func_connect_pinned_with_resumption(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,`hint`: Long,`earlyData`: RustBuffer.ByValue,
     ): Long
     external fun ffi_phantom_protocol_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1088,13 +1104,13 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_config() != 35502) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption() != 4302) {
+    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption() != 52312) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_config() != 23760) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 33992) {
+    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 25404) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_has_early_data() != 35020) {
@@ -1175,7 +1191,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_recv() != 6660) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_resumption_hint() != 42828) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_resumption_hint() != 62628) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_send() != 6054) {
@@ -1188,6 +1204,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping() != 60362) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_phantom_protocol_checksum_method_resumptionhint_resumption_secret() != 61611) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_phantom_protocol_checksum_method_resumptionhint_session_id() != 23596) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 65158) {
@@ -1238,7 +1260,10 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_signing_key_bytes() != 31864) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomsession_connect() != 59507) {
+    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomsession_connect() != 43760) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_phantom_protocol_checksum_constructor_resumptionhint_new() != 30264) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp() != 5261) {
@@ -3948,7 +3973,7 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
      *
      * A `#[deprecated]` attribute would be the natural way to flag this, but it
      * **cannot** be applied here: this constructor is `#[uniffi::constructor]`,
-     * and UniFFI 0.31 emits FFI scaffolding that calls `Self::connect()` from
+     * and UniFFI 0.32 emits FFI scaffolding that calls `Self::connect()` from
      * generated code in this same crate. That generated call would trip the
      * `deprecated` lint, which CI promotes to a hard error under
      * `clippy --lib -D warnings` — and no item-scoped `#[allow(deprecated)]`
@@ -5126,6 +5151,401 @@ public object FfiConverterTypePhantomUdpListener: FfiConverter<PhantomUdpListene
 }
 
 
+// This template implements a class for working with a Rust struct via a handle
+// to the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque handle to the underlying Rust struct.
+//     Method calls need to read this handle from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its handle should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the handle, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the handle, but is interrupted
+//      before it can pass the handle over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read handle value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+
+/**
+ * 0-RTT resumption material extracted from a completed session.
+ *
+ * Produced by [`PhantomSession::resumption_hint`] after a handshake completes,
+ * and fed back into [`connect_pinned_with_resumption`] (or
+ * [`PhantomSession::builder`] + `.resumption()`) to attempt a 0-RTT reconnect
+ * to the same server.
+ *
+ * # Why this is an object and not a record
+ *
+ * UniFFI lowers a record into a plain struct in each target language and
+ * generates that language's own stringifier for it. The Python one formats
+ * every field, so `print(hint)`, an f-string or `logging.info("%s", hint)`
+ * wrote the 32-byte resumption secret out in full — and the redacting Rust
+ * [`Debug`] below never prevented that, because UniFFI does not call it. An
+ * object crosses the FFI as an opaque handle instead: the generated classes
+ * carry no field-dumping `__str__` / `toString()` / `description`, and the
+ * bytes leave only through [`session_id`](Self::session_id) and
+ * [`resumption_secret`](Self::resumption_secret), where the caller asked for
+ * them by name. That removes the leak rather than documenting it.
+ *
+ * Both byte strings are exactly 32 bytes. The length is checked where the hint
+ * is *used* — the `connect_pinned_*_with_resumption` free functions and the
+ * builder's `.resumption()`, each before any I/O — and deliberately not in the
+ * constructor, so a stored blob of the wrong size surfaces as a clean
+ * `CoreError::ValidationError` on the connect path rather than as a failure a
+ * persistence layer has to handle on load.
+ *
+ * Store the hint alongside the pinned `HybridVerifyingKey` of the server it
+ * was negotiated against: the resumption secret is server-pinned, and reusing
+ * a hint across servers is a configuration bug.
+ */
+public interface ResumptionHintInterface {
+    
+    /**
+     * The resumption secret (32 bytes) — sensitive; treat it like a key.
+     *
+     * **Never log this value.** It is the proof-of-possession input a resuming
+     * handshake proves it holds (Security Invariant 9), so a copy in a log is
+     * a credential in a log. The warning sits on the accessor because that is
+     * what reaches every language: UniFFI copies a method's documentation into
+     * all four bindings, where it carries no record field's.
+     *
+     * Persist it the way a private key is persisted — the iOS sample uses the
+     * Keychain, the Android one `EncryptedSharedPreferences`.
+     */
+    fun `resumptionSecret`(): kotlin.ByteArray
+    
+    /**
+     * The negotiated session id (32 bytes).
+     *
+     * Not secret on its own — a resuming `ClientHello` carries it in the clear
+     * as `resume_session_id` — and useless without the secret below, which is
+     * what a resuming handshake actually proves possession of.
+     */
+    fun `sessionId`(): kotlin.ByteArray
+    
+    companion object
+}
+
+/**
+ * 0-RTT resumption material extracted from a completed session.
+ *
+ * Produced by [`PhantomSession::resumption_hint`] after a handshake completes,
+ * and fed back into [`connect_pinned_with_resumption`] (or
+ * [`PhantomSession::builder`] + `.resumption()`) to attempt a 0-RTT reconnect
+ * to the same server.
+ *
+ * # Why this is an object and not a record
+ *
+ * UniFFI lowers a record into a plain struct in each target language and
+ * generates that language's own stringifier for it. The Python one formats
+ * every field, so `print(hint)`, an f-string or `logging.info("%s", hint)`
+ * wrote the 32-byte resumption secret out in full — and the redacting Rust
+ * [`Debug`] below never prevented that, because UniFFI does not call it. An
+ * object crosses the FFI as an opaque handle instead: the generated classes
+ * carry no field-dumping `__str__` / `toString()` / `description`, and the
+ * bytes leave only through [`session_id`](Self::session_id) and
+ * [`resumption_secret`](Self::resumption_secret), where the caller asked for
+ * them by name. That removes the leak rather than documenting it.
+ *
+ * Both byte strings are exactly 32 bytes. The length is checked where the hint
+ * is *used* — the `connect_pinned_*_with_resumption` free functions and the
+ * builder's `.resumption()`, each before any I/O — and deliberately not in the
+ * constructor, so a stored blob of the wrong size surfaces as a clean
+ * `CoreError::ValidationError` on the connect path rather than as a failure a
+ * persistence layer has to handle on load.
+ *
+ * Store the hint alongside the pinned `HybridVerifyingKey` of the server it
+ * was negotiated against: the resumption secret is server-pinned, and reusing
+ * a hint across servers is a configuration bug.
+ */
+open class ResumptionHint: Disposable, AutoCloseable, ResumptionHintInterface
+{
+
+    @Suppress("UNUSED_PARAMETER")
+    /**
+     * @suppress
+     */
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    /**
+     * @suppress
+     *
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+    /**
+     * Construct a hint from stored bytes.
+     *
+     * The name `new` is load-bearing. UniFFI treats a constructor called `new`
+     * as the *primary* one, and only a primary constructor becomes a plain
+     * Python `__init__`, a Swift `init(sessionId:resumptionSecret:)` and a
+     * Kotlin primary constructor rather than a static factory. Renaming it
+     * would silently change the call shape in all three languages.
+     *
+     * Returns `Arc<Self>` so a Rust caller keeps the previous one-liner: the
+     * entry points take `Arc<ResumptionHint>`, so `ResumptionHint::new(sid,
+     * secret)` still drops straight into the call with no wrapper.
+     */
+    constructor(`sessionId`: kotlin.ByteArray, `resumptionSecret`: kotlin.ByteArray) :
+        this(UniffiWithHandle, 
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_phantom_protocol_fn_constructor_resumptionhint_new(
+    
+        
+        FfiConverterByteArray.lower(`sessionId`),
+        FfiConverterByteArray.lower(`resumptionSecret`),_status)
+}
+    )
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the handle being freed concurrently.
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(private val handle: Long) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) {
+                // Fake object created with `NoHandle`, don't try to free.
+                return;
+            }
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_phantom_protocol_fn_free_resumptionhint(handle, status)
+            }
+        }
+    }
+
+    /**
+     * @suppress
+     */
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) {
+            throw InternalException("uniffiCloneHandle() called on NoHandle object");
+        }
+        return uniffiRustCall() { status ->
+            UniffiLib.uniffi_phantom_protocol_fn_clone_resumptionhint(handle, status)
+        }
+    }
+
+    
+    /**
+     * The resumption secret (32 bytes) — sensitive; treat it like a key.
+     *
+     * **Never log this value.** It is the proof-of-possession input a resuming
+     * handshake proves it holds (Security Invariant 9), so a copy in a log is
+     * a credential in a log. The warning sits on the accessor because that is
+     * what reaches every language: UniFFI copies a method's documentation into
+     * all four bindings, where it carries no record field's.
+     *
+     * Persist it the way a private key is persisted — the iOS sample uses the
+     * Keychain, the Android one `EncryptedSharedPreferences`.
+     */override fun `resumptionSecret`(): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_phantom_protocol_fn_method_resumptionhint_resumption_secret(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * The negotiated session id (32 bytes).
+     *
+     * Not secret on its own — a resuming `ClientHello` carries it in the clear
+     * as `resume_session_id` — and useless without the secret below, which is
+     * what a resuming handshake actually proves possession of.
+     */override fun `sessionId`(): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_phantom_protocol_fn_method_resumptionhint_session_id(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    
+
+    
+
+
+    
+    
+    /**
+     * @suppress
+     */
+    companion object
+    
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeResumptionHint: FfiConverter<ResumptionHint, Long> {
+    override fun lower(value: ResumptionHint): Long {
+        return value.uniffiCloneHandle()
+    }
+
+    override fun lift(value: Long): ResumptionHint {
+        return ResumptionHint(UniffiWithHandle, value)
+    }
+
+    override fun read(buf: ByteBuffer): ResumptionHint {
+        return lift(buf.getLong())
+    }
+
+    override fun allocationSize(value: ResumptionHint) = 8UL
+
+    override fun write(value: ResumptionHint, buf: ByteBuffer) {
+        buf.putLong(lower(value))
+    }
+}
+
+
 
 /**
  * Flat, UniFFI-representable subset of [`MetricsSnapshot`].
@@ -5509,88 +5929,6 @@ public object FfiConverterTypePhantomConfig: FfiConverterRustBuffer<PhantomConfi
             FfiConverterDuration.write(value.`sessionTimeout`, buf)
             FfiConverterUInt.write(value.`sessionCacheCapacity`, buf)
             FfiConverterDuration.write(value.`sessionTicketLifetime`, buf)
-    }
-}
-
-
-
-/**
- * 0-RTT resumption material extracted from a completed session.
- *
- * Produced by [`PhantomSession::resumption_hint`] after a handshake
- * completes, and fed back into [`connect_pinned_with_resumption`] to
- * attempt a 0-RTT reconnect to the same server.
- *
- * Both fields are exactly 32 bytes — this record is the
- * UniFFI-representable surface for the internal `(session_id,
- * resumption_secret)` tuple. The fields are `Vec<u8>` because UniFFI
- * has no fixed-size-array type, so the length is a runtime invariant
- * checked when the hint is used.
- *
- * Store the hint alongside the pinned `HybridVerifyingKey` of the
- * server it was negotiated against: the `resumption_secret` is
- * server-pinned, and reusing a hint across servers is a configuration
- * bug.
- *
- * **Never log this value.** `resumption_secret` is the proof-of-possession
- * input a resuming handshake proves it holds, so a copy in a log is a
- * credential in a log. The warning sits on the type rather than only on the
- * field because that is what reaches every language: the Python binding
- * carries type documentation and not field documentation, and Python is the
- * one binding whose generated record stringifies its fields — `print(hint)`,
- * an f-string or `logging.info("%s", hint)` writes the secret out in full
- * there. Swift and Kotlin render the byte array's identity instead and do not
- * leak it. The Rust `Debug` below redacts the secret, but UniFFI never calls
- * it.
- */
-data class ResumptionHint (
-    /**
-     * The negotiated session id (32 bytes).
-     */
-    var `sessionId`: kotlin.ByteArray
-    , 
-    /**
-     * The resumption secret (32 bytes) — sensitive; treat like a key.
-     *
-     * **Never log this record, and in Python never `print`, `format` or `%s` it.**
-     * This is the proof-of-possession input a resuming handshake proves it holds
-     * (Security Invariant 9), so a copy in a log is a credential in a log. The
-     * Rust `Debug` below redacts it, but that impl is Rust-only: UniFFI never
-     * calls it, and the generated Python record carries a `__str__` that formats
-     * both fields, so `print(hint)`, an f-string or `logging.info("%s", hint)`
-     * writes the secret out in full. Swift and Kotlin render the byte array's
-     * identity rather than its contents and do not leak it.
-     */
-    var `resumptionSecret`: kotlin.ByteArray
-    
-){
-    
-
-    
-
-    
-    companion object
-}
-
-/**
- * @suppress
- */
-public object FfiConverterTypeResumptionHint: FfiConverterRustBuffer<ResumptionHint> {
-    override fun read(buf: ByteBuffer): ResumptionHint {
-        return ResumptionHint(
-            FfiConverterByteArray.read(buf),
-            FfiConverterByteArray.read(buf),
-        )
-    }
-
-    override fun allocationSize(value: ResumptionHint) = (
-            FfiConverterByteArray.allocationSize(value.`sessionId`) +
-            FfiConverterByteArray.allocationSize(value.`resumptionSecret`)
-    )
-
-    override fun write(value: ResumptionHint, buf: ByteBuffer) {
-            FfiConverterByteArray.write(value.`sessionId`, buf)
-            FfiConverterByteArray.write(value.`resumptionSecret`, buf)
     }
 }
 
@@ -6667,7 +7005,7 @@ public object FfiConverterOptionalTypeCoreError: FfiConverterRustBuffer<CoreExce
          * # #[tokio::main]
          * # async fn main() {
          * # let pinned_key: Vec<u8> = vec![];
-         * # let hint: phantom_protocol::api::session::ResumptionHint = unimplemented!();
+         * # let hint: std::sync::Arc<phantom_protocol::api::session::ResumptionHint> = unimplemented!();
          * let session = phantom_protocol::connect_pinned_udp_with_resumption(
          * "host".into(), 4242, pinned_key, hint, b"GET /".to_vec(),
          * )
@@ -6772,7 +7110,7 @@ public object FfiConverterOptionalTypeCoreError: FfiConverterRustBuffer<CoreExce
          * # #[tokio::main]
          * # async fn main() {
          * # let pinned_key: Vec<u8> = vec![];
-         * # let hint: phantom_protocol::api::session::ResumptionHint = unimplemented!();
+         * # let hint: std::sync::Arc<phantom_protocol::api::session::ResumptionHint> = unimplemented!();
          * let session = phantom_protocol::connect_pinned_with_resumption(
          * "host".into(), 4242, pinned_key, hint, b"GET /".to_vec(),
          * )

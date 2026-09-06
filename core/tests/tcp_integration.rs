@@ -164,9 +164,9 @@ async fn tcp_integration_zero_rtt_resumption_round_trip() {
     })
     .await
     .expect("resumption hint did not arrive within 5s");
-    assert_eq!(hint.session_id.len(), 32, "session_id is 32 bytes");
+    assert_eq!(hint.session_id().len(), 32, "session_id is 32 bytes");
     assert_eq!(
-        hint.resumption_secret.len(),
+        hint.resumption_secret().len(),
         32,
         "resumption_secret is 32 bytes"
     );

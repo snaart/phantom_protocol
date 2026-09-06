@@ -85,10 +85,18 @@ Phantom Protocol's `HybridVerifyingKey` provides the post-quantum auth layer.
 
 **Background mode.** iOS suspends connections when the app backgrounds. Register
 for Background App Refresh (`BGAppRefreshTask`); on `sceneDidEnterBackground`
-persist `session.resumptionHint()` — a `ResumptionHint` with `sessionId` /
-`resumptionSecret` — to Keychain (`SecItemAdd`); on foreground reload pass it
-to `connectPinnedWithResumption` (0-RTT skips PQC keygen). Discard hints older
+persist `session.resumptionHint()` — a `ResumptionHint` whose `sessionId()` and
+`resumptionSecret()` accessors return the two 32-byte values — to Keychain
+(`SecItemAdd`); on foreground reload rebuild it with
+`ResumptionHint(sessionId:resumptionSecret:)` and pass that to
+`connectPinnedWithResumption` (0-RTT skips PQC keygen). Discard hints older
 than 1 hour (server default).
+
+The hint is a `class`, not a `struct`, and conforms to neither `Equatable` nor
+`Hashable`: `==`, `XCTAssertEqual` on two hints, and use as a `Set` member or
+dictionary key no longer compile. Compare and key on the bytes the accessors
+return instead, and note that assigning a hint copies a reference rather than
+the two byte arrays.
 
 ## Android (Kotlin)
 
@@ -193,8 +201,12 @@ the app — iOS: `Bundle.main.url(forResource:withExtension:)`; Android:
 `R.raw.phantom_server_pk`. **Never** fetch the key at runtime — that voids the
 trust model. Rotating the signing key requires an app update.
 
-**Resumption ticket storage.** Persist the `ResumptionHint` (`sessionId`,
-`resumptionSecret`) from `session.resumptionHint()` to secure storage:
+**Resumption ticket storage.** `session.resumptionHint()` returns a
+`ResumptionHint` **object**; read the two 32-byte values out of it with the
+`sessionId()` / `resumptionSecret()` accessors — calls, not fields. The type is
+an object rather than a record because UniFFI gives a record a generated
+stringifier in every language, and the Python one printed both fields, which put
+the resumption secret one log line away. Persist those bytes to secure storage:
 
 - iOS: Keychain (`SecItemAdd`/`SecItemCopyMatching`),
   `kSecAttrAccessible = kSecAttrAccessibleAfterFirstUnlock`.
@@ -203,6 +215,32 @@ trust model. Rotating the signing key requires an app update.
 
 TTL: **1 hour** (server `SessionCache` default). Check saved timestamp before
 reuse; expired hints fall back to 1-RTT automatically.
+
+**Android: close every hint.** The generated Kotlin class implements
+`Disposable`/`AutoCloseable` over a native handle, so each instance — the one
+`resumptionHint()` returns *and* each one you construct to reconnect — should be
+closed. An unclosed one is not lost for the life of the process: the class
+registers a cleaner at construction, so the handle is freed once a GC collects
+the wrapper. But nothing in the app schedules that, and the Rust-side allocation
+stays live until it happens, so on a path that runs per reconnect the
+uncollected hints accumulate. Closing is what puts the release at a point the
+code chooses. This is an obligation a record did not carry; `use { }` discharges
+it on both paths:
+
+```kotlin
+session.resumptionHint()?.use { hint ->
+    prefs.edit()
+        .putString("sid",    Base64.encodeToString(hint.sessionId(),        Base64.NO_WRAP))
+        .putString("secret", Base64.encodeToString(hint.resumptionSecret(), Base64.NO_WRAP))
+        .putLong("savedAt", System.currentTimeMillis())
+        .apply()
+}
+
+// Reconnecting: the hint you build is yours to close as well.
+val session = ResumptionHint(sessionId = sid, resumptionSecret = secret).use { hint ->
+    connectPinnedUdpWithResumption(host, port, pinnedKey, hint, earlyData)
+}
+```
 
 **Connection migration (Wi-Fi ↔ LTE) — use the UDP transport + `migrate()`.**
 `PhantomSession.migrate(localAddr:)` (Phase 4) performs a **real seamless
@@ -221,10 +259,12 @@ use the connection-oriented `TcpSessionTransport`, which cannot rebind its local
 address; on a TCP session `migrate()` returns `Err(CoreError::Unsupported)` without
 moving the socket. If you must use TCP (e.g. a UDP-hostile network), handle a network
 change by **reconnecting** and minimise the cost with **0-RTT resumption**: harvest a
-`ResumptionHint` after the first connect and reconnect via
-`connectPinnedWithResumption`, which folds the first request into the new
-`ClientHello`. (The sample apps in `examples/mobile/` show the reconnect-with-0-RTT
-model; prefer the UDP path when seamless migration matters.)
+`ResumptionHint` after the first connect, keep the bytes its `sessionId()` /
+`resumptionSecret()` accessors return, and reconnect via
+`connectPinnedWithResumption` with a hint rebuilt from them — which folds the
+first request into the new `ClientHello`. (The sample apps in
+`examples/mobile/` show the reconnect-with-0-RTT model; prefer the UDP path when
+seamless migration matters.)
 
 ## Performance considerations
 

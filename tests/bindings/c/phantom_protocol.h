@@ -682,7 +682,10 @@ uint64_t uniffi_phantom_protocol_fn_method_phantomsession_recv(
     void                    *ptr);
 
 /* resumption_hint() -> async Option<ResumptionHint> (rust_buffer result).
- * Some(...) after a completed handshake; feeds connect_pinned_with_resumption. */
+ * Some(...) after a completed handshake; feeds connect_pinned_with_resumption.
+ * The RustBuffer carries a lowered Option<object handle>, NOT the two
+ * length-prefixed buffers a record would have produced — a parser written
+ * against the record shape reads garbage rather than failing. */
 uint64_t uniffi_phantom_protocol_fn_method_phantomsession_resumption_hint(
     void                    *ptr);
 
@@ -807,6 +810,50 @@ uint32_t uniffi_phantom_protocol_fn_method_phantomstream_stream_id(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
+/* -------------------------- ResumptionHint -------------------------- */
+
+/* 0-RTT resumption material. **An object, not a record** — and that is a
+ * security property, not a style choice. As a UniFFI record it was lowered
+ * into a struct in each target language, and the generated Python
+ * stringifier printed every field, so one `print(hint)` wrote the 32-byte
+ * resumption secret into a log. An object crosses the FFI as an opaque
+ * handle: the bytes leave only through the two accessors below.
+ *
+ * For a C consumer that means the hint parameter of the two
+ * `connect_pinned*_with_resumption` functions is a `uint64_t` handle, not a
+ * lowered `PhantomRustBuffer` — construct it first, and free it when done. */
+
+void *uniffi_phantom_protocol_fn_clone_resumptionhint(
+    void                    *ptr,
+    PhantomRustCallStatus   *call_status);
+
+void uniffi_phantom_protocol_fn_free_resumptionhint(
+    void                    *ptr,
+    PhantomRustCallStatus   *call_status);
+
+/* new(session_id: Vec<u8>, resumption_secret: Vec<u8>) -> ResumptionHint (sync).
+ * Both buffers must carry exactly 32 bytes. The length is NOT checked here:
+ * it is checked by whichever connect function the handle is passed to, before
+ * any socket is opened, and surfaces as ValidationError. */
+void *uniffi_phantom_protocol_fn_constructor_resumptionhint_new(
+    PhantomRustBuffer        session_id,
+    PhantomRustBuffer        resumption_secret,
+    PhantomRustCallStatus   *call_status);
+
+/* session_id() -> Vec<u8> (sync, rust_buffer result). Not secret on its own:
+ * a resuming ClientHello carries it in the clear. Caller frees the buffer. */
+PhantomRustBuffer uniffi_phantom_protocol_fn_method_resumptionhint_session_id(
+    void                    *ptr,
+    PhantomRustCallStatus   *call_status);
+
+/* resumption_secret() -> Vec<u8> (sync, rust_buffer result).
+ * **Sensitive — never log it.** This is the proof-of-possession input a
+ * resuming handshake proves it holds (Security Invariant 9), so a copy in a
+ * log is a credential in a log. Caller frees the buffer. */
+PhantomRustBuffer uniffi_phantom_protocol_fn_method_resumptionhint_resumption_secret(
+    void                    *ptr,
+    PhantomRustCallStatus   *call_status);
+
 /* --------------------------- AcceptOutcome -------------------------- */
 
 void *uniffi_phantom_protocol_fn_clone_acceptoutcome(
@@ -887,10 +934,11 @@ uint64_t uniffi_phantom_protocol_fn_func_connect_pinned(
  *
  * Resumption-aware analogue of `connect_pinned` — attempts a 0-RTT (wire
  * V3) reconnect using the `ResumptionHint` from a prior session's
- * `resumption_hint()`. `hint` is the lowered `ResumptionHint` record
- * (two length-prefixed 32-byte buffers); a field whose length is not 32
- * surfaces as `CoreError::ValidationError`. `early_data` (<= 16 KiB) is
- * sealed into the V3 ClientHello.
+ * `resumption_hint()`. `hint` is an **object handle**, not a lowered record:
+ * build it with `_fn_constructor_resumptionhint_new` and release it with
+ * `_fn_free_resumptionhint`. A value whose length is not 32 surfaces as
+ * `CoreError::ValidationError`, before any socket is opened. `early_data`
+ * (<= 16 KiB) is sealed into the V3 ClientHello.
  *
  * Returns a u64 future handle yielding the PhantomSession object handle
  * (use `_poll_u64` + `_complete_u64`). */
@@ -898,7 +946,7 @@ uint64_t uniffi_phantom_protocol_fn_func_connect_pinned_with_resumption(
     PhantomRustBuffer        host,
     uint16_t                 port,
     PhantomRustBuffer        pinned_key,
-    PhantomRustBuffer        hint,
+    void                    *hint,
     PhantomRustBuffer        early_data);
 
 /* connect_pinned_with_config(host: string, port: u16, pinned_key: Vec<u8>,
@@ -950,8 +998,9 @@ uint64_t uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_config(
  *
  * Resumption-aware analogue of `connect_pinned_udp` — attempts a 0-RTT
  * reconnect over PhantomUDP using the `ResumptionHint` from a prior session.
- * `hint` is the lowered `ResumptionHint` record; `early_data` (<= 16 KiB)
- * is sealed into the V3 ClientHello.
+ * `hint` is an **object handle** (see `_fn_constructor_resumptionhint_new`),
+ * not a lowered record; `early_data` (<= 16 KiB) is sealed into the V3
+ * ClientHello.
  *
  * Returns a u64 future handle yielding a `void *` PhantomSession pointer
  * (use `_poll_u64` + `_complete_u64`). */
@@ -959,7 +1008,7 @@ uint64_t uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_resumption(
     PhantomRustBuffer        host,
     uint16_t                 port,
     PhantomRustBuffer        pinned_key,
-    PhantomRustBuffer        hint,
+    void                    *hint,
     PhantomRustBuffer        early_data);
 
 /* ====================================================================
