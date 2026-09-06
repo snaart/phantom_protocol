@@ -94,7 +94,7 @@ jobs:
           # feature is forced via core/Cargo.toml so the transitive ml-dsa
           # pulls compile cleanly. The browser target uses wasm-bindgen, NOT
           # UniFFI, so `bindings` is dropped here via `--no-default-features`
-          # (mirroring the wasm32-wasip2 row): UniFFI 0.31's runtime is not
+          # (mirroring the wasm32-wasip2 row): UniFFI 0.32's runtime is not
           # wasm32-unknown-unknown-compatible (its rust-future glue requires
           # `Send`, which browser futures are not) and its FFI scaffolding is
           # unused in the browser build.

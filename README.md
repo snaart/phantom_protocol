@@ -517,10 +517,10 @@ cargo run --manifest-path cli/Cargo.toml -- version
 
 | Binding | Maturity | Notes |
 | --- | --- | --- |
-| **Swift** | Production-shape | Auto-gen via UniFFI 0.31; iOS XCFramework recipe in [`docs/operations/mobile.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/operations/mobile.md) |
+| **Swift** | Production-shape | Auto-gen via UniFFI 0.32; iOS XCFramework recipe in [`docs/operations/mobile.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/operations/mobile.md) |
 | **Kotlin** | Production-shape | Auto-gen; Android NDK + Gradle `jniLibs` recipe in `mobile.md` |
 | **Python** | UniFFI surface auto-gen | Demo harness `tests/run_test.py` |
-| **C** | Experimental | **Hand-curated** header — UniFFI 0.31 has no C generator. Covers `connect_pinned` / `connect_pinned_udp` (incl. `_with_config` / `_with_resumption`), the `bind*_with_signing_key_bytes` / `bind*_with_config_bytes` constructors, `generate_signing_key`, and `PhantomConfig`; the typed `HybridSigningKey` / `HybridVerifyingKey` objects and runtime injection stay Rust-only. README recommends Swift / Kotlin / Python instead |
+| **C** | Experimental | **Hand-curated** header — UniFFI 0.32 has no C generator. Covers `connect_pinned` / `connect_pinned_udp` (incl. `_with_config` / `_with_resumption`), the `bind*_with_signing_key_bytes` / `bind*_with_config_bytes` constructors, `generate_signing_key`, and `PhantomConfig`; the typed `HybridSigningKey` / `HybridVerifyingKey` objects and runtime injection stay Rust-only. README recommends Swift / Kotlin / Python instead |
 | **WASM (browser)** | Demo shipped | [`examples/wasm-demo/`](https://github.com/snaart/phantom_protocol/tree/main/examples/wasm-demo/) pairs with [`docs/operations/wasm.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/operations/wasm.md); uses `WebSocketLeg` + `WasmRuntime` |
 
 Regen: `tests/bindings/{generate_python,generate_swift,generate_kotlin,generate_c}.sh`.

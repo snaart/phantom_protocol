@@ -106,6 +106,43 @@ internal open class ForeignBytes : Structure() {
 
     class ByValue : ForeignBytes(), Structure.ByValue
 }
+
+// Converter for `&[u8]` / `[ByRef] bytes` arguments.
+//
+// Only `lower` is valid — zero-copy byte buffers only flow foreign -> Rust,
+// and only in argument position. `lift`, `read`, `write`, and
+// `allocationSize` have no sound implementation here and all panic at
+// runtime. The `FfiConverter` interface is implemented so that the
+// compiler enforces the full method set (rather than relying on eyeball).
+//
+// The provided `ByteBuffer` MUST be direct — only direct buffers have a
+// stable native address that JNA can expose via `getDirectBufferPointer`.
+// The returned `ForeignBytes.ByValue` is only valid for the duration of
+// the FFI call; the Rust side treats it as a borrow.
+internal object FfiConverterByRefBytes : FfiConverter<java.nio.ByteBuffer, ForeignBytes.ByValue> {
+    override fun lower(value: java.nio.ByteBuffer): ForeignBytes.ByValue {
+        require(value.isDirect) { "UniFFI zero-copy &[u8] requires a direct ByteBuffer. Use ByteBuffer.allocateDirect()." }
+        val remaining = value.remaining()
+        val fb = ForeignBytes.ByValue()
+        fb.len = remaining
+        // Zero-length direct buffers: skip getDirectBufferPointer (platform-variable behavior)
+        // and pass null. The Rust side treats (null, 0) as &[].
+        fb.data = if (remaining == 0) null else com.sun.jna.Native.getDirectBufferPointer(value)
+        return fb
+    }
+
+    override fun lift(value: ForeignBytes.ByValue): java.nio.ByteBuffer =
+        error("ByRef bytes cannot be lifted: zero-copy &[u8] only flows foreign->Rust")
+
+    override fun read(buf: java.nio.ByteBuffer): java.nio.ByteBuffer =
+        error("ByRef bytes cannot be read from a buffer: zero-copy &[u8] is only supported in argument position, not nested in records/options/etc.")
+
+    override fun write(value: java.nio.ByteBuffer, buf: java.nio.ByteBuffer): Unit =
+        error("ByRef bytes cannot be written to a buffer: zero-copy &[u8] is only supported in argument position, not nested in records/options/etc.")
+
+    override fun allocationSize(value: java.nio.ByteBuffer): ULong =
+        error("ByRef bytes have no RustBuffer allocation size: zero-copy &[u8] is only supported in argument position, not nested in records/options/etc.")
+}
 /**
  * The FfiConverter interface handles converter types to and from the FFI
  *
@@ -780,249 +817,249 @@ internal object UniffiLib {
         
     }
     external fun uniffi_phantom_protocol_fn_clone_acceptoutcome(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Long
-external fun uniffi_phantom_protocol_fn_free_acceptoutcome(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
-external fun uniffi_phantom_protocol_fn_method_acceptoutcome_has_early_data(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Byte
-external fun uniffi_phantom_protocol_fn_method_acceptoutcome_peer_addr_string(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): RustBuffer.ByValue
-external fun uniffi_phantom_protocol_fn_method_acceptoutcome_session(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Long
-external fun uniffi_phantom_protocol_fn_method_acceptoutcome_take_early_data(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): RustBuffer.ByValue
-external fun uniffi_phantom_protocol_fn_clone_phantomlistener(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Long
-external fun uniffi_phantom_protocol_fn_free_phantomlistener(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
-external fun uniffi_phantom_protocol_fn_constructor_phantomlistener_bind(`addr`: RustBuffer.ByValue,
-): Long
-external fun uniffi_phantom_protocol_fn_constructor_phantomlistener_bind_with_config_bytes(`addr`: RustBuffer.ByValue,`signingKey`: RustBuffer.ByValue,`config`: RustBuffer.ByValue,
-): Long
-external fun uniffi_phantom_protocol_fn_constructor_phantomlistener_bind_with_signing_key_bytes(`addr`: RustBuffer.ByValue,`signingKey`: RustBuffer.ByValue,
-): Long
-external fun uniffi_phantom_protocol_fn_method_phantomlistener_accept(`ptr`: Long,
-): Long
-external fun uniffi_phantom_protocol_fn_method_phantomlistener_is_shutting_down(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Byte
-external fun uniffi_phantom_protocol_fn_method_phantomlistener_local_addr(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): RustBuffer.ByValue
-external fun uniffi_phantom_protocol_fn_method_phantomlistener_metrics_snapshot(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): RustBuffer.ByValue
-external fun uniffi_phantom_protocol_fn_method_phantomlistener_set_early_data_enabled(`ptr`: Long,`enabled`: Byte,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
-external fun uniffi_phantom_protocol_fn_method_phantomlistener_shutdown(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
-external fun uniffi_phantom_protocol_fn_method_phantomlistener_verifying_key_bytes(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): RustBuffer.ByValue
-external fun uniffi_phantom_protocol_fn_clone_phantomsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Long
-external fun uniffi_phantom_protocol_fn_free_phantomsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
-external fun uniffi_phantom_protocol_fn_constructor_phantomsession_connect(`peerAddr`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-): Long
-external fun uniffi_phantom_protocol_fn_method_phantomsession_accept_stream(`ptr`: Long,
-): Long
-external fun uniffi_phantom_protocol_fn_method_phantomsession_await_ready(`ptr`: Long,
-): Long
-external fun uniffi_phantom_protocol_fn_method_phantomsession_connection_state(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): RustBuffer.ByValue
-external fun uniffi_phantom_protocol_fn_method_phantomsession_disconnect(`ptr`: Long,
-): Long
-external fun uniffi_phantom_protocol_fn_method_phantomsession_early_data_accepted(`ptr`: Long,
-): Long
-external fun uniffi_phantom_protocol_fn_method_phantomsession_flush_queue(`ptr`: Long,
-): Long
-external fun uniffi_phantom_protocol_fn_method_phantomsession_id(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): RustBuffer.ByValue
-external fun uniffi_phantom_protocol_fn_method_phantomsession_is_data_ready(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Byte
-external fun uniffi_phantom_protocol_fn_method_phantomsession_last_error(`ptr`: Long,
-): Long
-external fun uniffi_phantom_protocol_fn_method_phantomsession_metrics_snapshot(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): RustBuffer.ByValue
-external fun uniffi_phantom_protocol_fn_method_phantomsession_migrate(`ptr`: Long,`localAddr`: RustBuffer.ByValue,
-): Long
-external fun uniffi_phantom_protocol_fn_method_phantomsession_open_stream(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Long
-external fun uniffi_phantom_protocol_fn_method_phantomsession_peer_addr(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): RustBuffer.ByValue
-external fun uniffi_phantom_protocol_fn_method_phantomsession_queued_count(`ptr`: Long,
-): Long
-external fun uniffi_phantom_protocol_fn_method_phantomsession_recv(`ptr`: Long,
-): Long
-external fun uniffi_phantom_protocol_fn_method_phantomsession_resumption_hint(`ptr`: Long,
-): Long
-external fun uniffi_phantom_protocol_fn_method_phantomsession_send(`ptr`: Long,`data`: RustBuffer.ByValue,
-): Long
-external fun uniffi_phantom_protocol_fn_method_phantomsession_set_traffic_shaping(`ptr`: Long,`config`: RustBuffer.ByValue,
-): Long
-external fun uniffi_phantom_protocol_fn_method_phantomsession_supports_migration(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Byte
-external fun uniffi_phantom_protocol_fn_method_phantomsession_traffic_shaping(`ptr`: Long,
-): Long
-external fun uniffi_phantom_protocol_fn_clone_phantomstream(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Long
-external fun uniffi_phantom_protocol_fn_free_phantomstream(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
-external fun uniffi_phantom_protocol_fn_method_phantomstream_disconnect(`ptr`: Long,
-): Long
-external fun uniffi_phantom_protocol_fn_method_phantomstream_recv(`ptr`: Long,
-): Long
-external fun uniffi_phantom_protocol_fn_method_phantomstream_send_reliable(`ptr`: Long,`data`: RustBuffer.ByValue,
-): Long
-external fun uniffi_phantom_protocol_fn_method_phantomstream_send_unreliable(`ptr`: Long,`data`: RustBuffer.ByValue,
-): Long
-external fun uniffi_phantom_protocol_fn_method_phantomstream_set_priority(`ptr`: Long,`priority`: Int,
-): Long
-external fun uniffi_phantom_protocol_fn_method_phantomstream_stream_id(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Int
-external fun uniffi_phantom_protocol_fn_clone_phantomudplistener(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Long
-external fun uniffi_phantom_protocol_fn_free_phantomudplistener(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
-external fun uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp(`addr`: RustBuffer.ByValue,
-): Long
-external fun uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp_with_config_bytes(`addr`: RustBuffer.ByValue,`signingKey`: RustBuffer.ByValue,`config`: RustBuffer.ByValue,
-): Long
-external fun uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp_with_signing_key_bytes(`addr`: RustBuffer.ByValue,`signingKey`: RustBuffer.ByValue,
-): Long
-external fun uniffi_phantom_protocol_fn_method_phantomudplistener_accept(`ptr`: Long,
-): Long
-external fun uniffi_phantom_protocol_fn_method_phantomudplistener_is_shutting_down(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Byte
-external fun uniffi_phantom_protocol_fn_method_phantomudplistener_local_addr(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): RustBuffer.ByValue
-external fun uniffi_phantom_protocol_fn_method_phantomudplistener_metrics_snapshot(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): RustBuffer.ByValue
-external fun uniffi_phantom_protocol_fn_method_phantomudplistener_set_early_data_enabled(`ptr`: Long,`enabled`: Byte,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
-external fun uniffi_phantom_protocol_fn_method_phantomudplistener_shutdown(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
-external fun uniffi_phantom_protocol_fn_method_phantomudplistener_verifying_key_bytes(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): RustBuffer.ByValue
-external fun uniffi_phantom_protocol_fn_func_generate_signing_key(uniffi_out_err: UniffiRustCallStatus, 
-): RustBuffer.ByValue
-external fun uniffi_phantom_protocol_fn_func_verifying_key_from_signing_key(`seed`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-): RustBuffer.ByValue
-external fun uniffi_phantom_protocol_fn_func_connect_pinned(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,
-): Long
-external fun uniffi_phantom_protocol_fn_func_connect_pinned_udp(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,
-): Long
-external fun uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_config(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,`config`: RustBuffer.ByValue,
-): Long
-external fun uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_resumption(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,`hint`: RustBuffer.ByValue,`earlyData`: RustBuffer.ByValue,
-): Long
-external fun uniffi_phantom_protocol_fn_func_connect_pinned_with_config(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,`config`: RustBuffer.ByValue,
-): Long
-external fun uniffi_phantom_protocol_fn_func_connect_pinned_with_resumption(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,`hint`: RustBuffer.ByValue,`earlyData`: RustBuffer.ByValue,
-): Long
-external fun ffi_phantom_protocol_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): RustBuffer.ByValue
-external fun ffi_phantom_protocol_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-): RustBuffer.ByValue
-external fun ffi_phantom_protocol_rustbuffer_free(`buf`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
-external fun ffi_phantom_protocol_rustbuffer_reserve(`buf`: RustBuffer.ByValue,`additional`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): RustBuffer.ByValue
-external fun ffi_phantom_protocol_rust_future_poll_u8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_cancel_u8(`handle`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_free_u8(`handle`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_complete_u8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Int
-external fun ffi_phantom_protocol_rust_future_poll_i8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_cancel_i8(`handle`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_free_i8(`handle`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_complete_i8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Byte
-external fun ffi_phantom_protocol_rust_future_poll_u16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_cancel_u16(`handle`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_free_u16(`handle`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_complete_u16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Int
-external fun ffi_phantom_protocol_rust_future_poll_i16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_cancel_i16(`handle`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_free_i16(`handle`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_complete_i16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Short
-external fun ffi_phantom_protocol_rust_future_poll_u32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_cancel_u32(`handle`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_free_u32(`handle`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_complete_u32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Int
-external fun ffi_phantom_protocol_rust_future_poll_i32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_cancel_i32(`handle`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_free_i32(`handle`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_complete_i32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Int
-external fun ffi_phantom_protocol_rust_future_poll_u64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_cancel_u64(`handle`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_free_u64(`handle`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_complete_u64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Long
-external fun ffi_phantom_protocol_rust_future_poll_i64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_cancel_i64(`handle`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_free_i64(`handle`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_complete_i64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Long
-external fun ffi_phantom_protocol_rust_future_poll_f32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_cancel_f32(`handle`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_free_f32(`handle`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_complete_f32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Float
-external fun ffi_phantom_protocol_rust_future_poll_f64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_cancel_f64(`handle`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_free_f64(`handle`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_complete_f64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Double
-external fun ffi_phantom_protocol_rust_future_poll_rust_buffer(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_cancel_rust_buffer(`handle`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_free_rust_buffer(`handle`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_complete_rust_buffer(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): RustBuffer.ByValue
-external fun ffi_phantom_protocol_rust_future_poll_void(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_cancel_void(`handle`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_free_void(`handle`: Long,
-): Unit
-external fun ffi_phantom_protocol_rust_future_complete_void(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
+    ): Long
+    external fun uniffi_phantom_protocol_fn_free_acceptoutcome(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_phantom_protocol_fn_method_acceptoutcome_has_early_data(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
+    external fun uniffi_phantom_protocol_fn_method_acceptoutcome_peer_addr_string(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_phantom_protocol_fn_method_acceptoutcome_session(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Long
+    external fun uniffi_phantom_protocol_fn_method_acceptoutcome_take_early_data(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_phantom_protocol_fn_clone_phantomlistener(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Long
+    external fun uniffi_phantom_protocol_fn_free_phantomlistener(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_phantom_protocol_fn_constructor_phantomlistener_bind(`addr`: RustBuffer.ByValue,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_constructor_phantomlistener_bind_with_config_bytes(`addr`: RustBuffer.ByValue,`signingKey`: RustBuffer.ByValue,`config`: RustBuffer.ByValue,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_constructor_phantomlistener_bind_with_signing_key_bytes(`addr`: RustBuffer.ByValue,`signingKey`: RustBuffer.ByValue,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_method_phantomlistener_accept(`ptr`: Long,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_method_phantomlistener_is_shutting_down(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
+    external fun uniffi_phantom_protocol_fn_method_phantomlistener_local_addr(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_phantom_protocol_fn_method_phantomlistener_metrics_snapshot(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_phantom_protocol_fn_method_phantomlistener_set_early_data_enabled(`ptr`: Long,`enabled`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_phantom_protocol_fn_method_phantomlistener_shutdown(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_phantom_protocol_fn_method_phantomlistener_verifying_key_bytes(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_phantom_protocol_fn_clone_phantomsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Long
+    external fun uniffi_phantom_protocol_fn_free_phantomsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_phantom_protocol_fn_constructor_phantomsession_connect(`peerAddr`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Long
+    external fun uniffi_phantom_protocol_fn_method_phantomsession_accept_stream(`ptr`: Long,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_method_phantomsession_await_ready(`ptr`: Long,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_method_phantomsession_connection_state(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_phantom_protocol_fn_method_phantomsession_disconnect(`ptr`: Long,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_method_phantomsession_early_data_accepted(`ptr`: Long,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_method_phantomsession_flush_queue(`ptr`: Long,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_method_phantomsession_id(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_phantom_protocol_fn_method_phantomsession_is_data_ready(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
+    external fun uniffi_phantom_protocol_fn_method_phantomsession_last_error(`ptr`: Long,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_method_phantomsession_metrics_snapshot(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_phantom_protocol_fn_method_phantomsession_migrate(`ptr`: Long,`localAddr`: RustBuffer.ByValue,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_method_phantomsession_open_stream(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Long
+    external fun uniffi_phantom_protocol_fn_method_phantomsession_peer_addr(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_phantom_protocol_fn_method_phantomsession_queued_count(`ptr`: Long,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_method_phantomsession_recv(`ptr`: Long,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_method_phantomsession_resumption_hint(`ptr`: Long,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_method_phantomsession_send(`ptr`: Long,`data`: RustBuffer.ByValue,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_method_phantomsession_set_traffic_shaping(`ptr`: Long,`config`: RustBuffer.ByValue,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_method_phantomsession_supports_migration(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
+    external fun uniffi_phantom_protocol_fn_method_phantomsession_traffic_shaping(`ptr`: Long,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_clone_phantomstream(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Long
+    external fun uniffi_phantom_protocol_fn_free_phantomstream(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_phantom_protocol_fn_method_phantomstream_disconnect(`ptr`: Long,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_method_phantomstream_recv(`ptr`: Long,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_method_phantomstream_send_reliable(`ptr`: Long,`data`: RustBuffer.ByValue,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_method_phantomstream_send_unreliable(`ptr`: Long,`data`: RustBuffer.ByValue,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_method_phantomstream_set_priority(`ptr`: Long,`priority`: Int,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_method_phantomstream_stream_id(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Int
+    external fun uniffi_phantom_protocol_fn_clone_phantomudplistener(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Long
+    external fun uniffi_phantom_protocol_fn_free_phantomudplistener(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp(`addr`: RustBuffer.ByValue,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp_with_config_bytes(`addr`: RustBuffer.ByValue,`signingKey`: RustBuffer.ByValue,`config`: RustBuffer.ByValue,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp_with_signing_key_bytes(`addr`: RustBuffer.ByValue,`signingKey`: RustBuffer.ByValue,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_method_phantomudplistener_accept(`ptr`: Long,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_method_phantomudplistener_is_shutting_down(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
+    external fun uniffi_phantom_protocol_fn_method_phantomudplistener_local_addr(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_phantom_protocol_fn_method_phantomudplistener_metrics_snapshot(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_phantom_protocol_fn_method_phantomudplistener_set_early_data_enabled(`ptr`: Long,`enabled`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_phantom_protocol_fn_method_phantomudplistener_shutdown(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_phantom_protocol_fn_method_phantomudplistener_verifying_key_bytes(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_phantom_protocol_fn_func_generate_signing_key(uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_phantom_protocol_fn_func_verifying_key_from_signing_key(`seed`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_phantom_protocol_fn_func_connect_pinned(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_func_connect_pinned_udp(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_config(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,`config`: RustBuffer.ByValue,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_resumption(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,`hint`: RustBuffer.ByValue,`earlyData`: RustBuffer.ByValue,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_func_connect_pinned_with_config(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,`config`: RustBuffer.ByValue,
+    ): Long
+    external fun uniffi_phantom_protocol_fn_func_connect_pinned_with_resumption(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,`hint`: RustBuffer.ByValue,`earlyData`: RustBuffer.ByValue,
+    ): Long
+    external fun ffi_phantom_protocol_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun ffi_phantom_protocol_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun ffi_phantom_protocol_rustbuffer_free(`buf`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun ffi_phantom_protocol_rustbuffer_reserve(`buf`: RustBuffer.ByValue,`additional`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun ffi_phantom_protocol_rust_future_poll_u8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_cancel_u8(`handle`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_free_u8(`handle`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_complete_u8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Int
+    external fun ffi_phantom_protocol_rust_future_poll_i8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_cancel_i8(`handle`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_free_i8(`handle`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_complete_i8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
+    external fun ffi_phantom_protocol_rust_future_poll_u16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_cancel_u16(`handle`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_free_u16(`handle`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_complete_u16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Int
+    external fun ffi_phantom_protocol_rust_future_poll_i16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_cancel_i16(`handle`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_free_i16(`handle`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_complete_i16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Short
+    external fun ffi_phantom_protocol_rust_future_poll_u32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_cancel_u32(`handle`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_free_u32(`handle`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_complete_u32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Int
+    external fun ffi_phantom_protocol_rust_future_poll_i32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_cancel_i32(`handle`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_free_i32(`handle`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_complete_i32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Int
+    external fun ffi_phantom_protocol_rust_future_poll_u64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_cancel_u64(`handle`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_free_u64(`handle`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_complete_u64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Long
+    external fun ffi_phantom_protocol_rust_future_poll_i64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_cancel_i64(`handle`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_free_i64(`handle`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_complete_i64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Long
+    external fun ffi_phantom_protocol_rust_future_poll_f32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_cancel_f32(`handle`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_free_f32(`handle`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_complete_f32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Float
+    external fun ffi_phantom_protocol_rust_future_poll_f64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_cancel_f64(`handle`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_free_f64(`handle`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_complete_f64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Double
+    external fun ffi_phantom_protocol_rust_future_poll_rust_buffer(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_cancel_rust_buffer(`handle`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_free_rust_buffer(`handle`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_complete_rust_buffer(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun ffi_phantom_protocol_rust_future_poll_void(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_cancel_void(`handle`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_free_void(`handle`: Long,
+    ): Unit
+    external fun ffi_phantom_protocol_rust_future_complete_void(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
 
-    
+        
 }
 
 private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
@@ -1036,181 +1073,181 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 }
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
-    if (lib.uniffi_phantom_protocol_checksum_func_generate_signing_key() != 61598) {
+    if (lib.uniffi_phantom_protocol_checksum_func_generate_signing_key() != 39294) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_func_verifying_key_from_signing_key() != 48109) {
+    if (lib.uniffi_phantom_protocol_checksum_func_verifying_key_from_signing_key() != 62299) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned() != 34076) {
+    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned() != 2050) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp() != 35741) {
+    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp() != 56169) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_config() != 7565) {
+    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_config() != 35502) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption() != 59191) {
+    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption() != 4302) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_config() != 48093) {
+    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_config() != 23760) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 23673) {
+    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 33992) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_has_early_data() != 13201) {
+    if (lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_has_early_data() != 35020) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_peer_addr_string() != 47588) {
+    if (lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_peer_addr_string() != 38962) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_session() != 25558) {
+    if (lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_session() != 16275) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_take_early_data() != 27328) {
+    if (lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_take_early_data() != 40942) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_accept() != 8307) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_accept() != 17436) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_is_shutting_down() != 8474) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_is_shutting_down() != 40116) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_local_addr() != 46930) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_local_addr() != 13791) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_metrics_snapshot() != 63186) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_metrics_snapshot() != 53315) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_set_early_data_enabled() != 39659) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_set_early_data_enabled() != 22717) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_shutdown() != 60837) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_shutdown() != 63939) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_verifying_key_bytes() != 14523) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_verifying_key_bytes() != 11496) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_accept_stream() != 52368) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_accept_stream() != 18738) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_await_ready() != 6822) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_await_ready() != 29445) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_connection_state() != 25030) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_connection_state() != 5175) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_disconnect() != 61489) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_disconnect() != 16367) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_early_data_accepted() != 8121) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_early_data_accepted() != 46386) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_flush_queue() != 18912) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_flush_queue() != 35512) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_id() != 42609) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_id() != 20460) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_is_data_ready() != 25961) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_is_data_ready() != 3222) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_last_error() != 1347) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_last_error() != 47645) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_metrics_snapshot() != 36430) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_metrics_snapshot() != 13889) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_migrate() != 5135) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_migrate() != 51241) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_open_stream() != 25882) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_open_stream() != 23438) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_peer_addr() != 58516) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_peer_addr() != 8519) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_queued_count() != 34723) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_queued_count() != 33659) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_recv() != 44409) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_recv() != 6660) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_resumption_hint() != 52321) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_resumption_hint() != 42828) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_send() != 55912) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_send() != 6054) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 9439) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 18955) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_supports_migration() != 60201) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_supports_migration() != 35412) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping() != 8294) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping() != 60362) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 21465) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 65158) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_recv() != 18540) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_recv() != 45283) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_reliable() != 10962) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_reliable() != 35264) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable() != 59359) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable() != 18144) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_set_priority() != 56290) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_set_priority() != 18532) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_stream_id() != 28026) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_stream_id() != 46486) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_accept() != 58484) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_accept() != 3679) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_is_shutting_down() != 49450) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_is_shutting_down() != 19646) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_local_addr() != 6213) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_local_addr() != 14771) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_metrics_snapshot() != 18131) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_metrics_snapshot() != 38747) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_set_early_data_enabled() != 49550) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_set_early_data_enabled() != 26287) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_shutdown() != 50351) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_shutdown() != 50321) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_verifying_key_bytes() != 25697) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_verifying_key_bytes() != 9366) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind() != 49830) {
+    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind() != 2358) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_config_bytes() != 10908) {
+    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_config_bytes() != 17389) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_signing_key_bytes() != 19213) {
+    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_signing_key_bytes() != 31864) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomsession_connect() != 40022) {
+    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomsession_connect() != 59507) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp() != 57133) {
+    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp() != 5261) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp_with_config_bytes() != 28985) {
+    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp_with_config_bytes() != 45423) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp_with_signing_key_bytes() != 18642) {
+    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp_with_signing_key_bytes() != 47318) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -1828,6 +1865,11 @@ open class AcceptOutcome: Disposable, AutoCloseable, AcceptOutcomeInterface
     private val wasDestroyed = AtomicBoolean(false)
     private val callCounter = AtomicLong(1)
 
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
+
     override fun destroy() {
         // Only allow a single call to this method.
         // TODO: maybe we should log a warning if called more than once?
@@ -2258,6 +2300,11 @@ open class PhantomListener: Disposable, AutoCloseable, PhantomListenerInterface
     private val wasDestroyed = AtomicBoolean(false)
     private val callCounter = AtomicLong(1)
 
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
+
     override fun destroy() {
         // Only allow a single call to this method.
         // TODO: maybe we should log a warning if called more than once?
@@ -2420,6 +2467,7 @@ open class PhantomListener: Disposable, AutoCloseable, PhantomListenerInterface
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_phantom_protocol_fn_method_phantomlistener_set_early_data_enabled(
         it,
+        
         FfiConverterBoolean.lower(`enabled`),_status)
 }
     }
@@ -2494,7 +2542,8 @@ open class PhantomListener: Disposable, AutoCloseable, PhantomListenerInterface
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
      suspend fun `bind`(`addr`: kotlin.String) : PhantomListener {
         return uniffiRustCallAsync(
-        UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomlistener_bind(FfiConverterString.lower(`addr`),),
+        UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomlistener_bind(
+        FfiConverterString.lower(`addr`),),
         { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
         { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
         { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },
@@ -2516,7 +2565,10 @@ open class PhantomListener: Disposable, AutoCloseable, PhantomListenerInterface
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
      suspend fun `bindWithConfigBytes`(`addr`: kotlin.String, `signingKey`: kotlin.ByteArray, `config`: PhantomConfig) : PhantomListener {
         return uniffiRustCallAsync(
-        UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomlistener_bind_with_config_bytes(FfiConverterString.lower(`addr`),FfiConverterByteArray.lower(`signingKey`),FfiConverterTypePhantomConfig.lower(`config`),),
+        UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomlistener_bind_with_config_bytes(
+        FfiConverterString.lower(`addr`),
+        FfiConverterByteArray.lower(`signingKey`),
+        FfiConverterTypePhantomConfig.lower(`config`),),
         { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
         { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
         { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },
@@ -2539,7 +2591,9 @@ open class PhantomListener: Disposable, AutoCloseable, PhantomListenerInterface
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
      suspend fun `bindWithSigningKeyBytes`(`addr`: kotlin.String, `signingKey`: kotlin.ByteArray) : PhantomListener {
         return uniffiRustCallAsync(
-        UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomlistener_bind_with_signing_key_bytes(FfiConverterString.lower(`addr`),FfiConverterByteArray.lower(`signingKey`),),
+        UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomlistener_bind_with_signing_key_bytes(
+        FfiConverterString.lower(`addr`),
+        FfiConverterByteArray.lower(`signingKey`),),
         { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
         { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
         { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },
@@ -3152,6 +3206,11 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
     private val wasDestroyed = AtomicBoolean(false)
     private val callCounter = AtomicLong(1)
 
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
+
     override fun destroy() {
         // Only allow a single call to this method.
         // TODO: maybe we should log a warning if called more than once?
@@ -3565,7 +3624,8 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
         callWithHandle { uniffiHandle ->
             UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_migrate(
                 uniffiHandle,
-                FfiConverterString.lower(`localAddr`),
+                
+        FfiConverterString.lower(`localAddr`),
             )
         },
         { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_void(future, callback, continuation) },
@@ -3751,7 +3811,8 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
         callWithHandle { uniffiHandle ->
             UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_send(
                 uniffiHandle,
-                FfiConverterByteArray.lower(`data`),
+                
+        FfiConverterByteArray.lower(`data`),
             )
         },
         { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_void(future, callback, continuation) },
@@ -3789,7 +3850,8 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
         callWithHandle { uniffiHandle ->
             UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_set_traffic_shaping(
                 uniffiHandle,
-                FfiConverterTypeTrafficShapingConfig.lower(`config`),
+                
+        FfiConverterTypeTrafficShapingConfig.lower(`config`),
             )
         },
         { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_i8(future, callback, continuation) },
@@ -3903,6 +3965,7 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomsession_connect(
     
+        
         FfiConverterString.lower(`peerAddr`),_status)
 }
     )
@@ -4178,6 +4241,11 @@ open class PhantomStream: Disposable, AutoCloseable, PhantomStreamInterface
     private val wasDestroyed = AtomicBoolean(false)
     private val callCounter = AtomicLong(1)
 
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
+
     override fun destroy() {
         // Only allow a single call to this method.
         // TODO: maybe we should log a warning if called more than once?
@@ -4340,7 +4408,8 @@ open class PhantomStream: Disposable, AutoCloseable, PhantomStreamInterface
         callWithHandle { uniffiHandle ->
             UniffiLib.uniffi_phantom_protocol_fn_method_phantomstream_send_reliable(
                 uniffiHandle,
-                FfiConverterByteArray.lower(`data`),
+                
+        FfiConverterByteArray.lower(`data`),
             )
         },
         { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_void(future, callback, continuation) },
@@ -4386,7 +4455,8 @@ open class PhantomStream: Disposable, AutoCloseable, PhantomStreamInterface
         callWithHandle { uniffiHandle ->
             UniffiLib.uniffi_phantom_protocol_fn_method_phantomstream_send_unreliable(
                 uniffiHandle,
-                FfiConverterByteArray.lower(`data`),
+                
+        FfiConverterByteArray.lower(`data`),
             )
         },
         { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_void(future, callback, continuation) },
@@ -4412,7 +4482,8 @@ open class PhantomStream: Disposable, AutoCloseable, PhantomStreamInterface
         callWithHandle { uniffiHandle ->
             UniffiLib.uniffi_phantom_protocol_fn_method_phantomstream_set_priority(
                 uniffiHandle,
-                FfiConverterUInt.lower(`priority`),
+                
+        FfiConverterUInt.lower(`priority`),
             )
         },
         { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_void(future, callback, continuation) },
@@ -4732,6 +4803,11 @@ open class PhantomUdpListener: Disposable, AutoCloseable, PhantomUdpListenerInte
     private val wasDestroyed = AtomicBoolean(false)
     private val callCounter = AtomicLong(1)
 
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
+
     override fun destroy() {
         // Only allow a single call to this method.
         // TODO: maybe we should log a warning if called more than once?
@@ -4900,6 +4976,7 @@ open class PhantomUdpListener: Disposable, AutoCloseable, PhantomUdpListenerInte
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_set_early_data_enabled(
         it,
+        
         FfiConverterBoolean.lower(`enabled`),_status)
 }
     }
@@ -4957,7 +5034,8 @@ open class PhantomUdpListener: Disposable, AutoCloseable, PhantomUdpListenerInte
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
      suspend fun `bindUdp`(`addr`: kotlin.String) : PhantomUdpListener {
         return uniffiRustCallAsync(
-        UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp(FfiConverterString.lower(`addr`),),
+        UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp(
+        FfiConverterString.lower(`addr`),),
         { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
         { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
         { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },
@@ -4979,7 +5057,10 @@ open class PhantomUdpListener: Disposable, AutoCloseable, PhantomUdpListenerInte
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
      suspend fun `bindUdpWithConfigBytes`(`addr`: kotlin.String, `signingKey`: kotlin.ByteArray, `config`: PhantomConfig) : PhantomUdpListener {
         return uniffiRustCallAsync(
-        UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp_with_config_bytes(FfiConverterString.lower(`addr`),FfiConverterByteArray.lower(`signingKey`),FfiConverterTypePhantomConfig.lower(`config`),),
+        UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp_with_config_bytes(
+        FfiConverterString.lower(`addr`),
+        FfiConverterByteArray.lower(`signingKey`),
+        FfiConverterTypePhantomConfig.lower(`config`),),
         { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
         { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
         { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },
@@ -5002,7 +5083,9 @@ open class PhantomUdpListener: Disposable, AutoCloseable, PhantomUdpListenerInte
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
      suspend fun `bindUdpWithSigningKeyBytes`(`addr`: kotlin.String, `signingKey`: kotlin.ByteArray) : PhantomUdpListener {
         return uniffiRustCallAsync(
-        UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp_with_signing_key_bytes(FfiConverterString.lower(`addr`),FfiConverterByteArray.lower(`signingKey`),),
+        UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp_with_signing_key_bytes(
+        FfiConverterString.lower(`addr`),
+        FfiConverterByteArray.lower(`signingKey`),),
         { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
         { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
         { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },
@@ -6364,6 +6447,7 @@ public object FfiConverterOptionalTypeCoreError: FfiConverterRustBuffer<CoreExce
     uniffiRustCallWithError(CoreException) { _status ->
     UniffiLib.uniffi_phantom_protocol_fn_func_verifying_key_from_signing_key(
     
+        
         FfiConverterByteArray.lower(`seed`),_status)
 }
     )
@@ -6437,7 +6521,10 @@ public object FfiConverterOptionalTypeCoreError: FfiConverterRustBuffer<CoreExce
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
      suspend fun `connectPinned`(`host`: kotlin.String, `port`: kotlin.UShort, `pinnedKey`: kotlin.ByteArray) : PhantomSession {
         return uniffiRustCallAsync(
-        UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned(FfiConverterString.lower(`host`),FfiConverterUShort.lower(`port`),FfiConverterByteArray.lower(`pinnedKey`),),
+        UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned(
+        FfiConverterString.lower(`host`),
+        FfiConverterUShort.lower(`port`),
+        FfiConverterByteArray.lower(`pinnedKey`),),
         { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
         { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
         { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },
@@ -6505,7 +6592,10 @@ public object FfiConverterOptionalTypeCoreError: FfiConverterRustBuffer<CoreExce
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
      suspend fun `connectPinnedUdp`(`host`: kotlin.String, `port`: kotlin.UShort, `pinnedKey`: kotlin.ByteArray) : PhantomSession {
         return uniffiRustCallAsync(
-        UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_udp(FfiConverterString.lower(`host`),FfiConverterUShort.lower(`port`),FfiConverterByteArray.lower(`pinnedKey`),),
+        UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_udp(
+        FfiConverterString.lower(`host`),
+        FfiConverterUShort.lower(`port`),
+        FfiConverterByteArray.lower(`pinnedKey`),),
         { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
         { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
         { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },
@@ -6545,7 +6635,11 @@ public object FfiConverterOptionalTypeCoreError: FfiConverterRustBuffer<CoreExce
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
      suspend fun `connectPinnedUdpWithConfig`(`host`: kotlin.String, `port`: kotlin.UShort, `pinnedKey`: kotlin.ByteArray, `config`: PhantomConfig) : PhantomSession {
         return uniffiRustCallAsync(
-        UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_config(FfiConverterString.lower(`host`),FfiConverterUShort.lower(`port`),FfiConverterByteArray.lower(`pinnedKey`),FfiConverterTypePhantomConfig.lower(`config`),),
+        UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_config(
+        FfiConverterString.lower(`host`),
+        FfiConverterUShort.lower(`port`),
+        FfiConverterByteArray.lower(`pinnedKey`),
+        FfiConverterTypePhantomConfig.lower(`config`),),
         { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
         { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
         { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },
@@ -6602,7 +6696,12 @@ public object FfiConverterOptionalTypeCoreError: FfiConverterRustBuffer<CoreExce
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
      suspend fun `connectPinnedUdpWithResumption`(`host`: kotlin.String, `port`: kotlin.UShort, `pinnedKey`: kotlin.ByteArray, `hint`: ResumptionHint, `earlyData`: kotlin.ByteArray) : PhantomSession {
         return uniffiRustCallAsync(
-        UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_resumption(FfiConverterString.lower(`host`),FfiConverterUShort.lower(`port`),FfiConverterByteArray.lower(`pinnedKey`),FfiConverterTypeResumptionHint.lower(`hint`),FfiConverterByteArray.lower(`earlyData`),),
+        UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_resumption(
+        FfiConverterString.lower(`host`),
+        FfiConverterUShort.lower(`port`),
+        FfiConverterByteArray.lower(`pinnedKey`),
+        FfiConverterTypeResumptionHint.lower(`hint`),
+        FfiConverterByteArray.lower(`earlyData`),),
         { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
         { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
         { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },
@@ -6642,7 +6741,11 @@ public object FfiConverterOptionalTypeCoreError: FfiConverterRustBuffer<CoreExce
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
      suspend fun `connectPinnedWithConfig`(`host`: kotlin.String, `port`: kotlin.UShort, `pinnedKey`: kotlin.ByteArray, `config`: PhantomConfig) : PhantomSession {
         return uniffiRustCallAsync(
-        UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_with_config(FfiConverterString.lower(`host`),FfiConverterUShort.lower(`port`),FfiConverterByteArray.lower(`pinnedKey`),FfiConverterTypePhantomConfig.lower(`config`),),
+        UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_with_config(
+        FfiConverterString.lower(`host`),
+        FfiConverterUShort.lower(`port`),
+        FfiConverterByteArray.lower(`pinnedKey`),
+        FfiConverterTypePhantomConfig.lower(`config`),),
         { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
         { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
         { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },
@@ -6702,7 +6805,12 @@ public object FfiConverterOptionalTypeCoreError: FfiConverterRustBuffer<CoreExce
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
      suspend fun `connectPinnedWithResumption`(`host`: kotlin.String, `port`: kotlin.UShort, `pinnedKey`: kotlin.ByteArray, `hint`: ResumptionHint, `earlyData`: kotlin.ByteArray) : PhantomSession {
         return uniffiRustCallAsync(
-        UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_with_resumption(FfiConverterString.lower(`host`),FfiConverterUShort.lower(`port`),FfiConverterByteArray.lower(`pinnedKey`),FfiConverterTypeResumptionHint.lower(`hint`),FfiConverterByteArray.lower(`earlyData`),),
+        UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_with_resumption(
+        FfiConverterString.lower(`host`),
+        FfiConverterUShort.lower(`port`),
+        FfiConverterByteArray.lower(`pinnedKey`),
+        FfiConverterTypeResumptionHint.lower(`hint`),
+        FfiConverterByteArray.lower(`earlyData`),),
         { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
         { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
         { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },

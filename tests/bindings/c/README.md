@@ -12,7 +12,7 @@ library.
 
 ## Why hand-curated?
 
-Phantom Protocol's FFI is produced by Mozilla UniFFI 0.31 via
+Phantom Protocol's FFI is produced by Mozilla UniFFI 0.32 via
 `uniffi::setup_scaffolding!()` in `core/src/lib.rs`. UniFFI ships
 first-class generators for Kotlin, Swift, Python, and Ruby; pure-C is
 *not* one of them. Two third-party-ish alternatives we evaluated:
@@ -157,14 +157,14 @@ apply — please read before committing to a C-side integration:
    `verifying_key_bytes`. `CoreError` variants are lowered with a 1-based
    discriminant (18 = ServerIdentityMismatch, 19 = ProtocolRejected,
    20 = Unsupported).
-3. **Stale on UniFFI bump.** Contract version 30 (UniFFI 0.31) is current
+3. **Stale on UniFFI bump.** Contract version 30 (UniFFI 0.32) is current
    as of phantom_protocol 0.2.2. If you upgrade UniFFI, re-run
    `tests/bindings/generate_c.sh` and reconcile changes.
 4. **Integer-typed futures.** Only the `_u64`, `_rust_buffer`,
    `_void`, and `_u8` variants of the future-poll family are declared
    in the header. The rest (`i8`/`u16`/`i16`/`u32`/`i32`/`i64`/`f32`/`f64`)
    are present in the dylib and follow the identical pattern — re-declare
-   on demand. There is no `_pointer` variant: UniFFI 0.31 returns exported
+   on demand. There is no `_pointer` variant: UniFFI 0.32 returns exported
    objects as `u64` handles.
 5. **Checksums.** All 61 `uniffi_phantom_protocol_checksum_*` symbols are
    exported but not declared. Higher-level bindings call them at load

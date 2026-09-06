@@ -39,6 +39,52 @@ fileprivate extension ForeignBytes {
     init(bufferPointer: UnsafeBufferPointer<UInt8>) {
         self.init(len: Int32(bufferPointer.count), data: bufferPointer.baseAddress)
     }
+
+    init(rawBufferPointer: UnsafeRawBufferPointer) {
+        self.init(
+            len: Int32(rawBufferPointer.count),
+            data: rawBufferPointer.baseAddress?.assumingMemoryBound(to: UInt8.self)
+        )
+    }
+}
+
+// Converter for `&[u8]` / `[ByRef] bytes` arguments.
+//
+// Conforms to `FfiConverter` so the compiler enforces the full converter
+// method set. Only the scope-bound `lower(_:_body:)` overload is sound —
+// zero-copy byte buffers only flow foreign -> Rust, and only in argument
+// position. The four protocol-witness methods (`lift`, `lower`, `read`,
+// `write`) `fatalError` at runtime if anyone reaches them.
+//
+// The scope-bound `lower` takes a closure because the `ForeignBytes`
+// pointer is only guaranteed valid for the duration of
+// `Data.withUnsafeBytes`. Callers must run the full FFI call inside
+// the closure body.
+fileprivate enum FfiConverterByRefBytes: FfiConverter {
+    typealias SwiftType = Data
+    typealias FfiType = ForeignBytes
+
+    static func lower<R>(_ value: Data, _ body: (ForeignBytes) throws -> R) rethrows -> R {
+        return try value.withUnsafeBytes { rawBuf in
+            try body(ForeignBytes(rawBufferPointer: rawBuf))
+        }
+    }
+
+    static func lower(_ value: Data) -> ForeignBytes {
+        fatalError("ByRef bytes cannot use the plain lower: returning ForeignBytes escapes the Data.withUnsafeBytes scope. Use the scope-bound lower(_:_body:) overload instead.")
+    }
+
+    static func lift(_ value: ForeignBytes) throws -> Data {
+        fatalError("ByRef bytes cannot be lifted: zero-copy &[u8] only flows foreign->Rust")
+    }
+
+    static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Data {
+        fatalError("ByRef bytes cannot be read from a buffer: zero-copy &[u8] is only supported in argument position, not nested in records/options/etc.")
+    }
+
+    static func write(_ value: Data, into buf: inout [UInt8]) {
+        fatalError("ByRef bytes cannot be written to a buffer: zero-copy &[u8] is only supported in argument position, not nested in records/options/etc.")
+    }
 }
 
 // For every type used in the interface, we provide helper methods for conveniently
@@ -710,8 +756,9 @@ open class AcceptOutcome: AcceptOutcomeProtocol, @unchecked Sendable {
      */
 open func hasEarlyData() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_phantom_protocol_fn_method_acceptoutcome_has_early_data(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -724,8 +771,9 @@ open func hasEarlyData() -> Bool  {
      */
 open func peerAddrString() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_phantom_protocol_fn_method_acceptoutcome_peer_addr_string(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -735,8 +783,9 @@ open func peerAddrString() -> String  {
      */
 open func session() -> PhantomSession  {
     return try!  FfiConverterTypePhantomSession_lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_phantom_protocol_fn_method_acceptoutcome_session(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -749,8 +798,9 @@ open func session() -> PhantomSession  {
      */
 open func takeEarlyData() -> Data?  {
     return try!  FfiConverterOptionData.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_phantom_protocol_fn_method_acceptoutcome_take_early_data(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -1075,8 +1125,7 @@ open func accept()async throws  -> AcceptOutcome  {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_protocol_fn_method_phantomlistener_accept(
-                    self.uniffiCloneHandle()
-                    
+                        self.uniffiCloneHandle()
                 )
             },
             pollFunc: ffi_phantom_protocol_rust_future_poll_u64,
@@ -1092,8 +1141,9 @@ open func accept()async throws  -> AcceptOutcome  {
      */
 open func isShuttingDown() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_phantom_protocol_fn_method_phantomlistener_is_shutting_down(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -1105,8 +1155,9 @@ open func isShuttingDown() -> Bool  {
      */
 open func localAddr() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_phantom_protocol_fn_method_phantomlistener_local_addr(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -1118,8 +1169,9 @@ open func localAddr() -> String  {
      */
 open func metricsSnapshot() -> MetricsSnapshotFfi  {
     return try!  FfiConverterTypeMetricsSnapshotFfi_lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_phantom_protocol_fn_method_phantomlistener_metrics_snapshot(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -1134,9 +1186,10 @@ open func metricsSnapshot() -> MetricsSnapshotFfi  {
      * [`HandshakeServer::set_early_data_enabled`].
      */
 open func setEarlyDataEnabled(enabled: Bool)  {try! rustCall() {
+        uniffiCallStatus in
     uniffi_phantom_protocol_fn_method_phantomlistener_set_early_data_enabled(
             self.uniffiCloneHandle(),
-        FfiConverterBool.lower(enabled),$0
+        FfiConverterBool.lower(enabled),uniffiCallStatus
     )
 }
 }
@@ -1151,8 +1204,9 @@ open func setEarlyDataEnabled(enabled: Bool)  {try! rustCall() {
      * serving until their owning task closes them.
      */
 open func shutdown()  {try! rustCall() {
+        uniffiCallStatus in
     uniffi_phantom_protocol_fn_method_phantomlistener_shutdown(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
@@ -1164,8 +1218,9 @@ open func shutdown()  {try! rustCall() {
      */
 open func verifyingKeyBytes() -> Data  {
     return try!  FfiConverterData.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_phantom_protocol_fn_method_phantomlistener_verifying_key_bytes(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -1758,8 +1813,9 @@ open class PhantomSession: PhantomSessionProtocol, @unchecked Sendable {
      */
 public static func connect(peerAddr: String) -> PhantomSession  {
     return try!  FfiConverterTypePhantomSession_lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_phantom_protocol_fn_constructor_phantomsession_connect(
-        FfiConverterString.lower(peerAddr),$0
+        FfiConverterString.lower(peerAddr),uniffiCallStatus
     )
 })
 }
@@ -1792,8 +1848,7 @@ open func acceptStream()async throws  -> PhantomStream  {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_protocol_fn_method_phantomsession_accept_stream(
-                    self.uniffiCloneHandle()
-                    
+                        self.uniffiCloneHandle()
                 )
             },
             pollFunc: ffi_phantom_protocol_rust_future_poll_u64,
@@ -1828,8 +1883,7 @@ open func awaitReady()async throws   {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_protocol_fn_method_phantomsession_await_ready(
-                    self.uniffiCloneHandle()
-                    
+                        self.uniffiCloneHandle()
                 )
             },
             pollFunc: ffi_phantom_protocol_rust_future_poll_void,
@@ -1845,8 +1899,9 @@ open func awaitReady()async throws   {
      */
 open func connectionState() -> ConnectionState  {
     return try!  FfiConverterTypeConnectionState_lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_phantom_protocol_fn_method_phantomsession_connection_state(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -1891,8 +1946,7 @@ open func disconnect()async throws   {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_protocol_fn_method_phantomsession_disconnect(
-                    self.uniffiCloneHandle()
-                    
+                        self.uniffiCloneHandle()
                 )
             },
             pollFunc: ffi_phantom_protocol_rust_future_poll_void,
@@ -1918,8 +1972,7 @@ open func earlyDataAccepted()async  -> Bool?  {
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_protocol_fn_method_phantomsession_early_data_accepted(
-                    self.uniffiCloneHandle()
-                    
+                        self.uniffiCloneHandle()
                 )
             },
             pollFunc: ffi_phantom_protocol_rust_future_poll_rust_buffer,
@@ -1944,8 +1997,7 @@ open func flushQueue()async throws  -> UInt32  {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_protocol_fn_method_phantomsession_flush_queue(
-                    self.uniffiCloneHandle()
-                    
+                        self.uniffiCloneHandle()
                 )
             },
             pollFunc: ffi_phantom_protocol_rust_future_poll_u32,
@@ -1961,8 +2013,9 @@ open func flushQueue()async throws  -> UInt32  {
      */
 open func id() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_phantom_protocol_fn_method_phantomsession_id(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -1977,8 +2030,9 @@ open func id() -> String  {
      */
 open func isDataReady() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_phantom_protocol_fn_method_phantomsession_is_data_ready(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -2015,8 +2069,7 @@ open func lastError()async  -> CoreError?  {
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_protocol_fn_method_phantomsession_last_error(
-                    self.uniffiCloneHandle()
-                    
+                        self.uniffiCloneHandle()
                 )
             },
             pollFunc: ffi_phantom_protocol_rust_future_poll_rust_buffer,
@@ -2036,8 +2089,9 @@ open func lastError()async  -> CoreError?  {
      */
 open func metricsSnapshot() -> MetricsSnapshotFfi  {
     return try!  FfiConverterTypeMetricsSnapshotFfi_lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_phantom_protocol_fn_method_phantomsession_metrics_snapshot(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -2069,8 +2123,7 @@ open func migrate(localAddr: String)async throws   {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_protocol_fn_method_phantomsession_migrate(
-                    self.uniffiCloneHandle(),
-                    FfiConverterString.lower(localAddr)
+                        self.uniffiCloneHandle(),FfiConverterString.lower(localAddr)
                 )
             },
             pollFunc: ffi_phantom_protocol_rust_future_poll_void,
@@ -2086,8 +2139,9 @@ open func migrate(localAddr: String)async throws   {
      */
 open func openStream() -> PhantomStream  {
     return try!  FfiConverterTypePhantomStream_lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_phantom_protocol_fn_method_phantomsession_open_stream(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -2097,8 +2151,9 @@ open func openStream() -> PhantomStream  {
      */
 open func peerAddr() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_phantom_protocol_fn_method_phantomsession_peer_addr(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -2117,8 +2172,7 @@ open func queuedCount()async  -> UInt32  {
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_protocol_fn_method_phantomsession_queued_count(
-                    self.uniffiCloneHandle()
-                    
+                        self.uniffiCloneHandle()
                 )
             },
             pollFunc: ffi_phantom_protocol_rust_future_poll_u32,
@@ -2148,8 +2202,7 @@ open func recv()async throws  -> Data  {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_protocol_fn_method_phantomsession_recv(
-                    self.uniffiCloneHandle()
-                    
+                        self.uniffiCloneHandle()
                 )
             },
             pollFunc: ffi_phantom_protocol_rust_future_poll_rust_buffer,
@@ -2178,8 +2231,7 @@ open func resumptionHint()async  -> ResumptionHint?  {
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_protocol_fn_method_phantomsession_resumption_hint(
-                    self.uniffiCloneHandle()
-                    
+                        self.uniffiCloneHandle()
                 )
             },
             pollFunc: ffi_phantom_protocol_rust_future_poll_rust_buffer,
@@ -2232,8 +2284,7 @@ open func send(data: Data)async throws   {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_protocol_fn_method_phantomsession_send(
-                    self.uniffiCloneHandle(),
-                    FfiConverterData.lower(data)
+                        self.uniffiCloneHandle(),FfiConverterData.lower(data)
                 )
             },
             pollFunc: ffi_phantom_protocol_rust_future_poll_void,
@@ -2266,8 +2317,7 @@ open func setTrafficShaping(config: TrafficShapingConfig)async  -> Bool  {
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_protocol_fn_method_phantomsession_set_traffic_shaping(
-                    self.uniffiCloneHandle(),
-                    FfiConverterTypeTrafficShapingConfig_lower(config)
+                        self.uniffiCloneHandle(),FfiConverterTypeTrafficShapingConfig_lower(config)
                 )
             },
             pollFunc: ffi_phantom_protocol_rust_future_poll_i8,
@@ -2290,8 +2340,9 @@ open func setTrafficShaping(config: TrafficShapingConfig)async  -> Bool  {
      */
 open func supportsMigration() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_phantom_protocol_fn_method_phantomsession_supports_migration(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -2307,8 +2358,7 @@ open func trafficShaping()async  -> TrafficShapingConfig?  {
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_protocol_fn_method_phantomsession_traffic_shaping(
-                    self.uniffiCloneHandle()
-                    
+                        self.uniffiCloneHandle()
                 )
             },
             pollFunc: ffi_phantom_protocol_rust_future_poll_rust_buffer,
@@ -2551,8 +2601,7 @@ open func disconnect()async throws   {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_protocol_fn_method_phantomstream_disconnect(
-                    self.uniffiCloneHandle()
-                    
+                        self.uniffiCloneHandle()
                 )
             },
             pollFunc: ffi_phantom_protocol_rust_future_poll_void,
@@ -2579,8 +2628,7 @@ open func recv()async throws  -> Data?  {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_protocol_fn_method_phantomstream_recv(
-                    self.uniffiCloneHandle()
-                    
+                        self.uniffiCloneHandle()
                 )
             },
             pollFunc: ffi_phantom_protocol_rust_future_poll_rust_buffer,
@@ -2619,8 +2667,7 @@ open func sendReliable(data: Data)async throws   {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_protocol_fn_method_phantomstream_send_reliable(
-                    self.uniffiCloneHandle(),
-                    FfiConverterData.lower(data)
+                        self.uniffiCloneHandle(),FfiConverterData.lower(data)
                 )
             },
             pollFunc: ffi_phantom_protocol_rust_future_poll_void,
@@ -2660,8 +2707,7 @@ open func sendUnreliable(data: Data)async throws   {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_protocol_fn_method_phantomstream_send_unreliable(
-                    self.uniffiCloneHandle(),
-                    FfiConverterData.lower(data)
+                        self.uniffiCloneHandle(),FfiConverterData.lower(data)
                 )
             },
             pollFunc: ffi_phantom_protocol_rust_future_poll_void,
@@ -2681,8 +2727,7 @@ open func setPriority(priority: UInt32)async throws   {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_protocol_fn_method_phantomstream_set_priority(
-                    self.uniffiCloneHandle(),
-                    FfiConverterUInt32.lower(priority)
+                        self.uniffiCloneHandle(),FfiConverterUInt32.lower(priority)
                 )
             },
             pollFunc: ffi_phantom_protocol_rust_future_poll_void,
@@ -2695,8 +2740,9 @@ open func setPriority(priority: UInt32)async throws   {
     
 open func streamId() -> UInt32  {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_phantom_protocol_fn_method_phantomstream_stream_id(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -3009,8 +3055,7 @@ open func accept()async throws  -> AcceptOutcome  {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_protocol_fn_method_phantomudplistener_accept(
-                    self.uniffiCloneHandle()
-                    
+                        self.uniffiCloneHandle()
                 )
             },
             pollFunc: ffi_phantom_protocol_rust_future_poll_u64,
@@ -3026,8 +3071,9 @@ open func accept()async throws  -> AcceptOutcome  {
      */
 open func isShuttingDown() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_phantom_protocol_fn_method_phantomudplistener_is_shutting_down(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -3038,8 +3084,9 @@ open func isShuttingDown() -> Bool  {
      */
 open func localAddr() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_phantom_protocol_fn_method_phantomudplistener_local_addr(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -3059,8 +3106,9 @@ open func localAddr() -> String  {
      */
 open func metricsSnapshot() -> MetricsSnapshotFfi  {
     return try!  FfiConverterTypeMetricsSnapshotFfi_lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_phantom_protocol_fn_method_phantomudplistener_metrics_snapshot(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -3073,9 +3121,10 @@ open func metricsSnapshot() -> MetricsSnapshotFfi  {
      * [`HandshakeServer::set_early_data_enabled`].
      */
 open func setEarlyDataEnabled(enabled: Bool)  {try! rustCall() {
+        uniffiCallStatus in
     uniffi_phantom_protocol_fn_method_phantomudplistener_set_early_data_enabled(
             self.uniffiCloneHandle(),
-        FfiConverterBool.lower(enabled),$0
+        FfiConverterBool.lower(enabled),uniffiCallStatus
     )
 }
 }
@@ -3085,8 +3134,9 @@ open func setEarlyDataEnabled(enabled: Bool)  {try! rustCall() {
      * `ConnectionClosed`. Idempotent. Already-accepted sessions are unaffected.
      */
 open func shutdown()  {try! rustCall() {
+        uniffiCallStatus in
     uniffi_phantom_protocol_fn_method_phantomudplistener_shutdown(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
@@ -3097,8 +3147,9 @@ open func shutdown()  {try! rustCall() {
      */
 open func verifyingKeyBytes() -> Data  {
     return try!  FfiConverterData.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_phantom_protocol_fn_method_phantomudplistener_verifying_key_bytes(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -3916,8 +3967,7 @@ public func FfiConverterTypeTrafficShapingConfig_lower(_ value: TrafficShapingCo
     return FfiConverterTypeTrafficShapingConfig.lower(value)
 }
 
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 /**
  * Connection state for `PhantomSession`.
  *
@@ -4094,7 +4144,8 @@ public func FfiConverterTypeConnectionState_lower(_ value: ConnectionState) -> R
  * | `ConfigError`            | No         | Fix the configuration and retry               |
  * | `FipsSelfTestFailure`    | No         | Fatal POST failure — binary is broken         |
  */
-public enum CoreError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
+public 
+enum CoreError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
     
     
@@ -4355,8 +4406,7 @@ public func FfiConverterTypeCoreError_lower(_ value: CoreError) -> RustBuffer {
     return FfiConverterTypeCoreError.lower(value)
 }
 
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 /**
  * How a packet's on-wire size is chosen before sealing.
  */
@@ -4614,7 +4664,8 @@ fileprivate func uniffiFutureContinuationCallback(handle: UInt64, pollResult: In
  */
 public func generateSigningKey()throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_phantom_protocol_fn_func_generate_signing_key($0
+        uniffiCallStatus in
+    uniffi_phantom_protocol_fn_func_generate_signing_key(uniffiCallStatus
     )
 })
 }
@@ -4625,8 +4676,9 @@ public func generateSigningKey()throws  -> Data  {
  */
 public func verifyingKeyFromSigningKey(seed: Data)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+        uniffiCallStatus in
     uniffi_phantom_protocol_fn_func_verifying_key_from_signing_key(
-        FfiConverterData.lower(seed),$0
+        FfiConverterData.lower(seed),uniffiCallStatus
     )
 })
 }
@@ -4983,181 +5035,181 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_phantom_protocol_checksum_func_generate_signing_key() != 61598) {
+    if (uniffi_phantom_protocol_checksum_func_generate_signing_key() != 39294) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_func_verifying_key_from_signing_key() != 48109) {
+    if (uniffi_phantom_protocol_checksum_func_verifying_key_from_signing_key() != 62299) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_func_connect_pinned() != 34076) {
+    if (uniffi_phantom_protocol_checksum_func_connect_pinned() != 2050) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp() != 35741) {
+    if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp() != 56169) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_config() != 7565) {
+    if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_config() != 35502) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption() != 59191) {
+    if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption() != 4302) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_func_connect_pinned_with_config() != 48093) {
+    if (uniffi_phantom_protocol_checksum_func_connect_pinned_with_config() != 23760) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 23673) {
+    if (uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 33992) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_acceptoutcome_has_early_data() != 13201) {
+    if (uniffi_phantom_protocol_checksum_method_acceptoutcome_has_early_data() != 35020) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_acceptoutcome_peer_addr_string() != 47588) {
+    if (uniffi_phantom_protocol_checksum_method_acceptoutcome_peer_addr_string() != 38962) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_acceptoutcome_session() != 25558) {
+    if (uniffi_phantom_protocol_checksum_method_acceptoutcome_session() != 16275) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_acceptoutcome_take_early_data() != 27328) {
+    if (uniffi_phantom_protocol_checksum_method_acceptoutcome_take_early_data() != 40942) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomlistener_accept() != 8307) {
+    if (uniffi_phantom_protocol_checksum_method_phantomlistener_accept() != 17436) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomlistener_is_shutting_down() != 8474) {
+    if (uniffi_phantom_protocol_checksum_method_phantomlistener_is_shutting_down() != 40116) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomlistener_local_addr() != 46930) {
+    if (uniffi_phantom_protocol_checksum_method_phantomlistener_local_addr() != 13791) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomlistener_metrics_snapshot() != 63186) {
+    if (uniffi_phantom_protocol_checksum_method_phantomlistener_metrics_snapshot() != 53315) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomlistener_set_early_data_enabled() != 39659) {
+    if (uniffi_phantom_protocol_checksum_method_phantomlistener_set_early_data_enabled() != 22717) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomlistener_shutdown() != 60837) {
+    if (uniffi_phantom_protocol_checksum_method_phantomlistener_shutdown() != 63939) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomlistener_verifying_key_bytes() != 14523) {
+    if (uniffi_phantom_protocol_checksum_method_phantomlistener_verifying_key_bytes() != 11496) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_accept_stream() != 52368) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_accept_stream() != 18738) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_await_ready() != 6822) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_await_ready() != 29445) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_connection_state() != 25030) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_connection_state() != 5175) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_disconnect() != 61489) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_disconnect() != 16367) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_early_data_accepted() != 8121) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_early_data_accepted() != 46386) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_flush_queue() != 18912) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_flush_queue() != 35512) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_id() != 42609) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_id() != 20460) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_is_data_ready() != 25961) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_is_data_ready() != 3222) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_last_error() != 1347) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_last_error() != 47645) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_metrics_snapshot() != 36430) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_metrics_snapshot() != 13889) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_migrate() != 5135) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_migrate() != 51241) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_open_stream() != 25882) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_open_stream() != 23438) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_peer_addr() != 58516) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_peer_addr() != 8519) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_queued_count() != 34723) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_queued_count() != 33659) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_recv() != 44409) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_recv() != 6660) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_resumption_hint() != 52321) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_resumption_hint() != 42828) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_send() != 55912) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_send() != 6054) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 9439) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 18955) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_supports_migration() != 60201) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_supports_migration() != 35412) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping() != 8294) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping() != 60362) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 21465) {
+    if (uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 65158) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomstream_recv() != 18540) {
+    if (uniffi_phantom_protocol_checksum_method_phantomstream_recv() != 45283) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomstream_send_reliable() != 10962) {
+    if (uniffi_phantom_protocol_checksum_method_phantomstream_send_reliable() != 35264) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable() != 59359) {
+    if (uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable() != 18144) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomstream_set_priority() != 56290) {
+    if (uniffi_phantom_protocol_checksum_method_phantomstream_set_priority() != 18532) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomstream_stream_id() != 28026) {
+    if (uniffi_phantom_protocol_checksum_method_phantomstream_stream_id() != 46486) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomudplistener_accept() != 58484) {
+    if (uniffi_phantom_protocol_checksum_method_phantomudplistener_accept() != 3679) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomudplistener_is_shutting_down() != 49450) {
+    if (uniffi_phantom_protocol_checksum_method_phantomudplistener_is_shutting_down() != 19646) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomudplistener_local_addr() != 6213) {
+    if (uniffi_phantom_protocol_checksum_method_phantomudplistener_local_addr() != 14771) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomudplistener_metrics_snapshot() != 18131) {
+    if (uniffi_phantom_protocol_checksum_method_phantomudplistener_metrics_snapshot() != 38747) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomudplistener_set_early_data_enabled() != 49550) {
+    if (uniffi_phantom_protocol_checksum_method_phantomudplistener_set_early_data_enabled() != 26287) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomudplistener_shutdown() != 50351) {
+    if (uniffi_phantom_protocol_checksum_method_phantomudplistener_shutdown() != 50321) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomudplistener_verifying_key_bytes() != 25697) {
+    if (uniffi_phantom_protocol_checksum_method_phantomudplistener_verifying_key_bytes() != 9366) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind() != 49830) {
+    if (uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind() != 2358) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_config_bytes() != 10908) {
+    if (uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_config_bytes() != 17389) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_signing_key_bytes() != 19213) {
+    if (uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_signing_key_bytes() != 31864) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_constructor_phantomsession_connect() != 40022) {
+    if (uniffi_phantom_protocol_checksum_constructor_phantomsession_connect() != 59507) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp() != 57133) {
+    if (uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp() != 5261) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp_with_config_bytes() != 28985) {
+    if (uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp_with_config_bytes() != 45423) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp_with_signing_key_bytes() != 18642) {
+    if (uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp_with_signing_key_bytes() != 47318) {
         return InitializationResult.apiChecksumMismatch
     }
 

@@ -5215,7 +5215,7 @@ impl PhantomSession {
     ///
     /// A `#[deprecated]` attribute would be the natural way to flag this, but it
     /// **cannot** be applied here: this constructor is `#[uniffi::constructor]`,
-    /// and UniFFI 0.31 emits FFI scaffolding that calls `Self::connect()` from
+    /// and UniFFI 0.32 emits FFI scaffolding that calls `Self::connect()` from
     /// generated code in this same crate. That generated call would trip the
     /// `deprecated` lint, which CI promotes to a hard error under
     /// `clippy --lib -D warnings` — and no item-scoped `#[allow(deprecated)]`

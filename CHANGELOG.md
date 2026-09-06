@@ -461,6 +461,32 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
     it rather than widening `on_loss` is what keeps the two populations from sharing a
     denominator they do not share.
 
+- **Eight direct dependencies moved a major version, and one of them breaks every
+  generated binding.** `base64` 0.22 → 0.23, `lz4_flex` 0.13 → 0.14, `zstd` 0.13 → 0.14,
+  `argon2` 0.5 → 0.6, `ed25519-dalek` 2 → 3 and `x25519-dalek` 2 → 3 (which brings
+  `curve25519-dalek` 5 and the deferred `rand` 0.8 → 0.10 migration with it — `rand` is a
+  dev-only dependency; the production CSPRNG seam is `getrandom` via `crypto::rng::OsRng`
+  and did not move), and `uniffi` 0.31 → 0.32. Each landed as its own commit with its own
+  full gate run, because a group bump with one check at the end does not answer which of
+  them broke it. The two signature crates are the reason the wire vectors exist: `ed25519`
+  and `x25519` sit in the signing half and the classical half of the KEM, and the bump was
+  required to move **no byte** — `wire_vectors` (16), `nist_kat` (6) and `cavp` (5) are what
+  says it did not. A bump that moves a byte is a protocol change, not a bump.
+
+  **`uniffi` 0.32 is a binding-ABI break even though no Rust source changed.** The macro
+  now writes an `orig_name` field into every function's metadata buffer, and the per-item
+  checksum is an FNV hash *of that buffer* — so all 59 checksums this crate exports moved,
+  and none of them landed on its old value. `UNIFFI_CONTRACT_VERSION` did **not** move: it
+  is 30 in both releases. That combination is the part worth writing down, because the
+  coarse gate stays green through it — a consumer who updates the native library and keeps
+  the binding files generated against 0.31 gets `UniFFI API checksum mismatch` at import
+  time, not a compile error, and the contract-version check that looks like it would catch
+  that passes. **Regenerate all four bindings when you take this release.** The copies in
+  `tests/bindings/` were regenerated here; the public surface they expose is unchanged
+  (same methods, same 53 async entry points, no new `close`), and the only additions are
+  Kotlin's `uniffiIsDestroyed` property on each of the five objects and an internal
+  by-reference bytes converter in Python.
+
 - **`BandwidthEstimator::on_ack` and `Session::on_packet_acked` now hand back the RTT sample
   the acknowledgement produced.** `on_ack` returns `(u64, Duration)` where it returned the
   pacing rate alone, and `on_packet_acked` returns that `Duration` where it returned a

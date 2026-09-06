@@ -17,7 +17,7 @@ wasm-pack build --target bundler --release -- --manifest-path phantom-wasm-clien
 **Feature flags.** The browser row is `--no-default-features` plus `std`,
 `compression-zstd`, `classical-crypto`. Do NOT enable the native-only tokio
 features (`rt-multi-thread`, `net`), and leave the default-on `bindings`
-feature off — UniFFI 0.31's rust-future glue requires `Send`, which browser
+feature off — UniFFI 0.32's rust-future glue requires `Send`, which browser
 futures are not. Minimal `Cargo.toml` for the wasm-pack crate:
 
 ```toml

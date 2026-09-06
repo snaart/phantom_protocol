@@ -2,7 +2,7 @@
 #
 # generate_c.sh — regenerate / verify the C FFI header for phantom_protocol.
 #
-# UniFFI 0.31 has no first-class C generator, so the header at
+# UniFFI 0.32 has no first-class C generator, so the header at
 # tests/bindings/c/phantom_protocol.h is hand-curated against the exact
 # extern "C" symbols emitted by `uniffi::setup_scaffolding!()` into the
 # produced cdylib. This script:

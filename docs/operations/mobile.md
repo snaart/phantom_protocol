@@ -35,7 +35,7 @@ xcodebuild -create-xcframework \
 
 Auto-generated Swift sources in `tests/bindings/swift/`: `phantom_protocol.swift`,
 `phantom_protocolFFI.h`, `phantom_protocolFFI.modulemap`. Regenerate via
-`core/src/bin/uniffi-bindgen.rs` (uniffi 0.31 cli) after any surface change.
+`core/src/bin/uniffi-bindgen.rs` (uniffi 0.32 cli) after any surface change.
 
 **SwiftPM integration.**
 
