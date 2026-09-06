@@ -519,6 +519,13 @@ const PROBE_BW_GAINS: [f64; 4] = [1.25, 0.75, 1.0, 1.0];
 /// 2.0 — with the two equal, one round trip of pacing at this gain delivers
 /// exactly one congestion window, so pacing cannot slow the ramp it governs.
 /// That equality is the load-bearing part; change one and check the other.
+///
+/// The equality used to hold only on a clean round: a losing one ran the pacer
+/// at 2.0 against a window the loss response had put at `INFLIGHT_HI_BETA ×
+/// CWND_GAIN` = 1.4, so pacing *was* the binding constraint exactly where the
+/// ramp could least afford it. It holds unconditionally now, because
+/// `adapt_inflight_bound` does not lower the volume bound during Startup at
+/// all.
 const STARTUP_PACING_GAIN: f64 = 2.0;
 
 /// Startup growth threshold — if BW growth < 25%, consider pipe filled
@@ -685,16 +692,34 @@ const INFLIGHT_HI_BETA: f64 = 0.7;
 /// is load-bearing.** Through a cap of `g × BDP` on a path dropping a fraction
 /// `p`, the best sample is `g × (1 - p) × btl_bw`, so the cap is absorbing
 /// whenever `g ≤ 1 / (1 - p)` — at 1.25 that is any loss over a fifth, not
-/// "at or below the BDP". Worse, the condition that fires first is not this one
-/// but Startup's: `g × (1 - p) < 1 + STARTUP_GROWTH_THRESHOLD`, and since that
-/// threshold is **the same 1.25**, a sender pinned at this floor fails the
-/// Startup growth test on the first round that loses anything at all. That is
-/// why the loss response is measured down from the target and lands at
-/// `INFLIGHT_HI_BETA × CWND_GAIN` — see [`INFLIGHT_HI_LEVEL_SUPPORTS_LOSS_TO`],
-/// which asserts the relation between the three constants — and it is why this
-/// floor is now the *lower* of the two levels that matter rather than the
-/// operating point. Do not read the two doctrines as alternatives: this one
-/// governs where the bound may not go, the other governs where it lands.
+/// "at or below the BDP". That is why the loss response is measured down from
+/// the target and lands at `INFLIGHT_HI_BETA × CWND_GAIN` — see
+/// [`INFLIGHT_HI_LEVEL_SUPPORTS_LOSS_TO`], which asserts the relation between
+/// the three constants — and it is why this floor is the *lower* of the two
+/// levels that matter rather than the operating point. Do not read the two
+/// doctrines as alternatives: this one governs where the bound may not go, the
+/// other governs where it lands.
+///
+/// **A second collision used to be described here, and it is gone rather than
+/// resolved.** This gain and `1 + STARTUP_GROWTH_THRESHOLD` are the same 1.25,
+/// so a sender held at this floor during the ramp failed the Startup growth
+/// test on the first round that lost anything at all: through a bound of
+/// `g × BDP` a round delivers at most `g × (1 - p)` times the estimate that set
+/// it, and the growth test wants `1 + STARTUP_GROWTH_THRESHOLD`. The
+/// arithmetic was closed against itself, and the break-even at the loss level
+/// (1.4) was 10.7 per cent — above which a connection left its only exponential
+/// phase at whatever fraction of the link it had reached.
+///
+/// It no longer arises, because `adapt_inflight_bound` does not judge a Startup
+/// round: canonical BBR reaches `BBRAdaptUpperBounds` only through
+/// `BBRUpdateProbeBWCyclePhase`, whose first line is
+/// `if (!BBR.filled_pipe) return`, and initialises `BBR.inflight_hi` to
+/// Infinity, so loss cannot lower the volume bound anywhere in Startup. What
+/// the draft puts there instead is an *exit* (`BBRCheckStartupHighLoss`), not a
+/// narrower window — a phase the sender leaves is bounded in time, where a
+/// window it lowers is not. See [`STARTUP_SURVIVES_LOSS_TO`] for what the ramp
+/// now runs at, and `a_fifth_of_the_path_dropping_does_not_end_the_ramp` for
+/// the gate.
 ///
 /// **Where it actually binds**, since that is not where it reads as though it
 /// would. Not in the loss branch: the level there is `INFLIGHT_HI_BETA ×
@@ -735,16 +760,20 @@ const CWND_GAIN: f64 = 2.0;
 ///
 /// While `inflight_hi` binds, the window is `INFLIGHT_HI_BETA × CWND_GAIN ×
 /// BDP` and a round can deliver at most `(1 - p)` of it, so the estimate grows
-/// by at most `INFLIGHT_HI_BETA × CWND_GAIN × (1 - p)` per round. Startup ends
-/// after `STARTUP_ROUNDS_LIMIT` rounds that fail to beat the plateau by
-/// `STARTUP_GROWTH_THRESHOLD`. Below the loss rate where those two meet, a
-/// connection ramps; above it, Startup ends at whatever fraction of the link it
-/// had reached and the ProbeBW cycle has to climb the rest at a quarter per
-/// four round trips, the one gain of [`PROBE_BW_GAINS`] that probes upward —
-/// which is under a second a cycle on a 235 ms path and still fifteen seconds
-/// of gain cycling for a fortyfold climb, before any of it is spent on rounds
-/// that lose. A connection that leaves Startup low does not fail; it arrives
-/// late enough that a measurement window closes first.
+/// by at most `INFLIGHT_HI_BETA × CWND_GAIN × (1 - p)` per round. What that has
+/// to clear is the head-room the probe needs: the bound must not squeeze under
+/// `PROBE_BW_GAINS`' probe phase, whose whole job is to ask the path for a
+/// quarter more than the current estimate, or the probe cannot probe.
+///
+/// **This used to be derived through the Startup growth test instead**, and the
+/// arithmetic came out at the same number because `PROBE_BW_GAINS[0]` and
+/// `1 + STARTUP_GROWTH_THRESHOLD` are both 1.25 — a coincidence worth naming,
+/// or the next reader takes the unchanged figure for an unrevised paragraph.
+/// The Startup derivation no longer applies at all: `adapt_inflight_bound`
+/// returns before the loss branch during Startup, so no round of the ramp runs
+/// under this bound and the growth test is reading the path rather than this
+/// function's own output. [`STARTUP_SURVIVES_LOSS_TO`] is the constant that
+/// governs the ramp now.
 ///
 /// Eight per cent is the worst the reference WAN path's own raw-UDP control
 /// reports at rates far below the ceiling it later establishes, so that is what
@@ -754,6 +783,38 @@ const CWND_GAIN: f64 = 2.0;
 /// one-character change to `INFLIGHT_HI_BETA` — 0.7 to 0.635 — reverted the
 /// whole of that behaviour with every test in the crate still green.
 const INFLIGHT_HI_LEVEL_SUPPORTS_LOSS_TO: f64 = 0.08;
+
+/// The loss rate a connection still *ramps through*, which is a different
+/// question from the one above and now has a different answer.
+///
+/// [`INFLIGHT_HI_LEVEL_SUPPORTS_LOSS_TO`] states what the volume bound must
+/// hold once the bound is engaged. This states what Startup runs at when it is
+/// **not** — and since `adapt_inflight_bound` declines to judge a Startup round
+/// at all, the way canonical BBR does, the window during the ramp is
+/// [`CWND_GAIN`] flat. A round under a window of `g × BDP` on a path dropping
+/// `p` delivers at most `g × (1 - p)` times the estimate that set it, and
+/// Startup survives while that clears `1 + STARTUP_GROWTH_THRESHOLD`. At
+/// `g = CWND_GAIN` the break-even is 37.5 per cent; this is the margin under it
+/// that an edit may not spend.
+///
+/// It is the figure that used to be 10.7 per cent **by accident**: with the
+/// bound engaged during the ramp, the level was `INFLIGHT_HI_BETA × CWND_GAIN`
+/// and the break-even fell out of three constants that were never chosen with
+/// this question in mind. Measured on `core/examples/bottleneck_sim.rs`
+/// (`noisy`, four loss processes, base against fix): the 20 per cent rung went
+/// from 1–8 per cent of the link to 58–61, the 15 per cent rung from 18–31 to
+/// 66–68, and the 10 per cent rung from 50–58 to 74–75, with the 2 and 5 per
+/// cent rungs unmoved or slightly better.
+///
+/// **Honest about what the assertion below is worth today.** At the present
+/// constants it is implied by the one above — no assignment of
+/// `INFLIGHT_HI_BETA` satisfies that one and fails this one — so a mutation run
+/// finds it empty, and the behavioural gate
+/// (`a_fifth_of_the_path_dropping_does_not_end_the_ramp`) is what actually
+/// holds the property. It is here to state the relation, not to be counted as a
+/// second independent gate, and it bites the moment `CWND_GAIN` moves: at a
+/// gain of 1.6 it fails while the assertion above still passes.
+const STARTUP_SURVIVES_LOSS_TO: f64 = 0.30;
 
 const _: () = {
     // `const` arithmetic on f64 is allowed; the comparison is the assertion.
@@ -767,21 +828,24 @@ const _: () = {
          ProbeBW cycle to climb back a quarter per four round trips. Move the \
          constants together or move the supported rate deliberately."
     );
-    // And the floor itself has a bottom. Everything above leans on
-    // `INFLIGHT_HI_FLOOR_GAIN` being at least `1 + STARTUP_GROWTH_THRESHOLD` —
-    // that is what makes a round spent at the floor able to beat the growth
-    // test on a path that is not losing, and it is stated as an identity in
-    // the loss branch's own reasoning. Nothing asserted it, and at a gain of
-    // 1.0 the relax branch parks the bound at exactly one bandwidth-delay
-    // product, the absorbing point this file's own documentation warns about,
+    // And the floor itself has a bottom. At a gain of 1.0 the relax branch
+    // parks the bound at exactly one bandwidth-delay product — the absorbing
+    // point this file's own documentation warns about, where no sample can
+    // raise the estimate that set the bound — and nothing asserted otherwise,
     // with every library test still green.
+    //
+    // The bar is `1 + STARTUP_GROWTH_THRESHOLD` for a reason that is now
+    // arithmetic rather than a Startup argument: it is the same 1.25 as
+    // `PROBE_BW_GAINS`' probe phase, so a bound resting on the floor still
+    // leaves the probe its quarter. The Startup reading of this line —
+    // "a round held at the floor must still beat the growth test" — no longer
+    // applies, because no Startup round runs under the bound at all.
     assert!(
         INFLIGHT_HI_FLOOR_GAIN >= 1.0 + STARTUP_GROWTH_THRESHOLD,
-        "INFLIGHT_HI_FLOOR_GAIN has fallen under (1 + STARTUP_GROWTH_THRESHOLD), so a \
-         round held at the floor can no longer beat the Startup growth test even on a \
-         path that is losing nothing, and a bound relaxed onto the floor sits at or \
-         under one bandwidth-delay product, where no sample can raise the estimate that \
-         set it"
+        "INFLIGHT_HI_FLOOR_GAIN has fallen under the probe gain, so a bound relaxed \
+         onto the floor sits at or under one bandwidth-delay product, where no sample \
+         can raise the estimate that set it and the probe phase has nothing left to \
+         probe with"
     );
     // And the level has to clear the floor, or `INFLIGHT_HI_BETA` is dead code
     // and the reasoning above describes a branch that never decides anything.
@@ -789,6 +853,18 @@ const _: () = {
         level > INFLIGHT_HI_FLOOR_GAIN,
         "INFLIGHT_HI_BETA x CWND_GAIN has fallen to or under INFLIGHT_HI_FLOOR_GAIN, \
          so every loss response now clamps to the floor and the beta is inert"
+    );
+    // And Startup, which does not run under the bound at all, has a level of
+    // its own: `CWND_GAIN`, with nothing else capping the ramp. This is the
+    // loss rate a connection can climb through, and it is the figure that used
+    // to be 10.7% because three constants happened to multiply that way.
+    assert!(
+        CWND_GAIN * (1.0 - STARTUP_SURVIVES_LOSS_TO) > 1.0 + STARTUP_GROWTH_THRESHOLD,
+        "CWND_GAIN no longer clears (1 + STARTUP_GROWTH_THRESHOLD) at \
+         STARTUP_SURVIVES_LOSS_TO: a connection on a path losing that much cannot beat \
+         the Startup growth test even with no bound engaged, so it leaves the only \
+         exponential phase it has at whatever fraction of the link it had reached and \
+         is left to the ProbeBW cycle to climb a quarter per four round trips"
     );
 };
 
@@ -2068,7 +2144,7 @@ impl BandwidthEstimator {
         // heavy congestion. ProbeRTT is worse: the window there is pinned to
         // four packets on purpose, so both halves of the ratio are the
         // controller's own doing rather than the path's.
-        if is_app_limited || self.state == BbrState::ProbeRTT {
+        if is_app_limited || self.state == BbrState::ProbeRTT || self.state == BbrState::Startup {
             return;
         }
 
@@ -2090,48 +2166,46 @@ impl BandwidthEstimator {
             // form compounded to nothing — `0.7^5` — which the floor makes
             // impossible. The gain is real; that account of it was not.)
             //
-            // **Why twelve per cent of one level decides whether the connection
-            // works at all.** Startup is the only phase with exponential
-            // growth, and it ends after `STARTUP_ROUNDS_LIMIT` rounds that fail
-            // to beat the previous plateau by `STARTUP_GROWTH_THRESHOLD`. While
-            // this bound is engaged the window is `level × BDP`, so a round can
-            // deliver at most `level × (1 - p)` times the estimate that set it,
-            // where `p` is the fraction the path is dropping. Startup therefore
-            // survives exactly while
+            // **This branch does not run during the ramp, and that is the
+            // second half of the same story.** The paragraph that used to stand
+            // here worked out why twelve per cent of one level decided whether
+            // the connection worked at all: while the bound was engaged the
+            // window was `level × BDP`, a round delivered at most
+            // `level × (1 - p)` times the estimate that set it, and Startup
+            // survived only while that cleared
             //
             // ```text
             //     level × (1 - p)  ≥  1 + STARTUP_GROWTH_THRESHOLD
             // ```
             //
-            // and `INFLIGHT_HI_FLOOR_GAIN` is **the same number** as
-            // `1 + STARTUP_GROWTH_THRESHOLD`. A sender held at the floor
-            // therefore fails that test on the first round that loses anything
-            // at all, leaves Startup at whatever fraction of the link it had
-            // reached, and is left with the ProbeBW gain cycle to climb the
-            // rest — a quarter more per four-round cycle, which on a 235 ms
-            // path is fifteen seconds of gain cycling for a fortyfold climb
-            // and longer than that for every round spent losing. At `1.4` the
-            // same arithmetic
-            // tolerates `p ≤ 10.7%`, which covers the reference WAN path's own
-            // raw-UDP control (one to eight per cent at rates far below the
-            // ceiling it later establishes) with about three points to spare.
+            // At the floor (1.25, the same number as the right-hand side) that
+            // failed on the first round losing anything at all; at the level
+            // (1.4) it held to `p ≤ 10.7%` and broke above it. The reasoning was
+            // right and the arithmetic was right, and the conclusion to draw
+            // from it was not "pick a better level" but "this bound has no
+            // business being an input to that test". `adapt_inflight_bound` now
+            // returns before this point during Startup, as canonical BBR does,
+            // so the ramp runs at `CWND_GAIN` flat and the break-even is 37.5%
+            // — see [`STARTUP_SURVIVES_LOSS_TO`].
             //
-            // Measured, `bottleneck_sim -- noisy`, per cent of the link, and
-            // repeated across four different arrival patterns for the same
-            // rates (`PHANTOM_SIM_LOSS_SEED`) because evenly spaced loss is one
-            // draw and a controller is sensitive to which one it gets. What
-            // holds on all four: 2% gains two to seven points, 5% gains eight
-            // to eleven — and 5% reaches nine tenths of the link in about seven
-            // seconds where it used to take nineteen. Above that the spread
-            // between arrival patterns exceeds the effect: at 15% the evenly
-            // spaced run gains twenty points and one of the three random ones
-            // *loses* three, so no single figure from there is quotable. At 20%
-            // both builds are near zero for a reason this change does not
-            // address — the collision of constants above — and undoing that is
-            // a separate change with its own argument.
-            // `INFLIGHT_HI_LEVEL_SUPPORTS_LOSS_TO` states the bound this
-            // reasoning depends on so that a later edit to any of the three
-            // constants fails the build rather than the path.
+            // What remains true of *this* branch, which runs everywhere else:
+            // the level is `INFLIGHT_HI_BETA × CWND_GAIN`, and
+            // `INFLIGHT_HI_LEVEL_SUPPORTS_LOSS_TO` states the relation the three
+            // constants have to keep so that a later edit to any one of them
+            // fails the build rather than the path.
+            //
+            // Measured, `bottleneck_sim -- noisy`, per cent of the link, across
+            // four arrival patterns for the same rates (`PHANTOM_SIM_LOSS_SEED`)
+            // because evenly spaced loss is one draw and a controller is
+            // sensitive to which one it gets. Base against the Startup change,
+            // worst and best of the four: 10% went 50–58 → 74–75, 15% went
+            // 18–31 → 66–68, 20% went 1–8 → 58–61, while 2% and 5% moved from
+            // 85–87 → 87–88 and 78–80 → 82–83. The cost was read on `collapse`,
+            // where every loss is the queue overflowing rather than noise, at
+            // three buffer depths: refusals rose 0.1 points at a quarter-BDP
+            // buffer, 0.2 at a half, and 1.3 at a full BDP where delivery rose
+            // a point in exchange; standing queue and worst round trip did not
+            // move at any depth.
             //
             // **What it costs.** The response no longer varies with anything: a
             // round that lost 2.1% and a round that lost 99% set the same bound,
@@ -2439,6 +2513,61 @@ impl std::fmt::Debug for BandwidthEstimator {
 mod tests {
     use super::*;
 
+    /// Drive an estimator out of Startup on a clean, flat path, and return the
+    /// clock it left off at.
+    ///
+    /// **Every test of the loss response needs this now, and that is the point
+    /// of the change it accompanies.** `adapt_inflight_bound` declines to judge
+    /// a Startup round at all, the way canonical BBR does — `BBRAdaptUpperBounds`
+    /// is reachable only through `BBRUpdateProbeBWCyclePhase`, whose first line
+    /// is `if (!BBR.filled_pipe) return`, and `BBR.inflight_hi` starts at
+    /// Infinity. A fixture that stays in Startup therefore exercises none of that
+    /// branch, and three tests in this file did exactly that without saying so:
+    /// they were written before the branch had a phase it skipped, and they read
+    /// as testing the loss response while measuring nothing.
+    ///
+    /// Flat and clean is deliberate. Startup ends after
+    /// `STARTUP_ROUNDS_LIMIT` rounds that fail to beat the plateau by
+    /// `STARTUP_GROWTH_THRESHOLD`, so a constant rate ends it in a bounded
+    /// number of rounds without any loss having to be booked — which keeps the
+    /// warm-up from contributing to whatever the caller is about to measure.
+    fn drive_out_of_startup(est: &mut BandwidthEstimator, seg: u64, rtt: Duration) -> Instant {
+        const SEGMENTS_PER_ROUND: u32 = 40;
+        const MAX_ROUNDS: u32 = 12;
+
+        let mut now = Instant::now();
+        for round in 0..MAX_ROUNDS {
+            if est.state() != BbrState::Startup {
+                return now;
+            }
+            let delivered_at_send = est.delivered_bytes();
+            for _ in 0..SEGMENTS_PER_ROUND {
+                est.on_send(seg);
+            }
+            now += rtt;
+            for _ in 0..SEGMENTS_PER_ROUND {
+                est.on_ack(DeliverySample {
+                    delivered_bytes: delivered_at_send,
+                    delivered_at: est.delivered_time(),
+                    sent_at: now - rtt,
+                    acked_at: now,
+                    packet_bytes: seg,
+                    is_app_limited: false,
+                    ack_delay_us: 0,
+                    rtt_sampled: round == 0,
+                });
+            }
+        }
+        assert_ne!(
+            est.state(),
+            BbrState::Startup,
+            "a flat, lossless path did not leave Startup within {MAX_ROUNDS} rounds, \
+             so a fixture built on this helper would be measuring the ramp rather \
+             than the loss response it means to measure"
+        );
+        now
+    }
+
     fn make_sample(sent_at: Instant, rtt_ms: u64, packet_bytes: u64) -> DeliverySample {
         DeliverySample {
             delivered_bytes: 0,
@@ -2687,7 +2816,16 @@ mod tests {
         let run = |cause: LossCause, holes: u32| {
             const SEGMENTS: u32 = 100;
             let mut est = BandwidthEstimator::new();
-            let mut now = Instant::now();
+            // The loss response does not judge a Startup round, so a fixture
+            // that never leaves Startup measures nothing at all — including the
+            // positive control below, which would report "no bound" from an
+            // estimator that was never asked to set one.
+            let mut now = drive_out_of_startup(&mut est, SEG, RTT);
+            assert_ne!(
+                est.state(),
+                BbrState::Startup,
+                "precondition: the loss branch is unreachable during Startup"
+            );
             for round in 0..4u32 {
                 let delivered_at_send = est.delivered_bytes();
                 for _ in 0..SEGMENTS {
@@ -2830,7 +2968,15 @@ mod tests {
         const GROWTH_DENOMINATOR: u32 = 4;
 
         let mut est = BandwidthEstimator::new();
-        let mut now = Instant::now();
+        // The loss branch is unreachable during Startup, so the ramp has to be
+        // over before the first hole is booked — otherwise `bound_per_round` is
+        // all `None` and every assertion below is vacuous rather than false.
+        let mut now = drive_out_of_startup(&mut est, SEG, RTT);
+        assert_ne!(
+            est.state(),
+            BbrState::Startup,
+            "precondition: the loss branch is unreachable during Startup"
+        );
         let mut segments = 64u32;
         let mut bound_per_round: Vec<Option<u64>> = Vec::new();
         let mut estimate_per_round: Vec<u64> = Vec::new();
@@ -2985,7 +3131,17 @@ mod tests {
         const SEGMENTS_FAST: u32 = 400;
 
         let mut est = BandwidthEstimator::new();
-        let mut now = Instant::now();
+        // The relax branch this test is about lives in `adapt_inflight_bound`,
+        // which returns before reaching it during Startup — so the bound the
+        // first losing round is supposed to engage would never be set, and the
+        // `.expect` below would fire on a precondition rather than on the
+        // property.
+        let mut now = drive_out_of_startup(&mut est, SEG, RTT);
+        assert_ne!(
+            est.state(),
+            BbrState::Startup,
+            "precondition: the loss branch is unreachable during Startup"
+        );
 
         let round = |est: &mut BandwidthEstimator, now: &mut Instant, segments, holes| {
             let delivered_at_send = est.delivered_bytes();
@@ -3937,6 +4093,76 @@ mod tests {
             "cwnd {} B has not grown past the {} B it opened at",
             est.cwnd(),
             opening_cwnd
+        );
+    }
+
+    /// A path dropping a fifth of everything must still be a path this sender
+    /// ramps on.
+    ///
+    /// **This is state, not speed**: no wall-clock throughput assertion belongs in
+    /// `--lib`. What it asserts is that the connection
+    /// is still in Startup after ten losing rounds, and that its estimate rose
+    /// while it was — the second half being what stops "still in Startup" from
+    /// being satisfied by an estimator that is simply stuck.
+    ///
+    /// The arithmetic it was written against. Before the change, a Startup round
+    /// ran under `inflight_hi`, which the loss response set to
+    /// `INFLIGHT_HI_BETA × CWND_GAIN = 1.4` BDP. A round under a bound of
+    /// `g × BDP` on a path dropping `p` delivers at most `g × (1 - p)` times the
+    /// estimate that set the bound, and Startup survives only while that clears
+    /// `1 + STARTUP_GROWTH_THRESHOLD = 1.25`. At `p = 20%` that is
+    /// `1.4 × 0.8 = 1.12` against 1.25 — three such rounds and the ramp is over,
+    /// on a path that is not congested at all. The bound was not measuring the
+    /// path; it was measuring the controller's own output. Reverting the change
+    /// puts `filled_pipe` true within four rounds here.
+    ///
+    /// The growth floor is taken from the estimate **after the first round**,
+    /// not from a fresh estimator. A fresh `BandwidthEstimator` reports
+    /// `btl_bw` of zero, so a floor of `onset.max(1) * 8` would be "eight bytes
+    /// per second" — a bar one packet per round trip clears seven hundred times
+    /// over, which is a gate that cannot fail rather than one that passes.
+    #[test]
+    fn a_fifth_of_the_path_dropping_does_not_end_the_ramp() {
+        const RTT: Duration = Duration::from_millis(200);
+        /// The reference WAN path's own measured figure, in bytes per second.
+        const TRUE_BW: u64 = 1_167_500;
+        /// The top rung of the simulator's `noisy` sweep, and the one that this
+        /// controller left at one per cent of the link before the change.
+        const LOSS_PER_MILLE: u64 = 200;
+        const ROUNDS: u32 = 10;
+
+        let mut est = BandwidthEstimator::new();
+        let mut t = Instant::now();
+        let mut carry = 0;
+        let mut after_first_round = 0u64;
+
+        for round in 0..ROUNDS {
+            let (lost, took) = closed_loop_round(&mut est, t, RTT, TRUE_BW, LOSS_PER_MILLE, carry);
+            carry = lost;
+            t += took;
+            if round == 0 {
+                after_first_round = est.bottleneck_bandwidth();
+            }
+            assert_eq!(
+                est.state(),
+                BbrState::Startup,
+                "round {round}: the ramp ended on a path that drops a fifth and \
+                 queues nothing — the Startup growth test was reading this \
+                 controller's own inflight bound rather than the path"
+            );
+        }
+
+        assert!(
+            after_first_round > 0,
+            "the fixture must produce a bandwidth sample in its first round, or \
+             the growth floor below is measured against nothing"
+        );
+        assert!(
+            est.bottleneck_bandwidth() >= after_first_round * 4,
+            "ten rounds of exponential growth must multiply the estimate several \
+             times over; it went {after_first_round} -> {} B/s, which is a ramp \
+             that is technically still in Startup and going nowhere",
+            est.bottleneck_bandwidth()
         );
     }
 

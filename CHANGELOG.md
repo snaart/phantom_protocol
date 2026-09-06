@@ -1117,6 +1117,73 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Fixed
 
+- **A connection no longer stops ramping above ~10.7% packet loss, because the volume
+  bound no longer judges a Startup round.** `BandwidthEstimator::adapt_inflight_bound`
+  returns before the loss branch while the state is `Startup`, alongside the two cases it
+  already skipped (`app_limited` and `ProbeRTT`). The change is one condition, and what it
+  does is *remove* a mechanism from one phase rather than add one.
+
+  **The reason is that this implementation had diverged from the specification, and the
+  divergence was the defect.** In `draft-cardwell-iccrg-bbr-congestion-control-02`,
+  `BBRAdaptUpperBounds` is reachable only through `BBRUpdateProbeBWCyclePhase`, whose first
+  line is `if (!BBR.filled_pipe) return`, and `BBR.inflight_hi` is initialised to Infinity —
+  so loss cannot lower the volume bound anywhere in Startup. Linux BBRv3 agrees:
+  `bbr_is_probing_bandwidth()` returns true in `BBR_STARTUP`, so `bbr_adapt_lower_bounds()`
+  exits there too. What the draft puts in Startup instead is an *exit*
+  (`BBRCheckStartupHighLoss`), not a narrower window.
+
+  Here the bound did engage during the ramp, and it fed the test that decides whether the
+  ramp continues. Through a bound of `g × BDP` on a path dropping `p`, a round delivers at
+  most `g × (1 - p)` times the estimate that set the bound, and Startup survives only while
+  that clears `1 + STARTUP_GROWTH_THRESHOLD` = 1.25. At the loss level
+  (`INFLIGHT_HI_BETA × CWND_GAIN` = 1.4) the break-even is 10.7%. Above it the connection
+  left its only exponential phase at whatever fraction of the link it had reached and was
+  left to the ProbeBW cycle to climb a quarter per four round trips. The bound was not
+  measuring the path; it was measuring this controller's own output.
+
+  **Measured on `core/examples/bottleneck_sim.rs`**, per cent of the link, across four
+  arrival patterns for the same loss rates (`PHANTOM_SIM_LOSS_SEED`), because evenly spaced
+  loss is one draw and a controller is sensitive to which one it gets — worst and best of
+  the four:
+
+  | loss | before | after |
+  |---|---|---|
+  | 0–1% | 89–91% | 89–91% |
+  | 2% | 85–87% | 87–88% |
+  | 5% | 78–80% | 82–83% |
+  | 10% | **50–58%** | **74–75%** |
+  | 15% | **18–31%** | **66–68%** |
+  | 20% | **1–8%** | **58–61%** |
+
+  No rung regressed on any of the four. At 15% and 20% the time to reach nine tenths of the
+  link went from "never" to 3.7 and 4.0 seconds.
+
+  **The cost was measured where a previous attempt at this failed.** An earlier version of
+  this fix — forgiving the round instead of removing the bound, gated on
+  `smoothed_rtt / min_rtt` — was rejected partly because on a bottleneck buffer shallower
+  than a quarter round trip it doubled congestive loss for no throughput. This one was run
+  against `collapse`, where every loss is the queue overflowing rather than noise, at three
+  buffer depths: buffer refusals rose 0.1 points at a quarter-BDP buffer, 0.2 at a half, and
+  1.3 at a full BDP where delivered bytes rose a point in exchange. Standing queue and worst
+  round trip did not move at any depth.
+
+  **This is a model, not a measurement**, and the only thing a figure from it settles is a
+  comparison between two builds of the same file. What it does not cover is a real path,
+  where the reference route's own raw control drops one to eight per cent — inside the
+  region that already worked. `STARTUP_SURVIVES_LOSS_TO = 0.30` records the new margin,
+  with a `const` assertion, and its own documentation says plainly that the assertion is
+  implied by the neighbouring one at today's constants and that the behavioural test
+  (`a_fifth_of_the_path_dropping_does_not_end_the_ramp`) is what actually holds the
+  property. That test asserts *state* — still in Startup after ten losing rounds — rather
+  than a wall-clock rate, and was verified by mutation in both directions: reverting the fix
+  fails it at round 5, and inflating its growth floor fails it against the real numbers
+  (17,994 → 932,908 B/s over the ten rounds).
+
+  Three existing tests turned out to have been measuring nothing: their fixtures never left
+  Startup, so the loss branch they were written for never ran for them. They now leave the
+  ramp explicitly (`drive_out_of_startup`) and assert that precondition, so they cannot
+  quietly become vacuous again.
+
 - **The loss response was measured down from the bound already in force rather than from
   the target, which on a path that keeps losing held the sender one level too low — at
   exactly the level where Startup's growth test cannot be passed.** When a round loses more
