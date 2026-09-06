@@ -54,6 +54,18 @@ run_structure_gate() {
 
 # A report carrying one finding of each shape the tool emits, so a case can pick
 # the one it needs. The trailing verdict line is what makes it a completed run.
+# Same report, but carrying the `Building … (baseline)` line cargo-semver-checks
+# prints. That line is how the gate learns which published release the findings
+# are relative to; `write_report` deliberately omits it, so the two helpers
+# together also pin the fallback (no baseline named → `[Unreleased]` only).
+write_report_with_baseline() {
+    {
+        echo "    Building phantom-protocol v0.2.2 (baseline)"
+        echo "       Built [  19.210s] (baseline)"
+        write_report /dev/stdout
+    } > "$1"
+}
+
 write_report() {
     cat > "$1" <<'REPORT'
     Checking phantom-protocol v0.2.2 -> v0.2.2 (assume minor change)
@@ -397,6 +409,75 @@ LOG
     rm -rf "${dir}"
 }
 
+# The release-cutting case: at the moment a release is named, every entry moves
+# from `## [Unreleased]` to `## [0.3.0]`, and a gate that reads only the former
+# reports all of them as unwritten precisely when the notes are complete. That
+# happened when 0.3.0 was cut. The report names its baseline, so the gate can
+# tell a section describing *this* window from one describing a shipped release.
+case_a_named_release_above_the_baseline_counts() {
+    local dir
+    dir="$(mktemp -d)"
+    write_report_with_baseline "${dir}/report.txt"
+    cat > "${dir}/CHANGELOG.md" <<'LOG'
+# Changelog
+
+## [Unreleased]
+
+## [0.3.0] - 2026-09-07
+
+### Changed
+
+- `BandwidthSnapshot` gained `delivered_time`; construct it with the new field.
+- `PhantomConfig` lost `auto_fallback`; drop it from struct literals.
+- `Stream::local_recv_window` is now `advertised_recv_window`; rename the call.
+
+## [0.2.2] - 2026-06-22
+
+### Changed
+
+- Something already shipped.
+LOG
+    run_gate "${dir}/report.txt" "${dir}/CHANGELOG.md"
+    if [ "${RC}" -eq 0 ]; then
+        pass "a release section above the baseline satisfies the window"
+    else
+        fail "cutting the release made the gate reject its own complete notes: ${OUT}"
+    fi
+    rm -rf "${dir}"
+}
+
+# The other half, and the reason the comparison is against the baseline rather
+# than "any release heading": a symbol named only in the notes for an already
+# published release has not been written down for this window, and accepting it
+# would let the gate pass on a stale entry.
+case_a_named_release_at_or_below_the_baseline_does_not_count() {
+    local dir
+    dir="$(mktemp -d)"
+    write_report_with_baseline "${dir}/report.txt"
+    cat > "${dir}/CHANGELOG.md" <<'LOG'
+# Changelog
+
+## [Unreleased]
+
+## [0.2.1] - 2026-09-07
+
+### Changed
+
+- `BandwidthSnapshot` gained `delivered_time`; construct it with the new field.
+- `PhantomConfig` lost `auto_fallback`; drop it from struct literals.
+- `Stream::local_recv_window` is now `advertised_recv_window`; rename the call.
+LOG
+    run_gate "${dir}/report.txt" "${dir}/CHANGELOG.md"
+    if [ "${RC}" -eq 0 ]; then
+        fail "entries under a section at or below the baseline satisfied this window"
+    elif echo "${OUT}" | grep -q "delivered_time"; then
+        pass "a section at or below the baseline does not satisfy the window"
+    else
+        fail "the below-baseline case failed for some other reason: ${OUT}"
+    fi
+    rm -rf "${dir}"
+}
+
 case_duplicate_heading_in_unreleased_is_rejected() {
     local dir
     dir="$(mktemp -d)"
@@ -655,6 +736,8 @@ case_report_without_verdict_is_an_error
 case_clean_verdict_passes
 case_unreadable_entry_is_an_error
 case_older_section_does_not_count
+case_a_named_release_above_the_baseline_counts
+case_a_named_release_at_or_below_the_baseline_does_not_count
 case_duplicate_heading_in_unreleased_is_rejected
 case_a_heading_repeated_under_a_different_release_is_not_a_duplicate
 case_every_duplicated_heading_is_reported_with_its_lines

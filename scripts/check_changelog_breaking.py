@@ -186,8 +186,93 @@ def parse_report(text: str) -> list[tuple[str, str]]:
     return list(dict.fromkeys(findings))
 
 
+def baseline_version(report: str) -> str | None:
+    """The version `cargo-semver-checks` compared against, read from its report.
+
+    The tool prints `Building <crate> vX.Y.Z (baseline)` before it starts, so
+    the report says which published release the findings are relative to. That
+    is the only thing that decides which changelog sections may satisfy them.
+    """
+    match = re.search(r"^\s*Building \S+ v(\S+) \(baseline\)", report, re.M)
+    return match.group(1) if match else None
+
+
+def sections_newer_than_baseline(changelog: str, baseline: str | None) -> str:
+    """Every changelog section that describes work not in the baseline release.
+
+    `[Unreleased]` always qualifies. So does any named release *above* the
+    baseline — which is the case this function exists for: at the moment a
+    release is cut, `## [Unreleased]` becomes `## [0.3.0]` and every entry moves
+    with it. The entries did not stop existing, and a gate that reads only
+    `[Unreleased]` would report all of them as unwritten precisely when the
+    release notes are complete. That is what happened when 0.3.0 was cut, and
+    the previous version of this function is what made it happen.
+
+    Sections at or below the baseline are excluded rather than merely
+    unnecessary: a symbol named only in the notes for an *already published*
+    release has not been written down for this one, and accepting it would let
+    the gate pass on a stale entry.
+    """
+    lines = changelog.splitlines()
+    collected: list[str] = []
+    current: list[str] | None = None
+    heading = re.compile(r"^## \[([^\]]+)\]")
+
+    def keep(name: str) -> bool:
+        if name == "Unreleased":
+            return True
+        if baseline is None:
+            # No baseline in the report: fall back to `[Unreleased]` only, which
+            # is the previous behaviour and the conservative reading.
+            return False
+        return version_key(name) > version_key(baseline)
+
+    seen_any = False
+    for line in lines:
+        match = heading.match(line)
+        if match:
+            if current is not None:
+                collected.extend(current)
+            name = match.group(1)
+            if keep(name):
+                seen_any = True
+                current = []
+            else:
+                current = None
+            continue
+        if current is not None:
+            current.append(line)
+    if current is not None:
+        collected.extend(current)
+
+    if not seen_any:
+        raise ReportError(
+            "CHANGELOG.md has no '## [Unreleased]' section and no release section "
+            f"above the baseline {baseline!r}"
+        )
+    return "\n".join(collected)
+
+
+def version_key(name: str) -> tuple[int, ...]:
+    """Sort key for a release heading, tolerant of anything that is not a version.
+
+    A heading that does not parse as dotted digits sorts below every real
+    version, so it is never mistaken for one above the baseline.
+    """
+    parts = name.split("-")[0].strip().split(".")
+    try:
+        return tuple(int(part) for part in parts)
+    except ValueError:
+        return (-1,)
+
+
 def unreleased_section(changelog: str) -> str:
-    """The `## [Unreleased]` heading's text, up to the next release heading."""
+    """The `## [Unreleased]` heading's text, up to the next release heading.
+
+    Kept for the structure check and for callers that genuinely mean only the
+    unreleased section; the breaking-change check uses
+    [`sections_newer_than_baseline`] instead.
+    """
     lines = changelog.splitlines()
     start = None
     for index, line in enumerate(lines):
@@ -332,7 +417,9 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         findings = parse_report(report_text)
-        section = unreleased_section(changelog_text)
+        section = sections_newer_than_baseline(
+            changelog_text, baseline_version(report_text)
+        )
         # Collect first, check after, so a parse failure anywhere in the report
         # is reported as a parse failure rather than as a missing entry.
         wanted = [(lint, entry, required_names(entry)) for lint, entry in findings]
