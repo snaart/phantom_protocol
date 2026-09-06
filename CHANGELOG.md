@@ -8,7 +8,41 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-07
+
+**Peers of this release and of 0.2.2 will not talk to each other, and the refusal is
+explicit.** The wire moved twice inside this window — `WIRE_VERSION` 6 → 7 (cumulative
+`WINDOW_UPDATE`) and 7 → 8 (in-session `CONTROL` frames and the `CLOSE` / draining
+contract) — and `PROTOCOL_VERSION` moved 4 → 5 alongside, which is the whole reason it
+moved: the packet-level version check *drops* a mismatched frame silently, so a peer one
+wire version behind would complete a handshake, agree keys, and then never deliver a byte
+with nothing at either end to say why. Carrying the handshake version forward turns that
+into a typed `ServerReject` naming both versions, before any session exists. Upgrade both
+ends; there is no negotiation and no fallback, by design, pre-1.0.
+
+**Every language binding must be regenerated, not just relinked.** `uniffi` 0.32 changed
+the metadata each exported item hashes into its checksum, so all fifty-nine of this crate's
+checksums moved while `UNIFFI_CONTRACT_VERSION` stayed at 30 — the coarse gate passes and
+the mismatch lands at import time in the consumer's process. `ResumptionHint` also changed
+from a record to an object in the same release, which changes the C parameter type and
+removes Swift's `Equatable`. Both are detailed below.
+
+
 ### Removed
+
+- **`CoreError::Busy`, `CoreError::RuntimeError` and `CoreError::SessionNotFound`.** Three
+  variants no code path constructed. `CoreError` is `#[non_exhaustive]`, so a consumer
+  already needed a wildcard arm and these become dead arms rather than broken ones — delete
+  them, or leave them to the wildcard.
+
+  Worth recording for how the removal went rather than for the variants themselves.
+  `CoreError` carries a hand-written `Display` under `#[cfg(not(feature = "std"))]` that
+  mirrors the `thiserror` attributes arm for arm, and deleting the variants left three arms
+  matching things that no longer existed. The bare-metal row (`--no-default-features
+  --features embedded,no-std --target thumbv7em-none-eabihf`), a hard CI gate, stopped
+  compiling — while the local gate stayed green, because it built only the host. The blind
+  spot was the gate rather than the change; it now runs that row, the browser-wasm one and
+  the ring-free FIPS build.
 
 - **No flag that turns a memory budget into a session cap, and a second removal on the
   record.** `--max-recv-window-growth-mib` was built to state the left-hand side of that
@@ -348,7 +382,12 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
     the second for every copy. `Session` mirrors it: `on_packet_lost` unchanged in name and
     meaning, plus a new `Session::on_packet_retransmitted`. See **Fixed**.
   * `OutboundSegment` gained `first_retransmit: bool` — the field a caller reads to tell a
-    segment's first copy from its second. Exhaustive struct literals need it.
+    segment's first copy from its second — and `loss_cause: LossCause`, which records which
+    rule ordered the repair (packet threshold, time threshold, both, or RTO). The second is
+    a record and not a mechanism: `which_rule_ordered_a_repair_changes_no_decision` pins
+    that attributing the same holes to a different cause changes no congestion decision,
+    because one of those arms is selectable by the peer. Exhaustive struct literals need
+    both fields.
   * `Stream::local_recv_window` → `Stream::advertised_recv_window`.
   * `Stream::apply_peer_window_update(credit: u32)` →
     `Stream::apply_peer_window_limit(limit: u64)`. The argument changed meaning as well as

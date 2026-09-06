@@ -20,7 +20,7 @@ no_std. (An optional TLS-over-TCP DPI-mimicry transport — `mimicry` feature �
 makes a flow look like HTTPS to passive DPI; anti-DPI obfuscation only, detectable
 by active probing — see [Status & limitations](#status--limitations).)
 
-> **Pre-1.0 (`0.2.2`).** Wire format may break between minors; SemVer kicks in at
+> **Pre-1.0 (`0.3.0`).** Wire format may break between minors; SemVer kicks in at
 > 1.0. 0 workspace warnings, 0 `unsafe` outside two audited opt-ins, MSRV Rust
 > 1.93, CI green across the full cross-target matrix. See
 > [Status & limitations](#status--limitations).
@@ -32,7 +32,7 @@ Published on crates.io as [`phantom-protocol`](https://crates.io/crates/phantom-
 
 ```toml
 [dependencies]
-phantom-protocol = "0.2"
+phantom-protocol = "0.3"
 ```
 
 or `cargo add phantom-protocol`. API docs: <https://docs.rs/phantom-protocol>.
@@ -454,7 +454,7 @@ is OTLP push), signing-key volume at
 and TCP healthcheck.
 
 ```bash
-docker build -t phantom-server:0.2.2 .
+docker build -t phantom-server:0.3.0 .
 docker compose up -d
 ```
 
@@ -462,7 +462,7 @@ docker compose up -d
 
 Production-shape chart at
 [`docs/operations/helm/phantom-protocol/`](https://github.com/snaart/phantom_protocol/tree/main/docs/operations/helm/phantom-protocol/).
-`appVersion: 0.2.2`, ClusterIP service on `4242`, 3 replicas,
+`appVersion: 0.3.0`, ClusterIP service on `4242`, 3 replicas,
 `tcpSocket` liveness / readiness. Raw manifests + walkthrough in
 [`docs/operations/kubernetes.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/operations/kubernetes.md).
 
@@ -622,7 +622,7 @@ carry **SLSA-3 OIDC build-provenance attestations** via
 > plane. Do not protect anything high-risk with this until it has been
 > independently audited.
 
-- **Pre-1.0 (`0.2.2`).** Wire format may break between minors; SemVer applies
+- **Pre-1.0 (`0.3.0`).** Wire format may break between minors; SemVer applies
   once 1.0 ships. The current wire protocol is a single pinned version — the
   former V1/V2/V3 axes were collapsed pre-1.0 (no users, no negotiation, no
   fallback), so there are no cross-version migration guides.
@@ -674,7 +674,44 @@ carry **SLSA-3 OIDC build-provenance attestations** via
   same window on a 210 ms path yields 0.213. What is still missing is a second
   route and an external review — treat the data plane as measured-on-one-path,
   not battle-tested.
-- **Negative-security suite: 72 always-on tests** in
+- **What the transport does not reach, stated as measurements rather than as
+  work items.** These are properties of the shipped code on the one route it has
+  been measured on, and none of them is a defect with a fix pending. Every
+  figure is against a raw no-protocol control from the same run, per the rule
+  every performance claim here is held to.
+  - **Upload reaches about a third of the measured ceiling.** The September 2026
+    campaign put it at 26.7–28.3 Mbit/s against an 84.3–85.0 Mbit/s one-way
+    control — 32–34% of the link, up from 22.7% before the loss-response change,
+    and the first campaign in which the transfer converges rather than ending
+    mid-ramp. The instrument named an upload capacity for the first time:
+    27.4–29.5 Mbit/s. A third of the link is a real gap, and the reason it is
+    quotable at all is that both the numerator and the denominator come from the
+    same run.
+  - **Duplex runs at 81–89% of the slower one-way direction.** The criterion
+    the project set for itself was "reproducibly no worse than the slower
+    one-way", and 81–89% does not meet it. What did change is that the spread
+    collapsed from 48 percentage points to 8, so this is now a level rather than
+    a coin toss — the earlier variance was a 60-second window catching an
+    unfinished ramp, not a property of the protocol.
+  - **The ARQ send buffer is bounded in segments, not bytes.** At 1024 segments
+    it is 1024 × the segment size, so on a small application frame it binds
+    about four times sooner than the peer's window does: a `send_ceiling` sweep
+    reads 266,240 B of inflight on a 256-byte frame against 1,048,492 B on a
+    2308-byte one, in three runs each. An application that writes small messages
+    pays for that; one that writes large ones does not notice.
+  - **The TCP leg carries two congestion controllers stacked.** Phantom's own
+    BBR-style controller runs inside a TCP connection that has one of its own.
+    The leg exists to cross networks that pass TCP and nothing else, not to go
+    fast; the UDP leg is the production path and the only one where `migrate()`
+    works.
+  - **Against a mature implementation of the same class, on the same path, in
+    the same run.** On a route with a couple of per cent of baseline loss this
+    transport holds an order of magnitude more than a loss-based controller
+    does; on a clean path a mature QUIC implementation is roughly three times
+    faster. Both statements are about the same code, and the size of the gap is
+    a property of the route rather than a ranking — the reference itself moved
+    2.3× between two runs an hour apart on that route, while our leg moved 1.14×.
+- **Negative-security suite: 73 always-on tests** in
   `core/tests/security_invariants.rs`, covering most — not all — of the eleven
   numbered security invariants: identity pinning, the unencrypted-packet receive
   gate, replay rejection, rekey and epoch handling, path validation, transcript
@@ -689,7 +726,7 @@ carry **SLSA-3 OIDC build-provenance attestations** via
   (`docs/compliance/constant-time-audit.md`) and not a measurement. Where only
   part of an invariant is pinned, the tests say so.
   Plus the proptest, fuzz, wire-vector, runtime-integration, and CAVP suites,
-  635 library unit tests, and `#[ignore]`-gated loopback integration suites
+  683 library unit tests, and `#[ignore]`-gated loopback integration suites
   (TCP, UDP — including injected loss/reorder via the fault transport — WASI,
   TLS-mimicry). 0 workspace warnings, 0 clippy warnings. **Note:** broad test
   coverage, a fault-injection rig, and a WAN measurement campaign are *not* a

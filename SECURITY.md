@@ -17,7 +17,7 @@ Phantom Protocol uses GitHub Security Advisories for public CVE coordination.
 | Version | Status |
 | --- | --- |
 | `main` | Active development; security fixes land here first. |
-| `0.2.x` | Latest pre-1.0 release (currently `0.2.2`); security fixes backported. |
+| `0.2.x` | Latest pre-1.0 release (currently `0.3.0`); security fixes backported. |
 | Earlier | Unsupported. |
 
 ## Threat model (summary)
