@@ -160,7 +160,10 @@ mod tests {
     /// tied to this one.
     #[test]
     fn the_default_cap_commits_the_published_growth_figure() {
-        assert_eq!(cfg(1024).recv_window_growth_commitment_mib(), Some(8 * 1024));
+        assert_eq!(
+            cfg(1024).recv_window_growth_commitment_mib(),
+            Some(8 * 1024)
+        );
     }
 
     /// It is a product, so it tracks the cap. An operator who halves the cap has halved this.
