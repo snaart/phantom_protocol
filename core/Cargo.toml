@@ -227,9 +227,19 @@ serde = { version = "1", default-features = false, features = ["derive", "alloc"
 # frozen by `core/tests/wire_vectors.rs` (and the transcript hash by
 # `transport::handshake::tests::transcript_hash_wire_vector`). A patch/minor bump
 # to `borsh` can silently shift the handshake bytes and break interop with no
-# `WIRE_VERSION` change, so it is pinned to an exact version — bump it only as a
-# deliberate wire change, paired with a vector regeneration.
-borsh = { version = "=1.7.0", default-features = false, optional = true, features = ["derive"] }
+# `WIRE_VERSION` change, so it is pinned to an exact version — bump it only after
+# the vectors have been run against the new version, and treat a shifted byte as
+# a wire change rather than a bump.
+#
+# 1.7.0 -> 1.8.1 was taken that way and shifted nothing: `wire_vectors` (16),
+# its independent Python decoder (21 assertions), `transcript_hash_wire_vector`,
+# `nist_kat` (6) and `cavp` (5) all passed against the committed fixtures with
+# no regeneration. That is the evidence the pin exists to demand, and it is
+# what distinguishes this bump from a wire change — not the size of the version
+# jump. The fixtures were **not** regenerated, deliberately: a regenerated
+# vector proves the encoder agrees with itself, where an unchanged one proves
+# the bytes are the same as the ones the published release emits.
+borsh = { version = "=1.8.1", default-features = false, optional = true, features = ["derive"] }
 hex = { version = "0.4", default-features = false, optional = true, features = ["alloc"] }
 base64 = { version = "0.23", default-features = false, optional = true, features = ["alloc"] }
 anyhow = { version = "1", optional = true }
