@@ -4665,7 +4665,13 @@ async fn handle_packet<T: SessionTransport>(
                 return;
             }
         };
-        if let Some(stream) = streams_recv.get(&stream_id) {
+        // Clone the stream out so the table's shard is released before anything is awaited.
+        // `on_sack` waits for the stream's send-buffer lock, which the drain path holds for
+        // a whole pass, and a `DashMap` reference held across that wait holds the shard's
+        // read lock with it: `open_stream` and every other write to the shard would block
+        // the thread it runs on until the drain let go.
+        let stream = streams_recv.get(&stream_id).map(|s| s.clone());
+        if let Some(stream) = stream {
             // Retire EVERY segment the SACK covers (cumulative). RTT is sampled
             // inside `on_sack` per Karn (only for never-retransmitted segments);
             // feed BBR per retired segment using the real `ack_delay_us`.
@@ -4722,12 +4728,8 @@ async fn handle_packet<T: SessionTransport>(
             }
             // Reliable FIN teardown: if the stream was locally closed (via
             // `queue_fin`) AND its send buffer is now empty (the FIN was SACKed
-            // by the peer), remove it from the send-path tables. We drop the
-            // DashMap guard FIRST (by cloning what we need) before the async
-            // `is_fin_acked()` call to avoid holding a shard lock across an await.
-            let stream_clone = stream.clone();
-            drop(stream); // release the DashMap guard
-            if stream_clone.is_fin_acked().await {
+            // by the peer), remove it from the send-path tables.
+            if stream.is_fin_acked().await {
                 streams_recv.remove(&stream_id);
                 demux_recv.close_stream(stream_id);
                 // The stream just left the routing tables — retire it from the
@@ -8922,6 +8924,54 @@ mod tests {
         assert!(
             handle.rx.try_recv().is_err(),
             "a forged unencrypted FIN must not close an open_stream() stream"
+        );
+    }
+
+    /// A SACK waiting for a stream's send buffer does not hold the stream table.
+    ///
+    /// `Stream::on_sack` waits on that buffer's lock, which the drain path takes on every
+    /// pass. A caller still holding its `DashMap` reference while it waits holds the table
+    /// shard's read lock with it, and every write to that shard — `open_stream` on the
+    /// application's thread, a stream's removal in the pump — blocks the OS thread it runs
+    /// on until the drain lets go. On a single-threaded runtime that thread is the one the
+    /// drain needs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_sack_waiting_for_the_send_buffer_does_not_hold_the_stream_table() {
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+        let stream_id: TransportStreamId = 2;
+        let stream = Arc::new(TransportStream::new(stream_id));
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        streams.insert(stream_id as u32, stream.clone());
+        let ack = decode_recv_frame(
+            &build_encrypted_ack(&client_session, session_id, stream_id, 0, 0),
+            session_id,
+        );
+
+        let held = stream.hold_send_buffer_for_test().await;
+        let task = {
+            let streams = streams.clone();
+            let server_session = server_session.clone();
+            tokio::spawn(async move {
+                run_recv(ack, session_id, &server_session, &streams).await;
+            })
+        };
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !task.is_finished(),
+            "the SACK must be waiting on the held send buffer for this test to mean anything"
+        );
+        let shard_free = matches!(
+            streams.try_get_mut(&(stream_id as u32)),
+            dashmap::try_result::TryResult::Present(_)
+        );
+        drop(held);
+        task.await.expect("receive path");
+        assert!(
+            shard_free,
+            "a SACK waiting on the stream's send buffer held the stream table's shard lock"
         );
     }
 

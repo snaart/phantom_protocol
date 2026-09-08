@@ -1597,6 +1597,13 @@ impl Stream {
         self.local_finished.load(Ordering::SeqCst) && self.send_buffer.lock().await.is_empty()
     }
 
+    /// Hold the send buffer's lock, standing in for the drain path in the middle of a pass,
+    /// so a test can put a caller of [`on_sack`](Self::on_sack) into its wait for it.
+    #[cfg(test)]
+    pub(crate) async fn hold_send_buffer_for_test(&self) -> impl Sized + '_ {
+        self.send_buffer.lock().await
+    }
+
     /// Record the peer's FIN reliable offset (set-once; idempotent under FIN
     /// retransmits). The Close/EOF is NOT emitted here — see
     /// [`take_in_order_fin`](Self::take_in_order_fin).
