@@ -290,8 +290,8 @@ async fn observability_e2e_encrypt_decrypt_and_rtt_reach_the_ffi_snapshot() {
 /// `active_streams` is an `UpDownCounter`; an unbalanced gauge is the exact
 /// defect already pinned for *sessions* in the first test of this file. Opens N
 /// user streams over a real session, watches the gauge rise on both peers, then
-/// closes them cleanly (reliable FIN → peer SACK → routing removal) and requires
-/// the gauge to come back to its starting value.
+/// closes them cleanly (a reliable FIN from each end, each acknowledged → routing
+/// removal) and requires the gauge to come back to its starting value.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn observability_e2e_stream_gauge_returns_to_zero_after_clean_close() {
     const STREAMS: usize = 3;
@@ -305,11 +305,15 @@ async fn observability_e2e_stream_gauge_returns_to_zero_after_clean_close() {
     let (hold_tx, hold_rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
         let session = listener.accept().await.expect("accept").session();
-        // Drain each peer-initiated stream so the client's writes are consumed
-        // and its FINs get acknowledged.
+        // Read each peer-initiated stream to its end, then close this side's half,
+        // as an application that answers EOF with its own close does. A stream is
+        // closed once both of its halves are, and not before.
         for _ in 0..STREAMS {
             let stream = session.accept_stream().await.expect("accept_stream");
-            tokio::spawn(async move { while let Ok(Some(_)) = stream.recv().await {} });
+            tokio::spawn(async move {
+                while let Ok(Some(_)) = stream.recv().await {}
+                let _ = stream.disconnect().await;
+            });
         }
         let _ = hold_rx.await;
         drop(session);
@@ -348,8 +352,9 @@ async fn observability_e2e_stream_gauge_returns_to_zero_after_clean_close() {
         server_obs.snapshot()
     );
 
-    // Clean close: a reliable FIN per stream. The stream leaves the routing
-    // tables (and the gauge) only once the peer SACKs that FIN.
+    // Clean close: a reliable FIN per stream, answered by the server's own. A
+    // stream leaves the routing tables (and the gauge) once both are through —
+    // this side's FIN acknowledged and the peer's delivered.
     for stream in &streams {
         stream.disconnect().await.expect("stream disconnect");
     }

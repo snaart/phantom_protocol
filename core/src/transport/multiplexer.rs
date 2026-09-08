@@ -54,6 +54,9 @@ pub struct StreamDemultiplexer {
     streams: DashMap<u32, mpsc::Sender<StreamMessage>>,
     /// Control channel for session-level messages (stream_id = 0)
     control_tx: mpsc::Sender<Bytes>,
+    /// First id this side allocates: 3 for a client, 2 for a server. Fixes the parity of
+    /// every id [`open_stream`](Self::open_stream) will ever return.
+    first_stream_id: u32,
     /// Next stream ID to allocate (always steps by 2, starting at 3 for clients
     /// and 2 for servers; 0 and 1 are permanently reserved).
     next_stream_id: AtomicU32,
@@ -97,6 +100,7 @@ impl StreamDemultiplexer {
         let mux = Self {
             streams: DashMap::new(),
             control_tx,
+            first_stream_id: first_id,
             next_stream_id: AtomicU32::new(first_id),
             id_step: 2,
         };
@@ -128,6 +132,25 @@ impl StreamDemultiplexer {
         let (tx, rx) = mpsc::channel(buffer_size);
         self.streams.insert(stream_id, tx);
         StreamHandle { stream_id, rx }
+    }
+
+    /// Whether `stream_id` is in the half of the id space this side allocates from — odd
+    /// for a client, even for a server. The reserved ids 0 and 1 belong to neither side.
+    ///
+    /// The peer can therefore never open such a stream: the only way one exists is that
+    /// this side opened it.
+    pub fn is_local_stream_id(&self, stream_id: u32) -> bool {
+        stream_id > 1 && stream_id % 2 == self.first_stream_id % 2
+    }
+
+    /// Whether [`open_stream`](Self::open_stream) has already handed out `stream_id`.
+    ///
+    /// Allocation only moves forward, so an id of this side's parity below the next one to
+    /// be handed out has been used, whether or not its stream is still open.
+    pub fn has_opened(&self, stream_id: u32) -> bool {
+        self.is_local_stream_id(stream_id)
+            && stream_id >= self.first_stream_id
+            && stream_id < self.next_stream_id.load(Ordering::Relaxed)
     }
 
     /// Remove a stream from the routing table.

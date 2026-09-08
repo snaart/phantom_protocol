@@ -1400,8 +1400,8 @@ const RAW_APP_STREAM_ID: u32 = 1;
 /// - [`Self::opened`] is called where a user stream enters the session's stream
 ///   table: `PhantomSession::open_stream` (local) and the receive path's
 ///   new-peer-stream branch (remote, surfaced via `accept_stream`).
-/// - [`Self::closed`] is called where one leaves it (FIN acknowledged, or the
-///   `queue_fin` fallback teardown).
+/// - [`Self::closed`] is called where one leaves it (`retire_stream`, once both
+///   halves are closed, or the `queue_fin` fallback teardown).
 /// - [`Self::drain`] retires whatever is still open when the session ends. It
 ///   runs both at data-pump exit **and** in `Drop for PhantomSession` — the
 ///   `swap(0)` is atomic, so whichever runs first retires the streams and the
@@ -1563,6 +1563,9 @@ struct RecvScratch {
     /// materialised, and a stream built with a budget of its own would sit outside the
     /// session-wide bound.
     recv_tuning: Arc<SharedRecvTuning>,
+    /// The peer-opened stream ids this side has ever held, so that a frame for one it has
+    /// since dropped is not mistaken for the peer opening a new stream.
+    peer_streams: PeerStreamIds,
 }
 
 impl RecvScratch {
@@ -1578,6 +1581,56 @@ impl RecvScratch {
             last_peer_path: 0,
             stream_gauge,
             recv_tuning,
+            peer_streams: PeerStreamIds::default(),
+        }
+    }
+}
+
+/// Every stream id the peer has opened on this session, one bit each.
+///
+/// A stream is dropped once both of its halves are closed, and frames for it can still
+/// arrive after that: the peer retransmits its FIN whenever the acknowledgement of it is
+/// lost, and the path can deliver a delayed copy of anything. A stream is opened by the
+/// peer's first frame on a new id, so without a record of which ids it has already used,
+/// such a frame opens the stream a second time — handed to `accept_stream`, with its offsets
+/// starting over, and with nothing that will ever close it.
+///
+/// This side's own streams need no record: their ids come from the demultiplexer, which
+/// can say which of them it has handed out. The peer's are learnt only by seeing them, and
+/// stream ids are 16 bits on the wire with each side confined to one parity, so a bit per
+/// id of the peer's parity is the whole of the space: 32 768 bits. The table is allocated on
+/// the first stream the peer opens, so a session in which it opens none pays nothing.
+#[derive(Default)]
+struct PeerStreamIds {
+    seen: Option<Box<[u64; PEER_STREAM_ID_WORDS]>>,
+}
+
+/// Words in [`PeerStreamIds`]: one bit for every id of one parity in the 16-bit id space.
+const PEER_STREAM_ID_WORDS: usize = (1 << 16) / 2 / 64;
+
+impl PeerStreamIds {
+    /// Word index and bit mask for `stream_id`. Ids of one parity map one-to-one onto the
+    /// bits; `None` only for an id wider than the wire's 16 bits, which no frame carries.
+    fn slot(stream_id: u32) -> Option<(usize, u64)> {
+        let index = (stream_id >> 1) as usize;
+        (index / 64 < PEER_STREAM_ID_WORDS).then(|| (index / 64, 1u64 << (index % 64)))
+    }
+
+    fn has_seen(&self, stream_id: u32) -> bool {
+        match (&self.seen, Self::slot(stream_id)) {
+            (Some(seen), Some((word, bit))) => seen.get(word).is_some_and(|w| w & bit != 0),
+            _ => false,
+        }
+    }
+
+    fn mark_seen(&mut self, stream_id: u32) {
+        if let Some((word, bit)) = Self::slot(stream_id) {
+            let seen = self
+                .seen
+                .get_or_insert_with(|| Box::new([0; PEER_STREAM_ID_WORDS]));
+            if let Some(w) = seen.get_mut(word) {
+                *w |= bit;
+            }
         }
     }
 }
@@ -1634,6 +1687,15 @@ enum DeliverItem {
     /// Peer sent FIN on `stream_id`. Ordered after any `Data` items already
     /// queued for that stream so the consumer sees EOF last.
     Close(u32),
+    /// Both halves of `stream_id` are closed and the reader has dropped it from the
+    /// stream table: release its demultiplexer route.
+    ///
+    /// The route is the sender behind the application's channel, and the reader cannot
+    /// release it itself — the stream's last data and its EOF may still be queued ahead of
+    /// this item, and closing the channel first would lose them. Queued behind them
+    /// instead, it is acted on only once they have been handed over. Carries no payload
+    /// and is not charged to the backlog: the reader emits one per stream, not per frame.
+    Retire(u32),
 }
 
 /// Bytes charged to the delivery backlog for one queued item.
@@ -2071,6 +2133,11 @@ async fn run_data_pump<T: SessionTransport>(
                             );
                         }
                     }
+                    DeliverItem::Retire(stream_id) => {
+                        // Everything the stream had to deliver is in its channel by now,
+                        // so dropping the route only ends the channel after it.
+                        demux_b.close_stream(stream_id);
+                    }
                 }
             }
         }));
@@ -2107,6 +2174,12 @@ async fn run_data_pump<T: SessionTransport>(
                             // a counter that only climbs, which a peer emitting FINs on the
                             // raw-app id would ride into a false teardown.
                             undelivered_r.fetch_sub(delivery_charge(0), Ordering::AcqRel);
+                        }
+                    }
+                    DeliverItem::Retire(stream_id) => {
+                        // Only opened streams are ever retired; ids 0 and 1 have no route.
+                        if stream_id > RAW_APP_STREAM_ID {
+                            let _ = streams_tx_r.send(DeliverItem::Retire(stream_id));
                         }
                     }
                 }
@@ -2578,7 +2651,9 @@ async fn run_data_pump<T: SessionTransport>(
                     }
                     Some(SessionCommand::SendStreamUnreliable { stream_id, data }) => {
                         let stream = streams.get(&stream_id).map(|s| s.clone());
-                        if let Some(stream) = stream {
+                        // Nothing follows a FIN, unreliable or not: the peer has already
+                        // been told the stream ended.
+                        if let Some(stream) = stream.filter(|s| !s.is_local_finished()) {
                             for chunk in data.chunks(APP_CHUNK) {
                                 stream.send_unreliable(Bytes::copy_from_slice(chunk)).await;
                             }
@@ -2595,9 +2670,10 @@ async fn run_data_pump<T: SessionTransport>(
                         // The sentinel goes through the same send buffer + retransmit
                         // machinery as all other reliable data, so it is guaranteed to
                         // be delivered in order and acknowledged by the peer even under
-                        // packet loss. The stream stays in `streams` and `demux` until
-                        // `is_fin_acked()` confirms the SACK covered the FIN offset;
-                        // the next drain pass detects that and tears it down (see below).
+                        // packet loss. It closes this side's half only: the stream stays
+                        // in `streams` and `demux` — still receiving — until the FIN is
+                        // acknowledged AND the peer's own FIN has been released in order,
+                        // and the receive path drops it when both are true.
                         //
                         // Invariant 2 is preserved: the FIN packet is sealed with
                         // ENCRYPTED | RELIABLE | FIN — a forged unencrypted one is
@@ -2612,6 +2688,12 @@ async fn run_data_pump<T: SessionTransport>(
                         // pump. `flush_deferred_sends` carries the offset-exhaustion
                         // fallback (bare ENCRYPTED FIN + retire) that used to live
                         // inline here.
+                        //
+                        // A stream no longer in the table was closed from both ends and
+                        // dropped, and there is nothing to do: its route is released by
+                        // the delivery task behind whatever it still had to deliver, and
+                        // releasing it here — on a second `disconnect()`, say — could
+                        // cut that short.
                         let stream = streams.get(&stream_id).map(|s| s.clone());
                         if let Some(stream) = stream {
                             deferred.push_back(Deferred::Fin { stream_id, stream });
@@ -2620,13 +2702,9 @@ async fn run_data_pump<T: SessionTransport>(
                                 &demux, &stream_gauge, &observability,
                             )
                             .await;
-                            // The stream stays until the FIN is SACKed. Wake the
-                            // send loop so the FIN is put on the wire on the very
-                            // next drain pass rather than after a 10 ms tick.
+                            // Wake the send loop so the FIN is put on the wire on
+                            // the very next drain pass rather than after a 10 ms tick.
                             crypto_session.notify_outbound_ready();
-                        } else {
-                            // Stream not in our table — maybe already removed.
-                            demux.close_stream(stream_id);
                         }
                     }
                     Some(SessionCommand::Migrate(local_addr)) => {
@@ -3039,6 +3117,17 @@ async fn flush_deferred_sends<T: SessionTransport>(
     let mut admitted = false;
     while let Some(item) = deferred.front().cloned() {
         match item {
+            // A write queued behind its stream's FIN. The queue is FIFO, so by the time
+            // one reaches the front the FIN ahead of it has been admitted, and admitting
+            // this would send it on the offset after the FIN — past the end of the stream
+            // as the peer's application has already been told it.
+            Deferred::Data { stream, .. } if stream.is_local_finished() => {
+                log::debug!(
+                    "PhantomSession: dropping a write queued after stream {}'s close",
+                    stream.id()
+                );
+                deferred.pop_front();
+            }
             Deferred::Data { stream, data } => match stream.try_send_reliable(&data).await {
                 Ok(true) => {
                     admitted = true;
@@ -4726,19 +4815,13 @@ async fn handle_packet<T: SessionTransport>(
             if !result.lost.is_empty() || !result.retired.is_empty() {
                 crypto_recv.notify_outbound_ready();
             }
-            // Reliable FIN teardown: if the stream was locally closed (via
-            // `queue_fin`) AND its send buffer is now empty (the FIN was SACKed
-            // by the peer), remove it from the send-path tables.
-            if stream.is_fin_acked().await {
-                streams_recv.remove(&stream_id);
-                demux_recv.close_stream(stream_id);
-                // The stream just left the routing tables — retire it from the
-                // active-streams gauge (matched with the `opened` below / in
-                // `PhantomSession::open_stream`).
-                scratch.stream_gauge.closed(stream_id);
-                log::debug!(
-                    "PhantomSession: stream {stream_id} FIN acked — removed from routing tables"
-                );
+            // Reliable FIN teardown. An acknowledged FIN finishes this side's half of
+            // the stream and nothing more: the peer's half stays open until its own FIN is
+            // released in order, and until then the stream keeps receiving. It is dropped
+            // when both are done, which either this acknowledgement or the peer's FIN (the
+            // reliable branch below) can be the one to complete.
+            if stream.is_fully_closed().await {
+                retire_stream(stream_id, streams_recv, deliver_tx, &scratch.stream_gauge);
             }
         }
         // Route ACK signal non-blocking (informational for the stream table, not
@@ -5014,6 +5097,45 @@ async fn handle_packet<T: SessionTransport>(
         let local = match existing {
             Some(s) => s,
             None => {
+                match classify_unheld_stream(stream_id, demux_recv, &scratch.peer_streams) {
+                    UnheldStream::Opens => {}
+                    UnheldStream::Retired => {
+                        // Closed from both ends and dropped. What arrives now is a copy of
+                        // a segment this side already took — usually the peer's FIN, resent
+                        // because the acknowledgement of it was lost — so the answer is that
+                        // acknowledgement again and nothing else. It covers every offset up
+                        // to this one, all of which arrived before the stream was dropped:
+                        // that is what its read half having closed means.
+                        if let Some(sack) = crate::transport::sack::Sack::from_inclusive_ranges(
+                            vec![(0, stream_offset)],
+                            0,
+                        ) {
+                            send_stream_sack(
+                                &sack,
+                                stream_id,
+                                path_id,
+                                session_id,
+                                crypto_recv,
+                                transport_send_ack,
+                                &mut scratch.ack_buf,
+                                observability,
+                            )
+                            .await;
+                        }
+                        return;
+                    }
+                    UnheldStream::NotThePeers => {
+                        // Refused like a segment past the cap: unrecorded, so not
+                        // acknowledged. A peer allocating from this side's half of the id
+                        // space then sees a stall, where acknowledging would have it retire
+                        // data that no stream here will ever deliver.
+                        log::warn!(
+                            "PhantomSession: refusing a segment on stream {stream_id}, an id \
+                             of this side's parity that it never opened"
+                        );
+                        return;
+                    }
+                }
                 if streams_recv.len() >= MAX_STREAMS {
                     log::warn!(
                         "PhantomSession: refusing new receive stream {stream_id}: \
@@ -5039,10 +5161,13 @@ async fn handle_packet<T: SessionTransport>(
                 // (never accepted via this path). Registration happens exactly ONCE
                 // per stream_id (the `None` arm here), guarded by the DashMap entry.
                 if stream_id > RAW_APP_STREAM_ID {
+                    // From here on a frame for this id finds either the stream or the
+                    // record that it existed, never an id free to open again.
+                    scratch.peer_streams.mark_seen(stream_id);
                     // Peer-initiated user stream — count it on the active-streams
                     // gauge exactly once (this `None` arm runs once per stream id,
-                    // guarded by the DashMap entry). The matching retire is the
-                    // FIN-acked removal above, or the session-teardown drain.
+                    // guarded by the DashMap entry and the record above). The matching
+                    // retire is `retire_stream`, or the session-teardown drain.
                     scratch.stream_gauge.opened(stream_id);
                     let handle = demux_recv.register_stream(stream_id, STREAM_RECV_CHANNEL_DEPTH);
                     let phantom_stream = Arc::new(crate::api::stream::PhantomStream::new(
@@ -5071,41 +5196,19 @@ async fn handle_packet<T: SessionTransport>(
         let Some(sack) = local.received_sack(0).await else {
             return;
         };
-        let mut ack_flag_bits = PacketFlags::ENCRYPTED | PacketFlags::ACK;
-        match rekey_before_stamp(crypto_recv, observability) {
-            Some(extra) => ack_flag_bits |= extra,
-            // Epoch saturated — drop this ACK rather than reuse a nonce; the
-            // sender retransmits and the session is expected to reconnect.
-            None => return,
-        }
-        let ack_pn = crypto_recv.next_send_pn();
-        let ack_header = PacketHeader::new(
+        if !send_stream_sack(
+            &sack,
+            stream_id,
+            path_id,
             session_id,
-            stream_id as TransportStreamId,
-            ack_pn,
-            PacketFlags::new(ack_flag_bits),
+            crypto_recv,
+            transport_send_ack,
+            &mut scratch.ack_buf,
+            observability,
         )
-        .with_epoch(crypto_recv.current_epoch())
-        .with_path_id(path_id);
-        let ack_payload = sack.to_wire();
-        match timed_encrypt(crypto_recv, observability, &ack_header, &ack_payload, &[]) {
-            Ok(ct) => {
-                let ack_packet = PhantomPacket::new(ack_header, ct);
-                match crypto_recv.protect_packet(&ack_packet) {
-                    Ok(buf) => {
-                        scratch.ack_buf.clear();
-                        scratch.ack_buf.extend_from_slice(&buf);
-                        let size = scratch.ack_buf.len();
-                        let _ = transport_send_ack
-                            .send_bytes(&scratch.ack_buf[..size])
-                            .await;
-                    }
-                    Err(e) => {
-                        log::error!("PhantomSession: ACK header protection failed: {}", e)
-                    }
-                }
-            }
-            Err(e) => log::error!("PhantomSession: ACK encrypt failed: {}", e),
+        .await
+        {
+            return;
         }
 
         // Deliver the in-order run released by the reorder buffer (empty if this
@@ -5134,8 +5237,15 @@ async fn handle_packet<T: SessionTransport>(
         if packet.header.flags.contains(PacketFlags::FIN) {
             local.note_remote_fin(stream_offset);
         }
-        if local.take_in_order_fin() && deliver_tx.send(DeliverItem::Close(stream_id)).is_ok() {
-            undelivered_bytes.fetch_add(delivery_charge(0), Ordering::AcqRel);
+        if local.take_in_order_fin() {
+            if deliver_tx.send(DeliverItem::Close(stream_id)).is_ok() {
+                undelivered_bytes.fetch_add(delivery_charge(0), Ordering::AcqRel);
+            }
+            // The peer's half just ended. If this side's FIN was already acknowledged, both
+            // halves are done and this frame is the one that completes the close.
+            if local.is_fin_acked().await {
+                retire_stream(stream_id, streams_recv, deliver_tx, &scratch.stream_gauge);
+            }
         }
         return;
     }
@@ -5184,6 +5294,115 @@ fn deliver_in_order_run(
         {
             undelivered_bytes.fetch_add(charge, Ordering::AcqRel);
         }
+    }
+}
+
+/// Seal `sack` as an `ENCRYPTED | ACK` frame for `stream_id` and send it on the path the
+/// acknowledged segment arrived on.
+///
+/// Returns `false` only when the send epoch is saturated, in which case nothing was sent:
+/// the frame is dropped rather than a nonce reused, the sender retransmits, and the session
+/// is expected to reconnect. A failed seal or send is logged and still returns `true`.
+#[allow(clippy::too_many_arguments)]
+async fn send_stream_sack<T: SessionTransport>(
+    sack: &crate::transport::sack::Sack,
+    stream_id: u32,
+    path_id: u8,
+    session_id: SessionId,
+    crypto_recv: &Arc<Session>,
+    transport_send_ack: &Arc<T>,
+    ack_buf: &mut Vec<u8>,
+    observability: &Observability,
+) -> bool {
+    let mut ack_flag_bits = PacketFlags::ENCRYPTED | PacketFlags::ACK;
+    match rekey_before_stamp(crypto_recv, observability) {
+        Some(extra) => ack_flag_bits |= extra,
+        None => return false,
+    }
+    let ack_pn = crypto_recv.next_send_pn();
+    let ack_header = PacketHeader::new(
+        session_id,
+        stream_id as TransportStreamId,
+        ack_pn,
+        PacketFlags::new(ack_flag_bits),
+    )
+    .with_epoch(crypto_recv.current_epoch())
+    .with_path_id(path_id);
+    let ack_payload = sack.to_wire();
+    match timed_encrypt(crypto_recv, observability, &ack_header, &ack_payload, &[]) {
+        Ok(ct) => {
+            let ack_packet = PhantomPacket::new(ack_header, ct);
+            match crypto_recv.protect_packet(&ack_packet) {
+                Ok(buf) => {
+                    ack_buf.clear();
+                    ack_buf.extend_from_slice(&buf);
+                    let _ = transport_send_ack.send_bytes(ack_buf.as_slice()).await;
+                }
+                Err(e) => log::error!("PhantomSession: ACK header protection failed: {}", e),
+            }
+        }
+        Err(e) => log::error!("PhantomSession: ACK encrypt failed: {}", e),
+    }
+    true
+}
+
+/// Drop a stream whose two halves are both closed: this side's FIN acknowledged, and the
+/// peer's released in order.
+///
+/// The stream leaves the table and the active-streams gauge here and now. Its
+/// demultiplexer route is released by the delivery task instead, behind whatever it still
+/// has to hand to the application for this stream (see [`DeliverItem::Retire`]). The ids
+/// 0 and 1 are never dropped, and a stream already gone is left alone, so the gauge is
+/// retired exactly once per stream.
+fn retire_stream(
+    stream_id: u32,
+    streams: &DashMap<u32, Arc<Stream>>,
+    deliver_tx: &mpsc::UnboundedSender<DeliverItem>,
+    stream_gauge: &StreamGauge,
+) {
+    if stream_id <= RAW_APP_STREAM_ID || streams.remove(&stream_id).is_none() {
+        return;
+    }
+    stream_gauge.closed(stream_id);
+    // A closed delivery task means the session is ending, and its teardown drops every
+    // route with the demultiplexer.
+    let _ = deliver_tx.send(DeliverItem::Retire(stream_id));
+    log::debug!("PhantomSession: stream {stream_id} closed from both ends — dropped");
+}
+
+/// What a reliable segment on an id with no stream in the table is.
+enum UnheldStream {
+    /// The peer opening a new stream.
+    Opens,
+    /// A stream that was held here, closed from both ends, and dropped.
+    Retired,
+    /// An id of this side's parity that this side never opened, which the peer has no
+    /// business sending on.
+    NotThePeers,
+}
+
+/// Tell a segment that opens a stream from one that arrives after its stream was dropped.
+///
+/// Only the peer opens a stream by sending on it, and only in its own parity. So an id of
+/// this side's parity with no stream is one this side opened and has since dropped — or
+/// never opened at all — and one of the peer's parity is new exactly when the peer has
+/// never used it. Ids 0 and 1 belong to neither side and keep the behaviour they always
+/// had.
+fn classify_unheld_stream(
+    stream_id: u32,
+    demux: &StreamDemultiplexer,
+    peer_streams: &PeerStreamIds,
+) -> UnheldStream {
+    if demux.is_local_stream_id(stream_id) {
+        if demux.has_opened(stream_id) {
+            UnheldStream::Retired
+        } else {
+            UnheldStream::NotThePeers
+        }
+    } else if peer_streams.has_seen(stream_id) {
+        UnheldStream::Retired
+    } else {
+        UnheldStream::Opens
     }
 }
 
@@ -5320,9 +5539,9 @@ impl PhantomSession {
         ));
         self.streams.insert(stream_id, transport_stream);
         // Count the stream on the active-streams gauge. The matching retire is
-        // the pump's FIN-acked teardown, or — for a stream still open when the
-        // session ends (including one opened after the pump already exited) —
-        // the drain in `Drop for PhantomSession` / at pump exit.
+        // `retire_stream`, once both halves are closed, or — for a stream still
+        // open when the session ends (including one opened after the pump already
+        // exited) — the drain in `Drop for PhantomSession` / at pump exit.
         self.stream_gauge.opened(stream_id);
 
         Arc::new(crate::api::stream::PhantomStream::new(
@@ -8691,9 +8910,9 @@ mod tests {
         let session_id = fixed_session_id();
         let (client_session, server_session) = paired_sessions(session_id);
 
-        // Stream 2 is a user stream this side has never seen, so `handle_packet` takes the
-        // create-on-receive branch.
-        let frame = build_app_frame(&client_session, session_id, 2, 0, b"peer-opened");
+        // Stream 3 is a client-allocated user stream this side has never seen, so
+        // `handle_packet` takes the create-on-receive branch.
+        let frame = build_app_frame(&client_session, session_id, 3, 0, b"peer-opened");
         let v2 = decode_recv_frame(&frame, session_id);
 
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
@@ -8737,8 +8956,8 @@ mod tests {
         .await;
 
         let created = streams
-            .get(&2)
-            .expect("the packet must have opened stream 2");
+            .get(&3)
+            .expect("the packet must have opened stream 3");
         assert!(
             Arc::ptr_eq(created.value().recv_tuning(), &connection_budget),
             "a peer-initiated stream was built with a growth budget of its own"
@@ -8797,6 +9016,7 @@ mod tests {
         let (sid, received) = match item {
             DeliverItem::Data(sid, bytes, _) => (sid, bytes),
             DeliverItem::Close(sid) => panic!("unexpected Close({sid}) in deliver channel"),
+            DeliverItem::Retire(sid) => panic!("unexpected Retire({sid}) in deliver channel"),
         };
         assert_eq!(sid, stream_id as u32);
         assert_eq!(&received[..], b"hello-v2");
@@ -8925,6 +9145,408 @@ mod tests {
             handle.rx.try_recv().is_err(),
             "a forged unencrypted FIN must not close an open_stream() stream"
         );
+    }
+
+    // ── A stream's two halves, and what is left of it once both are closed ──
+
+    /// What the receive path handed to the delivery task, in a form a test can compare.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Delivered {
+        Data(u32, Vec<u8>),
+        Close(u32),
+        Retire(u32),
+    }
+
+    /// One receive path driven a packet at a time, keeping every channel it writes to so a
+    /// test can read back what each packet did.
+    ///
+    /// The receiving side is the server half of [`paired_sessions`] behind a server-role
+    /// demultiplexer, so it opens even stream ids and its peer odd ones — the allocation the
+    /// two ends of a real session make.
+    struct RecvRig {
+        session_id: SessionId,
+        client: Arc<InnerSession>,
+        server: Arc<InnerSession>,
+        streams: Arc<DashMap<u32, Arc<TransportStream>>>,
+        demux: Arc<StreamDemultiplexer>,
+        deliver_tx: mpsc::UnboundedSender<DeliverItem>,
+        deliver_rx: mpsc::UnboundedReceiver<DeliverItem>,
+        undelivered: AtomicU64,
+        transport: Arc<ChannelTransport>,
+        scratch: RecvScratch,
+        obs: Arc<Observability>,
+        cmd_tx: mpsc::Sender<SessionCommand>,
+        _cmd_rx: mpsc::Receiver<SessionCommand>,
+        inc_tx: mpsc::Sender<Arc<crate::api::stream::PhantomStream>>,
+        inc_rx: mpsc::Receiver<Arc<crate::api::stream::PhantomStream>>,
+        /// The peer's next packet number. Each frame it sends takes a fresh one, as a
+        /// retransmission does on the wire, so none is refused as a replay.
+        next_pn: u64,
+    }
+
+    impl RecvRig {
+        fn new() -> Self {
+            let session_id = fixed_session_id();
+            let (client, server) = paired_sessions(session_id);
+            let (demux, _ctrl_rx) = StreamDemultiplexer::new_with_role(16, false);
+            let (deliver_tx, deliver_rx) = mpsc::unbounded_channel();
+            // Deep enough that no frame the receive path emits is refused for room.
+            let (ack_tx, ack_rx) = mpsc::channel::<Vec<u8>>(8192);
+            let obs = Observability::new(ObservabilityConfig::default());
+            let scratch = test_recv_scratch(&obs, 256);
+            let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+            let (inc_tx, inc_rx) = mpsc::channel(8192);
+            Self {
+                session_id,
+                client,
+                server,
+                streams: Arc::new(DashMap::new()),
+                demux: Arc::new(demux),
+                deliver_tx,
+                deliver_rx,
+                undelivered: AtomicU64::new(0),
+                transport: Arc::new(ChannelTransport {
+                    tx: ack_tx,
+                    rx: Mutex::new(ack_rx),
+                }),
+                scratch,
+                obs,
+                cmd_tx,
+                _cmd_rx,
+                inc_tx,
+                inc_rx,
+                next_pn: 0,
+            }
+        }
+
+        /// Open a stream from this side the way `PhantomSession::open_stream` does. The
+        /// handle is returned so the stream's delivery channel stays open.
+        fn open_local(&self) -> crate::transport::multiplexer::StreamHandle {
+            let handle = self.demux.open_stream(STREAM_RECV_CHANNEL_DEPTH);
+            self.streams.insert(
+                handle.stream_id,
+                Arc::new(TransportStream::with_recv_tuning(
+                    handle.stream_id as TransportStreamId,
+                    self.scratch.recv_tuning.clone(),
+                )),
+            );
+            handle
+        }
+
+        /// Close this side's half of `stream_id` the way the pump's `CloseStream` arm
+        /// does: the FIN takes the stream's next offset.
+        async fn close_local(&self, stream_id: u32) {
+            let stream = self
+                .streams
+                .get(&stream_id)
+                .map(|s| s.clone())
+                .expect("the stream is in the table");
+            assert!(
+                stream.try_queue_fin().await.expect("offset space"),
+                "the send buffer has room for the FIN"
+            );
+        }
+
+        async fn feed(&mut self, packet: PhantomPacket) {
+            handle_packet(
+                packet,
+                self.session_id,
+                &self.server,
+                &self.streams,
+                &self.demux,
+                &self.transport,
+                &self.transport,
+                &self.deliver_tx,
+                &self.undelivered,
+                &mut self.scratch,
+                &self.obs,
+                LegType::Tcp,
+                &self.cmd_tx,
+                &self.inc_tx,
+                &connected_state(),
+            )
+            .await;
+        }
+
+        fn take_pn(&mut self) -> u64 {
+            let pn = self.next_pn;
+            self.next_pn += 1;
+            pn
+        }
+
+        /// The peer sends a reliable segment at `offset` on `stream_id` — its FIN when
+        /// `fin` is set, which carries no payload.
+        async fn peer_segment(&mut self, stream_id: u32, offset: u32, payload: &[u8], fin: bool) {
+            let mut bits = PacketFlags::RELIABLE | PacketFlags::ENCRYPTED;
+            if fin {
+                bits |= PacketFlags::FIN;
+            }
+            let header = PacketHeader::new(
+                self.session_id,
+                stream_id as TransportStreamId,
+                self.take_pn(),
+                PacketFlags::new(bits),
+            )
+            .with_epoch(self.client.current_epoch());
+            let mut plaintext = stream_offset_prefix(offset);
+            plaintext.extend_from_slice(payload);
+            let ciphertext = self
+                .client
+                .encrypt_packet(&header, &plaintext, &[])
+                .expect("encrypt");
+            let wire = PhantomPacket::new(header, ciphertext).to_wire();
+            self.feed(decode_recv_frame(&wire, self.session_id)).await;
+        }
+
+        /// The peer acknowledges offsets `0..=upto` on `stream_id`.
+        async fn peer_ack(&mut self, stream_id: u32, upto: u32) {
+            let sack = crate::transport::sack::Sack::from_inclusive_ranges(vec![(0, upto)], 0)
+                .expect("a non-empty range")
+                .to_wire();
+            let pn = self.take_pn() as u32;
+            let wire = build_encrypted_ack_with_payload(
+                &self.client,
+                self.session_id,
+                stream_id as TransportStreamId,
+                pn,
+                &sack,
+            );
+            self.feed(decode_recv_frame(&wire, self.session_id)).await;
+        }
+
+        /// Every SACK this side has emitted since the last call, decoded as the peer
+        /// would decode it, with the stream it was stamped on.
+        async fn emitted_sacks(&self) -> Vec<(u32, crate::transport::sack::Sack)> {
+            let mut out = Vec::new();
+            let mut rx = self.transport.rx.lock().await;
+            while let Ok(frame) = rx.try_recv() {
+                let packet = self
+                    .client
+                    .parse_protected(&frame)
+                    .expect("parse an emitted frame");
+                if !packet.header.flags.contains(PacketFlags::ACK) {
+                    continue;
+                }
+                let plaintext = self
+                    .client
+                    .decrypt_packet(&packet.header, &packet.payload, &[])
+                    .expect("decrypt an emitted ACK");
+                out.push((
+                    u32::from(packet.header.stream_id),
+                    crate::transport::sack::Sack::from_wire(&plaintext).expect("decode a SACK"),
+                ));
+            }
+            out
+        }
+
+        /// Stream ids handed to `accept_stream` since the last call.
+        fn accepted(&mut self) -> Vec<u32> {
+            let mut out = Vec::new();
+            while let Ok(stream) = self.inc_rx.try_recv() {
+                out.push(stream.stream_id());
+            }
+            out
+        }
+
+        /// What was handed to the delivery task since the last call.
+        fn delivered(&mut self) -> Vec<Delivered> {
+            let mut out = Vec::new();
+            while let Ok(item) = self.deliver_rx.try_recv() {
+                out.push(match item {
+                    DeliverItem::Data(id, bytes, _) => Delivered::Data(id, bytes.to_vec()),
+                    DeliverItem::Close(id) => Delivered::Close(id),
+                    DeliverItem::Retire(id) => Delivered::Retire(id),
+                });
+            }
+            out
+        }
+    }
+
+    fn stream_offset_prefix(offset: u32) -> Vec<u8> {
+        offset.to_be_bytes().to_vec()
+    }
+
+    /// The end that closes first keeps its read half: the peer's later data and FIN reach
+    /// the stream this side opened, and only then does the stream leave the table.
+    ///
+    /// Dropping the stream when the peer acknowledged this side's FIN took the read half
+    /// with it, and the peer's next segment — on an id the table no longer held — was taken
+    /// for the peer opening a new stream: one of this side's own parity, handed to
+    /// `accept_stream`, and never closed.
+    #[tokio::test]
+    async fn the_read_half_outlives_an_acknowledged_local_close() {
+        let mut rig = RecvRig::new();
+        let handle = rig.open_local();
+        let id = handle.stream_id;
+
+        rig.close_local(id).await;
+        rig.peer_ack(id, 0).await;
+        assert!(
+            rig.streams.contains_key(&id),
+            "the peer has not closed its half, so the stream must stay"
+        );
+
+        rig.peer_segment(id, 0, b"late", false).await;
+        rig.peer_segment(id, 1, b"", true).await;
+
+        assert_eq!(
+            rig.accepted(),
+            Vec::<u32>::new(),
+            "the peer's data on a stream this side opened surfaced as a new peer stream"
+        );
+        // The route is released behind the data and the EOF, never ahead of them.
+        assert_eq!(
+            rig.delivered(),
+            vec![
+                Delivered::Data(id, b"late".to_vec()),
+                Delivered::Close(id),
+                Delivered::Retire(id)
+            ]
+        );
+        assert!(
+            !rig.streams.contains_key(&id),
+            "closed from both ends and every segment of both halves settled, so dropped"
+        );
+    }
+
+    /// A frame for a stream this side has dropped is acknowledged and nothing else: it
+    /// neither opens a stream nor delivers anything.
+    ///
+    /// Such a frame is ordinary. The peer retransmits its FIN whenever the acknowledgement
+    /// of it is lost, and by then this side may have dropped the stream. Taking it for a new
+    /// stream is the defect above by another route; ignoring it would leave the peer
+    /// retransmitting it for as long as the session lives. Both directions of opening are
+    /// covered, since this side remembers the two differently.
+    #[tokio::test]
+    async fn a_late_frame_for_a_dropped_stream_is_only_acknowledged() {
+        let mut rig = RecvRig::new();
+
+        // A stream this side opened: the peer's FIN arrives first, then this side's is
+        // acknowledged, which completes the close.
+        let local = rig.open_local();
+        let local_id = local.stream_id;
+        rig.close_local(local_id).await;
+        rig.peer_segment(local_id, 0, b"", true).await;
+        rig.peer_ack(local_id, 0).await;
+        assert!(!rig.streams.contains_key(&local_id));
+
+        // A stream the peer opened: its data and FIN, then this side's close, acknowledged.
+        let peer_id = 3;
+        rig.peer_segment(peer_id, 0, b"hello", false).await;
+        rig.peer_segment(peer_id, 1, b"", true).await;
+        assert_eq!(rig.accepted(), vec![peer_id]);
+        rig.close_local(peer_id).await;
+        rig.peer_ack(peer_id, 0).await;
+        assert!(!rig.streams.contains_key(&peer_id));
+
+        let _ = rig.delivered();
+        let _ = rig.emitted_sacks().await;
+
+        // Each peer FIN again, as a retransmission whose acknowledgement was lost.
+        rig.peer_segment(local_id, 0, b"", true).await;
+        rig.peer_segment(peer_id, 1, b"", true).await;
+
+        assert_eq!(
+            rig.accepted(),
+            Vec::<u32>::new(),
+            "a dropped stream was reopened"
+        );
+        assert!(!rig.streams.contains_key(&local_id));
+        assert!(!rig.streams.contains_key(&peer_id));
+        assert_eq!(
+            rig.delivered(),
+            Vec::new(),
+            "a dropped stream delivered again"
+        );
+        let sacks = rig.emitted_sacks().await;
+        assert_eq!(
+            sacks.len(),
+            2,
+            "each retransmission must be acknowledged so the peer can stop sending it"
+        );
+        assert_eq!(sacks[0].0, local_id);
+        assert!(sacks[0].1.acks(0));
+        assert_eq!(sacks[1].0, peer_id);
+        assert!(sacks[1].1.acks(0) && sacks[1].1.acks(1));
+    }
+
+    /// A segment on an id of this side's own parity that this side never opened makes no
+    /// stream, and — having made none — is not acknowledged either.
+    ///
+    /// Only the peer can open a stream by sending on it, and it opens its own parity. A
+    /// segment like this is a peer allocating from the wrong half of the id space, and
+    /// leaving it unacknowledged makes that a stall the peer can see rather than data this
+    /// side claims to have taken and then discards.
+    #[tokio::test]
+    async fn a_segment_on_an_id_this_side_never_opened_makes_no_stream() {
+        let mut rig = RecvRig::new();
+        rig.peer_segment(2, 0, b"wrong half", false).await;
+
+        assert_eq!(rig.accepted(), Vec::<u32>::new());
+        assert!(!rig.streams.contains_key(&2));
+        assert_eq!(rig.delivered(), Vec::new());
+        assert!(rig.emitted_sacks().await.is_empty());
+    }
+
+    /// Streams closed from both ends leave the table as they found it, however many of
+    /// them there are, so the cap on concurrent streams keeps meaning concurrent.
+    ///
+    /// Anything a close left behind would count against [`MAX_STREAMS`] for the rest of
+    /// the session, and the cap is what refuses the peer's next stream. Both directions of
+    /// opening, and both orders of the two FINs, are cycled past the cap here.
+    #[tokio::test]
+    async fn closing_streams_from_both_ends_does_not_use_up_the_stream_table() {
+        let mut rig = RecvRig::new();
+        // Twice the cap, so that even the order that loses half of its streams to a leak
+        // runs past it.
+        let cycles = 2 * MAX_STREAMS as u32 + 44;
+
+        for n in 0..cycles {
+            // Opened here; this side's FIN is acknowledged before the peer's arrives on
+            // even cycles and after it on odd ones.
+            let local = rig.open_local();
+            let id = local.stream_id;
+            rig.close_local(id).await;
+            if n % 2 == 0 {
+                rig.peer_ack(id, 0).await;
+                rig.peer_segment(id, 0, b"", true).await;
+            } else {
+                rig.peer_segment(id, 0, b"", true).await;
+                rig.peer_ack(id, 0).await;
+            }
+
+            // Opened by the peer, closed by it first.
+            let peer_id = 3 + 2 * n;
+            rig.peer_segment(peer_id, 0, b"", true).await;
+            assert!(
+                rig.streams.contains_key(&peer_id),
+                "the peer's stream {peer_id} was refused after {n} cycles, with {} stream(s) \
+                 in the table",
+                rig.streams.len()
+            );
+            rig.close_local(peer_id).await;
+            rig.peer_ack(peer_id, 0).await;
+        }
+
+        assert!(
+            rig.streams.is_empty(),
+            "{} stream(s) left in the table after {cycles} closes from both ends",
+            rig.streams.len()
+        );
+        let accepted = rig.accepted();
+        assert_eq!(
+            accepted.len(),
+            cycles as usize,
+            "exactly the peer's own streams are accepted, once each"
+        );
+        assert!(accepted.iter().all(|id| id % 2 == 1));
+
+        // The peer can still open a stream.
+        let next = 3 + 2 * cycles;
+        rig.peer_segment(next, 0, b"still open for business", false)
+            .await;
+        assert_eq!(rig.accepted(), vec![next]);
+        assert!(rig.streams.contains_key(&next));
     }
 
     /// A SACK waiting for a stream's send buffer does not hold the stream table.
@@ -9669,6 +10291,7 @@ mod tests {
         let (sid, received) = match item {
             DeliverItem::Data(sid, bytes, _) => (sid, bytes),
             DeliverItem::Close(sid) => panic!("unexpected Close({sid}) in deliver channel"),
+            DeliverItem::Retire(sid) => panic!("unexpected Retire({sid}) in deliver channel"),
         };
         assert_eq!(sid, stream_id as u32);
         assert_eq!(&received[..], b"on-new-path");
@@ -11227,14 +11850,17 @@ mod tests {
         let (sa, a) = match deliver_rx.recv().await.expect("alpha") {
             DeliverItem::Data(sid, bytes, _) => (sid, bytes),
             DeliverItem::Close(sid) => panic!("unexpected Close({sid}) for alpha"),
+            DeliverItem::Retire(sid) => panic!("unexpected Retire({sid}) for alpha"),
         };
         let (sb, b) = match deliver_rx.recv().await.expect("bravo") {
             DeliverItem::Data(sid, bytes, _) => (sid, bytes),
             DeliverItem::Close(sid) => panic!("unexpected Close({sid}) for bravo"),
+            DeliverItem::Retire(sid) => panic!("unexpected Retire({sid}) for bravo"),
         };
         let (sc, c) = match deliver_rx.recv().await.expect("charlie") {
             DeliverItem::Data(sid, bytes, _) => (sid, bytes),
             DeliverItem::Close(sid) => panic!("unexpected Close({sid}) for charlie"),
+            DeliverItem::Retire(sid) => panic!("unexpected Retire({sid}) for charlie"),
         };
         assert_eq!(
             (sa, sb, sc),
@@ -12677,7 +13303,8 @@ mod tests {
 
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
-        let _handle = demux.register_stream(2, 64);
+        // A client-allocated stream, the parity a client's frames arrive on.
+        let _handle = demux.register_stream(3, 64);
 
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
         let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
@@ -12693,7 +13320,7 @@ mod tests {
 
         // A reliable frame: `[stream_offset: u32 BE][payload]`, the live sender's framing.
         let reliable = decode_recv_frame(
-            &build_app_frame(&client_session, session_id, 2, 0, b"reliable"),
+            &build_app_frame(&client_session, session_id, 3, 0, b"reliable"),
             session_id,
         );
         handle_packet(
@@ -12719,7 +13346,7 @@ mod tests {
         // reassembles it, and the UNRELIABLE flag in place of RELIABLE.
         let header = PacketHeader::new(
             session_id,
-            2,
+            3,
             1,
             PacketFlags::new(PacketFlags::UNRELIABLE | PacketFlags::ENCRYPTED),
         )
@@ -12776,10 +13403,10 @@ mod tests {
         let session_id = fixed_session_id();
         let (client_session, server_session) = paired_sessions(session_id);
 
-        // A registered opened stream (id 2).
+        // A registered opened stream (id 3, client-allocated).
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
-        let mut stream_handle = demux.register_stream(2, 64);
+        let mut stream_handle = demux.register_stream(3, 64);
 
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
         let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
@@ -12792,9 +13419,9 @@ mod tests {
         let obs = Observability::new(ObservabilityConfig::default());
         let mut scratch = test_recv_scratch(&obs, 256);
 
-        // --- Part 1: opened-stream frame (id=2) must NOT arrive as raw-app ---
+        // --- Part 1: opened-stream frame (id=3) must NOT arrive as raw-app ---
         let opened_frame = decode_recv_frame(
-            &build_app_frame(&client_session, session_id, 2, 0, b"opened-only"),
+            &build_app_frame(&client_session, session_id, 3, 0, b"opened-only"),
             session_id,
         );
         let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
@@ -12817,17 +13444,18 @@ mod tests {
         )
         .await;
 
-        // The item in deliver_tx must be tagged as id=2 (opened stream).
+        // The item in deliver_tx must be tagged as id=3 (opened stream).
         let item = tokio::time::timeout(std::time::Duration::from_millis(100), deliver_rx.recv())
             .await
             .expect("deliver channel must have item")
             .expect("channel open");
         match &item {
             DeliverItem::Data(sid, _, _) => assert_eq!(
-                *sid, 2,
-                "opened-stream frame must be tagged stream_id=2, not raw-app"
+                *sid, 3,
+                "opened-stream frame must be tagged stream_id=3, not raw-app"
             ),
             DeliverItem::Close(sid) => panic!("unexpected Close({sid})"),
+            DeliverItem::Retire(sid) => panic!("unexpected Retire({sid})"),
         }
         // Nothing else — no second copy.
         assert!(
@@ -12886,6 +13514,7 @@ mod tests {
                 assert_eq!(&bytes[..], b"raw-only", "raw-app payload must match");
             }
             DeliverItem::Close(sid) => panic!("unexpected Close({sid}) for raw-app"),
+            DeliverItem::Retire(sid) => panic!("unexpected Retire({sid}) for raw-app"),
         }
         // Nothing else in the channel.
         assert!(

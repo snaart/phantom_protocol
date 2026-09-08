@@ -382,8 +382,9 @@ header's `stream_id`, and that id is allocated by parity: initiator odd from 3,
 responder even from 2, with 0 and 1 reserved (PROTOCOL.md § 4.4). It is the rule
 here with the least behind it: every
 committed vector carries a single hard-coded id, so a peer that allocates in the
-wrong parity passes every check in this guide and then quietly merges its stream
-with its peer's.
+wrong parity passes every check in this guide and then fails quietly: its stream
+stalls, merges with its peer's, or is acknowledged and discarded, depending on
+what its peer holds for that id (PROTOCOL.md § 4.4).
 
 The flags combine, so the table above is only half the rule: which branch claims
 a packet carrying several of them is fixed, and PROTOCOL.md § 4.3 gives the
@@ -407,7 +408,10 @@ length — so three full-size chunks are offsets 0, 1, 2, and a SACK range of
 Unreliable frames carry no offset and are outside both. Closing a stream is not a
 separate frame type either: it is a `RELIABLE | FIN` segment with its 4-byte
 offset and **zero bytes after it**, which takes the next offset in sequence and is
-acknowledged like any other segment. Mind the near-collision with the persist
+acknowledged like any other segment. It closes one direction only. Send nothing on
+a stream after your own `FIN`; the other direction stays open, and this
+implementation keeps delivering what you send on a stream it has closed until your
+`FIN` arrives (PROTOCOL.md § 4.5). Mind the near-collision with the persist
 probe — a `RELIABLE` frame with an empty payload and no `FIN` is a window probe,
 delivers nothing, and consumes no offset.
 

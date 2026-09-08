@@ -547,14 +547,30 @@ both ends never collide. Source: `transport/multiplexer.rs`
 `api/session.rs` (`is_client = true` for the connecting side, `false` for the
 accepting side).
 
-The parity is an **allocation** discipline, not a receive-side check: a receiver
-creates a stream on first sight of any id greater than 1 and never asks whose
-parity it is. That is deliberate — an id is not a capability, and rejecting the
-wrong parity would buy nothing an authenticated peer could not sidestep — but it
-does mean a peer that allocates in the wrong parity produces no error anywhere.
-Its stream and its peer's stream of the same id merge into one, which surfaces as
-interleaved application bytes, not as a parse failure. Get this wrong and every
-byte-level vector in `INTEROP.md` still passes.
+The parity is an **allocation** discipline, and a receiver reads it for one
+purpose: telling a stream the peer is opening from a late frame for a stream
+that has gone. A stream is dropped once both of its halves are closed (§ 4.5),
+and frames for it can still arrive afterwards — a `FIN` is retransmitted whenever
+its acknowledgement is lost. So a `RELIABLE` segment on an id greater than 1 that
+names no stream the receiver holds is one of three things:
+
+- **An id of the peer's parity that it has never held:** the peer opening a
+  stream. The receiver creates it.
+- **An id whose stream the receiver has already dropped** — one of the peer's
+  parity that it held before, or one of its own that it allocated: a copy of a
+  segment it already took. The receiver acknowledges every offset up to the one
+  the segment carries, which all arrived before the stream closed, and does
+  nothing else — no stream is created and nothing is delivered.
+- **An id of the receiver's own parity that it never allocated:** refused and,
+  being unrecorded, not acknowledged, exactly like a segment past the cap below.
+
+None of this is a security check — an id is not a capability, and an
+authenticated peer can always open a fresh stream of its own parity. It does
+mean a peer that allocates in the wrong parity fails quietly, never with an
+error: a stream on an id its peer never allocated stalls, one on an id its peer
+still holds merges with that stream as interleaved application bytes, and one on
+an id its peer has since dropped is acknowledged and discarded. Get this wrong
+and every byte-level vector in `INTEROP.md` still passes.
 
 Concurrent *receive* streams are capped at `MAX_STREAMS = 256` per session
 (`api/session.rs`); a reliable segment naming a new id past that cap is refused
@@ -631,7 +647,11 @@ from the live reorder state, and emits an `ENCRYPTED | ACK` inline on the same
 stream, stamped with the `path_id` the data arrived on. There is no delayed-ACK
 timer and no every-other-packet rule; a second implementation may add one, since
 the SACK is cumulative and a sender's loss detection reads only what a SACK
-covers, but nothing here waits for it.
+covers, but nothing here waits for it. The exceptions are the segments § 4.4
+refuses — one that would open a stream past the cap, or one on the receiver's own
+parity that it never allocated — which are not acknowledged, and a segment for a
+stream already closed from both ends, whose reorder state is gone: its SACK
+covers every offset from zero up to the segment's own.
 
 Nothing else is acknowledged: unreliable data, `COALESCED` bundles (their
 sub-payloads are not independently sequenced), `WINDOW_UPDATE`,
@@ -692,11 +712,15 @@ no offset at all — they are outside both counters.
 half-close is a `RELIABLE | FIN` segment carrying its 4-byte `stream_offset` and
 **zero payload bytes** after it (`Stream::queue_fin`). It takes the next offset in
 sequence, rides the same retransmission machinery as data, and is acknowledged by
-the same SACK — the sender treats the stream as closed only once that offset is
-covered. A receiver reassembles it exactly like a data segment and releases the
+the same SACK — the sender treats its half of the stream as closed only once that
+offset is covered. A receiver reassembles it exactly like a data segment and releases the
 end-of-stream to its application only once the in-order cursor has passed the
 FIN's own offset (§ 4.3, step 12), which is what stops a FIN that overtook a gap
-from truncating the data behind it. Note the near-collision with the persist probe
+from truncating the data behind it. A FIN closes one direction and nothing more: the
+side that sent it keeps receiving until the peer's own FIN, and each side drops the
+stream only once both have happened — its own FIN acknowledged, the peer's released
+in order. Frames that arrive for it after that are answered as § 4.4 describes, not
+taken for a new stream. Note the near-collision with the persist probe
 described below, and that the flag is the whole difference: a `RELIABLE` frame
 with an empty payload and **no** `FIN` is a window probe, delivers nothing, and
 consumes no offset.
@@ -2725,7 +2749,9 @@ building against a real peer.
   that opens more than about 32 767 streams wraps its ids back onto low values —
   the reserved `0` and `1` included. Far outside any plausible use (the
   concurrent cap is 256), but it is a truncation, not a refusal, so nothing
-  reports it.
+  reports it: a frame on a reused id reaches whatever either end still keeps
+  for that id's first stream — the stream itself if it is open, otherwise the
+  record that it closed, which acknowledges the frame and discards it (§ 4.4).
 - **How to interoperate with a `fips` build.** § 6.7 explains why a fips peer
   and a default peer cannot talk, and § 11 notes the frozen vectors compile to
   nothing under that feature. What a fips-to-fips conformance set would contain

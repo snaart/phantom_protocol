@@ -1520,8 +1520,8 @@ impl Stream {
         let stream_offset = self.next_reliable_offset()?;
         permit.forget();
 
-        self.local_finished.store(true, Ordering::SeqCst);
-        self.send_buffer.lock().await.push_back(PendingData {
+        let mut buffer = self.send_buffer.lock().await;
+        buffer.push_back(PendingData {
             stream_offset,
             data: Bytes::new(),
             sent_at: None,
@@ -1533,6 +1533,8 @@ impl Stream {
             fin: true,
             charged: false,
         });
+        // Only once the FIN is in the buffer — see `queue_fin`.
+        self.local_finished.store(true, Ordering::SeqCst);
         Ok(true)
     }
 
@@ -1544,14 +1546,12 @@ impl Stream {
     /// under packet loss. The drain path (`drain_streams_priority_ordered`) ORs
     /// `PacketFlags::FIN` into the wire frame when it sees `seg.fin == true`.
     ///
-    /// Simultaneously marks `local_finished = true` so `is_fin_acked()` can detect
-    /// when the send buffer is empty (FIN was SACKed) and clean up.
+    /// Then marks `local_finished = true`, once the FIN is in the buffer, so
+    /// `is_fin_acked()` can detect when the send buffer is empty (FIN was SACKed).
     ///
     /// Calling this more than once on the same stream is a no-op in practice:
     /// the second call also allocates an offset and enqueues another zero-length
-    /// segment, which is harmless (the peer SACKs them all). The caller
-    /// (`CloseStream` handler in the pump) removes the stream from the table after
-    /// calling this once, so no second call is possible via the normal path.
+    /// segment, which is harmless (the peer SACKs them all).
     pub async fn queue_fin(&self) -> Result<(), CoreError> {
         // Acquire backpressure permit — reuses `send_reliable`'s logic.
         // PANIC-SAFETY: identical to the site in `send_reliable` above —
@@ -1580,25 +1580,47 @@ impl Stream {
             charged: false,
         };
 
-        // Mark local side finished now so `is_fin_acked()` knows the FIN
-        // was queued (not just that the buffer happened to be empty).
+        // Mark the local side finished so `is_fin_acked()` knows the FIN was queued, not
+        // just that the buffer happened to be empty — and only after the FIN is in the
+        // buffer, under its lock. Raised any earlier, it would read as a FIN already
+        // acknowledged to a receive path that takes the lock first and finds the buffer
+        // empty, and the stream would be dropped with its FIN never sent.
+        let mut buffer = self.send_buffer.lock().await;
+        buffer.push_back(pending);
         self.local_finished.store(true, Ordering::SeqCst);
-        self.send_buffer.lock().await.push_back(pending);
         Ok(())
     }
 
     /// Returns `true` if the local FIN was queued (via `queue_fin`) AND the
     /// send buffer is empty (the FIN has been SACKed by the peer).
     ///
-    /// Used by the data pump's `CloseStream` handler to know when it is safe to
-    /// remove the stream from the routing tables — we cannot remove it until the
-    /// FIN is gone from the send buffer, or retransmits would fail.
+    /// That is this side's half of the stream done: nothing it wrote is still owed a
+    /// retransmission. It says nothing about the peer's half, which stays open until the
+    /// peer's own FIN — see [`is_fully_closed`](Self::is_fully_closed).
     pub async fn is_fin_acked(&self) -> bool {
         self.local_finished.load(Ordering::SeqCst) && self.send_buffer.lock().await.is_empty()
     }
 
+    /// Returns `true` once this side has queued its FIN: nothing written after that point
+    /// may be sent, since the peer reads the FIN as the end of the stream.
+    pub fn is_local_finished(&self) -> bool {
+        self.local_finished.load(Ordering::SeqCst)
+    }
+
+    /// Returns `true` once both halves of the stream are done: this side's FIN has been
+    /// acknowledged ([`is_fin_acked`](Self::is_fin_acked)) and the peer's has been released
+    /// in order ([`take_in_order_fin`](Self::take_in_order_fin) has fired).
+    ///
+    /// Only then is there nothing left to send on the stream and nothing left to receive,
+    /// which is when the data pump drops it. Dropping it on the first of the two would end
+    /// the half that is still open.
+    pub async fn is_fully_closed(&self) -> bool {
+        self.remote_finished.load(Ordering::SeqCst) && self.is_fin_acked().await
+    }
+
     /// Hold the send buffer's lock, standing in for the drain path in the middle of a pass,
-    /// so a test can put a caller of [`on_sack`](Self::on_sack) into its wait for it.
+    /// so a test can put a caller that needs it — [`on_sack`](Self::on_sack), or a FIN on
+    /// its way in — into its wait for it.
     #[cfg(test)]
     pub(crate) async fn hold_send_buffer_for_test(&self) -> impl Sized + '_ {
         self.send_buffer.lock().await
@@ -5060,6 +5082,51 @@ mod tests {
             stream.is_fin_acked().await,
             "FIN was SACKed → is_fin_acked must be true"
         );
+    }
+
+    /// A FIN still on its way into the send buffer is not reported as queued.
+    ///
+    /// `is_fin_acked` reads "queued and nothing left in the buffer" as "acknowledged", and
+    /// the receive path drops the stream on that reading once the peer's half is closed too.
+    /// Were the stream marked finished before its FIN went in, a receive path that took the
+    /// buffer's lock in between would find it empty and drop the stream, and the FIN — then
+    /// in a stream the send loop no longer visits — would never be sent. Both ways of
+    /// queueing a FIN are held at the lock here, where that window is.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fin_is_not_marked_queued_before_it_is_in_the_send_buffer() {
+        for blocking in [false, true] {
+            let stream = Arc::new(Stream::new(3));
+            let held = stream.hold_send_buffer_for_test().await;
+            let queueing = {
+                let stream = stream.clone();
+                tokio::spawn(async move {
+                    if blocking {
+                        stream.queue_fin().await.map(|()| true)
+                    } else {
+                        stream.try_queue_fin().await
+                    }
+                })
+            };
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                !queueing.is_finished(),
+                "the FIN must be waiting on the held buffer for this test to mean anything"
+            );
+            assert!(
+                !stream.is_local_finished(),
+                "the stream reads as finished while its FIN is not in the send buffer \
+                 (blocking = {blocking})"
+            );
+            drop(held);
+            assert!(queueing.await.expect("task").expect("offset space"));
+            assert!(stream.is_local_finished());
+            assert!(
+                !stream.is_fin_acked().await,
+                "a FIN nobody has acknowledged"
+            );
+        }
     }
 
     /// The FIN segment bypasses the send-window check: even with a fully-drained

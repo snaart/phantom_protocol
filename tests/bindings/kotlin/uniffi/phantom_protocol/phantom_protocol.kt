@@ -1212,7 +1212,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_method_resumptionhint_session_id() != 23596) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 65158) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 49054) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_recv() != 45283) {
@@ -4136,7 +4136,13 @@ public object FfiConverterTypePhantomSession: FfiConverter<PhantomSession, Long>
 public interface PhantomStreamInterface {
     
     /**
-     * Close this stream; the peer will see EOF on its read half.
+     * Close this side of the stream; the peer will see EOF on its read half.
+     *
+     * Only the writing half closes. [`recv`](Self::recv) on this handle keeps
+     * returning what the peer sends until the peer closes its half as well, and the
+     * session holds the stream — counting it against its limit on concurrent
+     * streams — until both halves are closed. Anything written on this stream after
+     * this call is discarded rather than sent: the peer has been told it ended.
      *
      * Named `disconnect` rather than `close` for the same reason as
      * `PhantomSession::disconnect` — UniFFI's Kotlin generator emits
@@ -4338,7 +4344,13 @@ open class PhantomStream: Disposable, AutoCloseable, PhantomStreamInterface
 
     
     /**
-     * Close this stream; the peer will see EOF on its read half.
+     * Close this side of the stream; the peer will see EOF on its read half.
+     *
+     * Only the writing half closes. [`recv`](Self::recv) on this handle keeps
+     * returning what the peer sends until the peer closes its half as well, and the
+     * session holds the stream — counting it against its limit on concurrent
+     * streams — until both halves are closed. Anything written on this stream after
+     * this call is discarded rather than sent: the peer has been told it ended.
      *
      * Named `disconnect` rather than `close` for the same reason as
      * `PhantomSession::disconnect` — UniFFI's Kotlin generator emits

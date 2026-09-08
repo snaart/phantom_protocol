@@ -41,6 +41,8 @@ mod flow_control_tests;
 mod full_duplex_tests;
 #[cfg(test)]
 mod loss_recovery_tests;
+#[cfg(test)]
+mod stream_close_tests;
 
 // Cross-target re-exports
 pub use session::{ConnectionState, NoTransport, PhantomSession, SessionBuilder, SessionTransport};
