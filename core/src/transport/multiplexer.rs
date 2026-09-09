@@ -204,9 +204,12 @@ impl StreamDemultiplexer {
     }
 
     /// Route an ACK signal to a stream **without blocking**. Returns
-    /// `false` if the stream is unknown or its buffer is full — the recv pump
-    /// uses this on its never-block path, where a vestigial/absent stream
-    /// consumer must not stall inbound ACK/control processing.
+    /// `false` if the stream is unknown or its buffer is full.
+    ///
+    /// The session's receive path does not call this. A stream's channel is bounded and
+    /// only its reader empties it, so acknowledgements queued there by a stream that is
+    /// only ever written to would fill it — and the session's delivery task, which serves
+    /// every stream in turn, would then wait on that stream's next data or EOF for good.
     pub fn route_ack(&self, stream_id: u32, seq: SequenceNumber) -> bool {
         if stream_id == 0 {
             return false;

@@ -2057,7 +2057,10 @@ async fn run_data_pump<T: SessionTransport>(
     // a consumer that never calls PhantomStream::recv() will eventually fill the
     // per-stream bounded channel and backpressure Task B → streams_deliver_tx
     // (UNBOUNDED, can grow). This is accepted behaviour; per-stream independent
-    // tasks are future work. The raw-app path is NOT affected.
+    // tasks are future work. The raw-app path is NOT affected. What fills that
+    // channel is only ever what the peer sent on the stream — its data and its FIN,
+    // never this side's own acknowledgements — so a stream the application only
+    // writes to cannot fill it.
 
     // Downstream UNBOUNDED channels (the Router → Tasks A/B paths never block).
     let (raw_deliver_tx, mut raw_deliver_rx) = mpsc::unbounded_channel::<(Bytes, bool)>();
@@ -4824,10 +4827,12 @@ async fn handle_packet<T: SessionTransport>(
                 retire_stream(stream_id, streams_recv, deliver_tx, &scratch.stream_gauge);
             }
         }
-        // Route ACK signal non-blocking (informational for the stream table, not
-        // delivery). Route FIN through the delivery channel so it is ordered
-        // after any in-flight data frames and is delivered losslessly for id ≥ 2.
-        demux_recv.route_ack(stream_id, sack.largest_acked);
+        // The acknowledgement goes no further than the stream's send side. In particular it
+        // is not queued to the stream's application channel: nothing reads it there, and
+        // a stream only ever written to would fill that bounded channel with its own
+        // acknowledgements, after which the delivery task — which serves every stream in
+        // turn — would wait on that stream's next item for good. A FIN riding the ACK goes
+        // through the delivery channel so it is ordered after any in-flight data frames.
         if packet.header.flags.contains(PacketFlags::FIN)
             && deliver_tx.send(DeliverItem::Close(stream_id)).is_ok()
         {
@@ -9594,6 +9599,26 @@ mod tests {
         assert!(
             shard_free,
             "a SACK waiting on the stream's send buffer held the stream table's shard lock"
+        );
+    }
+
+    /// A SACK never reaches the stream's application channel.
+    ///
+    /// Nothing reads acknowledgements there — `PhantomStream::recv` skips them — while the
+    /// channel is bounded and shared with the stream's data and its EOF. A stream that is
+    /// only written to therefore filled it with its own acknowledgements, after which the
+    /// delivery task parked on the stream's next item for good.
+    #[tokio::test]
+    async fn a_sack_is_not_queued_to_the_streams_application_channel() {
+        let mut rig = RecvRig::new();
+        let mut handle = rig.open_local();
+        let id = handle.stream_id;
+        for _ in 0..8 {
+            rig.peer_ack(id, 0).await;
+        }
+        assert!(
+            handle.rx.try_recv().is_err(),
+            "an acknowledgement was queued to the stream's application channel"
         );
     }
 

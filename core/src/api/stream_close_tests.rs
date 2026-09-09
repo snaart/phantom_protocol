@@ -9,6 +9,8 @@
 //! * the end that closed first keeps reading what the peer sends afterwards, then EOF;
 //! * a stream closed from both ends leaves both sides' tables, and nothing the peer sends
 //!   on it later is taken for the peer opening a new stream;
+//! * a stream the application only writes to cannot fill its own delivery channel with the
+//!   acknowledgements of what it wrote, and so cannot stop delivery to the other streams;
 //! * nothing written after a stream's own close reaches the peer behind its EOF.
 //!
 //! The link has a real, if short, delay. Every defect pinned here depends on the order in
@@ -25,9 +27,10 @@ use std::time::Duration;
 use tokio::time::{timeout, Instant};
 
 use crate::api::full_duplex_tests::{establish_counted, shutdown};
-use crate::api::session::{PhantomSession, MAX_STREAMS};
+use crate::api::session::{PhantomSession, MAX_STREAMS, STREAM_RECV_CHANNEL_DEPTH};
 use crate::api::stream::PhantomStream;
 use crate::errors::CoreError;
+use crate::transport::mtu::MAX_APP_CHUNK;
 
 /// One-way delay of the simulated path. Short, because nothing here is about rate; non-zero,
 /// because the order of arrival is the point.
@@ -331,6 +334,70 @@ async fn streams_closed_from_both_ends_do_not_use_up_the_stream_table() {
     wait_until_no_streams(&client, "client").await;
     wait_until_no_streams(&server, "server").await;
     responder.abort();
+    shutdown(&client, &server).await;
+}
+
+/// A stream the application only writes to does not stop delivery to the session's other
+/// streams.
+///
+/// A stream's delivery channel is bounded and only its reader empties it. If every
+/// acknowledgement of that stream's own writes were queued there too, an upload whose
+/// application never reads would fill it with them; the delivery task, which serves every
+/// stream of the session in turn, would then park for good on the next thing addressed to
+/// that stream — here the peer's FIN — and nothing after it would reach any stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_that_is_only_written_to_does_not_stall_the_others() {
+    /// More segments than one stream's delivery channel has slots, so one acknowledgement
+    /// per segment would fill it.
+    const SEGMENTS: usize = STREAM_RECV_CHANNEL_DEPTH + 256;
+    let (client, server) = establish().await;
+
+    let upload = client.open_stream();
+    let total = SEGMENTS * MAX_APP_CHUNK;
+    upload
+        .send_reliable(vec![0x5A; total])
+        .await
+        .expect("queue the upload");
+    let sink = accept(&server, "server").await;
+    let mut received = 0;
+    while received < total {
+        match next_read(&sink, "server").await.expect("read the upload") {
+            Some(bytes) => received += bytes.len(),
+            None => panic!("EOF after {received} of {total} bytes"),
+        }
+    }
+
+    // The server acknowledged each of those segments before its application read it, so
+    // every acknowledgement is already on its way to the client, ahead of what follows.
+    sink.disconnect()
+        .await
+        .expect("close the server's half of the upload");
+    // The pump drains streams in id order, and the server's first stream would be id 2,
+    // below the upload's 3: its data would leave ahead of the FIN and reach the client
+    // before anything could stall. Spending id 2 puts the second stream after the upload,
+    // so the FIN is the first of the two on the wire.
+    let _spent = server.open_stream();
+    let other = server.open_stream();
+    assert!(other.stream_id() > upload.stream_id());
+    other
+        .send_reliable(b"elsewhere".to_vec())
+        .await
+        .expect("send on a second stream");
+
+    let other_here = accept(&client, "client").await;
+    assert_eq!(other_here.stream_id(), other.stream_id());
+    let delivered = timeout(STEP, other_here.recv())
+        .await
+        .expect("delivery to a second stream stalled behind a stream the application never reads")
+        .expect("recv on the second stream");
+    assert_eq!(delivered, Some(b"elsewhere".to_vec()));
+    assert_eq!(
+        next_read(&upload, "client")
+            .await
+            .expect("the upload stream's channel holds the server's EOF"),
+        None
+    );
+
     shutdown(&client, &server).await;
 }
 
