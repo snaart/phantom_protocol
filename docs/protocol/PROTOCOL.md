@@ -1780,7 +1780,7 @@ bounds or its hello is dropped before anything reads a field:
 | `client_key_package.ml_kem_pk` | 1184 B (FIPS 203, exact) |
 | `client_verify_key.ml_dsa_pk` | 1952 B (FIPS 204, exact) |
 | `protocol_variant` | 64 B |
-| `early_data` | `EARLY_DATA_MAX_LEN` = 16 KiB (§ 6.6) |
+| `early_data` (sealed) | `EARLY_DATA_SEALED_MAX_LEN` = 16 KiB + 16 B tag = 16400 B (§ 6.6) |
 
 Trailing bytes are rejected too: the walk must land exactly on the end of the
 buffer, and `borsh::from_slice` would reject a surplus anyway. There is therefore
@@ -1906,10 +1906,16 @@ key is bound to one `client_nonce`, which is one-shot because the server
 consumes the resumption ticket on first sight.
 
 **Size cap.** Early-data plaintext is capped at `EARLY_DATA_MAX_LEN = 16 KiB`
-(`handshake.rs`). The client constructor refuses a larger payload; the
-server checks `sealed.len() > EARLY_DATA_MAX_LEN + 16` **before** any crypto
-work (`handshake.rs`) and drops the blob, continuing 1-RTT — this caps the
-work an unauthenticated peer can force.
+(`handshake.rs`), and the client constructor refuses a larger payload. The
+server only sees the sealed field, one 16-byte GCM tag longer, so every
+server-side bound on it is `EARLY_DATA_SEALED_MAX_LEN = EARLY_DATA_MAX_LEN + 16`:
+the pre-decode walk (§ 6.2) refuses a hello whose field is longer before
+decoding it, and the gate in front of the AEAD open drops a longer blob before
+any crypto work, continuing 1-RTT — this caps the work an unauthenticated peer
+can force. A conforming client can never exceed the sealed bound, so neither
+check ever lands on a legal payload. A server that bounded the sealed field at
+the plaintext cap would refuse the hellos carrying the last 16 legal payload
+sizes, failing handshakes whose early-data it is only allowed to decline.
 
 **One-shot anti-replay (Invariant 9).** The defence is the resumption ticket
 itself: the server `peek()`s the ticket (no consume), verifies the

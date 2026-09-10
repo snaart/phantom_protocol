@@ -25,7 +25,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use zeroize::ZeroizeOnDrop;
 
-use crate::crypto::adaptive_crypto::{CipherSuite, CryptoSession};
+use crate::crypto::adaptive_crypto::{CipherSuite, CryptoSession, AEAD_OVERHEAD};
 use crate::crypto::hybrid_kem::{HybridCiphertext, HybridKeyPackage, HybridSecretKey};
 use crate::crypto::hybrid_sign::{HybridSignature, HybridSigningKey, HybridVerifyingKey};
 use crate::crypto::kdf::derive_early_data_keying;
@@ -40,11 +40,23 @@ use crate::transport::types::{SchedulerMode, SessionId};
 use std::sync::Arc;
 
 /// Maximum 0-RTT early-data plaintext, in bytes.
-/// The client constructor rejects a larger payload; the server drops
-/// an oversized blob and continues as a normal 1-RTT handshake. Caps
-/// the work an unauthenticated peer can force before the handshake
+/// The client constructor rejects a larger payload; the server bounds
+/// the sealed field instead, at [`EARLY_DATA_SEALED_MAX_LEN`]. Caps the
+/// work an unauthenticated peer can force before the handshake
 /// completes.
 pub const EARLY_DATA_MAX_LEN: usize = 16 * 1024;
+
+/// Maximum sealed 0-RTT blob in `ClientHello.early_data`, in bytes: an
+/// [`EARLY_DATA_MAX_LEN`] plaintext plus the AES-256-GCM tag.
+///
+/// The client caps the plaintext, but the server only ever sees the sealed
+/// field, so every server-side bound on it is this one — the pre-decode length
+/// walk both listeners run and the size gate in front of the AEAD open alike.
+/// A hello over it is refused before it is decoded, which no conforming client
+/// can cause. Bounding the field at the plaintext cap instead refused the last
+/// tag's worth of legal payloads there, and a refusal at that point fails the
+/// handshake rather than declining the early-data (Invariant 9).
+pub const EARLY_DATA_SEALED_MAX_LEN: usize = EARLY_DATA_MAX_LEN + AEAD_OVERHEAD;
 
 /// Compile-time protocol-variant tag, baked into every `ClientHello`
 /// (cleartext field) **and** the signed handshake transcript. Peers
@@ -202,7 +214,7 @@ pub struct ClientHello {
 /// Real maximum byte lengths of the variable-length `ClientHello` fields (M-7). The ML-KEM-768
 /// encapsulation key is 1184 B and the ML-DSA-65 verifying key 1952 B — both fixed by FIPS
 /// 203 / 204, independent of the classical/fips build — and the `PROTOCOL_VARIANT` tag is well
-/// under 32 B; 0-RTT early-data is capped at [`EARLY_DATA_MAX_LEN`].
+/// under 32 B; the sealed 0-RTT early-data field is capped at [`EARLY_DATA_SEALED_MAX_LEN`].
 const ML_KEM_PK_MAX: usize = 1184;
 const ML_DSA_PK_MAX: usize = 1952;
 const PROTOCOL_VARIANT_MAX: usize = 64;
@@ -305,7 +317,7 @@ pub(crate) fn client_hello_lengths_within_bounds(bytes: &[u8]) -> bool {
     // early_data Option<Vec<u8>>
     match read_opt(bytes, &mut pos) {
         Some(true) => {
-            if !vec_le(bytes, &mut pos, EARLY_DATA_MAX_LEN) {
+            if !vec_le(bytes, &mut pos, EARLY_DATA_SEALED_MAX_LEN) {
                 return false;
             }
         }
@@ -1098,7 +1110,7 @@ impl HandshakeServer {
                 // resume path above; the fallback covers "early-data offered with no
                 // `resume_session_id` at all", which is likewise no usable ticket.
                 resume_reject.unwrap_or(EarlyDataOutcome::RejectedUnknownTicket)
-            } else if blob.len() > EARLY_DATA_MAX_LEN + 16 {
+            } else if blob.len() > EARLY_DATA_SEALED_MAX_LEN {
                 // Mirrors `decrypt_early_data`'s pre-crypto size gate. Read-only —
                 // the decision was already made above.
                 EarlyDataOutcome::RejectedOversized
@@ -1623,7 +1635,7 @@ fn derive_session_id(shared_secret: &[u8; 32], nonce: &[u8; 32]) -> [u8; 32] {
 ///
 /// Returns `None` — early-data rejected, the handshake simply
 /// continues as 1-RTT — when:
-/// - the sealed blob exceeds the [`EARLY_DATA_MAX_LEN`] cap (checked
+/// - the sealed blob exceeds [`EARLY_DATA_SEALED_MAX_LEN`] (checked
 ///   before any crypto work — anti-DoS), or
 /// - the AEAD tag fails to verify (tampered / wrong key).
 fn decrypt_early_data(
@@ -1634,7 +1646,7 @@ fn decrypt_early_data(
 ) -> Option<Vec<u8>> {
     // A sealed blob is `plaintext || 16-byte GCM tag`. Reject anything
     // whose plaintext would exceed the cap before doing crypto work.
-    if sealed.len() > EARLY_DATA_MAX_LEN + 16 {
+    if sealed.len() > EARLY_DATA_SEALED_MAX_LEN {
         return None;
     }
     let (key, nonce) = derive_early_data_keying(resumption_secret, client_nonce);
@@ -2419,6 +2431,56 @@ mod tests {
         // Short garbage / empty frames (what a spoofed Initial carries) are rejected.
         assert!(!client_hello_lengths_within_bounds(b"not-a-clienthello"));
         assert!(!client_hello_lengths_within_bounds(&[]));
+    }
+
+    /// Invariant 9: the admission walk bounds the *sealed* early-data field, and a client
+    /// bounds the *plaintext*. The two differ by the AES-256-GCM tag, so the walk has to
+    /// admit a hello carrying the largest payload a client is allowed to send — otherwise
+    /// a legal 0-RTT attempt is refused before it is decoded and the connect fails, where
+    /// the contract is that early-data can only ever be declined. Driven from a real
+    /// `create_client_hello_with_resume`, so the sealed length is the one a client
+    /// actually produces rather than an arithmetic claim about it.
+    #[tokio::test]
+    async fn client_hello_length_walk_admits_the_largest_legal_early_data() {
+        let server = HandshakeServer::new().unwrap();
+        let client_ip = "127.0.0.1".parse().unwrap();
+        let (resume_id, resume_secret) = first_handshake_for_hint(&server, client_ip);
+
+        let payload = vec![0x5Au8; EARLY_DATA_MAX_LEN];
+        let client = HandshakeClient::new().unwrap();
+        let hello =
+            client.create_client_hello_with_resume(resume_id, &resume_secret, Some(&payload));
+        assert_eq!(
+            hello.early_data.as_ref().map(Vec::len),
+            Some(EARLY_DATA_SEALED_MAX_LEN),
+            "a full-size payload seals to exactly the server-side bound"
+        );
+
+        let bytes = borsh::to_vec(&hello).expect("serialize");
+        assert!(
+            client_hello_lengths_within_bounds(&bytes),
+            "the walk must admit a hello whose early-data plaintext is exactly the cap"
+        );
+
+        // And the admitted hello is then accepted as 0-RTT, not merely decoded: the walk and
+        // `decrypt_early_data` agree on the same bound.
+        let decoded = borsh::from_slice::<ClientHello>(&bytes).expect("decode");
+        match server.process_client_hello(&decoded, 0, client_ip) {
+            HandshakeResponse::Success(sh, _session, early_data) => {
+                assert!(sh.early_data_accepted, "a full-size blob is accepted");
+                assert_eq!(early_data.as_deref(), Some(&payload[..]));
+            }
+            _ => panic!("a fresh ticket with a full-size blob must complete as 0-RTT"),
+        }
+
+        // One byte past what any conforming client can seal is still refused before decode.
+        let mut over = hello.clone();
+        over.early_data = Some(vec![0u8; EARLY_DATA_SEALED_MAX_LEN + 1]);
+        let over_bytes = borsh::to_vec(&over).expect("serialize");
+        assert!(
+            !client_hello_lengths_within_bounds(&over_bytes),
+            "a sealed blob one byte past plaintext cap + tag must be refused before decode"
+        );
     }
 
     /// M-5 (audit 2026-06-11): the per-IP PoW-difficulty reduction for "ticket holders" must

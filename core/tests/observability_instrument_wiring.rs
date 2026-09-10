@@ -75,7 +75,7 @@ use phantom_protocol::api::udp_listener::PhantomUdpListener;
 use phantom_protocol::crypto::hybrid_sign::HybridVerifyingKey;
 use phantom_protocol::observability::{Observability, ObservabilityConfig};
 use phantom_protocol::transport::handshake::{
-    HandshakeClient, HandshakeResponse, HandshakeServer, EARLY_DATA_MAX_LEN,
+    HandshakeClient, HandshakeResponse, HandshakeServer, EARLY_DATA_SEALED_MAX_LEN,
 };
 use phantom_protocol::transport::liveness::LivenessConfig;
 use phantom_protocol::CoreError;
@@ -633,7 +633,7 @@ fn malformed_early_data_records_oversized_and_aead_rejections() {
         let (rid, secret) = mint(&server);
         let client = HandshakeClient::new().expect("HandshakeClient::new");
         let mut oversized = client.create_client_hello_with_resume(rid, &secret, Some(b"payload"));
-        oversized.early_data = Some(vec![0u8; EARLY_DATA_MAX_LEN + 17]);
+        oversized.early_data = Some(vec![0u8; EARLY_DATA_SEALED_MAX_LEN + 1]);
         match server.process_client_hello(&oversized, 0, ip) {
             HandshakeResponse::Success(sh, _, early) => {
                 assert!(
@@ -652,7 +652,7 @@ fn malformed_early_data_records_oversized_and_aead_rejections() {
             client2.create_client_hello_with_resume(rid2, &secret2, Some(b"payload"));
         let blob = tampered.early_data.as_mut().expect("blob was sealed");
         assert!(
-            blob.len() <= EARLY_DATA_MAX_LEN + 16,
+            blob.len() <= EARLY_DATA_SEALED_MAX_LEN,
             "the tampered blob must stay under the size gate so the AEAD is what fails"
         );
         blob[0] ^= 0xFF;

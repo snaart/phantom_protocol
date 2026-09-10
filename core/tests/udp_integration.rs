@@ -1657,6 +1657,106 @@ async fn udp_integration_ffi_connect_pinned_udp_resumption_1rtt_fallback() {
     server.await.unwrap();
 }
 
+/// Invariant 9 over PhantomUDP: a resumed connect carrying the largest early-data payload
+/// the client accepts (`EARLY_DATA_MAX_LEN` bytes) completes its handshake. Two walks sit
+/// on this path, the demux's before it commits a route and the handshake task's before it
+/// decodes, and both bound the sealed field, which is one AES-GCM tag longer than the
+/// plaintext the client caps. With the walks bounded at the plaintext cap the demux
+/// dropped every copy of this hello without a reply, and the connect ran out its deadline
+/// where early-data may only ever be declined. The payload has to reach the server
+/// byte-exact by one of the two routes the contract allows, and the client's verdict has
+/// to name the route it took.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_zero_rtt_full_size_early_data_completes_the_handshake() {
+    use phantom_protocol::api::session::{connect_pinned_udp, connect_pinned_udp_with_resumption};
+    use phantom_protocol::transport::handshake::EARLY_DATA_MAX_LEN;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let local: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key_bytes = listener.verifying_key_bytes();
+
+    let payload: Vec<u8> = (0..EARLY_DATA_MAX_LEN).map(|i| (i % 251) as u8).collect();
+    let expected = payload.clone();
+    let server = tokio::spawn(async move {
+        // Connection 1 (plain): lets the client harvest a ticket.
+        let first = listener.clone().accept().await.expect("accept 1").session();
+        assert_eq!(first.recv().await.expect("recv 1"), b"warmup");
+        // Connection 2 (resume with a full-size payload).
+        let outcome = listener.accept().await.expect("accept 2");
+        let taken = outcome.take_early_data();
+        let session = outcome.session();
+        let (got, as_zero_rtt) = match taken {
+            Some(early) => (early, true),
+            None => {
+                // Declined: the client re-sends it as ordinary data, which does not keep
+                // the payload's boundary, so read until the whole length is in.
+                let mut buf = Vec::with_capacity(EARLY_DATA_MAX_LEN);
+                while buf.len() < EARLY_DATA_MAX_LEN {
+                    buf.extend(session.recv().await.expect("re-sent early-data"));
+                }
+                (buf, false)
+            }
+        };
+        assert_eq!(got, expected, "the full-size payload arrives byte-exact");
+        let msg = session.recv().await.expect("recv after resume");
+        session.send(msg).await.expect("echo after resume");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(first);
+        as_zero_rtt
+    });
+
+    let c1 = connect_pinned_udp("127.0.0.1".to_string(), local.port(), key_bytes.clone())
+        .await
+        .expect("connect_pinned_udp c1");
+    c1.send(b"warmup".to_vec()).await.expect("c1 send");
+    let hint = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(h) = c1.resumption_hint().await {
+                return h;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("resumption hint did not arrive");
+
+    let c2 = connect_pinned_udp_with_resumption(
+        "127.0.0.1".to_string(),
+        local.port(),
+        key_bytes,
+        hint,
+        payload,
+    )
+    .await
+    .expect("a payload of exactly the cap passes the client-side check");
+    timeout(Duration::from_secs(15), c2.await_ready())
+        .await
+        .expect("handshake resolved in time")
+        .expect("a legal early-data payload must never fail the handshake");
+    let verdict = c2.early_data_accepted().await;
+    assert!(
+        verdict.is_some(),
+        "a resumed hello that carried early-data has a verdict"
+    );
+
+    c2.send(b"after-resume".to_vec()).await.expect("c2 send");
+    let echo = timeout(Duration::from_secs(10), c2.recv())
+        .await
+        .expect("echo timeout")
+        .expect("c2 recv");
+    assert_eq!(echo, b"after-resume");
+
+    let as_zero_rtt = server.await.expect("server task");
+    assert_eq!(
+        verdict,
+        Some(as_zero_rtt),
+        "the client's verdict names the route the server saw the payload arrive by"
+    );
+}
+
 /// `is_shutting_down` reflects `shutdown()`, and `accept()` after shutdown returns
 /// `ConnectionClosed` — exercises the newly UniFFI-exported listener surface.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

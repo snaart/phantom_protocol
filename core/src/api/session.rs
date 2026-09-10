@@ -13355,6 +13355,79 @@ mod tests {
         drop((s1, s2));
     }
 
+    /// Invariant 9 through the server's real admission path: a resumed connect carrying
+    /// the largest early-data payload the client accepts (`EARLY_DATA_MAX_LEN` bytes)
+    /// completes, with the payload taken as 0-RTT. The client caps the plaintext, while
+    /// the listener's pre-decode walk bounds the sealed field, which is one GCM tag
+    /// longer. When the walk bounded the sealed field at the plaintext cap, this hello
+    /// was refused before it was decoded, and a payload the client had just accepted
+    /// turned a 0-RTT attempt that may only ever be declined into a failed handshake.
+    ///
+    /// Both phases go through `drive_server_handshake`, the function both listeners
+    /// share, so the walk is on the path; a direct `process_client_hello` call, as in
+    /// the test above, would step around it.
+    #[tokio::test]
+    async fn zero_rtt_full_size_early_data_passes_the_listener_admission_walk() {
+        use crate::api::listener::drive_server_handshake;
+
+        let server_hs = HandshakeServer::new().unwrap();
+        let server_pinned_key = server_hs.verifying_key().clone();
+        let client_ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let wait = std::time::Duration::from_secs(5);
+
+        // ── Prime: a plain connect fills the ticket cache and yields a hint ──
+        let (c1, s1) = ChannelTransport::pair();
+        let phase1 =
+            PhantomSession::connect_with_transport("test:9000", c1, server_pinned_key.clone());
+        drive_server_handshake(&s1, &server_hs, client_ip)
+            .await
+            .expect("priming handshake");
+        tokio::time::timeout(wait, phase1.await_ready())
+            .await
+            .expect("phase 1 resolved in time")
+            .expect("phase 1 established");
+        let hint = tokio::time::timeout(wait, async {
+            loop {
+                if let Some(h) = phase1.resumption_hint().await {
+                    return h;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("phase 1 produced a resumption hint");
+
+        // ── Resume with a payload of exactly the client-side cap ──
+        let payload = vec![0xA5u8; EARLY_DATA_MAX_LEN];
+        let (c2, s2) = ChannelTransport::pair();
+        let phase2 = PhantomSession::builder("test:9000")
+            .transport(c2)
+            .pinned_key(server_pinned_key)
+            .resumption(hint, payload.clone())
+            .connect()
+            .await
+            .expect("a payload of exactly the cap passes the client-side check");
+
+        let (_server_session, early) = drive_server_handshake(&s2, &server_hs, client_ip)
+            .await
+            .expect("the listener must admit a hello whose early-data the client accepted");
+        assert_eq!(
+            early.as_deref(),
+            Some(&payload[..]),
+            "a fresh ticket takes the full-size payload as 0-RTT"
+        );
+
+        tokio::time::timeout(wait, phase2.await_ready())
+            .await
+            .expect("phase 2 resolved in time")
+            .expect("phase 2 established");
+        assert_eq!(phase2.early_data_accepted().await, Some(true));
+
+        // The server halves stay alive until here so neither client pump sees its
+        // transport close before the assertions have run.
+        drop((s1, s2));
+    }
+
     /// `connect_pinned_with_resumption` validates the `ResumptionHint`
     /// field lengths *before* opening any socket — a hint whose
     /// `session_id` or `resumption_secret` is not exactly 32 bytes is a
