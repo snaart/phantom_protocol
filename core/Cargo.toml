@@ -291,7 +291,7 @@ lz4_flex = { version = "0.13.1", optional = true }   # Fastest pure-Rust LZ4 (sa
 # zstd pinned to a release version. Optional (gated by `compression-zstd`
 # feature) so WASM / embedded builds can opt out of the C bindings in
 # zstd-sys, falling back to lz4_flex.
-zstd = { version = "0.13", optional = true }
+zstd = { version = "0.14", optional = true }
 
 # --- Networking ---
 # TCP/UDP-using crates are non-wasm-only (Phase 3.5). Moved to the
