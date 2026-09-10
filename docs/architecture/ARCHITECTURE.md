@@ -130,9 +130,15 @@ Both client and server, after their handshakes, spawn the **same** `run_data_pum
   - `poll_interval.tick()` (10 ms) — drains streams, flushes `WINDOW_UPDATE`s, and runs
     the **liveness sweep** (`apply_liveness`).
   - `send_notify.notified()` — event-driven outbound-ready fast path.
+  - `close_requested.changed()` — the local close, raised by `disconnect()` or by
+    dropping the handle. A `watch` signal rather than a command, and never gated: the
+    command arm below is disabled while the pump holds a write the send buffer refused,
+    which a peer that stops reading can make last indefinitely. The arm takes in the
+    commands queued ahead of the close for as long as the send buffers admit them,
+    pushes what the windows allow, announces the close and exits.
   - `cmd_rx.recv()` — `SessionCommand`s: `Send`, `SendStreamReliable/Unreliable`,
     `CloseStream`, `SetStreamPriority`, **`Migrate(local_addr)`**,
-    **`MigrateServer(local_addr)`**, `Close`.
+    **`MigrateServer(local_addr)`**, `Close`. Disabled while a refused write is held.
   - `recv_done_rx` — exit when the reader ends (transport closed).
 
 ---

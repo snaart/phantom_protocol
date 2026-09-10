@@ -17,6 +17,16 @@
 > count went 4 → 5 and the `Paced` outcome is inventoried below. Still no
 > cancel-safety code change — the change was made for scheduling reasons and
 > happens to close the concern outright.
+>
+> **Amended when the local close left the command channel.** `disconnect()` and
+> `Drop for PhantomSession` used to put `SessionCommand::Close` on the command
+> channel, whose arm is disabled while the pump holds a write the send buffer
+> refused — and a peer that stops reading can keep one refused indefinitely, so
+> the close was never read and a full channel also blocked `disconnect()`. They
+> now raise a `watch` signal the pump reads on an ungated arm of its own; the
+> arm count went 5 → 6. The new primitive is cancel-safe and its body follows
+> the same teardown-only cancellation argument as the others, so the verdict
+> stands.
 
 A `select!` arm that fires before its sibling completes effectively
 **cancels** the unfinished future. If that future was carrying
@@ -39,7 +49,7 @@ invocations: the 11 production sites inventoried below, plus two inside
 
 ## Inventory
 
-### `api/session.rs::run_data_pump` main loop (current, 5-arm)
+### `api/session.rs::run_data_pump` main loop (current, 6-arm)
 
 ```rust
 tokio::select! {
@@ -47,14 +57,16 @@ tokio::select! {
     _ = send_notify.notified()     => { drain_streams_priority_ordered(..).await }  // fast-wake
     _ = sleep_until(paced_wake),
         if paced_until.is_some()   => { drain_streams_priority_ordered(..).await }  // pacing wake
-    cmd_opt = cmd_rx.recv()        => { match cmd { Send | SendStream{Reliable,Unreliable}
+    _ = close_requested.changed()  => { /* take in queued commands, finish_and_announce, break */ }
+    cmd_opt = cmd_rx.recv(),
+        if deferred.is_empty()     => { take_command(cmd) — Send | SendStream{Reliable,Unreliable}
                                                    | SetStreamPriority | CloseStream
-                                                   | Migrate | MigrateServer | Close } }
+                                                   | Migrate | MigrateServer | Close }
     _ = &mut recv_done_rx          => { /* recv task ended -> break */ }
 }
 ```
 
-**Primitive cancel-safety (the five arms):**
+**Primitive cancel-safety (the six arms):**
 - `tokio::time::sleep_until()`: **cancel-safe** — it is a deadline, not an interval, so
   dropping and recreating the future does not lose or extend the wait. Recreated each
   iteration from `paced_until`, which is plain state the drain wrote; a lost poll costs
@@ -70,6 +82,13 @@ tokio::select! {
   `notified()`. The rare register-then-drop window can at worst *delay* a wake, and
   the 10 ms `poll_interval.tick()` is an explicit fallback that drains regardless,
   so a missed notification costs ≤ 10 ms of latency, never data.
+- `tokio::sync::watch::Receiver::changed()`: **cancel-safe** (tokio documents it so) —
+  a dropped future does not mark the new value seen, so a close raised while the pump
+  is in another arm is observed on the next iteration. It also resolves, with an
+  error, once the sender is gone; the arm treats that as the same request, which is
+  what a dropped handle means anyway. Never gated, so no refused write, full channel
+  or draining window can keep it from being read. Its body drains the command
+  channel with `try_recv`, bounded by the channel's length when the close was seen.
 - `tokio::sync::mpsc::Receiver::recv()`: **cancel-safe** — a dropped `recv` does not
   consume a queued message.
 - `tokio::sync::oneshot::Receiver` (`&mut recv_done_rx`): **cancel-safe** — polling
@@ -84,12 +103,12 @@ pump task can be cancelled mid-body**, and **what is lost if it is**.
 1. **The pump is never aborted mid-`await` in normal operation.** Both spawn sites
    detach the handle (`let _detached = runtime.spawn(run_data_pump ...)` on the
    server; the client awaits it inside an equally-detached `background_task`).
-   `Drop for PhantomSession` (`api/session.rs:3705`) only best-effort `try_send`s a
-   graceful `SessionCommand::Close` — it never aborts the pump task — and the only
-   production `.abort()` in the module is the pump aborting *its own* recv subtask
-   during teardown (`recv_handle.abort()`, `api/session.rs:1776`). The
-   pump exits exclusively through the loop `break` (a graceful `SessionCommand::Close`
-   from `disconnect()`, the `None` channel-closed arm, or `recv_done`). The *only* way
+   `Drop for PhantomSession` only raises the graceful close request — it never aborts
+   the pump task — and the only production `.abort()` in the module is the pump
+   aborting *its own* recv subtask during teardown (`recv_handle.abort()`). The
+   pump exits exclusively through the loop `break` (the graceful close request from
+   `disconnect()` or `Drop`, a `SessionCommand::Close`, the `None` channel-closed arm,
+   `recv_done`, the draining deadline, or a liveness `Dead` verdict). The *only* way
    an arm body is cancelled is the **runtime/process being torn down**, where losing
    in-flight bytes is expected and harmless.
 
@@ -470,8 +489,8 @@ any send, so no DashMap shard lock is ever held across `send_app_data`'s
 - Method: pattern match against `tokio::select!`, manual review of every
   `Mutex::lock().await` / `Semaphore::acquire().await` site in `core/src/api/` and
   `core/src/transport/`, plus a control-flow trace of the data pump's spawn/abort
-  topology (detached spawn, a `Drop for PhantomSession` that only enqueues a graceful
-  `SessionCommand::Close`, single self-`abort` of the recv subtask), covering the
+  topology (detached spawn, a `Drop for PhantomSession` that only raises the graceful
+  close request, single self-`abort` of the recv subtask), covering the
   inner recv task and the three-task delivery pipeline.
 - **Re-run trigger (Phase 4.4 — BBR congestion control, the loss-recovery rework
   and the observability wiring) discharged.** Re-run again if a future change either (a) gives the

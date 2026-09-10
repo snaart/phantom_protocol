@@ -433,10 +433,10 @@ async fn a_saturating_upload_does_not_starve_the_download() {
     shutdown(&client, &server).await;
 }
 
-/// Best-effort teardown. `disconnect()` hands a command to the pump over the same
-/// bounded channel the application sends on, so on a *failing* build it can block
-/// for as long as the pump stays parked; the timeout keeps a red assertion from
-/// turning into a hung test binary.
+/// Best-effort teardown. `disconnect()` raises a signal rather than waiting for room
+/// in the command channel, so it returns at once on a working build; the timeout is
+/// there so that a build where it does not cannot turn a red assertion into a hung
+/// test binary.
 pub(crate) async fn shutdown(client: &Arc<PhantomSession>, server: &Arc<PhantomSession>) {
     let _ = timeout(Duration::from_secs(10), client.disconnect()).await;
     let _ = timeout(Duration::from_secs(10), server.disconnect()).await;

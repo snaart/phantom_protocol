@@ -576,6 +576,17 @@ pub struct PhantomSession {
     send_queue: Arc<Mutex<Vec<Vec<u8>>>>,
     /// Channel to send commands to the background handshake task
     cmd_tx: mpsc::Sender<SessionCommand>,
+    /// Raised by [`disconnect`](Self::disconnect) and by dropping the handle, to ask the
+    /// pump to close the session.
+    ///
+    /// A signal of its own rather than a command queued behind the application's writes.
+    /// The pump stops reading its command channel while it holds a write the send buffer
+    /// refused, and it holds one until the peer acknowledges data that the peer's own
+    /// window may forbid sending — so a close queued in that channel was a close a peer
+    /// that stopped reading could postpone for as long as it liked, and a caller waiting
+    /// for room in the channel waited with it. Raising this never waits, and the pump
+    /// reads it whatever else it is holding.
+    close_request: watch::Sender<bool>,
     /// Command receiver — taken by the background task when spawned
     #[allow(dead_code)]
     cmd_rx: Mutex<Option<mpsc::Receiver<SessionCommand>>>,
@@ -691,7 +702,9 @@ pub enum SessionCommand {
     /// Takes effect on the next drain pass; no notify needed since priority only
     /// reorders an already-scheduled drain.
     SetStreamPriority { stream_id: u32, priority: u32 },
-    /// Close the session
+    /// Close the session. Honoured when it arrives, but `disconnect()` and a dropped
+    /// handle do not send it: their close travels on a signal of its own, which the
+    /// pump reads even while it has stopped reading this channel.
     Close,
 }
 
@@ -776,6 +789,7 @@ impl PhantomSession {
         liveness: Option<crate::transport::liveness::LivenessConfig>,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
+        let (close_request, close_requested) = watch::channel(false);
         let (recv_tx, recv_rx) = mpsc::channel(RAW_APP_RECV_CHANNEL_DEPTH);
         // Channel for peer-initiated streams exposed via accept_stream().
         let (incoming_stream_tx, incoming_stream_rx) = mpsc::channel(128);
@@ -823,6 +837,7 @@ impl PhantomSession {
             state: state.clone(),
             send_queue: send_queue.clone(),
             cmd_tx: cmd_tx.clone(),
+            close_request,
             cmd_rx: Mutex::new(None), // taken by background task
             recv_rx: Mutex::new(recv_rx),
             demux: demux.clone(),
@@ -843,13 +858,15 @@ impl PhantomSession {
         // Spawn the background handshake + data pump task on the supplied
         // runtime. `SpawnHandle` is detached: dropping it leaves the task
         // running. The session is owned by the caller for its lifetime
-        // and natural shutdown comes via `SessionCommand::Close`.
+        // and natural shutdown comes via the close request that
+        // `disconnect()` and dropping the handle raise.
         let runtime_for_pump = runtime.clone();
         let _detached = runtime.spawn(Box::pin(Self::background_task(
             state,
             send_queue,
             cmd_tx.clone(),
             cmd_rx,
+            close_requested,
             recv_tx,
             transport,
             peer,
@@ -909,6 +926,7 @@ impl PhantomSession {
         leg: LegType,
     ) -> Arc<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
+        let (close_request, close_requested) = watch::channel(false);
         let (recv_tx, recv_rx) = mpsc::channel(RAW_APP_RECV_CHANNEL_DEPTH);
         // Channel for peer-initiated streams exposed via accept_stream().
         let (incoming_stream_tx, incoming_stream_rx) = mpsc::channel(128);
@@ -952,6 +970,7 @@ impl PhantomSession {
             state: state.clone(),
             send_queue: send_queue.clone(),
             cmd_tx: cmd_tx.clone(),
+            close_request,
             cmd_rx: Mutex::new(None),
             recv_rx: Mutex::new(recv_rx),
             demux: demux.clone(),
@@ -1000,6 +1019,7 @@ impl PhantomSession {
             state,
             send_queue,
             cmd_rx,
+            close_requested,
             recv_tx,
             demux,
             streams,
@@ -1023,6 +1043,7 @@ impl PhantomSession {
         send_queue: Arc<Mutex<Vec<Vec<u8>>>>,
         _cmd_tx: mpsc::Sender<SessionCommand>,
         cmd_rx: mpsc::Receiver<SessionCommand>,
+        close_requested: watch::Receiver<bool>,
         recv_tx: mpsc::Sender<Bytes>,
         transport: T,
         peer: String,
@@ -1206,6 +1227,7 @@ impl PhantomSession {
             state,
             send_queue,
             cmd_rx,
+            close_requested,
             recv_tx,
             demux,
             streams,
@@ -1932,6 +1954,9 @@ async fn run_data_pump<T: SessionTransport>(
     state: Arc<AtomicU8>,
     send_queue: Arc<Mutex<Vec<Vec<u8>>>>,
     mut cmd_rx: mpsc::Receiver<SessionCommand>,
+    // The local close request (`PhantomSession::close_request`), read beside the command
+    // channel rather than through it.
+    mut close_requested: watch::Receiver<bool>,
     recv_tx: mpsc::Sender<Bytes>,
     demux: Arc<StreamDemultiplexer>,
     streams: Arc<DashMap<u32, Arc<Stream>>>,
@@ -1985,7 +2010,9 @@ async fn run_data_pump<T: SessionTransport>(
     // command arm below is disabled, so the pump keeps servicing the heartbeat,
     // the receive-driven wake-ups and the flow-control flush, and the
     // backpressure surfaces at the application's own `send()` instead of parking
-    // the pump.
+    // the pump. It also keeps servicing the local close request, which is read
+    // on an arm of its own for exactly this reason: nothing bounds how long this
+    // queue stays non-empty except the peer.
     let mut deferred: VecDeque<Deferred> = VecDeque::new();
 
     // ── Flush queued early-data onto the raw-app stream ──
@@ -2353,14 +2380,6 @@ async fn run_data_pump<T: SessionTransport>(
         let _ = recv_done_tx.send(());
     }));
 
-    // How much application data goes into one packet. Derived from the PhantomUDP
-    // datagram budget (`transport::mtu`) so that a full chunk plus its header, its
-    // in-plaintext stream offset and its AEAD tag is exactly one unfragmented
-    // datagram: a chunk one byte over the budget would be split into a full
-    // datagram plus a short tail, which doubles the datagram rate and makes the
-    // segment need both halves to survive. On the byte-pipe legs the same constant
-    // just sets the framing granularity.
-    const APP_CHUNK: usize = crate::transport::mtu::MAX_APP_CHUNK;
     // Phase 2.4: the 10 ms `poll_interval` stays as a retransmit-timer
     // fallback (streams without an explicit notifier reference still
     // get swept), but `send_notify.notified()` joins the select! so the
@@ -2581,6 +2600,62 @@ async fn run_data_pump<T: SessionTransport>(
                     !deferred.is_empty() || !cmd_rx.is_empty(),
                 );
             }
+            // The local close: `disconnect()`, or the handle dropped. On an arm of its
+            // own and not gated on `deferred`, which is the whole reason it is not a
+            // command. The command arm is disabled while a refused write is held, and
+            // a refused write is held until the peer acknowledges data its own window
+            // may forbid sending — so a peer that stopped reading, while still
+            // answering probes and keep-alives, could hold a close queued behind that
+            // write for as long as it chose. `changed()` also resolves once the
+            // handle's sender is gone, which is the same request.
+            //
+            // A graceful close with TCP-FIN shape: push what is queued, then announce.
+            // What is queued includes commands the application handed over before it
+            // asked to close, which the command arm has not necessarily read — the two
+            // arms can be ready at once — so they are taken in here, in order, for as
+            // long as the send buffers admit them. That is where the command arm stops
+            // too, and it keeps `send(x); disconnect()` pushing `x` exactly as it did
+            // when the close waited in line behind it. Nothing here waits on the peer:
+            // a write still refused once the drain is done is a write this close
+            // discards, which is what `disconnect()` documents.
+            _ = close_requested.changed() => {
+                log::info!("PhantomSession: closing");
+                if !crypto_session.peer_closed() {
+                    flush_deferred_sends(
+                        &mut deferred, &transport, &crypto_session, session_id, &streams,
+                        &demux, &stream_gauge, &observability,
+                    )
+                    .await;
+                    // Only what was queued when the close was seen, so a writer still at
+                    // work on another handle cannot keep a closing session busy.
+                    for _ in 0..cmd_rx.len() {
+                        if !deferred.is_empty() {
+                            break;
+                        }
+                        let Ok(cmd) = cmd_rx.try_recv() else {
+                            break;
+                        };
+                        // A `Close` among them asks for what is already under way.
+                        take_command(
+                            cmd, &raw_stream, &mut deferred, &transport, &crypto_session,
+                            session_id, &streams, &demux, &stream_gauge, &observability,
+                        )
+                        .await;
+                    }
+                }
+                finish_and_announce(
+                    &transport, &crypto_session, session_id, &streams, &observability,
+                )
+                .await;
+                if !deferred.is_empty() {
+                    log::debug!(
+                        "PhantomSession: the close discards {} chunk(s) the send buffers \
+                         never admitted",
+                        deferred.len()
+                    );
+                }
+                break;
+            }
             // Disabled while `deferred` holds work: the queue must clear in FIFO
             // order before another command is taken, which is what preserves
             // per-stream byte ordering and lets the bounded command channel carry
@@ -2596,8 +2671,8 @@ async fn run_data_pump<T: SessionTransport>(
                 // in the channel or what raced the publish by less than a scheduling
                 // point. Dropping those silently is the residue of a genuine race and
                 // not a window — which is what the state moved it from. The arm keeps
-                // *reading* commands so `disconnect()` and a dropped handle still land;
-                // only the writes are declined.
+                // *reading* commands so the ones that are not writes still land; only
+                // the writes are declined.
                 if draining_until.is_some()
                     && matches!(
                         cmd_opt,
@@ -2613,211 +2688,39 @@ async fn run_data_pump<T: SessionTransport>(
                     );
                     continue;
                 }
-                match cmd_opt {
-                    Some(SessionCommand::Send(data)) => {
-                        // Route through the raw-app stream so the payload is
-                        // buffered for retransmit until ACKed (drained by
-                        // `drain_streams_priority_ordered`), instead of being
-                        // fired once and forgotten on the wire. Admission goes
-                        // through `deferred` so a full send buffer refuses the
-                        // chunk instead of parking this whole loop.
-                        for chunk in data.chunks(APP_CHUNK) {
-                            deferred.push_back(Deferred::Data {
-                                stream: raw_stream.clone(),
-                                data: Bytes::copy_from_slice(chunk),
-                            });
-                        }
-                        flush_deferred_sends(
-                            &mut deferred, &transport, &crypto_session, session_id, &streams,
-                            &demux, &stream_gauge, &observability,
-                        )
-                        .await;
-                        crypto_session.notify_outbound_ready();
-                    }
-                    Some(SessionCommand::SendStreamReliable { stream_id, data }) => {
-                        // Clone the Arc out and drop the DashMap guard before any
-                        // await — the shard lock must never be held across one.
-                        let stream = streams.get(&stream_id).map(|s| s.clone());
-                        if let Some(stream) = stream {
-                            for chunk in data.chunks(APP_CHUNK) {
-                                deferred.push_back(Deferred::Data {
-                                    stream: stream.clone(),
-                                    data: Bytes::copy_from_slice(chunk),
-                                });
-                            }
-                            flush_deferred_sends(
-                                &mut deferred, &transport, &crypto_session, session_id, &streams,
-                                &demux, &stream_gauge, &observability,
-                            )
-                            .await;
-                        }
-                    }
-                    Some(SessionCommand::SendStreamUnreliable { stream_id, data }) => {
-                        let stream = streams.get(&stream_id).map(|s| s.clone());
-                        // Nothing follows a FIN, unreliable or not: the peer has already
-                        // been told the stream ended.
-                        if let Some(stream) = stream.filter(|s| !s.is_local_finished()) {
-                            for chunk in data.chunks(APP_CHUNK) {
-                                stream.send_unreliable(Bytes::copy_from_slice(chunk)).await;
-                            }
-                        }
-                    }
-                    Some(SessionCommand::SetStreamPriority { stream_id, priority }) => {
-                        if let Some(stream) = streams.get(&stream_id) {
-                            stream.set_priority(priority);
-                        }
-                    }
-                    Some(SessionCommand::CloseStream { stream_id }) => {
-                        // Reliable FIN over ARQ: enqueue a zero-length reliable
-                        // FIN sentinel rather than firing a bare (unreliable) FIN.
-                        // The sentinel goes through the same send buffer + retransmit
-                        // machinery as all other reliable data, so it is guaranteed to
-                        // be delivered in order and acknowledged by the peer even under
-                        // packet loss. It closes this side's half only: the stream stays
-                        // in `streams` and `demux` — still receiving — until the FIN is
-                        // acknowledged AND the peer's own FIN has been released in order,
-                        // and the receive path drops it when both are true.
-                        //
-                        // Invariant 2 is preserved: the FIN packet is sealed with
-                        // ENCRYPTED | RELIABLE | FIN — a forged unencrypted one is
-                        // dropped at the AEAD gate before FIN processing (the existing
-                        // "must have ENCRYPTED" gate in handle_packet). The security
-                        // invariant test `forged_unencrypted_fin_does_not_close_a_stream`
-                        // continues to pass because the drop happens before any FIN logic.
-                        //
-                        // Queued through `deferred` like any other reliable write,
-                        // so it lands strictly after the bytes queued before it and
-                        // a full send buffer refuses it rather than parking the
-                        // pump. `flush_deferred_sends` carries the offset-exhaustion
-                        // fallback (bare ENCRYPTED FIN + retire) that used to live
-                        // inline here.
-                        //
-                        // A stream no longer in the table was closed from both ends and
-                        // dropped, and there is nothing to do: its route is released by
-                        // the delivery task behind whatever it still had to deliver, and
-                        // releasing it here — on a second `disconnect()`, say — could
-                        // cut that short.
-                        let stream = streams.get(&stream_id).map(|s| s.clone());
-                        if let Some(stream) = stream {
-                            deferred.push_back(Deferred::Fin { stream_id, stream });
-                            flush_deferred_sends(
-                                &mut deferred, &transport, &crypto_session, session_id, &streams,
-                                &demux, &stream_gauge, &observability,
-                            )
-                            .await;
-                            // Wake the send loop so the FIN is put on the wire on
-                            // the very next drain pass rather than after a 10 ms tick.
-                            crypto_session.notify_outbound_ready();
-                        }
-                    }
-                    Some(SessionCommand::Migrate(local_addr)) => {
-                        // Embedder-triggered connection migration (Phase 4 / P4.2).
-                        // Rebind the transport to the new local socket FIRST (it keeps
-                        // the old socket for the overlap); only on a successful rebind
-                        // bump the send `path_id` so every subsequent packet from the
-                        // new socket carries a fresh, not-yet-Validated path label —
-                        // which is what makes the server detect + challenge the new
-                        // path (a still-`0` path_id would be skipped, path 0 being
-                        // permanently Validated). Both happen inside this `select!`
-                        // arm, so no send interleaves between them. Best-effort: a
-                        // failed rebind leaves the session untouched on the old socket
-                        // (broken-rebind safety) — migration never tears it down.
-                        match transport.migrate(local_addr).await {
-                            Ok(()) => {
-                                let from_path = crypto_session.current_send_path_id();
-                                let new_path = crypto_session.next_migration_path_id();
-                                // Real migration event: the local send path moved
-                                // from `from_path` to `new_path`.
-                                observability.record_path_migration(from_path, new_path);
-                                // ε / WIRE v5: rotate the outbound CID so every
-                                // post-migration datagram stamps an
-                                // independent-random ConnId an observer cannot link
-                                // to the pre-migration flow. The new CID_{i+1} is
-                                // already in the server's pre-registered inbound
-                                // window (which slides post-AEAD beyond K migrations).
-                                transport.set_outbound_cid(crypto_session.advance_outbound_cid());
-                                log::info!(
-                                    "PhantomSession: migrated send path -> path_id {}, CID rotated",
-                                    new_path
-                                );
-                                // Wake the send loop so app data + L1 retransmits flow
-                                // from the new socket immediately, triggering the
-                                // server-side new-source detection.
-                                crypto_session.notify_outbound_ready();
-                            }
-                            Err(e) => {
-                                log::warn!(
-                                    "PhantomSession: migrate rebind failed (staying on the old path): {}",
-                                    e
-                                );
-                            }
-                        }
-                    }
-                    Some(SessionCommand::MigrateServer(local_addr)) => {
-                        // Server-side migration (the mirror of `Migrate`). Rebind the
-                        // server's SEND socket to the new local address FIRST (its receive
-                        // keeps flowing on the old address through the listener demux during
-                        // the overlap, so c2s never drops); only on a successful rebind
-                        // rotate the s2c send `path_id` + outbound CID in lock-step, so the
-                        // client sees a fresh server source with a fresh, unlinkable ConnId
-                        // and follows it (its unconnected socket hears the new source). Both
-                        // happen inside this `select!` arm, so no send interleaves between
-                        // them. Best-effort: a failed rebind leaves the session on the old
-                        // send socket — server migration never tears it down.
-                        match transport.migrate_server(local_addr).await {
-                            Ok(()) => {
-                                let from_path = crypto_session.current_send_path_id();
-                                let new_path = crypto_session.next_migration_path_id();
-                                // Real migration event: the server's send path moved.
-                                observability.record_path_migration(from_path, new_path);
-                                transport.set_outbound_cid(crypto_session.advance_outbound_cid());
-                                log::info!(
-                                    "PhantomSession: migrated server send path -> path_id {}, s2c CID rotated",
-                                    new_path
-                                );
-                                // Wake the send loop so the next s2c packet carries the new
-                                // source + path_id + CID immediately.
-                                crypto_session.notify_outbound_ready();
-                            }
-                            Err(e) => {
-                                log::warn!(
-                                    "PhantomSession: server migrate rebind failed (staying on the old send socket): {}",
-                                    e
-                                );
-                            }
-                        }
-                    }
-                    Some(SessionCommand::Close) => {
-                        log::info!("PhantomSession: closing");
-                        // `disconnect()` is a *graceful* close with TCP-FIN shape:
-                        // push what is queued, then close. Mirror the handle-drop
-                        // (`None`) arm so buffered `send()` data still reaches the
-                        // peer: `session.send(x); session.disconnect()` must not lose
-                        // `x`, just like `send(x); drop(session)` — bearing in mind
-                        // that "push" is what the drain does and not "deliver", which
-                        // is what the method's own documentation says out loud.
-                        finish_and_announce(
-                            &transport, &crypto_session, session_id, &streams, &observability,
-                        )
-                        .await;
-                        break;
-                    }
-                    None => {
-                        log::info!("PhantomSession: command channel dropped");
-                        // The outer `PhantomSession` handle was dropped. Data already
-                        // handed to `send()` was routed onto the raw-app stream but may
-                        // not have hit the wire yet (transmission happens on the next
-                        // tick / notify of THIS loop). Flush it before exiting so a
-                        // fire-and-forget `send()` immediately followed by dropping the
-                        // handle still reaches the peer — otherwise a freshly-accepted
-                        // server session that does `recv(); send(echo)` then drops loses
-                        // the echo, and the client's `recv()` hangs to its timeout.
-                        finish_and_announce(
-                            &transport, &crypto_session, session_id, &streams, &observability,
-                        )
-                        .await;
-                        break;
-                    }
+                let Some(cmd) = cmd_opt else {
+                    log::info!("PhantomSession: command channel dropped");
+                    // The outer `PhantomSession` handle was dropped. Data already
+                    // handed to `send()` was routed onto the raw-app stream but may
+                    // not have hit the wire yet (transmission happens on the next
+                    // tick / notify of THIS loop). Flush it before exiting so a
+                    // fire-and-forget `send()` immediately followed by dropping the
+                    // handle still reaches the peer — otherwise a freshly-accepted
+                    // server session that does `recv(); send(echo)` then drops loses
+                    // the echo, and the client's `recv()` hangs to its timeout.
+                    finish_and_announce(
+                        &transport, &crypto_session, session_id, &streams, &observability,
+                    )
+                    .await;
+                    break;
+                };
+                if take_command(
+                    cmd, &raw_stream, &mut deferred, &transport, &crypto_session, session_id,
+                    &streams, &demux, &stream_gauge, &observability,
+                )
+                .await
+                {
+                    log::info!("PhantomSession: closing");
+                    // A `Close` that came down the channel: the same graceful close as
+                    // the local close request above — push what is queued, then
+                    // announce — bearing in mind that "push" is what the drain does and
+                    // not "deliver", which is what `disconnect()`'s own documentation
+                    // says out loud.
+                    finish_and_announce(
+                        &transport, &crypto_session, session_id, &streams, &observability,
+                    )
+                    .await;
+                    break;
                 }
             }
             _ = &mut recv_done_rx => {
@@ -2868,6 +2771,236 @@ async fn run_data_pump<T: SessionTransport>(
     stream_gauge.drain();
     // Session torn down — drop the active-session gauge back down.
     observability.session_closed(leg);
+}
+
+/// How much application data goes into one packet. Derived from the PhantomUDP
+/// datagram budget (`transport::mtu`) so that a full chunk plus its header, its
+/// in-plaintext stream offset and its AEAD tag is exactly one unfragmented
+/// datagram: a chunk one byte over the budget would be split into a full
+/// datagram plus a short tail, which doubles the datagram rate and makes the
+/// segment need both halves to survive. On the byte-pipe legs the same constant
+/// just sets the framing granularity.
+const APP_CHUNK: usize = crate::transport::mtu::MAX_APP_CHUNK;
+
+/// Take one application command into the pump.
+///
+/// Two callers: the command arm, one command per turn, and the local close, which
+/// takes in what was queued ahead of it before it announces. Nothing here waits on
+/// the peer — a write the send buffer cannot take yet stays at the tail of
+/// `deferred`, and that is what tells the command arm to stop reading. Returns `true`
+/// for [`SessionCommand::Close`] and leaves acting on it to the caller, because
+/// ending the session is the loop's decision.
+#[allow(clippy::too_many_arguments)]
+async fn take_command<T: SessionTransport>(
+    cmd: SessionCommand,
+    raw_stream: &Arc<Stream>,
+    deferred: &mut VecDeque<Deferred>,
+    transport: &Arc<T>,
+    crypto_session: &Arc<Session>,
+    session_id: SessionId,
+    streams: &Arc<DashMap<u32, Arc<Stream>>>,
+    demux: &Arc<StreamDemultiplexer>,
+    stream_gauge: &Arc<StreamGauge>,
+    observability: &Observability,
+) -> bool {
+    match cmd {
+        SessionCommand::Send(data) => {
+            // Route through the raw-app stream so the payload is
+            // buffered for retransmit until ACKed (drained by
+            // `drain_streams_priority_ordered`), instead of being
+            // fired once and forgotten on the wire. Admission goes
+            // through `deferred` so a full send buffer refuses the
+            // chunk instead of parking this whole loop.
+            for chunk in data.chunks(APP_CHUNK) {
+                deferred.push_back(Deferred::Data {
+                    stream: raw_stream.clone(),
+                    data: Bytes::copy_from_slice(chunk),
+                });
+            }
+            flush_deferred_sends(
+                deferred,
+                transport,
+                crypto_session,
+                session_id,
+                streams,
+                demux,
+                stream_gauge,
+                observability,
+            )
+            .await;
+            crypto_session.notify_outbound_ready();
+        }
+        SessionCommand::SendStreamReliable { stream_id, data } => {
+            // Clone the Arc out and drop the DashMap guard before any
+            // await — the shard lock must never be held across one.
+            let stream = streams.get(&stream_id).map(|s| s.clone());
+            if let Some(stream) = stream {
+                for chunk in data.chunks(APP_CHUNK) {
+                    deferred.push_back(Deferred::Data {
+                        stream: stream.clone(),
+                        data: Bytes::copy_from_slice(chunk),
+                    });
+                }
+                flush_deferred_sends(
+                    deferred,
+                    transport,
+                    crypto_session,
+                    session_id,
+                    streams,
+                    demux,
+                    stream_gauge,
+                    observability,
+                )
+                .await;
+            }
+        }
+        SessionCommand::SendStreamUnreliable { stream_id, data } => {
+            let stream = streams.get(&stream_id).map(|s| s.clone());
+            // Nothing follows a FIN, unreliable or not: the peer has already
+            // been told the stream ended.
+            if let Some(stream) = stream.filter(|s| !s.is_local_finished()) {
+                for chunk in data.chunks(APP_CHUNK) {
+                    stream.send_unreliable(Bytes::copy_from_slice(chunk)).await;
+                }
+            }
+        }
+        SessionCommand::SetStreamPriority {
+            stream_id,
+            priority,
+        } => {
+            if let Some(stream) = streams.get(&stream_id) {
+                stream.set_priority(priority);
+            }
+        }
+        SessionCommand::CloseStream { stream_id } => {
+            // Reliable FIN over ARQ: enqueue a zero-length reliable
+            // FIN sentinel rather than firing a bare (unreliable) FIN.
+            // The sentinel goes through the same send buffer + retransmit
+            // machinery as all other reliable data, so it is guaranteed to
+            // be delivered in order and acknowledged by the peer even under
+            // packet loss. It closes this side's half only: the stream stays
+            // in `streams` and `demux` — still receiving — until the FIN is
+            // acknowledged AND the peer's own FIN has been released in order,
+            // and the receive path drops it when both are true.
+            //
+            // Invariant 2 is preserved: the FIN packet is sealed with
+            // ENCRYPTED | RELIABLE | FIN — a forged unencrypted one is
+            // dropped at the AEAD gate before FIN processing (the existing
+            // "must have ENCRYPTED" gate in handle_packet). The security
+            // invariant test `forged_unencrypted_fin_does_not_close_a_stream`
+            // continues to pass because the drop happens before any FIN logic.
+            //
+            // Queued through `deferred` like any other reliable write,
+            // so it lands strictly after the bytes queued before it and
+            // a full send buffer refuses it rather than parking the
+            // pump. `flush_deferred_sends` carries the offset-exhaustion
+            // fallback (bare ENCRYPTED FIN + retire) that used to live
+            // inline here.
+            //
+            // A stream no longer in the table was closed from both ends and
+            // dropped, and there is nothing to do: its route is released by
+            // the delivery task behind whatever it still had to deliver, and
+            // releasing it here — on a second `disconnect()`, say — could
+            // cut that short.
+            let stream = streams.get(&stream_id).map(|s| s.clone());
+            if let Some(stream) = stream {
+                deferred.push_back(Deferred::Fin { stream_id, stream });
+                flush_deferred_sends(
+                    deferred,
+                    transport,
+                    crypto_session,
+                    session_id,
+                    streams,
+                    demux,
+                    stream_gauge,
+                    observability,
+                )
+                .await;
+                // Wake the send loop so the FIN is put on the wire on
+                // the very next drain pass rather than after a 10 ms tick.
+                crypto_session.notify_outbound_ready();
+            }
+        }
+        SessionCommand::Migrate(local_addr) => {
+            // Embedder-triggered connection migration (Phase 4 / P4.2).
+            // Rebind the transport to the new local socket FIRST (it keeps
+            // the old socket for the overlap); only on a successful rebind
+            // bump the send `path_id` so every subsequent packet from the
+            // new socket carries a fresh, not-yet-Validated path label —
+            // which is what makes the server detect + challenge the new
+            // path (a still-`0` path_id would be skipped, path 0 being
+            // permanently Validated). Both happen inside this one
+            // command, so no send interleaves between them. Best-effort: a
+            // failed rebind leaves the session untouched on the old socket
+            // (broken-rebind safety) — migration never tears it down.
+            match transport.migrate(local_addr).await {
+                Ok(()) => {
+                    let from_path = crypto_session.current_send_path_id();
+                    let new_path = crypto_session.next_migration_path_id();
+                    // Real migration event: the local send path moved
+                    // from `from_path` to `new_path`.
+                    observability.record_path_migration(from_path, new_path);
+                    // ε / WIRE v5: rotate the outbound CID so every
+                    // post-migration datagram stamps an
+                    // independent-random ConnId an observer cannot link
+                    // to the pre-migration flow. The new CID_{i+1} is
+                    // already in the server's pre-registered inbound
+                    // window (which slides post-AEAD beyond K migrations).
+                    transport.set_outbound_cid(crypto_session.advance_outbound_cid());
+                    log::info!(
+                        "PhantomSession: migrated send path -> path_id {}, CID rotated",
+                        new_path
+                    );
+                    // Wake the send loop so app data + L1 retransmits flow
+                    // from the new socket immediately, triggering the
+                    // server-side new-source detection.
+                    crypto_session.notify_outbound_ready();
+                }
+                Err(e) => {
+                    log::warn!(
+                        "PhantomSession: migrate rebind failed (staying on the old path): {}",
+                        e
+                    );
+                }
+            }
+        }
+        SessionCommand::MigrateServer(local_addr) => {
+            // Server-side migration (the mirror of `Migrate`). Rebind the
+            // server's SEND socket to the new local address FIRST (its receive
+            // keeps flowing on the old address through the listener demux during
+            // the overlap, so c2s never drops); only on a successful rebind
+            // rotate the s2c send `path_id` + outbound CID in lock-step, so the
+            // client sees a fresh server source with a fresh, unlinkable ConnId
+            // and follows it (its unconnected socket hears the new source). Both
+            // happen inside this one command, so no send interleaves between
+            // them. Best-effort: a failed rebind leaves the session on the old
+            // send socket — server migration never tears it down.
+            match transport.migrate_server(local_addr).await {
+                Ok(()) => {
+                    let from_path = crypto_session.current_send_path_id();
+                    let new_path = crypto_session.next_migration_path_id();
+                    // Real migration event: the server's send path moved.
+                    observability.record_path_migration(from_path, new_path);
+                    transport.set_outbound_cid(crypto_session.advance_outbound_cid());
+                    log::info!(
+                        "PhantomSession: migrated server send path -> path_id {}, s2c CID rotated",
+                        new_path
+                    );
+                    // Wake the send loop so the next s2c packet carries the new
+                    // source + path_id + CID immediately.
+                    crypto_session.notify_outbound_ready();
+                }
+                Err(e) => {
+                    log::warn!(
+                        "PhantomSession: server migrate rebind failed (staying on the old send socket): {}",
+                        e
+                    );
+                }
+            }
+        }
+        SessionCommand::Close => return true,
+    }
+    false
 }
 
 /// Evaluate path liveness once (Phase 4 / P4.3) and apply the resulting transition to
@@ -5512,6 +5645,8 @@ impl PhantomSession {
             state: Arc::new(AtomicU8::new(ConnectionState::Failed as u8)),
             send_queue: Arc::new(Mutex::new(Vec::new())),
             cmd_tx,
+            // No pump to read it; raising it is a harmless no-op.
+            close_request: watch::channel(false).0,
             cmd_rx: Mutex::new(Some(cmd_rx)),
             recv_rx: Mutex::new(recv_rx),
             demux: Arc::new(demux),
@@ -5960,7 +6095,11 @@ impl PhantomSession {
     /// object, and a Rust-side `close` here would conflict with it.
     pub async fn disconnect(&self) -> Result<(), CoreError> {
         self.set_state(ConnectionState::Closed);
-        let _ = self.cmd_tx.send(SessionCommand::Close).await;
+        // Raised rather than queued: a full command channel, or a pump that has stopped
+        // reading it because the peer stopped reading, must not be able to hold this
+        // call or the close it asks for.
+        self.close_request
+            .send_modify(|requested| *requested = true);
         Ok(())
     }
 }
@@ -6095,20 +6234,21 @@ impl std::fmt::Debug for PhantomSession {
 /// would linger with an open transport
 /// indefinitely — blocking the remote peer's next `recv()`.
 ///
-/// The Drop impl sends `SessionCommand::Close` (non-blocking `try_send`) which
-/// is processed in-order through `cmd_rx` — AFTER any pending `send()` data
-/// — so a fire-and-forget `send(x); drop(session)` idiom still delivers `x`
-/// before the pump exits. `disconnect().await` (which also sends `Close`) is
-/// the cooperative path for callers who can await; Drop is the best-effort
-/// fallback (the pump may not be running, or the channel may be momentarily
-/// full — in either case the loss is acceptable since the session is being
-/// abandoned anyway).
+/// The Drop impl raises the same close request `disconnect()` does. It used to
+/// `try_send` a `SessionCommand::Close` instead, which failed silently whenever
+/// the channel was full and, when it did land, sat unread for as long as the
+/// pump held a write the send buffer had refused — so a peer that stopped
+/// reading kept a dropped session running indefinitely. The request is a
+/// signal the pump reads whatever else it is holding, and the pump takes in
+/// the commands queued ahead of it before announcing the close, so a
+/// fire-and-forget `send(x); drop(session)` idiom still pushes `x` before the
+/// pump exits — pushes, not delivers, exactly as for `disconnect()`.
 impl Drop for PhantomSession {
     fn drop(&mut self) {
-        // Best-effort: if the channel is full (capacity 256) or the pump is
-        // gone, the send fails silently. The liveness dead-timer or transport
-        // close will tear down the pump eventually.
-        let _ = self.cmd_tx.try_send(SessionCommand::Close);
+        // Cannot fail and cannot block. With no pump listening (a handshake that
+        // never completed, the inert `connect()`) it is a no-op.
+        self.close_request
+            .send_modify(|requested| *requested = true);
         // Retire any stream still counted on the active-streams gauge. The pump
         // drains too (that is the normal path, and it fires promptly); this
         // covers the cases the pump cannot — a session whose pump never started
@@ -11809,6 +11949,253 @@ mod tests {
              is the only loss tolerance an unacknowledged frame has, and a fixed count \
              is the only one that cannot run away"
         );
+    }
+
+    /// Two established sessions joined by an in-memory pipe, each running the production
+    /// pump. Returns the session a test will close, the one facing it, and the latter's
+    /// negotiated inner session, which is where a close announcement is recorded when it
+    /// arrives.
+    fn live_session_pair() -> (Arc<PhantomSession>, Arc<PhantomSession>, Arc<InnerSession>) {
+        let session_id = fixed_session_id();
+        let (closing_inner, peer_inner) = paired_sessions(session_id);
+        // `announce_close` speaks only for a session that reached the wire, and these two
+        // skipped the handshake that would have said so.
+        closing_inner.set_state(SessionState::Connected);
+        peer_inner.set_state(SessionState::Connected);
+        let (closing_t, peer_t) = ChannelTransport::pair();
+        let closing = PhantomSession::from_accepted_server_session(
+            "closing".into(),
+            closing_t,
+            closing_inner,
+        );
+        let peer = PhantomSession::from_accepted_server_session(
+            "never-reads".into(),
+            peer_t,
+            peer_inner.clone(),
+        );
+        (closing, peer, peer_inner)
+    }
+
+    /// A session driven into the state a local close has to get out of, facing a peer
+    /// that never reads.
+    ///
+    /// The peer's application never calls `recv()`, so its receive window stops opening
+    /// once the bounded queue in front of `recv()` is full. It still acknowledges
+    /// everything it was sent, answers persist probes and answers keep-alives, so the
+    /// liveness timer never has a reason to end either side. The closing session is
+    /// handed several times what that window and its own send buffer hold between them,
+    /// which leaves its pump holding writes the send buffer refused — and while it holds
+    /// any, it takes no further command. A second writer then fills the command channel
+    /// behind them, so a caller that has to wait for room in that channel waits for good.
+    ///
+    /// Also returns the closing session's observability handle, whose active-sessions
+    /// gauge is the pump's own record of having exited, and the writer's task, which only
+    /// ends once the pump lets go of the channel it is blocked on.
+    async fn wedge_a_session_behind_a_peer_that_never_reads() -> (
+        Arc<PhantomSession>,
+        Arc<PhantomSession>,
+        Arc<InnerSession>,
+        Arc<Observability>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (closing, peer, peer_inner) = live_session_pair();
+        let obs = closing.observability();
+
+        // Several times what the peer's window and this side's 1024-segment send buffer can
+        // take between them, so most of it can only wait in the pump's queue of refused writes.
+        closing
+            .send(vec![0x5A; 4 << 20])
+            .await
+            .expect("the pump takes the write in");
+        let stream = closing.open_stream();
+        let writer =
+            tokio::spawn(
+                async move { while stream.send_reliable(vec![0xC3; 64]).await.is_ok() {} },
+            );
+
+        // The witness that the pump holds refused writes: the raw stream's send buffer is
+        // full and the command channel is full behind it, and stays full. A pump still
+        // reading commands would be emptying the channel as fast as the writer fills it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let buffer_full = closing
+                .streams
+                .get(&RAW_APP_STREAM_ID)
+                .is_some_and(|s| s.send_buffer_full());
+            if buffer_full && closing.cmd_tx.capacity() == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the harness never wedged the session: send buffer full = {buffer_full}, \
+                 command-channel room = {}",
+                closing.cmd_tx.capacity()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            closing.cmd_tx.capacity(),
+            0,
+            "the command channel drained again, so the pump is still reading it and the \
+             session is not wedged"
+        );
+        assert_eq!(obs.snapshot().active_sessions, 1, "the pump is running");
+        assert!(!peer_inner.peer_closed(), "nobody has asked to close yet");
+        (closing, peer, peer_inner, obs, writer)
+    }
+
+    /// What a session that has let go looks like from outside: the peer heard the close,
+    /// the pump's gauge came back down, and a writer blocked on the command channel was
+    /// released because the pump dropped its end.
+    ///
+    /// Five seconds is generous for work that takes milliseconds, and a session that
+    /// fails this does not fail it by being slow: nothing in its configuration will ever
+    /// end it.
+    async fn assert_the_session_let_go(
+        obs: &Arc<Observability>,
+        peer_inner: &Arc<InnerSession>,
+        writer: tokio::task::JoinHandle<()>,
+    ) {
+        let bound = std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + bound;
+        while (obs.snapshot().active_sessions != 0 || !peer_inner.peer_closed())
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            peer_inner.peer_closed(),
+            "the peer never received the close announcement within {bound:?}"
+        );
+        assert_eq!(
+            obs.snapshot().active_sessions,
+            0,
+            "the pump was still running {bound:?} after the close was requested"
+        );
+        assert!(
+            tokio::time::timeout(bound, writer).await.is_ok(),
+            "a writer blocked on the command channel was never released, so the pump never \
+             dropped its end of it"
+        );
+    }
+
+    /// `disconnect()` ends a session whose peer has stopped reading, and returns
+    /// promptly while doing it.
+    ///
+    /// The close used to travel on the command channel, behind the application's writes,
+    /// and the pump stops reading that channel while it holds a write the send buffer
+    /// refused — which it holds until the peer acknowledges data the peer's own closed
+    /// window forbids sending. So a peer that stopped reading but kept answering held the
+    /// session open for as long as it chose: the close was never read, the pump, its
+    /// buffers and its demux routes stayed up, and with the channel full `disconnect()`
+    /// did not even return. On a server that is a client deciding when it may be evicted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn disconnect_ends_a_session_whose_peer_stopped_reading() {
+        let (closing, _peer, peer_inner, obs, writer) =
+            wedge_a_session_behind_a_peer_that_never_reads().await;
+
+        let returned =
+            tokio::time::timeout(std::time::Duration::from_secs(2), closing.disconnect()).await;
+        assert!(
+            matches!(returned, Ok(Ok(()))),
+            "disconnect() did not return within 2 s: it is waiting for room in a command \
+             channel the pump has stopped reading"
+        );
+        assert_the_session_let_go(&obs, &peer_inner, writer).await;
+    }
+
+    /// Dropping the handle is the same request with no await to make, so it must end
+    /// the same wedged session. Its old form was a `try_send` into that full command
+    /// channel, which failed silently and left the pump running with nothing that would
+    /// ever stop it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dropping_the_handle_ends_a_session_whose_peer_stopped_reading() {
+        let (closing, _peer, peer_inner, obs, writer) =
+            wedge_a_session_behind_a_peer_that_never_reads().await;
+
+        drop(closing);
+        assert_the_session_let_go(&obs, &peer_inner, writer).await;
+    }
+
+    /// A write handed to `send()` and then a `disconnect()` — or a dropped handle — in
+    /// the next statement still reaches the peer, whichever of the two the pump notices
+    /// first.
+    ///
+    /// The close does not wait in line behind the application's writes, so the writes
+    /// queued ahead of it have to be taken in by the close itself. On a single-threaded
+    /// runtime nothing runs between the two statements, so the pump wakes to find both
+    /// the write and the close waiting and picks between them at random; thirty-two
+    /// rounds put both orders in play with near certainty, and a close that dropped what
+    /// was queued ahead of it would lose the write in about half of them.
+    #[tokio::test]
+    async fn a_write_queued_before_a_close_reaches_the_peer_whichever_the_pump_sees_first() {
+        const LAST_WORDS: &[u8] = b"the-last-thing-said";
+        for round in 0..32 {
+            let (closing, peer, _peer_inner) = live_session_pair();
+            closing
+                .send(LAST_WORDS.to_vec())
+                .await
+                .expect("the write is accepted");
+            if round % 2 == 0 {
+                closing.disconnect().await.expect("disconnect");
+            } else {
+                drop(closing);
+            }
+            let received = tokio::time::timeout(std::time::Duration::from_secs(5), peer.recv())
+                .await
+                .unwrap_or_else(|_| panic!("round {round}: nothing reached the peer"))
+                .unwrap_or_else(|e| panic!("round {round}: the peer's session ended first: {e}"));
+            assert_eq!(
+                received, LAST_WORDS,
+                "round {round}: the write queued ahead of the close did not reach the peer"
+            );
+        }
+    }
+
+    /// A write queued while the handshake is still running, followed by a close
+    /// requested before it finishes, is still pushed once the handshake completes.
+    ///
+    /// Pre-handshake writes do not come through the command channel at all: the pump
+    /// moves them into its queue of not-yet-admitted writes when it starts, and the
+    /// ordinary arms admit them on their first turn. A pump that starts with a close
+    /// already requested finds that arm ready at the same moment, so the close has to
+    /// admit them itself. One that skipped the admission would announce the close with
+    /// the write still unsent in about a third of these rounds — the close arm is one
+    /// of three ready on that first turn — so sixteen rounds all pass by luck less than
+    /// twice in a thousand runs.
+    #[tokio::test]
+    async fn a_write_queued_during_the_handshake_is_pushed_by_a_close_requested_during_it() {
+        use crate::api::full_duplex_tests::{drive_server, Link};
+
+        const LAST_WORDS: &[u8] = b"said-before-the-keys-were-agreed";
+        for round in 0..16 {
+            let server_hs = HandshakeServer::new().unwrap();
+            let pinned = server_hs.verifying_key().clone();
+            let (client_link, server_link) = Link::pair(std::time::Duration::ZERO, 1 << 40);
+            let client =
+                PhantomSession::connect_with_transport("test-server:9000", client_link, pinned);
+            client
+                .send(LAST_WORDS.to_vec())
+                .await
+                .expect("a write is queued while connecting");
+            assert_eq!(
+                client.connection_state(),
+                ConnectionState::Connecting,
+                "round {round}: the write must land in the pre-handshake queue"
+            );
+            client.disconnect().await.expect("disconnect");
+
+            let server = drive_server(server_hs, server_link).await;
+            let received = tokio::time::timeout(std::time::Duration::from_secs(5), server.recv())
+                .await
+                .unwrap_or_else(|_| panic!("round {round}: nothing reached the peer"))
+                .unwrap_or_else(|e| panic!("round {round}: the peer's session ended first: {e}"));
+            assert_eq!(
+                received, LAST_WORDS,
+                "round {round}: the pre-handshake write was not pushed ahead of the close"
+            );
+        }
     }
 
     #[tokio::test]
