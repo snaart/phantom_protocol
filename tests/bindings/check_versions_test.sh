@@ -36,8 +36,19 @@ make_tree() {
         >"${root}/tests/bindings/pyproject.toml"
     printf 'Name: phantom_protocol\nVersion: %s\n' "${VERSION}" \
         >"${root}/tests/bindings/c/phantom_protocol.pc.in"
+    compose_with_image "${root}" "phantom-server:${VERSION}"
     cp "${UNDER_TEST}" "${root}/tests/bindings/check_versions.sh"
     chmod +x "${root}/tests/bindings/check_versions.sh"
+}
+
+# A docker-compose.yml shaped like the real one: the service's `image:` line is
+# the only place the tag appears. The second argument is written verbatim after
+# `image: `, so a case can quote it or drop the tag entirely.
+compose_with_image() {
+    local root="$1"
+    local image="$2"
+    printf 'services:\n  phantom-server:\n    build:\n      context: .\n    image: %s\n    ports:\n      - "4242:4242"\n' \
+        "${image}" >"${root}/docker-compose.yml"
 }
 
 # Run the copied script against a tree and report what it decided.
@@ -143,7 +154,82 @@ case_the_older_entries_still_bite() {
     rm -rf "${root}"
 }
 
+# The compose image tag is the one entry that is not a manifest, and the one a
+# release bump is most likely to miss: nothing in CI builds from it, so a stale
+# tag fails nothing until an operator deploys it. Remove the compose block from
+# check_versions.sh and this case goes red.
+case_compose_tag_drift_is_rejected() {
+    local root
+    root="$(mktemp -d)"
+    make_tree "${root}"
+    compose_with_image "${root}" "phantom-server:0.0.1"
+    run_in "${root}"
+    if [ "${RC}" -eq 0 ]; then
+        fail "the docker-compose.yml image tag drifted to 0.0.1 and the check passed"
+    elif echo "${OUT}" | grep -q "docker-compose.yml"; then
+        pass "docker-compose.yml image tag drift is rejected and named"
+    else
+        fail "compose tag drift was rejected but the output does not name docker-compose.yml"
+    fi
+    rm -rf "${root}"
+}
+
+# The tag is read out of free-form YAML rather than a `version =` line, so the
+# ways it can stop being found are the ones worth pinning: a quoted value must
+# still be read (and still judged), and a compose file with no tag, or no
+# compose file at all, must fail rather than report a clean run about a value
+# it never saw.
+case_compose_tag_is_found_or_the_check_fails() {
+    local root
+
+    root="$(mktemp -d)"
+    make_tree "${root}"
+    compose_with_image "${root}" "\"phantom-server:${VERSION}\""
+    run_in "${root}"
+    if [ "${RC}" -eq 0 ]; then
+        pass "a quoted compose image tag that agrees is accepted"
+    else
+        fail "a quoted compose image tag that agrees was rejected (exit ${RC})"
+    fi
+    rm -rf "${root}"
+
+    root="$(mktemp -d)"
+    make_tree "${root}"
+    compose_with_image "${root}" "\"phantom-server:0.0.1\""
+    run_in "${root}"
+    if [ "${RC}" -eq 0 ]; then
+        fail "a quoted compose image tag drifted to 0.0.1 and the check passed"
+    else
+        pass "a quoted compose image tag that drifted is rejected"
+    fi
+    rm -rf "${root}"
+
+    root="$(mktemp -d)"
+    make_tree "${root}"
+    compose_with_image "${root}" "phantom-server"
+    run_in "${root}"
+    if [ "${RC}" -eq 0 ]; then
+        fail "the compose image carries no tag and the check passed"
+    else
+        pass "a compose image with no tag is rejected"
+    fi
+    rm -rf "${root}"
+
+    root="$(mktemp -d)"
+    make_tree "${root}"
+    rm "${root}/docker-compose.yml"
+    run_in "${root}"
+    if [ "${RC}" -eq 0 ]; then
+        fail "docker-compose.yml is missing and the check passed"
+    else
+        pass "a missing docker-compose.yml is rejected"
+    fi
+    rm -rf "${root}"
+}
+
 case_all_aligned
+case_compose_tag_drift_is_rejected
+case_compose_tag_is_found_or_the_check_fails
 case_testbed_drift_is_rejected
 case_unreadable_testbed_manifest_is_rejected
 case_the_older_entries_still_bite

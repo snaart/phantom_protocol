@@ -192,7 +192,7 @@ an OTLP pipeline in a `telemetry-otel` build.
 | Attribute | Source | Example |
 |-----------|--------|---------|
 | `service.name` | embedder builder | `phantom-server` |
-| `service.version` | `CARGO_PKG_VERSION` | `0.2.2` |
+| `service.version` | `CARGO_PKG_VERSION` | `0.3.0` |
 | `service.instance.id` | not set by the reference embedder — add it yourself via `OTEL_RESOURCE_ATTRIBUTES` or a custom `Resource` | `phantom-server-abc123` |
 | `phantom.role` | embedder | `server` / `client` |
 | `telemetry.sdk.name`, `telemetry.sdk.language`, `telemetry.sdk.version` | added by the OTel SDK's default detectors | — |

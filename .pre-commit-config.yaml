@@ -109,5 +109,5 @@ repos:
         entry: tests/bindings/check_versions.sh
         language: system
         # Only fire when something touches a manifest the script reads.
-        files: ^(core/Cargo\.toml|server/Cargo\.toml|cli/Cargo\.toml|tests/bindings/pyproject\.toml|tests/bindings/c/phantom_protocol\.pc\.in)$
+        files: ^(core/Cargo\.toml|server/Cargo\.toml|cli/Cargo\.toml|testbed/Cargo\.toml|python/pyproject\.toml|tests/bindings/pyproject\.toml|tests/bindings/c/phantom_protocol\.pc\.in|docker-compose\.yml)$
         pass_filenames: false

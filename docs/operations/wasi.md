@@ -15,7 +15,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-phantom-protocol = { version = "0.2", default-features = false, features = ["std", "wasi-leg", "classical-crypto"] }
+phantom-protocol = { version = "0.3", default-features = false, features = ["std", "wasi-leg", "classical-crypto"] }
 futures = { version = "0.3", default-features = false, features = ["executor"] }
 
 [[bin]]

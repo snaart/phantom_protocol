@@ -14,7 +14,7 @@ containerized, packaged, or daemonized.
 | Docker | `docs/operations/docker.md` | Distroless / alpine variants; multi-arch builds. |
 | systemd | `docs/operations/systemd.md` | Hardening profile, sysctl tuning, multi-instance template. |
 | Kubernetes | [`kubernetes.md`](kubernetes.md) | Deployment + Service + probes + Secrets + PDB + HPA + NetworkPolicy. Operator remains a follow-up. |
-| Helm | [`helm/phantom-protocol/`](helm/phantom-protocol/README.md) | Production chart (appVersion 0.2.2) implementing every pattern in `kubernetes.md`. |
+| Helm | [`helm/phantom-protocol/`](helm/phantom-protocol/README.md) | Production chart (appVersion 0.3.0) implementing every pattern in `kubernetes.md`. |
 | AWS EC2 / bare metal | use `systemd` guide | Same unit file applies. |
 
 ## Client-side
