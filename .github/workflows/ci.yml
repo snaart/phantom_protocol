@@ -224,8 +224,9 @@ jobs:
         with:
           workspaces: "."
       # The archive's README is core/README.md, which is a copy of the
-      # repository-root landing page. Assert, never repair: a CI step that
-      # rewrote the tree would go green on a state nobody committed.
+      # repository-root landing page, and its LICENSE is core/LICENSE, a copy
+      # of the root LICENSE. Assert, never repair: a CI step that rewrote the
+      # tree would go green on a state nobody committed.
       #
       # The script's own cases run first. A gate whose report says only that two
       # files have different sizes stops being useful the moment the drift is a
@@ -251,6 +252,19 @@ jobs:
           CRATE=$(ls target/package/phantom-protocol-*.crate)
           NAME=$(basename "${CRATE}" .crate)
           tar -xzOf "${CRATE}" "${NAME}/README.md" | cmp - README.md
+      # The same check for the license text. `license = "Apache-2.0"` is an SPDX
+      # identifier, not a file, so the archive carries license text only because
+      # core/LICENSE is a tracked file under the manifest directory, and
+      # Apache-2.0 §4(a) requires every redistribution to include it. --verify
+      # cannot see its absence either: nothing compiles against a LICENSE.
+      # A crate without one still turns this step red even though the default
+      # shell runs without pipefail: `tar` then writes nothing, and `cmp` of an
+      # empty stream against the 11 KiB root LICENSE reports EOF and fails.
+      - name: Archive ships the license text
+        run: |
+          CRATE=$(ls target/package/phantom-protocol-*.crate)
+          NAME=$(basename "${CRATE}" .crate)
+          tar -xzOf "${CRATE}" "${NAME}/LICENSE" | cmp - LICENSE
       # Full verification: unpack and build the crate as a consumer would.
       - run: cargo package --manifest-path core/Cargo.toml --locked
 

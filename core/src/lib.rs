@@ -219,6 +219,13 @@ uniffi::setup_scaffolding!();
 /// and the docs.rs front page then ship the string, with every exit code zero. A
 /// duplicate cannot fail that way — it can only drift, and drift is what the two
 /// tests below and `scripts/sync_readme.sh` exist to make impossible.
+///
+/// The license text is in the same position for a different reason. The manifest's
+/// `license = "Apache-2.0"` names the license by its SPDX identifier and carries no
+/// text, so an archive built from `core/` alone ships none — while Apache-2.0 §4(a)
+/// requires every redistribution to give its recipients a copy. `core/LICENSE` is a
+/// byte copy of the repository-root `LICENSE`, mirrored by the same script and held
+/// to it by `packaged_license_is_the_repository_license`.
 #[cfg(test)]
 mod packaged_readme {
     /// The repository-root README: the page GitHub renders, and the one the
@@ -229,6 +236,15 @@ mod packaged_readme {
     /// `readme = "README.md"` resolves relative to the manifest directory, so this
     /// is the file crates.io renders — and the only README a tarball carries.
     const PACKAGED: &str = include_str!("../README.md");
+
+    /// The repository-root license text, the one GitHub shows and the source of
+    /// truth for the copy below.
+    const REPOSITORY_LICENSE: &str = include_str!("../../LICENSE");
+
+    /// The license text inside the archive, and the only one a `.crate` carries.
+    /// Named directly, so deleting the copy is a build failure of this module
+    /// rather than a test that quietly compares nothing.
+    const PACKAGED_LICENSE: &str = include_str!("../LICENSE");
 
     /// This file's own source, so the attribute's argument can be read as text.
     /// Nothing else can see it: `include_str!` leaves no trace of its argument in
@@ -431,6 +447,7 @@ mod packaged_readme {
     /// include slipping past because nobody looked is not available.
     const ESCAPES_OUTSIDE_THE_PACKAGE: &[(&str, &str)] = &[
         ("src/lib.rs", "../../README.md"),
+        ("src/lib.rs", "../../LICENSE"),
         ("src/lib.rs", "../../BENCHMARKS.md"),
         ("src/lib.rs", "../../docs/operations/deployment.md"),
     ];
@@ -673,6 +690,30 @@ mod packaged_readme {
     #[test]
     fn packaged_readme_is_the_landing_page() {
         assert_landing_pages_agree(LANDING_PAGE, PACKAGED);
+    }
+
+    /// The license text the archive carries must be the repository's, byte for
+    /// byte. A copy that drifted would put a license into every downloaded crate
+    /// that is not the one the project grants, and nothing downstream reads it
+    /// closely enough to notice.
+    #[test]
+    fn packaged_license_is_the_repository_license() {
+        if let Some(at) = first_difference(REPOSITORY_LICENSE, PACKAGED_LICENSE) {
+            panic!(
+                "core/LICENSE has drifted from LICENSE at byte {at} (LICENSE {} bytes, \
+                 core/LICENSE {} bytes); run scripts/sync_readme.sh\n  \
+                 LICENSE      …{}…\n  core/LICENSE …{}…",
+                REPOSITORY_LICENSE.len(),
+                PACKAGED_LICENSE.len(),
+                excerpt(REPOSITORY_LICENSE, at),
+                excerpt(PACKAGED_LICENSE, at),
+            );
+        }
+        assert!(
+            PACKAGED_LICENSE.contains("Apache License") && PACKAGED_LICENSE.contains("Version 2.0"),
+            "core/LICENSE agrees with LICENSE but is not the Apache-2.0 text that \
+             core/Cargo.toml's `license = \"Apache-2.0\"` declares"
+        );
     }
 
     /// A failing gate has to say what went wrong, and this one runs inside

@@ -18,7 +18,7 @@ set -euo pipefail
 #
 # The script finds the repository root relative to its own path, so a case
 # builds a throwaway tree of the same shape, drops a copy of the script into it,
-# and runs it there. Nothing touches the real READMEs.
+# and runs it there. Nothing touches the real files.
 #
 #     scripts/sync_readme_test.sh
 
@@ -27,8 +27,9 @@ UNDER_TEST="${SCRIPT_DIR}/sync_readme.sh"
 
 failures=0
 
-# A tree whose two READMEs agree, with enough text that "the whole file" and
-# "the part that changed" are visibly different amounts of output.
+# A tree whose two READMEs agree, and whose two LICENSE files agree, with
+# enough text that "the whole file" and "the part that changed" are visibly
+# different amounts of output.
 make_tree() {
     local root="$1"
     mkdir -p "${root}/scripts" "${root}/core"
@@ -42,6 +43,15 @@ make_tree() {
         done
     } >"${root}/README.md"
     cp "${root}/README.md" "${root}/core/README.md"
+    {
+        echo "                                 Apache License"
+        echo "                           Version 2.0, January 2004"
+        echo ""
+        for i in $(seq 1 150); do
+            echo "Clause ${i} of the license, which the archive must carry verbatim."
+        done
+    } >"${root}/LICENSE"
+    cp "${root}/LICENSE" "${root}/core/LICENSE"
     cp "${UNDER_TEST}" "${root}/scripts/sync_readme.sh"
     chmod +x "${root}/scripts/sync_readme.sh"
 }
@@ -72,9 +82,9 @@ case_agreeing_copies_are_accepted() {
     make_tree "${root}"
     run_in "${root}" --check
     if [ "${RC}" -eq 0 ]; then
-        pass "--check accepts two identical READMEs"
+        pass "--check accepts a tree whose copies all agree"
     else
-        fail "--check rejected two identical READMEs (exit ${RC})"
+        fail "--check rejected a tree whose copies all agree (exit ${RC})"
     fi
     rm -rf "${root}"
 }
@@ -164,11 +174,84 @@ case_missing_file_is_an_error() {
     rm -rf "${root}"
 }
 
+# The license copy is checked on its own account, not only when the README
+# happens to drift alongside it. The README here agrees, so the verdict can
+# only come from the LICENSE comparison — drop LICENSE from the script's
+# mirrored set and this case goes red.
+case_license_drift_is_rejected_and_named() {
+    local root
+    root="$(mktemp -d)"
+    make_tree "${root}"
+    sed 's/Apache License/Apache Licence/' "${root}/LICENSE" >"${root}/core/LICENSE.tmp"
+    mv "${root}/core/LICENSE.tmp" "${root}/core/LICENSE"
+
+    if [ "$(wc -c <"${root}/LICENSE")" -ne "$(wc -c <"${root}/core/LICENSE")" ]; then
+        echo "FAIL: the LICENSE fixture is not same-length; the case proves nothing" >&2
+        failures=$((failures + 1))
+        rm -rf "${root}"
+        return
+    fi
+
+    run_in "${root}" --check
+    if [ "${RC}" -eq 0 ]; then
+        fail "a one-byte same-length drift in core/LICENSE was accepted"
+    elif ! echo "${OUT}" | grep -q "core/LICENSE"; then
+        fail "LICENSE drift was rejected, but the output does not name core/LICENSE"
+    elif echo "${OUT}" | grep -qi "differ"; then
+        pass "--check rejects a same-length drift in core/LICENSE, names it and locates it"
+    else
+        fail "LICENSE drift was rejected, but the output does not say where"
+    fi
+    rm -rf "${root}"
+}
+
+# The archive has no license text but this copy, so a missing one is the case
+# that matters most, and it must fail rather than be skipped.
+case_missing_license_is_an_error() {
+    local root
+    root="$(mktemp -d)"
+    make_tree "${root}"
+    rm "${root}/core/LICENSE"
+    run_in "${root}" --check
+    if [ "${RC}" -eq 0 ]; then
+        fail "a missing core/LICENSE was accepted"
+    elif echo "${OUT}" | grep -q "core/LICENSE does not exist"; then
+        pass "a missing core/LICENSE is named as a missing file"
+    else
+        fail "a missing core/LICENSE was rejected without saying so"
+    fi
+    rm -rf "${root}"
+}
+
+# Sync mode repairs every drifted copy in one run, not just the first it finds,
+# and still stops for re-staging.
+case_sync_repairs_both_copies() {
+    local root
+    root="$(mktemp -d)"
+    make_tree "${root}"
+    echo "drifted" >"${root}/core/README.md"
+    echo "drifted" >"${root}/core/LICENSE"
+    run_in "${root}"
+    if [ "${RC}" -eq 0 ]; then
+        fail "sync mode repaired the tree and reported success"
+    elif ! cmp -s "${root}/README.md" "${root}/core/README.md"; then
+        fail "sync mode left core/README.md drifted"
+    elif ! cmp -s "${root}/LICENSE" "${root}/core/LICENSE"; then
+        fail "sync mode left core/LICENSE drifted"
+    else
+        pass "sync mode repairs core/README.md and core/LICENSE together and exits non-zero"
+    fi
+    rm -rf "${root}"
+}
+
 case_agreeing_copies_are_accepted
 case_same_length_drift_is_located
 case_truncated_copy_is_located
 case_sync_repairs_and_still_stops
 case_missing_file_is_an_error
+case_license_drift_is_rejected_and_named
+case_missing_license_is_an_error
+case_sync_repairs_both_copies
 
 if [ "${failures}" -ne 0 ]; then
     echo ""

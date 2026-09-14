@@ -89,9 +89,9 @@ repos:
         files: ^CHANGELOG\.md$
         pass_filenames: false
 
-      # ── Landing-page copy that ships inside the crate ─────────────────
+      # ── Landing page and license text that ship inside the crate ──────
       - id: sync-readme
-        name: core/README.md mirrors README.md
+        name: core/README.md and core/LICENSE mirror the root copies
         # Copies rather than complains: the file is derived, the author who
         # edited the root README has no reason to know a second copy exists,
         # and a hook that repairs and then stops for re-staging costs them one
@@ -100,7 +100,7 @@ repos:
         # a state nobody committed.
         entry: scripts/sync_readme.sh
         language: system
-        files: ^(README\.md|core/README\.md)$
+        files: ^(README\.md|core/README\.md|LICENSE|core/LICENSE)$
         pass_filenames: false
 
       # ── Binding manifest version sync ─────────────────────────────────
