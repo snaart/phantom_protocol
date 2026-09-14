@@ -436,6 +436,17 @@ impl RunState {
     }
 }
 
+/// The phantom-protocol release this build links, recorded in every run
+/// artifact next to the numbers it produced.
+///
+/// Taken from the testbed's own package version, which is the same string:
+/// phantom-protocol is a path dependency, and `tests/bindings/check_versions.sh`
+/// fails CI unless `testbed/Cargo.toml` carries core's version exactly. The field
+/// used to be a string literal, and a literal does not move at a release — it
+/// was still "0.2.2" after core became 0.3.0, so every run made against the new
+/// release would have been filed under the old one.
+const PHANTOM_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub async fn run(cfg: ProbeConfig) -> Result<PathBuf> {
     cfg.validate()?;
     let run_id = run_id_stamp();
@@ -461,7 +472,7 @@ pub async fn run(cfg: ProbeConfig) -> Result<PathBuf> {
         legs: cfg.legs.clone(),
         client: crate::sysinfo::host_info(Some(&cfg.endpoints.addr_for(Leg::Udp))),
         testbed_version: env!("CARGO_PKG_VERSION").to_string(),
-        phantom_version: "0.2.2".to_string(),
+        phantom_version: PHANTOM_VERSION.to_string(),
         build: BuildId::current(),
         // Filled from the daemon's STATS reply during clock_sync; see there.
         daemon_build: None,
@@ -1191,6 +1202,78 @@ mod tests {
     // integrity probe walks keep bracketing the real split point if the path-MTU
     // budget ever moves.
     use phantom_protocol::transport::mtu::MAX_APP_CHUNK;
+
+    /// The `[package]` version of a Cargo manifest, as written.
+    fn package_version(manifest: &str) -> Option<&str> {
+        let mut in_package = false;
+        for line in manifest.lines() {
+            let line = line.trim();
+            if let Some(header) = line.strip_prefix('[') {
+                in_package = header.starts_with("package]");
+                continue;
+            }
+            if !in_package {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if key.trim() == "version" {
+                return value
+                    .trim()
+                    .strip_prefix('"')
+                    .and_then(|rest| rest.split_once('"'))
+                    .map(|(version, _)| version);
+            }
+        }
+        None
+    }
+
+    /// Every run artifact names the phantom-protocol release it measured, and
+    /// that name has to be the one the probe was built against.
+    ///
+    /// Two halves, because there are two ways back to a wrong stamp. The first
+    /// compares the recorded value with the version in the manifest of the crate
+    /// this build links by path, so it holds even in a tree that never ran
+    /// `check_versions.sh`. The second reads this file and rejects a string
+    /// literal assigned to the field, which is the exact shape that went stale:
+    /// a literal agrees with core on the day it is written and on no day after.
+    #[test]
+    fn run_meta_records_the_linked_phantom_version_and_not_a_literal() {
+        let core_version = package_version(include_str!("../../../core/Cargo.toml"))
+            .expect("core/Cargo.toml's [package] table carries a version");
+        assert_eq!(
+            PHANTOM_VERSION, core_version,
+            "run artifacts would be stamped phantom_version {PHANTOM_VERSION} while this \
+             build links phantom-protocol {core_version}; testbed/Cargo.toml and \
+             core/Cargo.toml must carry the same version"
+        );
+
+        // Assembled from pieces so this test's own text does not contain it.
+        let literal_assignment = ["phantom_version", ": \""].concat();
+        assert!(
+            !include_str!("mod.rs").contains(&literal_assignment),
+            "RunMeta.phantom_version is assigned a string literal in probe/mod.rs; \
+             fill it from PHANTOM_VERSION so it follows the release"
+        );
+    }
+
+    #[test]
+    fn manifest_version_reader_reads_the_package_table_only() {
+        assert_eq!(
+            package_version("[package]\nname = \"x\"\nversion = \"1.2.3\"\n"),
+            Some("1.2.3")
+        );
+        // A dependency's version is not the package's.
+        assert_eq!(
+            package_version("[package]\nname = \"x\"\n\n[dependencies.y]\nversion = \"9\"\n"),
+            None
+        );
+        assert_eq!(
+            package_version("[dependencies.y]\nversion = \"9\"\n[package]\nversion = \"2\"\n"),
+            Some("2")
+        );
+    }
 
     /// A sidecar an analysis cannot find is a sidecar that was never written.
     /// The three files a transfer leaves are joined by name and by nothing else,
