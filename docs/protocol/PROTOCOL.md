@@ -3,12 +3,16 @@
 Specification of the wire format, handshake state machine, and key-derivation
 constructions used by `phantom_protocol` 0.x. There is exactly **one** wire
 protocol: a single packet shape, a single handshake, and a single pinned
-version byte. The protocol is **not negotiated** — pre-1.0 there are no
-deployed peers, so there is no version handshake, no fallback, and no
-protocol-*version* migration path. The one surviving version byte is a
-tamper-check anchor and a hook for a future, deliberate bump. (*Connection*
-migration — one session surviving a network-path change without re-handshaking
-— is a separate axis on the **same** wire; see § 12.)
+version byte. The protocol is **not negotiated**: there is no version
+handshake, no fallback, and no protocol-*version* migration path. That is not
+for want of deployed peers — 0.2.x is published and speaks `WIRE_VERSION` 6 /
+`PROTOCOL_VERSION` 3, and 0.3.0 (8 / 5) cannot talk to it. Pre-1.0 a wire
+change is a hard cut: a peer on the other side of it is refused at the
+handshake (§ 1), and both ends of a connection upgrade together. The one
+surviving version byte is a tamper-check anchor and a hook for a future,
+deliberate bump. (*Connection* migration — one session surviving a
+network-path change without re-handshaking — is a separate axis on the
+**same** wire; see § 12.)
 
 Audit-friendly format: every field names the Rust file that is its source of
 truth. The canonical wire bytes are the byte-frozen vectors in

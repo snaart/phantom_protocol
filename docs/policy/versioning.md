@@ -17,8 +17,8 @@ And one pinned constant that is **not** an evolving axis (see §3):
 
 | Constant | Identifier | Lives in | Value |
 | --- | --- | --- | --- |
-| Wire-format version | `WIRE_VERSION` (packet-header byte) | `core/src/transport/types.rs` | `7` |
-| Protocol version | `PROTOCOL_VERSION` (`ClientHello.version`) | `core/src/transport/handshake.rs` | `4` |
+| Wire-format version | `WIRE_VERSION` (packet-header byte) | `core/src/transport/types.rs` | `8` |
+| Protocol version | `PROTOCOL_VERSION` (`ClientHello.version`) | `core/src/transport/handshake.rs` | `5` |
 
 A single commit can move zero, one, or both of the live axes. Each axis has its
 own changelog entry (see `CHANGELOG.md`).
@@ -80,8 +80,11 @@ whose number changed passes it silently.
 
 The wire format is **one protocol with one pinned version byte**. There is no
 `VersionedPacket` enum, no per-session `wire_version` negotiation, and no
-in-protocol fallback. Pre-1.0 there are no deployed peers to stay compatible
-with, so there is nothing to negotiate against.
+in-protocol fallback. That is a decision, not an absence of peers: 0.2.x is
+published on crates.io and speaks `WIRE_VERSION` 6 / `PROTOCOL_VERSION` 3, and
+0.3.0 (8 / 5) cannot talk to it. Pre-1.0 a wire change ships as a hard cut
+rather than as something to negotiate — a peer on the other side of the cut is
+refused at the handshake, and the two ends of a connection upgrade together.
 
 Two constants pin the format:
 
@@ -91,8 +94,10 @@ Two constants pin the format:
 - `PROTOCOL_VERSION = 5` — `ClientHello.version` (`transport/handshake.rs`),
   bound into the signed handshake transcript.
 
-Both bumped several times pre-1.0, as a hard cut each time (no negotiation, no
-deployed peers to keep compatible). The history, for the record:
+Both bumped several times pre-1.0, as a hard cut each time (no negotiation). A
+cut strands every peer still running the release before it: 0.2.0 could not
+talk to the published 0.1.x (`WIRE_VERSION` 2 / `PROTOCOL_VERSION` 2), and
+0.3.0 cannot talk to the published 0.2.x (6 / 3). The history, for the record:
 
 - **`WIRE_VERSION 1 → 2`** — the packet codec moved off `alkahest` to the
   hand-rolled big-endian layout.
@@ -202,12 +207,14 @@ A change to any of the following requires bumping `WIRE_VERSION` /
   disagree about how much may be sent or what was acknowledged.
 
 Because there is no negotiation, such a bump is a **coordinated, breaking
-change**: every peer must move to the new constant at once. Pre-1.0 there are no
-peers to keep on the old value, so the bump ships as a single hard cut (a crate
-**major** version bump, plus a migration note in `CHANGELOG.md`). The
-constant exists precisely so a future deliberate bump has a single, signed,
-tamper-checked anchor to move — not so that multiple versions coexist on the
-wire.
+change**: every peer must move to the new constant at once. Published releases
+do leave peers on the old value — 0.3.0 left every 0.2.x deployment behind — and
+pre-1.0 the bump still ships as a single hard cut rather than a negotiated
+transition: a crate **major** version bump (the minor position while pre-1.0, as
+0.2 → 0.3 was), plus a migration note in `CHANGELOG.md` that tells operators to
+upgrade both ends together. The constant exists precisely so a future deliberate
+bump has a single, signed, tamper-checked anchor to move — not so that multiple
+versions coexist on the wire.
 
 ---
 
