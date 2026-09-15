@@ -6,8 +6,20 @@ detailed guide for each.
 ## Server-side
 
 Phantom Protocol ships as a Rust library; you deploy a thin wrapper binary
-that calls `PhantomListener::bind` / `accept`. The wrapper is what gets
+that binds a listener and runs its `accept` loop. The wrapper is what gets
 containerized, packaged, or daemonized.
+
+**The reference wrapper, `phantom-server`, binds the TCP leg only.** It listens
+with `PhantomListener::bind_with_signing_key` on `--bind` and opens no UDP
+socket, so it does not serve PhantomUDP — the transport recommended under
+*Choosing a transport* below — and the root `Dockerfile`, `docker-compose.yml`
+and the Helm chart expose and probe TCP 4242 to match. A PhantomUDP deployment
+embeds `PhantomUdpListener` in its own wrapper:
+`PhantomUdpListener::bind_udp_with_signing_key_bytes` accepts the same 64-byte
+seed that `phantom-cli keygen` and `phantom-server` write, so one pinned
+identity can serve both transports. The guides in the table below are written
+for the TCP wrapper; for a UDP one, publish and allow the port as UDP, and
+replace the `tcpSocket` probes, which have nothing to connect to on a UDP port.
 
 | Surface | Guide | Notes |
 | --- | --- | --- |
@@ -67,13 +79,15 @@ Measured, by the WAN harness in `testbed/`:
 | Observation on the TCP leg | Figure | Read it as |
 | --- | --- | --- |
 | min-RTT, worst seen | up to **4112 ms** | queueing under our own sender; no route the harness runs over is four seconds long |
-| application throughput, across campaign runs | **0.75–4.33 Mbit/s** | a range, not a rating — path capacity moved with it |
-| run `20260822-062705`, both ends from `8f710f69` | 4.83 Mbit/s received by the server | the one figure with a same-run control beside it: raw UDP echo measured 13.26 Mbit/s round-trip and the one-way downlink ceiling 20.90 Mbit/s on that path in that run |
+| application throughput | moved with the route from run to run | quote only a figure with a same-run control beside it, like the row below |
+| run `20260822-062705`, both ends from `8f710f69` | 4.83 Mbit/s received by the server | raw UDP echo measured 13.26 Mbit/s round-trip and the one-way downlink ceiling 20.90 Mbit/s on that path in that run |
 
-The harness, its controls and its caveats are described in `testbed/README.md`.
-Do not quote a throughput number from the table above without the raw control
-from the same run beside it; path capacity on that route has moved by a factor
-of ten between campaigns.
+How the harness measures, and which control each figure is read against, is in
+`testbed/README.md`; the campaigns themselves, with their controls and caveats,
+are summarised under *Performance* in the root `README.md`. Do not quote a
+throughput number from the table above without the raw control from the same
+run beside it: the one-way downlink ceiling on that route read 60–63 Mbit/s on
+2026-08-17, 21 Mbit/s five days later and 76.5 Mbit/s on 2026-09-05.
 
 None of this touches correctness or security. The leg carries the identical inner
 wire (`docs/protocol/PROTOCOL.md`), and pinning, the AEAD and the replay window

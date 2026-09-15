@@ -80,12 +80,13 @@ a congestion window means two control loops stacked on each other, communicating
 only through the queue between them. Measured consequence, from the WAN harness
 in [`testbed/`](https://github.com/snaart/phantom_protocol/tree/main/testbed):
 min-RTT on the TCP leg has been observed as high as **4112 ms** — that is queueing
-under our own sender, not a property of the route — and application throughput
-across campaign runs spans **0.75–4.33 Mbit/s**. In the one run whose figures sit
-in the repository with a control beside them, `20260822-062705`, the server
-received 4.83 Mbit/s over this leg while raw UDP echo on the same path in the same
-run measured 13.26 Mbit/s round-trip. Never quote a throughput number for this
-leg without the control from the same run.
+under our own sender, not a property of the route — and its throughput has moved
+with the route from run to run, so the figure to quote is one with a control
+from its own run: in run `20260822-062705` the server received 4.83 Mbit/s over
+this leg while raw UDP echo on the same path in the same run measured
+13.26 Mbit/s round-trip. How the harness counts, and which control each figure
+is read against, is in
+[`testbed/README.md`](https://github.com/snaart/phantom_protocol/blob/main/testbed/README.md).
 
 This is what the leg is, not a defect being worked on: the inner wire, the
 pinning, the AEAD and the replay window are identical on every transport, and TCP
@@ -125,8 +126,9 @@ independent multiplexed streams with per-stream flow control.
   controls (see [Performance](#performance)) — over one route, and with no
   external audit.
 - **Multi-stream** — strict-priority scheduler, `WINDOW_UPDATE` per-stream
-  flow control, BBRv2-inspired pacing (Startup / Drain / ProbeBW / ProbeRTT /
-  FastRecovery).
+  flow control, BBRv2-inspired pacing (Startup / Drain / ProbeBW / ProbeRTT).
+  Loss is not a state: it is answered by an `inflight_hi` volume bound, from
+  which Startup is exempt.
 - **DoS-resistant handshake** — stateless HMAC-SHA-256 cookie (per-process
   master → hourly-rotated derived secret, 5-minute validity buckets) + adaptive
   blake3 proof-of-work (load-tiered difficulty 0–16).
@@ -318,8 +320,9 @@ set is **loopback and in-process**: it measures the cryptography and the packet
 codec on one machine, and says nothing about how the transport behaves on a
 path. The second set is from a **real route**, and every figure there is printed
 beside the raw no-protocol control measured in the same run: on that route the
-one-way capacity ceiling moved by a factor of three between two campaigns five
-days apart, so a throughput number without its own control is not a result.
+one-way downward ceiling moved by a factor of three between two campaigns five
+days apart, and the upward one by about a third within a single day, so a
+throughput number without its own control is not a result.
 
 ### Cryptography and codec — loopback, single host
 
@@ -356,53 +359,125 @@ Measured by [`testbed/`](https://github.com/snaart/phantom_protocol/tree/main/te
 workstation drives a scenario matrix against a daemon on a remote host. The
 daemon binds the three Phantom legs, a **quinn QUIC reference** leg — a mature
 implementation of the same class of protocol, on the same path, in the same run
-— and **raw TCP/UDP echo controls that carry no protocol at all**. The raw
-control is the denominator; the reference is a second opinion, not a ranking.
+— and **raw UDP controls that carry no protocol at all**: an echo, and a one-way
+capacity ladder in each direction. The raw control is the denominator; the
+reference is a second opinion, not a ranking. (A raw TCP echo runs as well, but a
+TCP socket brings its own congestion control, so it is a second reference rather
+than a control.)
 
-Upload, as counted by the receiving server over its own observation interval. A
-client-side figure would be counting how fast `send()` filled a buffer:
+Every rate is counted by the end that received it: the server on an upload, the
+client on a download. A sending side's own count would be measuring how fast
+`send()` filled a buffer. Every run in the tables below had both ends built from
+one commit, verified from the run manifest.
+
+**2026-09-05 — two campaigns on the same day, six hours apart, three runs each:
+the last full campaigns before this release.** Uploads ran for 60 s and
+downloads for 180 s, and every PhantomUDP transfer converged rather than ending
+mid-ramp.
+
+| Upload | Phantom UDP | quinn (reference) | One-way upward control, same run |
+| --- | --- | --- | --- |
+| `20260905-032309` | **28.11 Mbit/s** | not run | 84.97 |
+| `20260905-033508` | **27.02** | not run | 84.26 |
+| `20260905-034708` | **28.33** | not run | 84.49 |
+| `20260905-103139` | **26.03** | 28.03 | 58.64 |
+| `20260905-105207` | **27.10** | 65.85 | 59.29 |
+| `20260905-111225` | **23.71** | 31.54 | 55.56 |
+
+| Download | Phantom UDP | quinn (reference) | One-way downward control, same run |
+| --- | --- | --- | --- |
+| `20260905-032309` | **16.30 Mbit/s** | not run | 76.51 |
+| `20260905-033508` | **16.38** | not run | 76.64 |
+| `20260905-034708` | **16.45** | not run | 76.77 |
+| `20260905-103139` | **11.46** | 0.33 | 76.53 |
+| `20260905-105207` | **12.07** | 0.49 | 76.47 |
+| `20260905-111225` | **11.13** | 0.36 | 76.51 |
+
+Read these before reusing any of them:
+
+- **The two campaigns ran the same library.** Between their two builds `core/src`
+  differs by one compile-time assertion and one test, so what differs between the
+  morning rows and the afternoon rows is the route.
+- **The upward control fell by about a third within the day** — 84.26–84.97
+  Mbit/s in the morning, 55.56–59.29 in the afternoon — and in `105207` quinn
+  delivered 111% of that run's control, which says the ladder under-read the
+  path rather than that quinn beat it. A share of the upward link is therefore
+  not yet a reliable figure. The morning's 32–34% is quotable against its own
+  control; the afternoon's is not.
+- **Upload against quinn: 1.1–2.4× in quinn's favour, and the reference is the
+  noisier of the two.** Across three consecutive runs it moved 2.3×, while this
+  leg moved 1.14×.
+- **Download against quinn goes the other way, and the route explains it.** The
+  downward control held its 76.5 Mbit/s ceiling in both campaigns, but in the
+  afternoon it lost 1.0–7.3% of datagrams at 1 Mbit/s and 2.0–9.9% at 5 Mbit/s,
+  far below that ceiling, where in the morning it lost at most 0.4% on the same
+  rungs. quinn ships a loss-based controller (Cubic), which reads each of those
+  losses as congestion, and its 0.33–0.49 Mbit/s is within what the Mathis et
+  al. formula predicts for such a controller at that loss and a round trip of
+  about 200 ms. This transport paces to a measured delivery rate instead, and
+  held 11.13–12.07 Mbit/s. That is a statement about the route, not a ranking.
+- **Duplex** — the download half of a transfer running both ways at once,
+  against the one-way download of the same run: 81–89% in the morning, 49–63% in
+  the afternoon.
+- **The released 0.3.0 is not the build measured here.** One congestion-control
+  change landed after these campaigns — the loss-driven volume bound no longer
+  applies during Startup — and it has so far been measured only in the in-tree
+  bottleneck model (see [`CHANGELOG.md`](https://github.com/snaart/phantom_protocol/blob/main/CHANGELOG.md)),
+  not on this route.
+
+**2026-08-17 and 2026-08-22.** Upload only, and against a round-trip echo,
+because no one-way upward control was taken in these runs:
 
 | Run | Phantom UDP | quinn (reference) | Raw UDP echo, same run |
 | --- | --- | --- | --- |
-| 2026-08-17 `124710` | **16.51 Mbit/s** | 5.81 | 18.02 round-trip, 9.9% loss |
-| 2026-08-17 `130955` | **18.96** | 40.52 | 18.28 round-trip, 8.6% loss |
+| 2026-08-17 `124710` | **16.51 Mbit/s** | 5.81 | 33.52 round-trip |
+| 2026-08-17 `130955` | **18.96** | 40.52 | 31.61 round-trip |
 | 2026-08-22 `061422` | **1.96** | 9.13 | 12.17 round-trip |
 | 2026-08-22 `062705` | did not establish — `Timeout` on `connect` | 9.38 | 13.26 round-trip |
 
-The 2026-08-22 runs had both ends built from one commit, verified from the run
-manifest. Read the caveats before reusing any figure above:
-
 - **Rows from different campaigns are not comparable.** The route on 2026-08-22
   was materially worse than on 2026-08-17: the same raw UDP echo control read
-  12.17 / 13.26 Mbit/s against 18.02 / 18.28, and the one-way downstream ceiling
-  read 21.09 / 20.90 against 60–63. Within one campaign the control holds steady
-  and the rows can be read against each other.
+  12.17 / 13.26 Mbit/s against 33.52 / 31.61, and the one-way downward ceiling
+  read 21.09 / 20.90 against 60.45 / 62.97. Within one campaign the control holds
+  steady and the rows can be read against each other.
 - **The reference moved sevenfold between two adjacent runs** on the same route
   (5.81, then 40.52). A single comparison against quinn is not a ranking, in
   either direction.
-- **Downstream is not quoted at all.** In the 2026-08-17 campaign every leg
-  *including the reference* sat at the scenario's own ceiling, 0.55–0.95 Mbit/s,
-  while the one-way downstream control read 60–63. That describes the harness
-  and the route, not the protocol.
-- **The `Timeout` in run `062705` has no established cause.** Isolated timeouts
-  appeared in earlier campaigns too, and the keepalive hypothesis that would
-  have explained them has since been disproved by a fix.
-- **No one-way upstream control was taken on 2026-08-22**, so those upload
-  figures have only a round-trip echo to normalise against.
-- **Handshake: 524 ms against 234 ms for quinn.** That is the price of a hybrid
-  X25519 + ML-KEM-768 / Ed25519 + ML-DSA-65 handshake against a classical
-  TLS 1.3 one — expected, and not a defect to optimise away.
+- **August downloads are not quoted.** In the two 2026-08-17 runs above,
+  PhantomUDP's download was still accelerating when its window closed, so its
+  3.57 / 4.84 Mbit/s measured a ramp rather than a capacity, against a one-way
+  downward control of 60.45 / 62.97; the byte-pipe legs and the reference read
+  0.55–0.95.
+- **The `Timeout` in run `062705` was a lost `ServerHello`, and 0.3.0 fixes it.**
+  The server received the hello, completed the handshake and sent its reply — a
+  six-datagram flight with no retransmission of its own — and the reply was lost
+  on the way down. The client repeated its hello three times, and each repeat was
+  routed into the session the server had already committed, which does not parse
+  handshake messages, so one lost datagram out of six cost the whole connect at
+  the end of the client's 8-second budget. A PhantomUDP listener now retains the
+  reply flight and repeats it byte for byte when the same hello arrives again
+  ([`docs/protocol/PROTOCOL.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/protocol/PROTOCOL.md)
+  § 6.1). Isolated PhantomUDP connect timeouts appear in earlier runs too — one
+  handshake in ten in each 2026-08-17 run — but those runs did not record what
+  would confirm their cause.
+- **Handshake: a median of 416.0–589.1 ms per run against 254.5–304.4 ms for
+  quinn**, in the four runs above. The difference is about one round trip, and
+  it is a design choice rather than a defect: a PhantomUDP listener always
+  answers a first hello with a stateless cookie before it commits any state, so
+  the handshake takes two round trips where QUIC's takes one. The hybrid
+  post-quantum cryptography itself costs about a millisecond (see the loopback
+  table above).
 
-An earlier campaign (2026-08-03, five runs) put upload at 3.0–3.7 Mbit/s against
-a steady 38.4–39.6 Mbit/s one-way upstream control. Cumulative `WINDOW_UPDATE`
-(the `WIRE_VERSION` 6 → 7 bump), a segment-idempotent flow-control charge, and
-symmetric reliable-byte accounting on both ends of the ledger landed between
-that campaign and the next. The two cannot be chained into a ratio: their
-controls are different instruments — a one-way capacity probe there, a
-round-trip echo afterwards.
+An earlier campaign (2026-08-03, five runs) put upload at 2.40–3.59 Mbit/s,
+counted by the server, in the four runs whose upload connected, against a
+round-trip echo of 27.75–42.85 Mbit/s from the same runs. Cumulative
+`WINDOW_UPDATE` (the `WIRE_VERSION` 6 → 7 bump), a segment-idempotent
+flow-control charge, and symmetric reliable-byte accounting on both ends of the
+ledger landed between that campaign and 2026-08-17. The campaigns are not
+comparable, so no ratio between them is claimed.
 
-Two results from the most recent campaign are not about speed at all, and are
-the firmer part of it:
+Two results from the 2026-08-22 campaign are not about speed at all, and are the
+firmer part of it:
 
 - **A departed UDP client no longer holds a server session open.** Median
   server-side UDP session lifetime fell from **135.55 s to 2.19 s**, and the
@@ -414,10 +489,12 @@ the firmer part of it:
   interval, while the **raw single sample ran at 1.02×** — one session per run,
   because both quantities are only recorded where the server was the sender.
 
-The harness and its rules are documented in
-[`testbed/README.md`](https://github.com/snaart/phantom_protocol/blob/main/testbed/README.md),
-including the rule that governs every performance claim in this repository: a
-number never appears without the control from its own run.
+The harness, its scenarios, and how each figure above is computed — which end
+counts, which control is the denominator, when a transfer counts as converged —
+are documented in
+[`testbed/README.md`](https://github.com/snaart/phantom_protocol/blob/main/testbed/README.md).
+The rule this section follows is that a throughput figure never appears without
+the raw control from its own run.
 
 ## Deploying
 
@@ -426,6 +503,15 @@ number never appears without the control from its own run.
 Production embedder. Auto-loads-or-creates a persistent `HybridSigningKey`,
 pushes OTLP telemetry to an OTel Collector / SaaS backend, handles SIGTERM
 / SIGINT with a 10s drain.
+
+**It binds the TCP leg only.** `phantom-server` listens with
+`PhantomListener::bind_with_signing_key` on `--bind` and opens no UDP socket, so
+it does not serve PhantomUDP — the transport recommended above — and the
+Dockerfile, compose file and Helm chart below expose and probe TCP 4242
+accordingly. A PhantomUDP deployment embeds `PhantomUdpListener` in its own
+server binary; `PhantomUdpListener::bind_udp_with_signing_key_bytes` accepts the
+same 64-byte seed that `phantom-cli keygen` and `phantom-server` write, so one
+pinned identity can serve both transports.
 
 | Flag | Env | Default |
 | --- | --- | --- |
@@ -624,8 +710,14 @@ carry **SLSA-3 OIDC build-provenance attestations** via
 
 - **Pre-1.0 (`0.3.0`).** Wire format may break between minors; SemVer applies
   once 1.0 ships. The current wire protocol is a single pinned version — the
-  former V1/V2/V3 axes were collapsed pre-1.0 (no users, no negotiation, no
-  fallback), so there are no cross-version migration guides.
+  former V1/V2/V3 axes were collapsed pre-1.0, with no negotiation and no
+  fallback, so there are no cross-version migration guides. **0.3.x and 0.2.x
+  peers do not interoperate:** this release speaks `WIRE_VERSION` <!--pinned:WIRE_VERSION-->8
+  and `PROTOCOL_VERSION` <!--pinned:PROTOCOL_VERSION-->5, where 0.2.x spoke 6 and
+  3, and the handshake refuses the mismatch with a typed `ServerReject` rather
+  than negotiating down. Upgrade both ends together, and regenerate the language
+  bindings rather than relinking them — every UniFFI checksum moved in 0.3.0 (see
+  [`CHANGELOG.md`](https://github.com/snaart/phantom_protocol/blob/main/CHANGELOG.md)).
 - **Native UDP transport (PhantomUDP): handshake + demux + reliability shipped.**
   `PhantomSession` runs an authenticated session over TCP, WebSocket, and raw UDP
   (connection-ID demux, server accept, fragmented handshake). The UDP data plane
@@ -668,31 +760,40 @@ carry **SLSA-3 OIDC build-provenance attestations** via
   exercised by `udp_integration` over `test_harness/fault_transport.rs`
   (injected loss + reorder) *and* by the WAN campaigns above, where it runs
   beside a QUIC reference and raw controls on the same path in the same run.
-  That instrument is what found the congestion-control defects recorded in the
-  changelog, none of which the test suite could see: at a loopback round
-  trip of 0.4 ms a 5600-byte congestion window still yields 112 Mbit/s, and the
-  same window on a 210 ms path yields 0.213. What is still missing is a second
-  route and an external review — treat the data plane as measured-on-one-path,
-  not battle-tested.
+  That instrument is what found the congestion-control defects fixed in 0.3.0
+  (recorded in
+  [`CHANGELOG.md`](https://github.com/snaart/phantom_protocol/blob/main/CHANGELOG.md)),
+  none of which the test suite could see: at a loopback round trip of 0.4 ms a
+  5600-byte congestion window still yields 112 Mbit/s, and the same window on a
+  210 ms path yields 0.213. What is still missing is a second route and an
+  external review — treat the data plane as measured-on-one-path, not
+  battle-tested.
 - **What the transport does not reach, stated as measurements rather than as
-  work items.** These are properties of the shipped code on the one route it has
-  been measured on, and none of them is a defect with a fix pending. Every
-  figure is against a raw no-protocol control from the same run, per the rule
-  every performance claim here is held to.
-  - **Upload reaches about a third of the measured ceiling.** The September 2026
-    campaign put it at 26.7–28.3 Mbit/s against an 84.3–85.0 Mbit/s one-way
-    control — 32–34% of the link, up from 22.7% before the loss-response change,
-    and the first campaign in which the transfer converges rather than ending
-    mid-ramp. The instrument named an upload capacity for the first time:
-    27.4–29.5 Mbit/s. A third of the link is a real gap, and the reason it is
-    quotable at all is that both the numerator and the denominator come from the
-    same run.
-  - **Duplex runs at 81–89% of the slower one-way direction.** The criterion
-    the project set for itself was "reproducibly no worse than the slower
-    one-way", and 81–89% does not meet it. What did change is that the spread
-    collapsed from 48 percentage points to 8, so this is now a level rather than
-    a coin toss — the earlier variance was a 60-second window catching an
-    unfinished ramp, not a property of the protocol.
+  work items.** These are properties of the builds measured on the one route
+  there is — those of the 2026-09-05 campaigns, which differ from this release
+  by the one Startup change noted under [Performance](#performance) — and none
+  of them is a defect with a fix pending. Every throughput figure taken on the
+  route is against a raw no-protocol control from the same run.
+  - **Upload reaches about a third of the measured ceiling.** The morning
+    campaign of 2026-09-05 put it at 27.02–28.33 Mbit/s against an
+    84.26–84.97 Mbit/s one-way upward control from the same runs — 32–34% of the
+    link, up from 22–24% against the same 84 Mbit/s control on 2026-08-26, before
+    the loss-response change. The transfer reached its final rate about six
+    seconds into its sixty, where the 2026-08-26 runs took 13–18 s. A third of
+    the link is a real gap, and the reason it is quotable at all is that both the
+    numerator and the denominator come from the same run. It is quotable only
+    against that run: six hours later the same control read 55.56–59.29 Mbit/s
+    on the same route with the same library, so a share of the upward link is
+    not yet a stable figure.
+  - **Duplex runs short of the slower one-way direction, by an amount that
+    moves with the route.** The download half of a duplex transfer, against a
+    one-way download from the same run, ran at 81–89% in the morning campaign of
+    2026-09-05 and at 49–63% six hours later, when the downward control had
+    started losing 1–10% of datagrams at low rates. The criterion the project
+    set for itself was "reproducibly no worse than the slower one-way", and
+    neither campaign meets it. Within each campaign the three runs agree to
+    within 14 percentage points, where the three 60-second runs of 2026-08-26
+    spread across 35 (52–86%).
   - **The ARQ send buffer is bounded in segments, not bytes.** At 1024 segments
     it is 1024 × the segment size, so on a small application frame it binds
     about four times sooner than the peer's window does: a `send_ceiling` sweep
@@ -705,12 +806,20 @@ carry **SLSA-3 OIDC build-provenance attestations** via
     fast; the UDP leg is the production path and the only one where `migrate()`
     works.
   - **Against a mature implementation of the same class, on the same path, in
-    the same run.** On a route with a couple of per cent of baseline loss this
-    transport holds an order of magnitude more than a loss-based controller
-    does; on a clean path a mature QUIC implementation is roughly three times
-    faster. Both statements are about the same code, and the size of the gap is
-    a property of the route rather than a ranking — the reference itself moved
-    2.3× between two runs an hour apart on that route, while our leg moved 1.14×.
+    the same run.** On upload, in the three afternoon runs of 2026-09-05, quinn
+    delivered 1.1–2.4× what this transport did (28.03 / 65.85 / 31.54 against
+    26.03 / 27.10 / 23.71 Mbit/s, counted by the server) against a one-way
+    upward control of 58.64 / 59.29 / 55.56 from the same runs. The reference
+    itself moved 2.3× across those three runs while this leg moved 1.14×, and in
+    one of them quinn delivered 111% of the control, so the control under-read
+    the path. That control moved between 55 and 85 Mbit/s within one day, so
+    shares of the upward link are not yet reliable. On download, in the same
+    runs, the route lost 1–10% of datagrams far below its 76.5 Mbit/s ceiling,
+    and this transport held 11.13–12.07 Mbit/s where quinn's loss-based
+    controller held 0.33–0.49 — more than an order of magnitude. In a loopback
+    run of the download scenario, with no route and no raw control beside it,
+    quinn moved roughly three times what this transport did. The size of the gap
+    in either direction is a property of the path rather than a ranking.
 - **Negative-security suite: 73 always-on tests** in
   `core/tests/security_invariants.rs`, covering most — not all — of the eleven
   numbered security invariants: identity pinning, the unencrypted-packet receive
@@ -780,7 +889,7 @@ carry **SLSA-3 OIDC build-provenance attestations** via
 - **Policy:** [`docs/policy/versioning.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/policy/versioning.md)
 - **Performance:** [`BENCHMARKS.md`](https://github.com/snaart/phantom_protocol/blob/main/BENCHMARKS.md)
   (loopback benches), [`testbed/README.md`](https://github.com/snaart/phantom_protocol/blob/main/testbed/README.md)
-  (the WAN measurement harness, and the rules every performance claim is held to)
+  (the WAN measurement harness, and how each real-route figure is computed)
 - **Change log:** [`CHANGELOG.md`](https://github.com/snaart/phantom_protocol/blob/main/CHANGELOG.md)
 
 ## Contributing
