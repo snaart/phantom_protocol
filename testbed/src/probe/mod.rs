@@ -1235,9 +1235,12 @@ mod tests {
     /// Two halves, because there are two ways back to a wrong stamp. The first
     /// compares the recorded value with the version in the manifest of the crate
     /// this build links by path, so it holds even in a tree that never ran
-    /// `check_versions.sh`. The second reads this file and rejects a string
-    /// literal assigned to the field, which is the exact shape that went stale:
-    /// a literal agrees with core on the day it is written and on no day after.
+    /// `check_versions.sh`. The second reads this file's production code and
+    /// requires the field to be filled from `PHANTOM_VERSION`, and that constant
+    /// to be read from the package version, with no string literal in either.
+    /// A literal is the exact shape that went stale: it agrees with core on the
+    /// day it is written and on no day after, and the first half cannot see it
+    /// until that day comes.
     #[test]
     fn run_meta_records_the_linked_phantom_version_and_not_a_literal() {
         let core_version = package_version(include_str!("../../../core/Cargo.toml"))
@@ -1249,12 +1252,43 @@ mod tests {
              core/Cargo.toml must carry the same version"
         );
 
-        // Assembled from pieces so this test's own text does not contain it.
-        let literal_assignment = ["phantom_version", ": \""].concat();
+        // Everything above the test module. The marker is assembled from pieces
+        // so that this test's own text is not where the split lands.
+        let source = include_str!("mod.rs");
+        let test_module = ["#[cfg", "(test)]"].concat();
+        let production = source
+            .split_once(test_module.as_str())
+            .map_or(source, |(above, _)| above);
+
+        // Every initialiser of the field, however it is spelled: a literal behind
+        // `String::from`, `.into()` or `format!` is as stale as a bare one.
+        let initialisers: Vec<&str> = production
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("phantom_version"))
+            .collect();
         assert!(
-            !include_str!("mod.rs").contains(&literal_assignment),
-            "RunMeta.phantom_version is assigned a string literal in probe/mod.rs; \
-             fill it from PHANTOM_VERSION so it follows the release"
+            !initialisers.is_empty(),
+            "found no `phantom_version` initialiser above the test module in \
+             probe/mod.rs, so this check read nothing; point it at where RunMeta is built"
+        );
+        for line in &initialisers {
+            assert!(
+                line.contains("PHANTOM_VERSION") && !line.contains('"'),
+                "RunMeta.phantom_version is filled by `{line}` in probe/mod.rs; \
+                 fill it from PHANTOM_VERSION so it follows the release"
+            );
+        }
+
+        let definition = production
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("const PHANTOM_VERSION"))
+            .expect("probe/mod.rs defines PHANTOM_VERSION above its test module");
+        assert!(
+            definition.contains(r#"env!("CARGO_PKG_VERSION")"#),
+            "PHANTOM_VERSION is `{definition}`; read it with env!(\"CARGO_PKG_VERSION\") \
+             so it follows the release"
         );
     }
 
