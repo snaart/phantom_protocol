@@ -13,20 +13,53 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 **Peers of this release and of 0.2.2 will not talk to each other, and the refusal is
 explicit.** The wire moved twice inside this window — `WIRE_VERSION` 6 → 7 (cumulative
 `WINDOW_UPDATE`) and 7 → 8 (in-session `CONTROL` frames and the `CLOSE` / draining
-contract) — and `PROTOCOL_VERSION` moved 4 → 5 alongside, which is the whole reason it
-moved: the packet-level version check *drops* a mismatched frame silently, so a peer one
-wire version behind would complete a handshake, agree keys, and then never deliver a byte
-with nothing at either end to say why. Carrying the handshake version forward turns that
-into a typed `ServerReject` naming both versions, before any session exists. Upgrade both
-ends; there is no negotiation and no fallback, by design, pre-1.0.
+contract) — and `PROTOCOL_VERSION` moved 3 → 5 alongside, 3 → 4 with the first and 4 → 5
+with the second, which is the whole reason it moved: the packet-level version check *drops*
+a mismatched frame silently, so a peer one wire version behind would complete a handshake,
+agree keys, and then never deliver a byte with nothing at either end to say why. Carrying
+the handshake version forward turns that into a typed `ServerReject` naming both versions,
+before any session exists. Upgrade both ends; there is no negotiation and no fallback, by
+design, pre-1.0.
 
 **Every language binding must be regenerated, not just relinked.** `uniffi` 0.32 changed
 the metadata each exported item hashes into its checksum, so all fifty-nine of this crate's
 checksums moved while `UNIFFI_CONTRACT_VERSION` stayed at 30 — the coarse gate passes and
 the mismatch lands at import time in the consumer's process. `ResumptionHint` also changed
 from a record to an object in the same release, which changes the C parameter type and
-removes Swift's `Equatable`. Both are detailed below.
+removes Swift's `Equatable`, and three `ConnectionState` variants were removed, which
+renumbers the value every later variant lowers to across the FFI. All three are detailed
+below.
 
+### Security
+
+Pointers only: each item is set out in full in the entry named.
+
+- The Python binding printed the 0-RTT `resumption_secret` whenever a `ResumptionHint` was
+  formatted — **Changed**, "`ResumptionHint` is a `uniffi::Object` rather than a
+  `uniffi::Record`".
+- An authenticated peer could pin the local congestion window to its floor for the life of
+  the connection by reporting a false `Sack::ack_delay_us` — **Fixed**, "A peer could set
+  the local congestion window by reporting a false acknowledgement delay".
+- An authenticated peer could put a frame of up to 4 MiB into each delivery-queue slot sized
+  for 1156 B, against an application that is not reading — **Fixed**, "A peer could put a
+  4 MiB frame in a delivery-queue slot sized for 1156 B".
+- The send-window check added a charge to the sent total unchecked, so at the top of the
+  `u64` range a limit the peer advertised let the sum leave the range — a panic in the task
+  that drains every stream in a debug build, a wrap in a release one — **Fixed**, "A number
+  the peer writes could end the task that drains every stream on the session".
+- The bandwidth and minimum-RTT sliding filters grew without bound under an acknowledgement
+  cadence the peer controls — **Fixed**, "Both sliding filters were as long as the peer
+  cared to make them".
+- `Session::open_stream` gave each stream its own receive-window growth allowance, so a
+  stream count the peer picks multiplied a per-session memory bound — **Fixed**, "The
+  receive-window growth budget was handed out per stream on the raw session API".
+- `PhantomSession::set_rekey_threshold`, which moves the key-rotation watermark of a live
+  session, was callable from every language binding in 0.2.2 — **Removed**,
+  "`PhantomSession::current_epoch()` and `set_rekey_threshold()` are no longer exported over
+  FFI".
+- The server now validates a client's ML-KEM-768 encapsulation key before encapsulating to
+  it, and refuses the handshake on a malformed one — **Changed**, the `ml-kem` 0.2 → 0.3
+  item of the dependency entry.
 
 ### Removed
 
@@ -43,44 +76,6 @@ removes Swift's `Equatable`. Both are detailed below.
   compiling — while the local gate stayed green, because it built only the host. The blind
   spot was the gate rather than the change; it now runs that row, the browser-wasm one and
   the ring-free FIPS build.
-
-- **No flag that turns a memory budget into a session cap, and a second removal on the
-  record.** `--max-recv-window-growth-mib` was built to state the left-hand side of that
-  arithmetic and derive `--max-sessions` from it, and it is removed before shipping.
-  Its arithmetic was exact, which is what makes it worth recording: the earlier
-  `--max-recv-memory-mib` divided by a per-session *total* that was an estimate corrected
-  upward three times, this one divided by a constant the transport enforces, and it was
-  still the wrong thing to offer. Its unit is MiB, nobody reaches for a MiB-denominated
-  server flag except with a memory limit in hand — so what it was handed was a memory limit
-  and what it returned was a session cap that same memory could not support, by the ratio
-  between this term and the two the deployment guide ranks an order of magnitude above it. A knob whose documentation has to say "do not
-  read this as its unit reads" belongs in the log instead, so that is where it is:
-  `phantom-server` prints `recv_window_growth_commitment` beside the session cap at startup
-  and offers no control that appears to bound it. Sizing a host ends in measurement.
-
-- **`api::session::SESSION_RECV_MEMORY_COMMITMENT`, and `phantom-server`'s
-  `--max-recv-memory-mib` / `PHANTOM_MAX_RECV_MEMORY_MIB` with it.** The constant published a
-  single per-session resident total for the receive path, and the flag divided an operator's
-  memory budget by it to derive a session cap. It was wrong three times. Each correction
-  raised it, and each time the error had the same shape: a figure this endpoint chooses was
-  treated as though it bounded the peer. The last of them charged a delivery-queue slot the
-  sender's own chunk size while the receive path would have accepted a frame three thousand
-  times larger.
-
-  The frame ceiling above fixes the mechanism, but the total is withdrawn rather than
-  restated. A per-session total has to enumerate every allocation the receive path makes,
-  including the ones beneath this layer — the byte pipe's receive accumulator, the
-  per-session PhantomUDP fragment reassembler, the `Stream` structures themselves — and a sum
-  that misses one reads as a bound while being an estimate. What is published in its place is
-  the per-buffer table in the module documentation of `api::session`: each bound, what it
-  limits, and the code that enforces it, with the two that are *not* enforced marked as such
-  — the advertised receive window, which nothing on the receive path consults, and the
-  delivery hard cap, which one frame's charge crosses before the reader notices (that
-  overshoot is now published as `MAX_DELIVERY_CHARGE_PER_FRAME` rather than rounded away).
-  `docs/security/threat-model.md` §5 §D.1 and `docs/operations/deployment.md` carry the same
-  split. A cap derived from an estimate under-provisions a host by exactly the factor the
-  estimate is out, which is worse than no flag, so sizing goes back to measurement against
-  `PHANTOM_MAX_SESSIONS`.
 
 - **`transport::udp_transport` — a public module nothing could reach, carrying the crate's
   only native `unsafe`.** `UdpTransport`, `UdpHandshakeListener`, `PacedSender` and
@@ -118,9 +113,36 @@ removes Swift's `Equatable`. Both are detailed below.
   embedded target against that table would have planned for key material the protocol will
   never send, and would have had no way to find that out short of reading the handshake. The
   non-crypto knobs beside them (`buffer_size`, `max_streams`, `coalescing`, MTU) steered
-  nothing either. This is a public API removal in the pre-1.0 breaking window; nothing could
-  have depended on it for behaviour, since constructing a `DeviceProfile` changed no bytes and
-  no timing.
+  nothing either. This is a public API removal, breaking (0.2 → 0.3); nothing could have
+  depended on it for behaviour, since constructing a `DeviceProfile` changed no bytes and no
+  timing.
+
+- **`ConnectionState::{ClassicalReady, PqcUpgrading, PqcReady}` and
+  `PhantomSession::is_pqc_ready()`.** They belonged to a staged classical-then-post-quantum
+  upgrade the protocol never shipped: the hybrid handshake is a single flight, so no
+  production path ever wrote those three states and `is_pqc_ready()` was permanently false.
+  An embedder following the rustdoc would have waited for a state that cannot arrive, or
+  gated its send path on a readiness flag that never turns true. The session rustdoc now
+  describes the machine that exists — `Connecting → Connected → Migrating → Dead`, plus
+  `Failed`, `Closed` and the peer-initiated `Draining` added in this release. Use
+  `is_data_ready()`: because the handshake is one flight, a data-ready session is
+  post-quantum protected by construction.
+
+  Discriminants `1..=3` are left retired rather than reused, and that promise is about the
+  Rust `#[repr(u8)]` value only — the number `state as u8` yields, which an old log may
+  carry. It does not hold for the value the enum lowers to across the FFI, which UniFFI
+  numbers by declaration position and which every later variant therefore moved on; the
+  entry under **Changed** gives the old and new numbers side by side. Breaking (0.2 → 0.3)
+  for the FFI enum and for `is_pqc_ready()` callers.
+
+- **`PhantomSession::current_epoch()` and `set_rekey_threshold()` are no longer exported
+  over FFI.** Both documented themselves as Rust-only while sitting inside the UniFFI
+  export block, so 0.2.2 shipped them in every binding. `set_rekey_threshold` moves the
+  watermark that triggers key rotation on a live session — a knob on the same axis as the
+  `AEAD_MAX_INVOCATIONS` ceiling, which is documented as not to be moved without an audit —
+  so it should not have reached foreign callers by accident. Both remain public Rust API for
+  soak and integration harnesses. Breaking (0.2 → 0.3) for any binding consumer that called
+  them.
 
 ### Changed (wire-breaking)
 
@@ -335,7 +357,7 @@ removes Swift's `Equatable`. Both are detailed below.
   crate pairs `fips` with `no-std`, which `core/src/lib.rs` rejects outright — so the run
   died building rustdoc and exited non-zero exactly as a real finding does.
 
-  Three things the tool does not see, stated here because a complete-looking list invites
+  Four things the tool does not see, stated here because a complete-looking list invites
   the assumption that it sees everything:
 
   * **Feature sets it cannot build together.** The comparison covers default features plus
@@ -344,12 +366,18 @@ removes Swift's `Equatable`. Both are detailed below.
     surfaces are compared by nothing; a break in `CoreError::FipsSelfTestFailure` or in the
     WASI leg arrives unannounced.
   * **Values.** It compares shapes, not numbers, so a `pub const` whose value changed is
-    absent from it. This window has one that matters — `MAX_SEND_WINDOW` and
-    `MAX_RECV_WINDOW` went from 512 KiB to 1 MiB, recorded below.
-  * **The FFI ABI.** It reads Rust signatures, and the UniFFI record layout is a second,
-    independent compatibility axis. `MetricsSnapshotFfi` gained a field mid-record this
-    window, which breaks every generated binding and breaks the C one silently; that is its
-    own entry below and nothing in the semver report hints at it.
+    absent from it. This release has one that matters — `MAX_SEND_WINDOW` went from 512 KiB
+    to 1 MiB, and the new `MAX_RECV_WINDOW` equals it — recorded below.
+  * **The FFI ABI.** It reads Rust signatures, and what crosses the FFI is a second,
+    independent compatibility axis. This release moves it three ways the report does not
+    hint at: `ResumptionHint` crosses as an object handle rather than a lowered record, the
+    value `ConnectionState` lowers to is renumbered for every variant after the three that
+    were removed, and `uniffi` 0.32 moved every exported checksum. Each has its own entry
+    below.
+  * **Traits that belong to a dependency.** A public bound on another crate's trait breaks
+    when that crate moves a major version, and the tool compares this crate's items rather
+    than the versions they name. `EmbeddedLeg`'s `R: Read` / `W: Write` bounds are
+    `embedded-io-async`'s, which moved 0.6 → 0.7; see the dependency entry below.
 
   *Modules and types that are gone* — delete the import; the reasoning is under **Removed**:
 
@@ -401,7 +429,8 @@ removes Swift's `Equatable`. Both are detailed below.
 
   * `ConnectionState::{ClassicalReady, PqcUpgrading, PqcReady}`: states no production path
     ever wrote. `ConnectionState` is `#[non_exhaustive]`, so any `match` on it already had a
-    wildcard; delete the three arms. See **Documented**.
+    wildcard; delete the three arms. See **Removed**, and **Changed** for what the removal
+    does to the value the enum lowers to across the FFI.
   * `BbrState::FastRecovery`: loss is a signal, not a phase. See **Fixed**.
 
   *Struct fields that are gone* — drop them from any struct literal:
@@ -512,8 +541,9 @@ removes Swift's `Equatable`. Both are detailed below.
   not leak, so this was one language, not four — but it was the language the loopback smoke
   test is written in.
 
-  The previous release documented the leak. This one removes it: an object crosses the FFI
-  as an opaque handle and gets no field-dumping stringifier in any of the four languages.
+  0.2.2 shipped the leak with a code comment claiming the opposite; an earlier change in
+  this release documented it, and this one removes it: an object crosses the FFI as an
+  opaque handle and gets no field-dumping stringifier in any of the four languages.
   Checked by running it, not by reading the generator — `str(hint)` now returns
   `<phantom_protocol.ResumptionHint object at 0x…>`.
 
@@ -571,17 +601,59 @@ removes Swift's `Equatable`. Both are detailed below.
   loopback smoke test carries the other half, asserting on the rendered hint itself — the
   leak lives in a generated file that no Rust test can see.
 
-- **Eight direct dependencies moved a major version, and one of them breaks every
-  generated binding.** `base64` 0.22 → 0.23, `lz4_flex` 0.13 → 0.14, `zstd` 0.13 → 0.14,
-  `argon2` 0.5 → 0.6, `ed25519-dalek` 2 → 3 and `x25519-dalek` 2 → 3 (which brings
-  `curve25519-dalek` 5 and the deferred `rand` 0.8 → 0.10 migration with it — `rand` is a
-  dev-only dependency; the production CSPRNG seam is `getrandom` via `crypto::rng::OsRng`
-  and did not move), and `uniffi` 0.31 → 0.32. Each landed as its own commit with its own
-  full gate run, because a group bump with one check at the end does not answer which of
-  them broke it. The two signature crates are the reason the wire vectors exist: `ed25519`
-  and `x25519` sit in the signing half and the classical half of the KEM, and the bump was
-  required to move **no byte** — `wire_vectors` (16), `nist_kat` (6) and `cavp` (5) are what
-  says it did not. A bump that moves a byte is a protocol change, not a bump.
+- **Direct dependencies that moved a major version, and what each one means for a
+  consumer.** Counted from `core/Cargo.toml` at 0.2.2 to this release, with a `0.x` minor
+  counted as a major, as Cargo reads it. Two of them change what a consumer compiles or
+  links against, one tightens what the handshake accepts, and the rest are internal:
+
+  * **`uniffi` 0.31 → 0.32** breaks every generated binding; the paragraph after this list
+    is about it.
+  * **`embedded-io-async` 0.6 → 0.7** is a public API break for embedded users.
+    `EmbeddedLeg<R, W, N>` requires `R: embedded_io_async::Read` and
+    `W: embedded_io_async::Write`, and those are now the 0.7 traits, so a HAL adapter that
+    implements 0.6's satisfies neither the bounds nor `impl_embedded_session_transport!`.
+    In 0.7 `Write::flush` has no default, so every `impl Write` has to define it.
+  * **`ml-kem` 0.2 → 0.3** (0.3.2) validates an encapsulation key before anything is
+    encapsulated to it: `EncapsulationKey::new` rejects an out-of-range or non-canonical
+    encoding, where 0.2's `from_bytes` took any 1184 bytes. A `ClientHello` whose key
+    package carries such a key now fails the handshake with `HandshakeError::KemFailed`
+    instead of being answered. `decapsulate` is infallible in 0.3 (FIPS 203 implicit
+    rejection), and the feature set went from `deterministic` to `hazmat`, `getrandom` and
+    `zeroize`. `nist_kat` still byte-matches the published FIPS-203 vectors, so no encoding
+    moved.
+  * **`getrandom` 0.2 → 0.4** is the production CSPRNG seam of every `std` build but `fips`:
+    `crypto::rng::OsRng` now calls `getrandom::fill`. On `wasm32-unknown-unknown` the
+    unaliased `getrandom` is 0.4 with `wasm_js`, and a `getrandom02` alias keeps 0.2's `js`
+    backend on for the copy `ring` still pulls.
+  * **`ed25519-dalek` 2 → 3 and `x25519-dalek` 2 → 3**, bringing `curve25519-dalek` 5 — the
+    signing half and the classical half of the KEM.
+  * **`aes` 0.8 → 0.9 and `chacha20` 0.9 → 0.10**, the header-protection mask ciphers, now
+    on `cipher` 0.5. `chacha20`'s `cipher` feature is named explicitly because 0.10 leaves
+    it off by default; the RFC 9001 header-protection known-answer test is unchanged.
+  * **`base64` 0.22 → 0.23, `lz4_flex` 0.13 → 0.14, `zstd` 0.13 → 0.14 and `argon2`
+    0.5 → 0.6**, none of them on a path that could move a byte.
+
+  Three more changes to the production graph are not version moves. **`rand` is no longer
+  a production dependency.** It was an optional dependency enabled by `std` at 0.8; every
+  production draw it served — X25519 key generation, the session identifiers,
+  traffic-shaping jitter — now goes through `OsRng`, and ML-KEM key generation through
+  `ml-kem`'s own `getrandom` feature. `rand` remains a dev-dependency only, now at 0.10, a
+  migration the dalek pair forced because their generators take the current `rand_core`.
+  **`libc` is gone**, with `transport::udp_transport` (see **Removed**). **`borsh` moved its
+  exact pin from `=1.6.1` to `=1.8.1`**, by way of `=1.7.0`. `borsh` encodes the handshake
+  messages and is pinned because a minor release could shift those bytes with no
+  `WIRE_VERSION` change to announce it, so each step was taken only once `wire_vectors`
+  passed against the committed fixtures *without* regenerating them (the second step also
+  ran the independent Python decoder and `transcript_hash_wire_vector`) — a regenerated
+  vector proves the encoder agrees with itself, an unchanged one that the bytes match what
+  the published release emits.
+
+  The same bar held for every move above: the signature and KEM crates are the reason the
+  wire vectors exist, and `wire_vectors` (16), `nist_kat` (6) and `cavp` (5) are unchanged
+  across all of them. A bump that moves a byte is a protocol change, not a bump. Among the
+  dev-dependencies `criterion` moved 0.5 → 0.8 and `rand` 0.8 → 0.10; the `cli`, `server`
+  and `testbed` lockfiles took the same moves; and the SHA-pinned CI actions advanced,
+  `codecov/codecov-action` 6 → 7 among them.
 
   **`uniffi` 0.32 is a binding-ABI break even though no Rust source changed.** The macro
   now writes an `orig_name` field into every function's metadata buffer, and the per-item
@@ -592,10 +664,21 @@ removes Swift's `Equatable`. Both are detailed below.
   the binding files generated against 0.31 gets `UniFFI API checksum mismatch` at import
   time, not a compile error, and the contract-version check that looks like it would catch
   that passes. **Regenerate all four bindings when you take this release.** The copies in
-  `tests/bindings/` were regenerated here; the public surface they expose is unchanged
-  (same methods, same 53 async entry points, no new `close`), and the only additions are
-  Kotlin's `uniffiIsDestroyed` property on each of the five objects and an internal
-  by-reference bytes converter in Python.
+  `tests/bindings/` were regenerated here. The `uniffi` move on its own changed no
+  exported method (same methods, same 53 async entry points, no new `close`); its only
+  additions are Kotlin's `uniffiIsDestroyed` property on each exported object and an
+  internal by-reference bytes converter in Python.
+
+- **The benchmark regression gate holds the three ML-DSA-65 signing benches to a 10×
+  ceiling rather than 2×.** ML-DSA signing is Fiat–Shamir with aborts: each signature loops
+  a random number of times, so the median of a signing micro-bench swings two- to six-fold
+  between runs of byte-identical binaries on a shared runner, and the flat 2× gate read
+  that as a regression on pull requests that changed no code at all.
+  `crypto_pq_vs_classical/sign_ml_dsa_65`, `crypto_pq_vs_classical/sign_hybrid` and
+  `pqc_operations/hybrid_sign` are now compared against `BENCH_SOFT_REGRESSION_THRESHOLD`
+  (default 10×), which realistic jitter does not reach and a broken signing path still
+  does; they still run and print their ratios. Key generation and Ed25519 signing do not
+  reject-sample and stay on the 2× gate.
 
 - **`BandwidthEstimator::on_ack` and `Session::on_packet_acked` now hand back the RTT sample
   the acknowledgement produced.** `on_ack` returns `(u64, Duration)` where it returned the
@@ -665,17 +748,22 @@ removes Swift's `Equatable`. Both are detailed below.
   `Stream::recv_tuning` hands the handle on, so a stream created by the pump or by a peer
   joins the same ledger as one opened through the API. `SESSION_RECV_WINDOW_GROWTH_BUDGET`
   (8 MiB) is what the ledger holds and `SharedRecvTuning::remaining_growth_budget` reports
-  what is left of it. `MAX_SEND_WINDOW` and `MAX_RECV_WINDOW` doubled from 512 KiB to 1 MiB
-  with the ceiling above. `MAX_RECV_REORDER` and the new `REORDER_ENTRY_OVERHEAD_BYTES` are
-  public alongside them, and `api::session` exports `MAX_STREAMS`,
-  `RECV_DELIVERY_HARD_CAP`, `DELIVERY_ITEM_OVERHEAD_BYTES`,
-  `MAX_DELIVERY_CHARGE_PER_FRAME`, `STREAM_RECV_CHANNEL_DEPTH` and
-  `RAW_APP_RECV_CHANNEL_DEPTH`, with `transport::mtu` exporting `MAX_RECV_FRAME` and
-  `MAX_RECV_PAYLOAD` and `transport::sack` exporting `MAX_SACK_WIRE`. Each names one
-  receive-side bound the transport enforces; the module documentation of `api::session`
-  lists them together with what enforces each and marks the two that are observed rather
-  than enforced. They are deliberately not summed into a per-session total — see the
-  Removed entry below.
+  what is left of it. `MAX_SEND_WINDOW` doubled from 512 KiB to 1 MiB, and the new
+  `MAX_RECV_WINDOW`, the ceiling auto-tuning grows the advertised window to, equals it.
+  `MAX_RECV_REORDER` and the new `REORDER_ENTRY_OVERHEAD_BYTES` are public alongside them,
+  and `api::session` exports `MAX_STREAMS`, `RECV_DELIVERY_HARD_CAP`,
+  `DELIVERY_ITEM_OVERHEAD_BYTES`, `MAX_DELIVERY_CHARGE_PER_FRAME`,
+  `STREAM_RECV_CHANNEL_DEPTH` and `RAW_APP_RECV_CHANNEL_DEPTH`, with `transport::mtu`
+  exporting `MAX_RECV_FRAME` and `MAX_RECV_PAYLOAD` and `transport::sack` exporting
+  `MAX_SACK_WIRE`. Each names one receive-side bound; the module documentation of
+  `api::session` lists them together with the code that enforces each, and marks the two
+  that are observed rather than enforced — the advertised receive window, which nothing on
+  the receive path consults, and the delivery hard cap, which one frame's charge can cross
+  by `MAX_DELIVERY_CHARGE_PER_FRAME` before the reader notices. They are deliberately not
+  summed into a per-session total: a total has to enumerate every allocation the receive
+  path makes, including the ones beneath this layer — the byte pipe's receive accumulator,
+  the PhantomUDP fragment reassembler, the `Stream` structures themselves — and a sum that
+  misses one reads as a bound while being an estimate.
 - **`migrate()` on a non-migration transport now returns `Err(CoreError::Unsupported)`**
   instead of a silent `Ok(())` no-op. Real migration requires a UDP-backed session
   (`connect_pinned_udp*`); on TCP / WebSocket / WASI / Embedded it now errors honestly.
@@ -686,29 +774,45 @@ removes Swift's `Equatable`. Both are detailed below.
   `PhantomSession::connect_with_transport_with_runtime` and
   `PhantomListener::bind_with_runtime` survive, as do `connect_with_transport` and the
   UniFFI-exported free functions and constructors. `PhantomStream::recv()` returns
-  `Option<Vec<u8>>` (`None` = clean EOF). All breaking, within the pre-1.0 0.2.x window.
+  `Option<Vec<u8>>` (`None` = clean EOF). All breaking (0.2 → 0.3).
 - **`PhantomUdpListener::accept()` now takes an owned receiver** (`self: Arc<Self>`
   instead of `self: &Arc<Self>`) — required by its new UniFFI export. Rust callers
-  write `listener.clone().accept().await`. Breaking, within the pre-1.0 0.2.x window.
-- **`MetricsSnapshotFfi` gained a field, which breaks every FFI consumer built against
-  0.2.2 — and breaks the C one silently.** `unencrypted_dropped_total` (see Added) sits
-  between `aead_failure_total` and `uptime_secs`, and a UniFFI record is lowered as its
-  fields in declaration order with nothing on the wire naming them. Nothing catches this at
-  load time: UniFFI's per-function checksums are computed from the function's name and the
-  *names* of its argument and return types, so adding a field to a record leaves every
-  checksum and the contract version unchanged. Python, Swift and Kotlin fail at the call
-  instead — their generated lift asserts the buffer was fully consumed and raises "junk
-  data left in buffer" / `incompleteData` — which is loud but says nothing about the cause.
-  A C consumer walking the buffer per the layout documented in
-  `tests/bindings/c/phantom_protocol.h` gets no error at all: it reads the new counter as
-  `uptime_secs` and stops one field short.
+  write `listener.clone().accept().await`. Breaking (0.2 → 0.3).
+- **`ConnectionState` crosses the FFI as different numbers, and a C consumer has to
+  re-derive them.** UniFFI lowers an enum as a 4-byte big-endian integer counted from 1 in
+  *declaration order*, not as its Rust discriminant. Removing `ClassicalReady`,
+  `PqcUpgrading` and `PqcReady` (see **Removed**) therefore moved every later variant down
+  three places, and `Draining` took the next free one:
 
-  What a consumer must do: regenerate. `tests/bindings/generate_{python,swift,kotlin}.sh`
-  produce the updated glue and the in-tree bindings are already regenerated with it; C
-  consumers must re-copy `phantom_protocol.h` and re-check any hand-written decoder against
-  the `PhantomMetricsSnapshotFfi` layout in it. Bindings and native library must be shipped
-  as a matched pair — a new `libphantom_protocol` under an old binding is the failure above.
-  Breaking, within the pre-1.0 0.2.x window.
+  | Variant | Rust discriminant | Lowered in 0.2.2 | Lowered in 0.3.0 |
+  |---|---|---|---|
+  | `Connecting` | 0 | 1 | 1 |
+  | `ClassicalReady` | 1 | 2 | removed |
+  | `PqcUpgrading` | 2 | 3 | removed |
+  | `PqcReady` | 3 | 4 | removed |
+  | `Connected` | 4 | 5 | 2 |
+  | `Failed` | 5 | 6 | 3 |
+  | `Closed` | 6 | 7 | 4 |
+  | `Migrating` | 7 | 8 | 5 |
+  | `Dead` | 8 | 9 | 6 |
+  | `Draining` | 9 | new | 7 |
+
+  Nothing fails loudly for a hand-written C decoder that keeps the 0.2.2 numbering: it reads
+  `Connected` as `ClassicalReady`, `Failed` as `PqcUpgrading`, `Closed` as `PqcReady`,
+  `Migrating` as `Connected`, `Dead` as `Failed` and `Draining` as `Closed` — a path that
+  went silent reads as connected, and a dead session as a failed connect. Re-derive the
+  numbers from the comment beside `connection_state()` in
+  `tests/bindings/c/phantom_protocol.h`, which now states them; the 0.2.2 header gave a
+  table that matched neither column (see **Fixed**). The Python, Swift and Kotlin
+  converters are generated from the same declaration as the library, so a regenerated
+  binding agrees with it, and a stale one against the new library already fails its
+  checksum at load (see the dependency entry).
+
+  The promise that discriminants `1..=3` are never reused covers the Rust `#[repr(u8)]`
+  value only. The generated enums copy that value into their own `value` / `rawValue`
+  (Python, Kotlin, Swift), so those still read `4` for `Connected` in both releases; the
+  number that crosses the FFI, and Kotlin's `ordinal`, are declaration positions and moved.
+  Breaking (0.2 → 0.3).
 
 ### Added
 
@@ -883,6 +987,15 @@ removes Swift's `Equatable`. Both are detailed below.
   64 KiB initial window — 2.6 Mbit/s on a 200 ms path, with nothing in the affected sessions
   distinguishing that from a slow path. The present design's failure mode is a host sized
   too small, which an operator can see and fix.
+
+  No server flag derives a session cap from a memory figure: the two that did during
+  development (`--max-recv-memory-mib` with a `SESSION_RECV_MEMORY_COMMITMENT` constant,
+  then `--max-recv-window-growth-mib`) were withdrawn before any release, because an
+  operator hands a MiB-denominated flag a memory limit and what came back was a session cap
+  that memory could not support — so `phantom-server` logs `recv_window_growth_commitment`
+  beside the session cap instead, and sizing stays a measurement against
+  `PHANTOM_MAX_SESSIONS`.
+
 - **Two encoder-only conformance checks in `tests/wire_vectors_decode.py`, covering the
   signed handshake transcript and the 47-byte AEAD AAD image.** Every check the independent
   decoder carried until now was a round trip, and a round trip has a blind spot that matters
@@ -967,10 +1080,11 @@ removes Swift's `Equatable`. Both are detailed below.
   refused what arrived" looked identical. It now increments a lock-free counter alongside
   `replay_rejected_total` and `aead_failure_total` and surfaces through `MetricsSnapshot` /
   `MetricsSnapshotFfi`, so it is readable from every language binding with no exporter
-  configured. The FFI record gains one `u64` field, and the Python, Swift, Kotlin and
-  hand-curated C surfaces are regenerated with it. The testbed's own `ClientMetrics` carries
-  it too, so a wire-capture record now shows whether the gate fired — the one thing a capture
-  cannot establish, since header protection hides the flag the gate reads.
+  configured. It is one `u64` field of that record (itself new in this release, see "In-app
+  metrics over FFI"), carried by the Python, Swift, Kotlin and hand-curated C surfaces
+  alike. The testbed's own `ClientMetrics` carries it too, so a wire-capture record now
+  shows whether the gate fired — the one thing a capture cannot establish, since header
+  protection hides the flag the gate reads.
 
   And `core/tests/security_invariants.rs` — the file this project points auditors at as the
   place its numbered invariants are pinned — did not drive that receive path at all. What it
@@ -1856,17 +1970,17 @@ removes Swift's `Equatable`. Both are detailed below.
   at the peer, and raising it moves the cliff rather than removing it. Below the cap the
   emitted bytes are exactly what they were.
 
-- **The receive window's ceiling sat below the path.** `MAX_RECV_WINDOW` was 512 KiB, and a
-  window of `W` bytes admits `W / RTT` bytes per second whatever congestion control decides.
-  On the 235 ms path this transport was last measured on that is 17.85 Mbit/s, against
-  41.8 and 42.9 Mbit/s of raw one-way UDP over the same path in two runs; server-side
-  samples showed inflight pinned flat against the cap at 492–520 KB run after run. The
-  ceiling is now 1 MiB, which doubles that to 35.7 Mbit/s. It is not raised further because
-  nothing above it is reachable: a stream's ARQ send buffer holds at most 1024 unacked
-  segments of at most 1156 bytes, so 1 183 744 B is all one stream can ever have
-  outstanding whatever credit it is granted, and window granted past that is memory
-  committed for data that cannot arrive. Moving both together is a separate change with its
-  own memory case to make.
+- **The receive window's ceiling sat below the path.** The auto-tuned window (the entry
+  below) first capped at 512 KiB, and a window of `W` bytes admits `W / RTT` bytes per
+  second whatever congestion control decides. On the 235 ms path this transport was last
+  measured on that is 17.85 Mbit/s, against 41.8 and 42.9 Mbit/s of raw one-way UDP over the
+  same path in two runs; server-side samples showed inflight pinned flat against the cap at
+  492–520 KB run after run. The ceiling is now 1 MiB, which doubles that to 35.7 Mbit/s. It
+  is not raised further because nothing above it is reachable: a stream's ARQ send buffer
+  holds at most 1024 unacked segments of at most 1156 bytes, so 1 183 744 B is all one
+  stream can ever have outstanding whatever credit it is granted, and window granted past
+  that is memory committed for data that cannot arrive. Moving both together is a separate
+  change with its own memory case to make.
 
   The receive-side memory a session can be made to commit is now bounded by a session-wide
   growth budget (`SESSION_RECV_WINDOW_GROWTH_BUDGET`, 8 MiB) that every doubling draws on
@@ -2010,13 +2124,16 @@ removes Swift's `Equatable`. Both are detailed below.
   before, it moved from 1.34 to 2.59 Mbit/s and stopped. Sustained loss still costs the
   sender a 37.5% window reduction, and a clean path returns it in full.
   What is deliberately not implemented: `bw_lo` / `bw_hi`, the draft's short-term
-  *bandwidth* bounds. They exist to bound the pacing rate, and this crate's pacer is inert
-  on the live path (`Pacer::unlimited()` at every `Session` construction, `set_enabled`
-  never called), so a second bound there would be a knob wired to nothing — the congestion
-  window is the only limiter the drain loop consults. `BBRCheckStartupHighLoss` is also
-  omitted: the inflight bound already caps Startup's overshoot, and a second Startup exit
-  keyed on loss would end the connection's only exponential-growth phase on exactly the
-  class of path this change is about.
+  *bandwidth* bounds. They bound the pacing rate on a shorter horizon than `btl_bw`'s
+  maximum filter, and since the drain now consults the pacer (the entry above on the
+  congestion window being released as a burst) they would be wired to something. They are
+  still left out: this controller already answers loss with a volume bound, and adding a
+  second, faster response to the same signal without a measurement to size it against is
+  how a controller acquires two knobs that fight. The congestion window decides how much
+  may be outstanding; the pacer decides how fast it leaves. `BBRCheckStartupHighLoss` is
+  also omitted: the inflight bound already caps Startup's overshoot, and a second Startup
+  exit keyed on loss would end the connection's only exponential-growth phase on exactly
+  the class of path this change is about.
   `Session::bbr_bytes_lost()` replaces the BBR phase as the observable for "the send path
   reported a retransmission to congestion control".
   **Sender-local congestion control only: no wire-format, handshake or key-schedule change,
@@ -2034,11 +2151,13 @@ removes Swift's `Equatable`. Both are detailed below.
   The receiver now auto-tunes the window it advertises, the same mechanism TCP receive-window
   auto-tuning and QUIC flow-control auto-tuning implement. Over a measurement interval of
   two round trips, if the application consumed more than four fifths of a window, the window
-  is close enough to being the binding constraint to double it, up to the existing 512 KiB
-  `MAX_SEND_WINDOW` — so the advertised window converges on two and a half bandwidth-delay
-  products and stops. The threshold sits deliberately below the round half, because a flow
-  that really is window-limited achieves about half its nominal ceiling and a test placed on
-  that figure would never fire on the flow it exists for.
+  is close enough to being the binding constraint to double it, up to `MAX_RECV_WINDOW`
+  (1 MiB as released: it was 512 KiB, equal to `MAX_SEND_WINDOW` at the time, until the
+  entry above on the receive window's ceiling raised both) — so the advertised window
+  converges on two and a half bandwidth-delay products and stops. The threshold sits
+  deliberately below the round half, because a flow that really is window-limited achieves
+  about half its nominal ceiling and a test placed on that figure would never fire on the
+  flow it exists for.
   What the growth is tied to is the whole of its safety argument: **delivery onward, never
   arrival**. The counter is fed only by the delivery task, so nothing a peer merely sends
   moves the window. Delivery is one bounded queue short of the application reading, though,
@@ -2415,8 +2534,11 @@ removes Swift's `Equatable`. Both are detailed below.
   `stream_offset` is a frame counter starting at 0 rather than a byte position, and closing a
   stream is a zero-length `RELIABLE | FIN` segment that consumes one; § 6.1, nothing under
   the handshake is reliable on PhantomUDP — the client re-sends its whole flight on a bounded
-  stop-and-wait schedule and the server never retransmits, so a lost `HelloRetryRequest` is
-  repaired and a lost `ServerHello` is not; § 6.2, there is no client authentication at all
+  stop-and-wait schedule and the server holds no timer, answering only a hello in front of
+  it, so a client must tolerate a duplicate reply and act on the first (a lost
+  `HelloRetryRequest` is re-derived from the repeated hello, and a lost `ServerHello` is
+  repaired by the listener repeating the reply flight it retained, whose six rules § 6.1
+  now carries as well — see **Fixed**); § 6.2, there is no client authentication at all
   and `ClientHello.client_verify_key` is carried, transcript-covered and verified by nobody;
   § 6.6, resumption transmits nothing — both ends derive the secret from the previous
   session's shared secret and reuse its `session_id`, so there is no ticket message to look
@@ -2471,40 +2593,6 @@ removes Swift's `Equatable`. Both are detailed below.
   failure mode is silent for structured payloads: the first chunk still parses, with
   the tail gone. Embedders that need message semantics must frame and reassemble
   themselves; `testbed/src/framing.rs` is a worked example.
-- **`migrate()` on a non-migration transport now returns `Err(CoreError::Unsupported)`**
-  instead of a silent `Ok(())` no-op. Real migration requires a UDP-backed session
-  (`connect_pinned_udp*`); on TCP / WebSocket / WASI / Embedded it now errors honestly.
-- **Combinatorial Rust constructors were removed** in favour of the builder:
-  `PhantomSession::connect_with_resumption`,
-  `PhantomListener::bind_with_signing_key_with_runtime`, and
-  `PhantomListener::bind_with_signing_key_mimic`. The runtime-injection shims
-  `PhantomSession::connect_with_transport_with_runtime` and
-  `PhantomListener::bind_with_runtime` survive, as do `connect_with_transport` and the
-  UniFFI-exported free functions and constructors. `PhantomStream::recv()` returns
-  `Option<Vec<u8>>` (`None` = clean EOF). All breaking, within the pre-1.0 0.2.x window.
-- **`PhantomUdpListener::accept()` now takes an owned receiver** (`self: Arc<Self>`
-  instead of `self: &Arc<Self>`) — required by its new UniFFI export. Rust callers
-  write `listener.clone().accept().await`. Breaking, within the pre-1.0 0.2.x window.
-- **`ConnectionState::{ClassicalReady, PqcUpgrading, PqcReady}` and
-  `PhantomSession::is_pqc_ready()` were removed.** They belonged to a staged
-  classical-then-post-quantum upgrade the protocol never shipped: the hybrid handshake is a
-  single flight, so no production path ever wrote those three states and `is_pqc_ready()`
-  was permanently false. An embedder following the rustdoc would have waited for a state
-  that cannot arrive, or gated its send path on a readiness flag that never turns true.
-  The session rustdoc now describes the machine that exists —
-  `Connecting → Connected → Migrating → Dead`, plus `Failed`, `Closed` and the
-  peer-initiated `Draining` added later in this window. Use
-  `is_data_ready()`: because the handshake is one flight, a data-ready session is
-  post-quantum protected by construction. Discriminants `1..=3` are left retired rather
-  than reused. Breaking for the FFI enum and for `is_pqc_ready()` callers, within the
-  pre-1.0 breaking window.
-- **`PhantomSession::current_epoch()` and `set_rekey_threshold()` are no longer exported
-  over FFI.** Both documented themselves as Rust-only while sitting inside the UniFFI
-  export block. `set_rekey_threshold` lowers the watermark that triggers key rotation on a
-  live session — a knob on the same axis as the `AEAD_MAX_INVOCATIONS` ceiling, which is
-  documented as not to be moved without an audit — so it should not have reached foreign
-  callers by accident. Both remain public Rust API for soak and integration harnesses.
-  Breaking for any binding consumer that called them.
 - **`docs/DEFERRED_WORK.md` §4 no longer rests its ECN deferral on an `unsafe` block that
   does not exist.** It argued that reading the ingress ECN codepoint would mean a *net-new*
   `unsafe` `recvmsg`/cmsg path in `udp_transport.rs`, parenthesising that "the module's only
@@ -3511,3 +3599,11 @@ dependency changes** — binary- and wire-compatible with 0.2.0
   silently exhausted the BBR congestion window after a few dozen packets and
   stalled all further sends. Send accounting now uses the payload length, so
   inflight balances exactly against the ACK and loss paths.
+
+[Unreleased]: https://github.com/snaart/phantom_protocol/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/snaart/phantom_protocol/compare/v0.2.2...v0.3.0
+[0.2.2]: https://github.com/snaart/phantom_protocol/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/snaart/phantom_protocol/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/snaart/phantom_protocol/compare/v0.1.1...v0.2.0
+[0.1.1]: https://github.com/snaart/phantom_protocol/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/snaart/phantom_protocol/releases/tag/v0.1.0
