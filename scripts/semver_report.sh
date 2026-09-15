@@ -72,8 +72,19 @@ REPORT="${1:-${REPO_ROOT}/semver-report.txt}"
 FEATURES="telemetry-otel,mimicry,embedded"
 
 if ! command -v cargo-semver-checks > /dev/null 2>&1; then
+    # Name the version CI runs, read from the workflow rather than repeated
+    # here: a different release has a different set of lints, so a local run
+    # with it is not the check the pull request will get.
+    PINNED="$(
+        sed -nE 's/^[[:space:]]*tool:[[:space:]]*cargo-semver-checks@([^[:space:]]+).*$/\1/p' \
+            "${REPO_ROOT}/.github/workflows/release.yml" 2>/dev/null | head -n 1
+    )"
     echo "semver_report: cargo-semver-checks is not installed." >&2
-    echo "  cargo install --locked cargo-semver-checks" >&2
+    if [ -n "${PINNED}" ]; then
+        echo "  cargo install --locked cargo-semver-checks --version ${PINNED}" >&2
+    else
+        echo "  cargo install --locked cargo-semver-checks" >&2
+    fi
     exit 2
 fi
 

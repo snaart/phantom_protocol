@@ -70,10 +70,27 @@ jobs:
       # that action runs the tool itself and leaves the output only in the job
       # log, and the report is the deliverable here. `taiki-e/install-action` is
       # already the installer this repository uses for cargo-fuzz.
+      #
+      # The version is pinned. Unpinned, the installer takes whatever was
+      # released last, so the set of lints that decides this job changes under
+      # a PR that did not touch it: a new release that adds a lint can fail an
+      # unchanged tree, and the failure reads as a defect in whichever PR
+      # happened to run next. When 0.50.0 was pinned it was run against this
+      # tree on rustc 1.93.0 (the MSRV) and 1.98.1 (the `stable` of the day):
+      # both runs reached a verdict, they agreed, and every break they
+      # reported is named in CHANGELOG.md. The installer's manifest at the
+      # pinned action SHA carries this version's checksums.
+      #
+      # The cost of a pin is that `stable` keeps moving and the tool does not:
+      # a later rustc can emit a rustdoc JSON format this release cannot read.
+      # That fails loudly — semver_report.sh finds no verdict line and exits
+      # non-zero — and the fix is to move the pin, as its own change, after
+      # running scripts/semver_report.sh with the new version and
+      # scripts/check_changelog_breaking.py on its report.
       - name: Install cargo-semver-checks
         uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2
         with:
-          tool: cargo-semver-checks
+          tool: cargo-semver-checks@0.50.0
       - name: Compare the public API against the published release
         run: scripts/semver_report.sh "${GITHUB_WORKSPACE}/semver-report.txt"
       # `always()` on both of the next two steps: a report is most worth having
