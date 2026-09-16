@@ -44,8 +44,10 @@ Compliance: ✅ class A satisfied.
 
 ### Path-validation challenge response (Class A)
 
-`core/src/transport/path.rs` — `Session::complete_path_validation`.
-The 32-byte challenge is server-issued and unique per `(path_id, session)`.
+`core/src/transport/path.rs` — `PathRegistry::verify_response`, reached
+from `Session::complete_path_validation` (`core/src/transport/session.rs`),
+which delegates to it. The 32-byte challenge is server-issued and unique per
+`(path_id, session)`.
 The response from the peer is attacker-controllable.
 
 Discipline:
@@ -63,14 +65,16 @@ controllable (the client submits it).
 Discipline:
 - The PoW invariant is "leading zero bits of `BLAKE3(nonce ‖ solution_le)`
   ≥ difficulty" — an **unkeyed** hash over public inputs. The hash is
-  computed in full regardless of the result; the zero-bit count is
-  evaluated by reading bytes left-to-right and comparing each byte to
-  `0u8`. The early termination happens on a non-zero byte, but the loop
-  bound is `difficulty / 8 + 1` — which is determined by the **server's**
-  policy, not the attacker. No secret bytes flow into the loop counter.
+  computed in full regardless of the result; the zero-bit count
+  (`check_leading_zeros`, same file) reads bytes left-to-right and stops at
+  the first non-zero byte, so its running time depends on the hash value.
+  That value is a public function of the challenge nonce and the
+  attacker's own solution — the attacker can compute it offline — so the
+  early exit reveals nothing the attacker does not already hold. No secret
+  bytes flow into the loop.
 
-Compliance: ✅ class A satisfied. (The early-exit is on `difficulty`, a
-public server policy parameter; not on a secret.)
+Compliance: ✅ class A satisfied. (The early exit depends on the unkeyed
+hash of public inputs, not on a secret.)
 
 ### PoW challenge-integrity MAC (Class A) — CRYPTO-2/HS-04
 
@@ -89,11 +93,12 @@ Compliance: ✅ class A satisfied (since CRYPTO-2/HS-04).
 ### 0-RTT resumption binder (Class A)
 
 `core/src/transport/handshake.rs` — `HandshakeServer::has_valid_resume`
-(handshake.rs:809) and the resume fast path in `process_client_hello`
-(handshake.rs:902) compare the client-supplied
-`ClientHello.resumption_binder` against `derive_resumption_binder(secret,
-rid, nonce)` (handshake.rs:495), which is keyed by the cached 32-byte
-resumption secret. The presented binder is fully attacker-controllable.
+and the 0-RTT resume fast path at the top of
+`HandshakeServer::process_client_hello` (the closure that builds `resumed`)
+compare the client-supplied `ClientHello.resumption_binder` against
+`derive_resumption_binder(secret, rid, nonce)` (a free function in the same
+file), which is keyed by the cached 32-byte resumption secret. The presented
+binder is fully attacker-controllable.
 
 Discipline:
 - `bool::from(presented.ct_eq(&expected))` via `subtle::ConstantTimeEq`.
@@ -154,9 +159,9 @@ Compliance: N/A — packet numbers are public.
 ### Session ID compares
 
 `core/src/api/session.rs` / `core/src/transport/handshake.rs` — `SessionId`
-is `[u8; 32]`. Since WIRE v5 it is **never transmitted**: it is bound into
-the 47-byte AEAD AAD image only, and the receiver fills it from session
-context before the AEAD open. It is a routing/context identifier, not a
+(defined in `core/src/transport/types.rs`) is `[u8; 32]`. Since WIRE v5 it
+is **never transmitted**: it is bound into the 47-byte AEAD AAD image only,
+and the receiver fills it from session context before the AEAD open. It is a routing/context identifier, not a
 confidentiality secret, and both peers already hold it.
 
 Compliance: ✅ class C — plain `==` is correct.

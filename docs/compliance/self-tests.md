@@ -11,7 +11,7 @@ This document describes the self-test implementation for Phantom Protocol. **Pow
 | Type | When | What it proves |
 | --- | --- | --- |
 | **POST** | At module initialization (first `PhantomListener::bind` / `PhantomSession::connect`). | Each primitive implementation matches its standardized test vectors — i.e. the code path is bug-free for at least the published KAT inputs. |
-| **PCT** | After every key-pair generation (`HybridSigningKey::generate`, `HybridKemSecret::generate`). | The newly generated key pair satisfies the algorithm's correctness property (e.g., `verify(sign(m, sk), pk, m) == OK`). Detects RAM corruption or fault injection during keygen. |
+| **PCT** | After every key-pair generation (`HybridSigningKey::generate`, `HybridSecretKey::generate`). | The newly generated key pair satisfies the algorithm's correctness property (e.g., `verify(sign(m, sk), pk, m) == OK`). Detects RAM corruption or fault injection during keygen. |
 | **CST** (continuous self-test) | On every cryptographic operation, on hot paths where allowed. | Entropy source has not regressed; cipher implementation continues to produce expected output for sentinel inputs. **Most CSTs are platform-provided** by `aws-lc-rs` / `ring`. |
 | **On-demand** | API: `crypto::self_tests::run_post()` (re-runs the full battery) or `ensure_post_passed()` (cached single-shot). | Operator can run the POST explicitly; the `fips` bootstrap calls `ensure_post_passed()` automatically. |
 
@@ -93,9 +93,13 @@ trimmed `.json` files (`ml_kem_768_keygen.json`,
 | X25519 keypair | Compute `dh = X25519(sk, base_point)`. Compare against `pk` for consistency. |
 | ML-KEM-768 keypair | `encap(pk)` to produce `(ss, ct)`; `decap(sk, ct)` must yield `ss`. |
 
-Failure → return `CryptoError::PairwiseConsistencyFailed` and zero all key
-material immediately. Caller is responsible for re-attempting keygen
-(typically once — sustained failures indicate RAM corruption).
+Failure → the shipped signing-key check returns `Err(HybridSignError)`
+(`HybridSigningKey::pairwise_consistency_check`, `core/src/crypto/hybrid_sign.rs`)
+and the generation site refuses the key, which is zeroized when it drops —
+for example `HandshakeServer::new` / `HandshakeServer::new_with_cache` fail
+construction with `HandshakeError::RngError`. Caller is responsible for
+re-attempting keygen (typically once — sustained failures indicate RAM
+corruption).
 
 ## Continuous self-tests
 

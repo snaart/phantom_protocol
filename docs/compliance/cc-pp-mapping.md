@@ -124,27 +124,31 @@ Client (has prior resumption_hint)              Server
 ```
 
 The server `peek()`s the cached ticket, verifies the
-`ClientHello.resumption_binder` in constant time
-(`transport/handshake.rs:897-910`), then **eagerly** consumes it via
+`ClientHello.resumption_binder` in constant time (the 0-RTT resume fast
+path at the top of `HandshakeServer::process_client_hello`,
+`transport/handshake.rs`), then **eagerly** consumes it via
 `remove()` (race-free one-shot) and re-inserts it unchanged on any later
-handshake failure. A replayed ClientHello therefore finds no ticket and
-falls back to 1-RTT + the cookie/PoW gate. `SessionCache::try_resume`
-(`transport/session_cache.rs:160`) survives on the type but is exercised
-only by tests (`session_cache.rs:308`).
+handshake failure (`HandshakeServer::fail_and_reinsert`). A replayed
+ClientHello therefore finds no ticket and falls back to 1-RTT + the
+cookie/PoW gate. `SessionCache::try_resume` (`transport/session_cache.rs`)
+survives on the type but is exercised only by tests (for example
+`try_resume_is_one_shot` in that file's test module).
 
 ### Session Data (post-handshake)
 
 All application data is wrapped in a single `PhantomPacket` frame:
 
 - Every outbound packet has `PacketFlags::ENCRYPTED` set (`api/session.rs`
-  — `run_data_pump` send path).
+  — `send_app_data`, the `run_data_pump` send path).
 - Every inbound packet is AEAD-decrypted before delivery; **every**
   post-handshake packet without `ENCRYPTED` is silently dropped, including
-  an empty-payload one (`api/session.rs` — `run_data_pump` recv path).
+  an empty-payload one (`api/session.rs` — `handle_packet`, called from
+  `run_data_pump`'s receive task).
 - Rekey: `Session::rekey()` derives the next epoch key via
   `HKDF-Expand(current, "phantom-rekey-v1", 32)` and performs an `ArcSwap`
   store — the old `CryptoState` is zeroed when the last reader drops it
-  (`transport/session.rs:741-760`). The epoch counter is `u8` and never
+  (`transport/session.rs` — `Session::rekey`, which installs the new epoch
+  through `Session::commit_forward_crypto`). The epoch counter is `u8` and never
   wraps: `rekey()` returns an error at `u8::MAX` (reconnect required).
 - Single per-direction replay window (`security/replay_window.rs`) with a
   1024-bit bitmap keyed on the u64 packet number, checked *after* AEAD
@@ -193,7 +197,7 @@ everything is now a `SessionTransport`.
 | FCS_CKM.1.2 | Keygen — asymmetric (KEM / key establishment) | `crypto/hybrid_kem.rs` — `HybridSecretKey::generate`: ephemeral X25519 secret (default) / ECDH P-256 (under `--features fips`, via `aws-lc-rs::agreement`) + ML-KEM-768 decapsulation key per handshake. | OK | X25519 is not FIPS-approved; the **`fips` build swaps the classical leg to ECDH P-256** (shipped). ML-KEM-768 is FIPS 203. |
 | FCS_CKM.2.1 | Key establishment — hybrid KEM | `transport/handshake.rs` — `process_client_hello`: server encapsulates into client's ML-KEM-768 public key; the classical DH (X25519 default / ECDH P-256 under `--features fips`) runs in parallel; combined shared secret via HKDF (`kdf.rs`). | OK | Both KEM legs must succeed. The FIPS-approved P-256 classical leg ships under `--features fips`. Evidence: `core/tests/security_invariants.rs` (`tampered_ciphertext_is_rejected`). |
 | FCS_CKM.3.1 | Key distribution (server public key) | `api/listener.rs` — `PhantomListener::verifying_key_bytes()` exposes the public verifying key bytes for out-of-band distribution to clients. Private key never leaves the process. | ✅ | `key-management.md §1` documents the distribution responsibility. |
-| FCS_CKM.4.1 | Key destruction / zeroization | `crypto/hybrid_sign.rs` — `#[derive(ZeroizeOnDrop)]` on `HybridSigningKey`. `transport/session.rs` — `CryptoState` zeroed on drop. `transport/handshake.rs` — client nonce + server master secret zeroed on drop. | ✅ | `key-management.md` §Storage classes table. All heap-resident secrets zeroed; ring `LessSafeKey` interior noted as partial (ring does not expose its interior for zeroize — documented gap). |
+| FCS_CKM.4.1 | Key destruction / zeroization | `crypto/hybrid_sign.rs` — `#[derive(ZeroizeOnDrop)]` on `HybridSigningKey`. `transport/session.rs` — `CryptoState` zeroed on drop. `transport/handshake.rs` — client nonce + server master secret zeroed on drop. | ✅ | `key-management.md` §Storage classes and zeroize-on-drop coverage. All heap-resident secrets zeroed; ring `LessSafeKey` interior noted as partial (ring does not expose its interior for zeroize — documented gap). |
 
 #### FCS_COP: Cryptographic Operations
 
@@ -202,8 +206,8 @@ everything is now a `SessionTransport`.
 | FCS_COP.1(1) | AES-256-GCM encryption | `crypto/adaptive_crypto.rs` — `CipherSuite::Aes256Gcm` uses `ring::aead::AES_256_GCM` (default build) / `aws_lc_rs::aead` AES-256-GCM (under `--features fips`, AWS-LC-FIPS backend, ring-free). `AEAD_MAX_INVOCATIONS = 2^48` enforced (`NonceExhausted` error). | ✅ | Hardware-accelerated via AES-NI / ARMv8 crypto. Nonce exhaustion guard satisfies NIST SP 800-38D §8.3. |
 | FCS_COP.1(2) | ChaCha20-Poly1305 encryption | `crypto/adaptive_crypto.rs` — `CipherSuite::ChaCha20Poly1305` via `ring`. Available as software fallback on platforms without AES-NI. | OK | Not FIPS-approved. **Under `--features fips` it is rejected at handshake with `CoreError::CipherSuiteUnavailable`** (shipped); the enum variant is retained only for wire-format stability. Remains selectable on the default build as an OE-policy choice. |
 | FCS_COP.1(3) | SHA-256 hashing | Transitively via `hkdf`, `hmac` crates (both backed by `sha2`). Used in HKDF-SHA-256, HMAC-SHA-256 cookie derivation (`transport/handshake.rs` — `derive_session_secret_for_hour` / `generate_cookie_for_bucket`), session-ID derivation (`handshake.rs` — `derive_session_id`). | ✅ | FIPS 180-4. |
-| FCS_COP.1(4) | HMAC-SHA-256 (integrity / cookie) | `transport/handshake.rs:1546-1601` — `generate_cookie_for_bucket` HMACs the client IP string plus the 5-minute bucket index under an hour-rotating derived secret (no port). Constant-time accumulation over the 2×2 (hour × bucket) candidate set in `validate_cookie`, reached from `cookie_pow_gate` (class A, `constant-time-audit.md §Cookie validation`). | ✅ | FIPS 198-1. Negative evidence: `security_invariants.rs` (`cookie_tampering_yields_retry_not_success`). |
-| FCS_COP.1(5) | HKDF-SHA-256 (key derivation) | `crypto/kdf.rs` — `derive_key_32` (blake3 on the default build / HKDF-SHA-256 under fips) + `derive_early_data_keying`; session-key label `"phantom-transport-key"` (`transport/session.rs:131`), rekey label `"phantom-rekey-v1"`, cookie/PoW bucket derivation (`handshake.rs:1500-1602`, label `"phantom-pow-cookie-v1"`). | ✅ | NIST SP 800-56C. KDF labels documented in `docs/protocol/PROTOCOL.md §4`. CAVP vectors: `core/tests/cavp.rs`. |
+| FCS_COP.1(4) | HMAC-SHA-256 (integrity / cookie) | `transport/handshake.rs` — `generate_cookie_for_bucket` HMACs the client IP string plus the 5-minute bucket index under an hour-rotating derived secret (no port). Constant-time accumulation over the 2×2 (hour × bucket) candidate set in `validate_cookie`, reached from `cookie_pow_gate` (class A, `constant-time-audit.md §Cookie validation`). | ✅ | FIPS 198-1. Negative evidence: `security_invariants.rs` (`cookie_tampering_yields_retry_not_success`). |
+| FCS_COP.1(5) | HKDF-SHA-256 (key derivation) | `crypto/kdf.rs` — `derive_key_32` (blake3 on the default build / HKDF-SHA-256 under fips) + `derive_early_data_keying`; session-key label `"phantom-transport-key"` (`transport/session.rs` — `CryptoState::new`), rekey label `"phantom-rekey-v1"` (`Session::rekey`), cookie/PoW bucket derivation (`transport/handshake.rs` — `derive_session_secret_for_hour`, label `"phantom-pow-cookie-v1"`, over the constants `COOKIE_BUCKET_SECONDS` and `SECRET_ROTATION_SECONDS`). | ✅ | NIST SP 800-56C. KDF labels documented in `docs/protocol/PROTOCOL.md §4`. CAVP vectors: `core/tests/cavp.rs`. |
 | FCS_COP.1(6) | ML-KEM-768 encap / decap | `crypto/hybrid_kem.rs` — `ml-kem` crate (RustCrypto, pure-Rust, FIPS 203). Both encapsulate and decapsulate exercised per handshake. | ✅ | FIPS 203. CAVP vectors: `core/tests/cavp.rs`. |
 | FCS_COP.1(7) | ML-DSA-65 sign / verify | `crypto/hybrid_sign.rs` — `HybridSigningKey::sign` + `HybridVerifyingKey::verify`. Both halves must succeed; the one-failure-is-failure policy is enforced inside `HybridVerifyingKey::verify`. | ✅ | FIPS 204. Negative: `security_invariants.rs` (`server_identity_mismatch_aborts_handshake`). |
 | FCS_COP.1(8) | Ed25519 sign / verify | `crypto/hybrid_sign.rs` — `ed25519-dalek` with FIPS 186-5 EdDSA (`verify_strict` on the verify path). Paired with ML-DSA-65 in every hybrid operation. | ✅ | FIPS 186-5. |
@@ -213,13 +217,13 @@ everything is now a `SessionTransport`.
 | SFR | Title | Implementation | Status | Notes / Evidence |
 |-----|-------|---------------|--------|-----------------|
 | FCS_RBG_EXT.1.1 | DRBG seeding and operation | `crypto/rng.rs` — `RngProvider` trait; default `OsRng` delegates to `getrandom` (Linux: `getrandom(2)`, macOS: `getentropy(2)`, Windows: `BCryptGenRandom`, browser: `window.crypto.getRandomValues`). | OK | OS-provided CSPRNG satisfies intent but is not a formally validated SP 800-90A DRBG **on the default build**. The **`fips` build substitutes `aws_lc_rs::rand::SystemRandom` (SP 800-90A CTR_DRBG inside the AWS-LC-FIPS module)** via the `RngProvider for OsRng` impl (shipped). `rng-audit.md` §Backends per target has per-platform detail. |
-| FCS_RBG_EXT.1.2 | DRBG use for key material | All cryptographic key generation sites use `OsRng` or a `getrandom` direct call. Call site inventory: `rng-audit.md §RNG call sites`. | ✅ | Non-cryptographic entropy (test jitter and loss decisions, `test_harness/mod.rs:142,179`) is explicitly separated. |
+| FCS_RBG_EXT.1.2 | DRBG use for key material | All cryptographic key generation sites use `OsRng` or a `getrandom` direct call. Call site inventory: `rng-audit.md §RNG call sites`. | ✅ | Non-cryptographic entropy (test jitter and loss decisions, `test_harness/mod.rs` — `NetworkSimulator::effective_latency` and `NetworkSimulator::should_drop_packet`) is explicitly separated. |
 
 #### FCS_TLSC / FCS_IPSEC: Protocol equivalence
 
 | SFR | Title | Implementation | Status | Notes / Evidence |
 |-----|-------|---------------|--------|-----------------|
-| FCS_TLSC_EXT.1 | TLS Client | Phantom Protocol does not implement TLS. It implements its own post-quantum session protocol. | N/A | The Phantom Protocol session is the trusted channel (see `FTP_DIT.1` below). Evaluators should treat §3 of `docs/protocol/PROTOCOL.md` as the protocol specification in lieu of a TLS profile claim. The shipped `MimicTlsLeg` (`transport/legs/mimic_tls/`) presents a synthetic TLS 1.3 ClientHello to DPI while the *inner* session stays Phantom Protocol, not TLS. |
+| FCS_TLSC_EXT.1 | TLS Client | Phantom Protocol does not implement TLS. It implements its own post-quantum session protocol. | N/A | The Phantom Protocol session is the trusted channel (see `FTP_ITC.1` below). Evaluators should treat §3 of `docs/protocol/PROTOCOL.md` as the protocol specification in lieu of a TLS profile claim. The shipped `MimicTlsLeg` (`transport/legs/mimic_tls/`) presents a synthetic TLS 1.3 ClientHello to DPI while the *inner* session stays Phantom Protocol, not TLS. |
 | FCS_HTTPS_EXT.1 | HTTPS for management | Phantom Protocol does not expose an HTTPS management interface. The WebSocket leg (`legs/websocket.rs`) carries the Phantom Protocol session; it is not an independent HTTPS service. | N/A | `docs/protocol/PROTOCOL.md §11` and `docs/operations/wasm.md` describe the WebSocket transport. Metrics exposition is now via the observability module (Phase 8); the library provides `MetricsSnapshot` and OTel instruments, and the embedder integrates with collectors. The HTTP server is OE. |
 | FCS_STO_EXT.1 | Key storage | `key-management.md §Storage at rest`: Phantom Protocol does not persist any key material. All key bytes exist only in process memory. Long-term server signing key (`HybridSigningKey`) is heap-resident; ephemeral KEM keys are dropped after handshake. | ð | Platform key-store integration (iOS Keychain, Android Keystore) is OE responsibility. A future `SigningKeyBackend` trait is planned but not on the current roadmap. Evaluators must confirm the embedder's key-storage posture. |
 
@@ -229,7 +233,7 @@ everything is now a `SessionTransport`.
 
 | SFR | Title | Implementation | Status | Notes / Evidence |
 |-----|-------|---------------|--------|-----------------|
-| FTP_ITC.1.1 | Trusted channel between the TOE and remote endpoints | The Phantom Protocol session protocol is the trusted channel. After handshake, every application-data packet is AEAD-encrypted (`api/session.rs` — `run_data_pump` sets `PacketFlags::ENCRYPTED` unconditionally). Every post-handshake packet without `ENCRYPTED` is dropped on receipt, including an empty-payload one (`api/session.rs` — `run_data_pump` recv path). | ✅ | Security invariant 2 (`SECURITY.md` / `docs/security/threat-model.md`). Negative: `security_invariants.rs` (`forged_unencrypted_post_handshake_packet_is_dropped_by_the_recv_path` — drives a live session's receive path with forged unencrypted frames, including the empty-payload standalone FIN, and asserts neither their bytes nor their FIN takes effect; `tampered_ciphertext_is_rejected` and `tampered_header_is_rejected_via_aad` cover the adjacent case, a genuine packet whose flag is stripped in flight). |
+| FTP_ITC.1.1 | Trusted channel between the TOE and remote endpoints | The Phantom Protocol session protocol is the trusted channel. After handshake, every application-data packet is AEAD-encrypted (`api/session.rs` — `send_app_data`, on `run_data_pump`'s send path, sets `PacketFlags::ENCRYPTED` unconditionally). Every post-handshake packet without `ENCRYPTED` is dropped on receipt, including an empty-payload one (`api/session.rs` — `handle_packet`, the `ENCRYPTED` branch and the `else` arm that drops everything else). | ✅ | Security invariant 2 (`SECURITY.md` / `docs/security/threat-model.md`). Negative: `security_invariants.rs` (`forged_unencrypted_post_handshake_packet_is_dropped_by_the_recv_path` — drives a live session's receive path with forged unencrypted frames, including the empty-payload standalone FIN, and asserts neither their bytes nor their FIN takes effect; `tampered_ciphertext_is_rejected` and `tampered_header_is_rejected_via_aad` cover the adjacent case, a genuine packet whose flag is stripped in flight). |
 | FTP_ITC.1.2 | Channel initiation | Clients always initiate via `PhantomSession::connect_with_transport`. Server identity pinning is mandatory: `expected_server_key: HybridVerifyingKey` is a required parameter of `connect_with_transport`, and `SessionBuilder::connect` errors with `ConfigError` when `.pinned_key(...)` was never set (`api/session.rs`). The handshake passes `Some(&expected_server_key)` to `process_server_hello` — never `None`. | ✅ | Security invariant 1 (`SECURITY.md` / `docs/security/threat-model.md`). Negative: `security_invariants.rs` (`server_identity_mismatch_aborts_handshake`). |
 
 ---
@@ -238,8 +242,8 @@ everything is now a `SessionTransport`.
 
 | SFR | Title | Implementation | Status | Notes / Evidence |
 |-----|-------|---------------|--------|-----------------|
-| FPT_SKP_EXT.1.1 | Protection of TSF data in transit | AEAD on every packet (FTP_ITC.1.1 above). No raw key bytes cross the `SessionTransport` interface after handshake. | ✅ | `api/session.rs` — `run_data_pump` encrypt path and decrypt path (with the `ENCRYPTED` flag check). |
-| FPT_SKP_EXT.1.2 | Protection of TSF data at rest | Key material is not persisted (see FCS_STO_EXT.1). Zeroize-on-drop on all in-memory secrets. | ð | Partial — ring `LessSafeKey` interior is opaque, input bytes are zeroed but ring does not guarantee interior zeroization. Documented in `key-management.md §Storage classes table`. |
+| FPT_SKP_EXT.1.1 | Protection of TSF data in transit | AEAD on every packet (FTP_ITC.1.1 above). No raw key bytes cross the `SessionTransport` interface after handshake. | ✅ | `api/session.rs` — `send_app_data` (encrypt path) and `handle_packet` (decrypt path, with the `ENCRYPTED` flag check), both driven by `run_data_pump`. |
+| FPT_SKP_EXT.1.2 | Protection of TSF data at rest | Key material is not persisted (see FCS_STO_EXT.1). Zeroize-on-drop on all in-memory secrets. | ð | Partial — ring `LessSafeKey` interior is opaque, input bytes are zeroed but ring does not guarantee interior zeroization. Documented in `key-management.md §Storage classes and zeroize-on-drop coverage`. |
 | FPT_TST_EXT.1.1 | TSF self-test | CAVP-style known-answer tests are implemented for all approved primitives: `core/tests/cavp.rs`. **Power-on self-tests (POST) are shipped** in `core/src/crypto/self_tests.rs` (`run_post` / `ensure_post_passed`), auto-invoked from `PhantomListener::bind*` / `PhantomSession::connect*` / `connect_pinned*` under `--features fips`. | OK | KAT vectors present and always-on in CI. POST is wired into the fips bootstrap; failure returns `CoreError::FipsSelfTestFailure`. `self-tests.md` documents the shipped battery. |
 | FPT_AEX_EXT.1 | Anti-exploitation features | `#![deny(unsafe_code)]` at crate root (`core/src/lib.rs`). Two `unsafe` opt-ins: `transport/legs/websocket.rs` (wasm32-only, wasm-bindgen JS-boundary glue) and `transport/legs/wasi.rs` (WASI-only, `unsafe impl Send/Sync` over WIT-bindgen socket handles); a native build compiles no `unsafe` at all. MSRV 1.93 enforced in CI. Fuzz harnesses: `fuzz/` (seven libFuzzer targets, all nightly + ASan, gated on PR by `.github/workflows/fuzz.yml`). | ✅ | Unsafe discipline enforced at `core/src/lib.rs` (`#![deny(unsafe_code)]`); contributor lint policy in `CONTRIBUTING.md`. |
 
@@ -258,7 +262,7 @@ everything is now a `SessionTransport`.
 
 | SFR | Title | Implementation | Status | Notes / Evidence |
 |-----|-------|---------------|--------|-----------------|
-| FDP_RIP.1 | Residual information protection | `CryptoState` zeroized on drop. Per-handshake KEM ephemeral keys consumed and dropped after `process_server_hello` (`key-management.md §2`). Session traffic secret zeroed on rekey via `ArcSwap` drop of old `Arc<CryptoState>`. | ✅ | `key-management.md §Storage classes table`. |
+| FDP_RIP.1 | Residual information protection | `CryptoState` zeroized on drop. Per-handshake KEM ephemeral keys consumed and dropped after `process_server_hello` (`key-management.md §2`). Session traffic secret zeroed on rekey via `ArcSwap` drop of old `Arc<CryptoState>`. | ✅ | `key-management.md §Storage classes and zeroize-on-drop coverage`. |
 | FDP_IFC.1 | Subset information flow control | Replay protection: `security/replay_window.rs` — a single per-direction sliding-window bitmap (`WINDOW_BITS = 1024`) keyed on the u64 packet number, per RFC 4303 §3.4.3. Check occurs *after* AEAD verify in `Session::decrypt_packet` (`transport/session.rs`). | ✅ | Security invariant 4 (`SECURITY.md` / `docs/security/threat-model.md`). Negative: `security_invariants.rs` (`replay_window_rejects_duplicate_sequence`). |
 
 ---
@@ -271,7 +275,7 @@ configuration and security-relevant parameters. Phantom Protocol's relevant surf
 | SFR | Title | Implementation | Status | Notes |
 |-----|-------|---------------|--------|-------|
 | FMT_CFG_EXT.1.1 | Secure default configuration | Default features `["compression-zstd", "std", "bindings", "classical-crypto"]` enable all security mechanisms. No insecure mode is on-by-default. Listener-side: `PhantomListener::bind()` generates a fresh `HybridSigningKey` automatically. | ✅ | No configuration knob disables AEAD or signature verification in the public API. |
-| FMT_MEC_EXT.1.1 | Supported configuration mechanism | Configuration is code-level (`PhantomConfig` struct, `api/config.rs`). No file-based config parser; attack surface is minimal. | ✅ | `PhantomConfig` documented via UniFFI surface. |
+| FMT_MEC_EXT.1.1 | Supported configuration mechanism | Configuration is code-level (`PhantomConfig` struct, `core/src/config.rs`). No file-based config parser; attack surface is minimal. | ✅ | `PhantomConfig` documented via UniFFI surface. |
 
 ---
 
@@ -303,8 +307,8 @@ the client's IP address protection. Phantom Protocol's position:
 | ATE_FUN.1 | Functional Testing | `core/tests/security_invariants.rs` — 73 formal negative-security tests (always-on, not `#[ignore]`). `core/tests/property.rs` — proptest harness (AEAD round-trip, AAD-mismatch, replay window). `core/tests/cavp.rs` — 5 CAVP-style KAT vectors. `core/tests/tcp_integration.rs` — loopback end-to-end (run with `-- --ignored`). | Lab will execute the test suite independently. The 73 security invariant tests are the primary ATE_FUN evidence. |
 | ATE_COV.1 | Analysis of Coverage | `cargo llvm-cov` **line** coverage on stable (`--lcov --output-path lcov.info`). Coverage workflow: `.github/workflows/coverage.yml`; branch coverage is deliberately out of scope (it requires nightly's `-Z coverage-options=branch`, whose `llvm-cov export` crashes). | Line-coverage percentage for security-critical paths (crypto/, security/) should be documented in the ST; branch coverage must be argued separately. |
 | ATE_IND.1 | Independent Testing — Conformance | The lab will independently run `cargo test --manifest-path core/Cargo.toml --test security_invariants` and the property tests. The CAVP vectors in `core/tests/cavp.rs` are independently verifiable against NIST-published vectors. | None beyond providing the source and build instructions. |
-| AVA_VAN.1 | Vulnerability Survey | `docs/security/threat-model.md` — STRIDE + LINDDUN analysis, trust-boundary diagram, mitigation-to-file:line traceability. Seven libFuzzer fuzz targets in `fuzz/` — `fuzz_aead_decrypt`, `fuzz_client_hello`, `fuzz_embedded_framing`, `fuzz_hello_retry`, `fuzz_packet_parse`, `fuzz_path_validation`, `fuzz_server_hello`. All require a nightly toolchain (libFuzzer instrumentation + ASan); CI runs the full matrix on every PR touching `core/**` / `fuzz/**` (60 s per target) and 600 s on a daily cron. | No public CVE history to date. Lab will conduct independent vulnerability analysis. |
-| AVA_VAN.3 | Focused Vulnerability Analysis (EAL3+) | `docs/security/panic-sites.md` — 19 audited production panic sites with adversarial review checklist. `docs/security/cancel-safety-audit.md` — every `tokio::select!` classified. `docs/compliance/constant-time-audit.md` — every secret comparison. | Required only if evaluation targets EAL3+. Not needed for EAL2. |
+| AVA_VAN.1 | Vulnerability Survey | `docs/security/threat-model.md` — STRIDE + LINDDUN analysis, trust-boundary diagram, mitigation-to-code traceability (each pointer names a file and the item inside it). Seven libFuzzer fuzz targets in `fuzz/` — `fuzz_aead_decrypt`, `fuzz_client_hello`, `fuzz_embedded_framing`, `fuzz_hello_retry`, `fuzz_packet_parse`, `fuzz_path_validation`, `fuzz_server_hello`. All require a nightly toolchain (libFuzzer instrumentation + ASan); CI runs the full matrix on every PR touching `core/**` / `fuzz/**` (60 s per target) and 600 s on a daily cron. | No public CVE history to date. Lab will conduct independent vulnerability analysis. |
+| AVA_VAN.3 | Focused Vulnerability Analysis (EAL3+) | `docs/security/panic-sites.md` — 23 audited production panic sites (rows keyed on file and enclosing function, checked against the code by `scripts/check_panic_sites.py`) with adversarial review checklist. `docs/security/cancel-safety-audit.md` — every `tokio::select!` classified. `docs/compliance/constant-time-audit.md` — every secret comparison. | Required only if evaluation targets EAL3+. Not needed for EAL2. |
 
 ---
 
@@ -324,7 +328,7 @@ the client's IP address protection. Phantom Protocol's position:
 
 | # | SFR | Gap | Proposed Remediation | Phase |
 |---|-----|-----|---------------------|-------|
-| G-4 | FCS_RBG_EXT.1.1 | `OsRng` / `getrandom` is not a formally validated SP 800-90A DRBG on the default build. OS-provided CSPRNGs satisfy the security property but are outside the FIPS module boundary. | **CLOSED (shipped).** Under `--features fips` the `RngProvider for OsRng` substrate is `aws_lc_rs::rand::SystemRandom` (SP 800-90A CTR_DRBG inside AWS-LC-FIPS). Swap `OsRng` → `aws-lc-rs::rand::SystemRandom` under `fips` feature. `rng-audit.md §FIPS-mode requirements §1`. | 5.3 |
+| G-4 | FCS_RBG_EXT.1.1 | `OsRng` / `getrandom` is not a formally validated SP 800-90A DRBG on the default build. OS-provided CSPRNGs satisfy the security property but are outside the FIPS module boundary. | **CLOSED (shipped).** Under `--features fips` the `RngProvider for OsRng` substrate is `aws_lc_rs::rand::SystemRandom` (SP 800-90A CTR_DRBG inside AWS-LC-FIPS). Swap `OsRng` → `aws-lc-rs::rand::SystemRandom` under `fips` feature. `rng-audit.md §FIPS-mode RNG`, item 1. The swap reaches only call sites that go through `OsRng`: four direct `getrandom::fill` sites (server master secret, both handshake nonces, the initial UDP connection id) and ml-kem's internal draws still read the OS CSPRNG on the fips build — `rng-audit.md §Status of near-term actions`, item 1. | 5.3 |
 | G-5 | FCS_RBG_EXT.1.1 | `thread_rng()` entropy-downgrade fallbacks (session ID in `transport/types.rs`, the TLS-Hello random in `transport/legs/mimic_tls/`, path challenge in `transport/path.rs`) — FIPS forbids them. | **CLOSED (shipped).** The fallbacks were removed outright — not cfg-gated — when the `RngProvider` seam landed; all three sites now draw from `crate::crypto::rng::OsRng`, and `rand` is a dev-dependency only. `rng-audit.md` Section "Fallback chain semantics". | 5.3 |
 | G-6 | FCS_RBG_EXT.1.1 | Embedded target (`thumbv7em-none-eabihf`) has no validated entropy source. `getrandom` is not available. | Downstream HAL must supply a hardware TRNG driver that implements `RngProvider` (`crypto/rng.rs`). `rng-audit.md §Embedded path`. The `RngProvider` seam is shipped (Phase 3.8); the embedded entropy source remains an OE obligation. | 5.3 / OE |
 
@@ -342,7 +346,7 @@ the client's IP address protection. Phantom Protocol's position:
 | # | SFR | Gap | Proposed Remediation | Phase |
 |---|-----|-----|---------------------|-------|
 | G-11 | FCS_STO_EXT.1 | No built-in key-store integration. Platform key stores (Keychain, Keystore) are OE. | Optionally introduce a `SigningKeyBackend` trait for HSM / Keychain integration. Document OE obligation in ST. | Post-Phase-7 |
-| G-12 | FPT_SKP_EXT.1.2 | `ring::LessSafeKey` does not expose interior bytes for zeroization. Input key bytes are zeroed; ring internals are not guaranteed to be (default build). | **Partially CLOSED (shipped).** The `--features fips` build is ring-free and uses `aws-lc-rs` for the AEAD; input key bytes are zeroed regardless of backend. The default-build ring interior remains a documented known limitation — it provides a Rust-side clear path. Document as a known limitation in the interim. `key-management.md §Storage classes table`. | 5.1 |
+| G-12 | FPT_SKP_EXT.1.2 | `ring::LessSafeKey` does not expose interior bytes for zeroization. Input key bytes are zeroed; ring internals are not guaranteed to be (default build). | **Partially CLOSED (shipped).** The `--features fips` build is ring-free and uses `aws-lc-rs` for the AEAD; input key bytes are zeroed regardless of backend. The default-build ring interior remains a documented known limitation — it provides a Rust-side clear path. Document as a known limitation in the interim. `key-management.md §Storage classes and zeroize-on-drop coverage`. | 5.1 |
 
 ### Self-Test Gap
 

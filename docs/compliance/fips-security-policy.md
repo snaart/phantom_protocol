@@ -134,7 +134,8 @@ returns `true` iff the build is FIPS-feature'd AND POST has succeeded.
 
 ## 7. Key zeroization
 
-See `docs/compliance/key-management.md` §"Zeroize-on-Drop coverage". All
+See `docs/compliance/key-management.md` §"Storage classes and zeroize-on-drop
+coverage". All
 key material is zeroized when its containing struct is dropped. The
 `Drop` impls come from the `zeroize` crate's `ZeroizeOnDrop` derive.
 
