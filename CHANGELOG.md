@@ -60,6 +60,11 @@ Pointers only: each item is set out in full in the entry named.
 - The server now validates a client's ML-KEM-768 encapsulation key before encapsulating to
   it, and refuses the handshake on a malformed one — **Changed**, the `ml-kem` 0.2 → 0.3
   item of the dependency entry.
+- A peer that stopped reading, while still answering keep-alives and persist probes, could
+  keep a session the local side had closed — its pump, buffers and demux routes — running
+  for as long as it chose, and `disconnect()` blocked once the command channel was full —
+  **Fixed**, "`disconnect()` ends the session promptly even when the peer has stopped
+  reading".
 
 ### Removed
 
@@ -814,6 +819,20 @@ Pointers only: each item is set out in full in the entry named.
   number that crosses the FFI, and Kotlin's `ordinal`, are declaration positions and moved.
   Breaking (0.2 → 0.3).
 
+- **Closing a stream closes only its writing half.** `PhantomStream::disconnect()` sends a
+  FIN and nothing more: the handle keeps receiving until the peer closes too, the stream
+  stays in the session's table and counts toward `MAX_STREAMS` until both halves have
+  closed, writes made on it after `disconnect()` are discarded, and a reliable segment on
+  the receiver's own stream-id parity for an id it never opened is refused. The UniFFI
+  checksum of `PhantomStream.disconnect` moved with its documentation. Set out in full under
+  **Fixed**, "A stream closed from both ends no longer comes back through `accept_stream()`
+  or holds a slot in the session's stream limit".
+
+- **`PhantomSession::disconnect()` discards what the send buffer has not admitted when the
+  close is seen**, rather than waiting behind it. Against a healthy peer this can drop most
+  of a large payload written just before the call. Set out in full under **Fixed**,
+  "`disconnect()` ends the session promptly even when the peer has stopped reading".
+
 ### Added
 
 - **`phantom-probe --transfer-cap-secs`, and the duplex scenario now reports how much of its
@@ -1268,7 +1287,88 @@ Pointers only: each item is set out in full in the entry named.
   `aead_failure_total`. Nothing about what is counted changes; the counters were always there,
   only unreadable.
 
+- **`phantom_protocol::transport::handshake::EARLY_DATA_SEALED_MAX_LEN`**, the largest
+  sealed 0-RTT blob a server admits (`EARLY_DATA_MAX_LEN` plus the AEAD tag). See **Fixed**,
+  "A 0-RTT payload within the last 16 bytes of the limit no longer fails the resumed
+  handshake".
+
 ### Fixed
+
+- **A stream closed from both ends no longer comes back through `accept_stream()` or holds a
+  slot in the session's stream limit, and closing a stream closes only its writing half.**
+  `PhantomStream::disconnect()` sends a FIN, and a FIN closes one direction. The pump
+  treated it as closing the whole stream: once this side's FIN was acknowledged it dropped
+  the stream, read half included, so the handle's `recv()` reported `ConnectionClosed`, and
+  the peer's next segment on that id — its reply, or the FIN it sends after reading this
+  side's EOF — found no stream and was taken for the peer opening a new one. That stream
+  surfaced through `accept_stream()` with this side's own parity, nothing ever closed it,
+  and it counted against `MAX_STREAMS` (256), so after a few hundred ordinary
+  request/response exchanges the session refused every stream the peer opened and stopped
+  acknowledging their segments. A stream is now dropped only when both halves are closed —
+  its own FIN acknowledged and the peer's released in order — and the handle keeps receiving
+  until the peer closes too. A retransmitted FIN that arrives after the stream is gone is
+  acknowledged and otherwise ignored.
+
+  Two more defects in the same table are fixed with it. A stream that was only ever written
+  to filled its own bounded channel with the acknowledgements of its writes, which nothing
+  consumed; after about a thousand segments the next frame the peer sent on that stream
+  parked the session's single delivery task, and delivery to **every** other stream of the
+  session stopped. Acknowledgements now go no further than the stream's send side. And the
+  receive path kept its reference into the stream table — and with it the table's shard lock
+  — while it waited for a stream's send buffer to apply an acknowledgement, so a concurrent
+  `open_stream()` blocked the thread it ran on until the drain released that buffer; on a
+  single-threaded runtime that thread is the one the drain needs. The stream is now cloned
+  out of the table before anything is awaited.
+
+  **Behaviour changes.** A stream stays in the session's table, and counts toward
+  `MAX_STREAMS`, until both halves have closed, so a stream this side has closed holds its
+  slot until the peer closes its half as well. Anything written on a stream after its
+  `disconnect()` is discarded rather than sent, reliable or not: the peer has already been
+  told the stream ended. A reliable segment on the receiver's own stream-id parity for an id
+  it never allocated opens nothing and is not acknowledged, where it used to open a stream.
+  The documentation of `PhantomStream::disconnect` now says it closes the writing half, and
+  UniFFI folds documentation into checksums, so Python, Swift or Kotlin bindings generated
+  from an earlier build fail at import with a checksum mismatch — regenerate them. No byte,
+  flag or version on the wire moves; `docs/protocol/PROTOCOL.md` §4.4 and §4.5 state the new
+  rules.
+
+- **`disconnect()` ends the session promptly even when the peer has stopped reading, and so
+  does dropping the handle.** Both used to ask the pump to close by queueing
+  `SessionCommand::Close` behind the application's writes. The pump stops reading that queue
+  while it holds a write the stream's send buffer refused, and it holds one until the peer
+  acknowledges data that the peer's own receive window may forbid sending. So a peer that
+  stopped reading, while still answering persist probes and keep-alives, kept the window
+  shut, the write held and the close unread for as long as it chose: the pump, its buffers
+  and its demux routes stayed up and liveness never had a reason to fire. Once the 256-slot
+  command channel was full, `disconnect()` blocked waiting for room and a dropped handle's
+  close was lost outright. A server had no way to evict a slow or hostile reader. The close
+  now travels on a signal of its own, which the pump reads even while it holds a refused
+  write. Writes queued ahead of it are still taken in order for as long as the send buffers
+  admit them, so `send(x); disconnect()` still pushes `x`; the pump then pushes what the
+  windows allow and announces the close as before.
+
+  **Behaviour change.** Whatever the send buffer has not admitted when the close is seen is
+  discarded. Against a healthy peer this can drop most of a large payload written just
+  before `disconnect()`. That was always the documented contract — `disconnect()` is not a
+  delivery guarantee — but a write waiting on a full window used to delay the close rather
+  than be dropped by it. If delivery matters, have the peer confirm receipt at the
+  application level and close after that answer.
+
+- **A 0-RTT payload within the last 16 bytes of the limit no longer fails the resumed
+  handshake.** The client caps early-data plaintext at `EARLY_DATA_MAX_LEN` (16 KiB), and
+  sealing adds a 16-byte AES-GCM tag, but the length walk both listeners run before decoding
+  a `ClientHello` bounded the *sealed* field at the plaintext cap. A payload of 16369 to
+  16384 bytes therefore passed every client check and was refused before the hello was
+  decoded: over TCP the listener closed the connection, and over PhantomUDP the demux
+  dropped every copy and the connect ran out its deadline. Either way the handshake failed,
+  where the contract (Invariant 9, `docs/security/invariants.md`) is that early data can
+  only be declined and the connect goes on as 1-RTT. The new public constant
+  `phantom_protocol::transport::handshake::EARLY_DATA_SEALED_MAX_LEN` names the sealed
+  bound, and the walk, the gate in front of the AEAD open and the oversized-blob attribution
+  in the handshake metrics all read it, so the server now admits every payload the client
+  allows. A blob longer than that is still refused before decode, which no conforming client
+  can cause. The wire does not change. **Upgrade servers:** a patched client against an
+  unpatched server still fails for those sizes.
 
 - **A connection no longer stops ramping above ~10.7% packet loss, because the volume
   bound no longer judges a Startup round.** `BandwidthEstimator::adapt_inflight_bound`
