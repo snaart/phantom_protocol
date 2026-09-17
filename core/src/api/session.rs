@@ -411,10 +411,24 @@ pub use crate::transport::session_transport::{FramePhase, SessionTransport};
 /// handle through every send site. Wraps the concrete `SessionTransport` just
 /// before the data pump takes over, so handshake bytes are not counted as
 /// data-plane packets (they have their own handshake metric).
+///
+/// It is also where the pump learns that the transport has given up on the peer.
+/// A [`CoreError::Timeout`] from either I/O method means exactly that (see
+/// [`SessionTransport::send_bytes`]), and it is noticed here because this is the
+/// one place every write and every read passes through: the write that gives up
+/// is usually one of the pump's own, deep inside a helper that reports failure as
+/// a `bool`, while the task that has to hear about it is the receive loop, parked
+/// in a read the peer may never answer. From then on nothing more is written —
+/// the transport may have left a frame cut part-way through — and
+/// [`given_up`](Self::given_up) resolves, which is what ends that loop.
 struct ObservedTransport<T> {
     inner: T,
     observability: Arc<Observability>,
     leg: LegType,
+    /// Set once the transport has reported [`CoreError::Timeout`]; never cleared.
+    gave_up: std::sync::atomic::AtomicBool,
+    /// Wakes whoever is waiting in [`given_up`](Self::given_up).
+    gave_up_notify: tokio::sync::Notify,
 }
 
 impl<T> ObservedTransport<T> {
@@ -423,23 +437,59 @@ impl<T> ObservedTransport<T> {
             inner,
             observability,
             leg,
+            gave_up: std::sync::atomic::AtomicBool::new(false),
+            gave_up_notify: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Record that the transport has given up on the peer, and wake the waiter.
+    fn give_up(&self) {
+        if !self.gave_up.swap(true, Ordering::AcqRel) {
+            self.gave_up_notify.notify_waiters();
+        }
+    }
+
+    /// Whether the transport has given up on the peer.
+    fn has_given_up(&self) -> bool {
+        self.gave_up.load(Ordering::Acquire)
+    }
+
+    /// Resolves once the transport has given up on the peer.
+    ///
+    /// Meant to be created once and polled across a whole loop rather than once per
+    /// iteration, so the waiter is registered a single time. It registers before it
+    /// looks at the flag, so a give-up landing between the two is still seen.
+    async fn given_up(&self) {
+        let notified = self.gave_up_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.has_given_up() {
+            return;
+        }
+        notified.await;
     }
 }
 
 impl<T: SessionTransport> SessionTransport for ObservedTransport<T> {
     async fn send_bytes(&self, data: &[u8]) -> Result<(), CoreError> {
+        if self.has_given_up() {
+            return Err(CoreError::Timeout);
+        }
         let result = self.inner.send_bytes(data).await;
-        if result.is_ok() {
-            self.observability.record_send(data.len(), self.leg);
+        match result {
+            Ok(()) => self.observability.record_send(data.len(), self.leg),
+            Err(CoreError::Timeout) => self.give_up(),
+            Err(_) => {}
         }
         result
     }
 
     async fn recv_bytes(&self) -> Result<Bytes, CoreError> {
         let result = self.inner.recv_bytes().await;
-        if let Ok(ref bytes) = result {
-            self.observability.record_recv(bytes.len(), self.leg);
+        match result {
+            Ok(ref bytes) => self.observability.record_recv(bytes.len(), self.leg),
+            Err(CoreError::Timeout) => self.give_up(),
+            Err(_) => {}
         }
         result
     }
@@ -988,8 +1038,8 @@ impl PhantomSession {
             incoming_stream_rx: Arc::new(Mutex::new(incoming_stream_rx)),
             // The same slot the pump is handed below. A server-side session runs no
             // handshake to fail, but its pump can still end it with a cause — the
-            // liveness timer — and a fresh slot here would leave `last_error()` and
-            // `recv()` reading one nobody writes.
+            // liveness timer, a transport that gave up on its peer — and a fresh slot
+            // here would leave `last_error()` and `recv()` reading one nobody writes.
             terminal_error: terminal_error.clone(),
             ready_tx: Arc::new(ready_tx),
             ready_rx,
@@ -1961,7 +2011,9 @@ fn record_terminal_cause(slot: &parking_lot::Mutex<Option<CoreError>>, cause: Co
 async fn run_data_pump<T: SessionTransport>(
     crypto_session: Arc<Session>,
     session_id: SessionId,
-    transport: Arc<T>,
+    // Always the observing wrapper: it is how the pump learns that the transport has
+    // given up on the peer (see `ObservedTransport`).
+    transport: Arc<ObservedTransport<T>>,
     state: Arc<AtomicU8>,
     send_queue: Arc<Mutex<Vec<Vec<u8>>>>,
     mut cmd_rx: mpsc::Receiver<SessionCommand>,
@@ -1990,7 +2042,8 @@ async fn run_data_pump<T: SessionTransport>(
     recv_tuning: Arc<SharedRecvTuning>,
     // Where a terminal cause is recorded, shared with the `PhantomSession` handle so
     // `last_error()`, `await_ready()` and `recv()` can report it. The pump writes into
-    // it at the one place it ends a session of its own accord: the liveness timer.
+    // it at the two places it ends a session of its own accord: the liveness timer,
+    // and a transport that has given up on a peer which stopped taking bytes.
     terminal_error: Arc<parking_lot::Mutex<Option<CoreError>>>,
 ) {
     // Session is now established and active — bump the active-session gauge.
@@ -2245,6 +2298,7 @@ async fn run_data_pump<T: SessionTransport>(
     // Clones moved into the recv task for new-stream registration.
     let cmd_tx_recv = cmd_tx_for_stream.clone();
     let incoming_stream_tx_recv = incoming_stream_tx.clone();
+    let terminal_error_recv = terminal_error.clone();
     // Completion signal for the receive task. `SpawnHandle` from the
     // runtime trait does not expose a `Future` for `.await` directly
     // (different runtimes provide different join futures), so we wire a
@@ -2273,6 +2327,12 @@ async fn run_data_pump<T: SessionTransport>(
         // announced its close. `None` until the first close copy is handled, and
         // computed exactly once from a window the peer cannot extend.
         let mut drain_deadline: Option<std::time::Instant> = None;
+        // Resolves once the transport gives up on the peer — almost always because one
+        // of the send loop's writes waited out its deadline while this loop sat in a
+        // read that same peer is not answering. Built once, outside the loop, so its
+        // waiter is registered once rather than on every packet.
+        let given_up = transport_recv.given_up();
+        tokio::pin!(given_up);
         loop {
             // Flow-control / anti-flood gate: if the app-delivery backlog
             // has blown past the cap, the peer is not honouring the window —
@@ -2286,9 +2346,14 @@ async fn run_data_pump<T: SessionTransport>(
                 );
                 break;
             }
-            let data = match transport_recv.recv_bytes().await {
-                Ok(b) => b,
-                Err(_) => break,
+            // A read abandoned here may be part-way through a frame, which is harmless:
+            // the transport is not read again.
+            let data = tokio::select! {
+                received = transport_recv.recv_bytes() => match received {
+                    Ok(b) => b,
+                    Err(_) => break,
+                },
+                () = &mut given_up => break,
             };
 
             // Frame-size gate. Everything below this line ends up in a queue that is
@@ -2381,6 +2446,17 @@ async fn run_data_pump<T: SessionTransport>(
                 }
             }
         }
+        // A transport that gave up on the peer ends the session with a cause, and the
+        // cause is written here, before `deliver_tx` goes, rather than by the send loop
+        // when it hears this task finish. Dropping `deliver_tx` is what eventually
+        // closes the channel `recv()` waits on, and a `recv()` woken by that reads the
+        // slot at once — a cause written any later would reach it as a bare "closed".
+        // A peer that announced its own close is the exception: the session is ending
+        // in the orderly way, and a write that failed during its drain is no failure
+        // of the session's.
+        if transport_recv.has_given_up() && !crypto_recv.peer_closed() {
+            record_terminal_cause(&terminal_error_recv, CoreError::Timeout);
+        }
         // Reader exiting → drop `deliver_tx` so the delivery task drains any
         // queued items and then sees the channel closed and exits.
         drop(deliver_tx);
@@ -2402,8 +2478,9 @@ async fn run_data_pump<T: SessionTransport>(
     let mut poll_interval = tokio::time::interval(std::time::Duration::from_millis(10));
     let send_notify = crypto_session.send_notifier();
     // Liveness keep-alive bookkeeping (P4.3): `Some(t)` while in the `Migrating`
-    // window (the pump-local truth + how long); `died` records an idle-timeout death
-    // so the teardown publishes `Dead` instead of overwriting it with `Closed`.
+    // window (the pump-local truth + how long); `died` records a death — the idle
+    // timeout here, or a transport that gave up on its peer, at the teardown — so the
+    // teardown publishes `Dead` instead of overwriting it with `Closed`.
     let mut migrating_since: Option<std::time::Instant> = None;
     let mut died = false;
     // Idle keep-alive bookkeeping (download-only liveness): the
@@ -2731,6 +2808,11 @@ async fn run_data_pump<T: SessionTransport>(
                     // answering a close with a close would only make two sessions each
                     // wait for the other's last word.
                     log::info!("PhantomSession: peer closed the session");
+                } else if transport.has_given_up() {
+                    log::warn!(
+                        "PhantomSession: the transport gave up on a peer that stopped taking \
+                         bytes; ending the session"
+                    );
                 } else {
                     log::error!(
                         "PhantomSession: receive task ended unexpectedly (transport closed)"
@@ -2739,6 +2821,18 @@ async fn run_data_pump<T: SessionTransport>(
                 break;
             }
         }
+    }
+
+    // A transport that gave up on its peer ends the session as a death, whichever arm
+    // above happened to notice first: the receive task finishing, or a local close that
+    // raced it — in which case the close was not announced, because the write carrying
+    // it was refused. Recorded before the receive task is aborted, since aborting it is
+    // what starts closing the channel `recv()` waits on. The receive task records the
+    // same cause on its own way out; whichever comes second finds the slot taken.
+    if transport.has_given_up() && !crypto_session.peer_closed() {
+        record_terminal_cause(&terminal_error, CoreError::Timeout);
+        state.store(ConnectionState::Dead as u8, Ordering::Relaxed);
+        died = true;
     }
 
     // Abort the recv task if it's still running; idempotent on a finished
@@ -2758,8 +2852,9 @@ async fn run_data_pump<T: SessionTransport>(
     // to wait for the same deadline the receive loop does, and it does that by being
     // here rather than at the moment the close was read.
     crypto_session.signal_route_retire();
-    // A liveness idle-timeout death already published `ConnectionState::Dead`; only a
-    // normal teardown (graceful close / transport drop) publishes `Closed`.
+    // A death — the liveness idle timeout, or the transport giving up above — has
+    // already published `ConnectionState::Dead`; only a normal teardown (graceful close
+    // / transport drop) publishes `Closed`.
     if !died {
         state.store(ConnectionState::Closed as u8, Ordering::Relaxed);
     }
@@ -10204,6 +10299,91 @@ mod tests {
         );
     }
 
+    /// A transport whose writes fail with a scripted error and whose reads never
+    /// complete — the shape of a stream transport whose peer has stopped reading and
+    /// has nothing to say.
+    struct ScriptedWriteFailure {
+        failure: CoreError,
+        writes: AtomicU64,
+    }
+
+    impl SessionTransport for ScriptedWriteFailure {
+        async fn send_bytes(&self, _data: &[u8]) -> Result<(), CoreError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Err(self.failure.clone())
+        }
+        async fn recv_bytes(&self) -> Result<Bytes, CoreError> {
+            std::future::pending().await
+        }
+    }
+
+    fn observed(failure: CoreError) -> ObservedTransport<ScriptedWriteFailure> {
+        ObservedTransport::new(
+            ScriptedWriteFailure {
+                failure,
+                writes: AtomicU64::new(0),
+            },
+            Observability::new(ObservabilityConfig::default()),
+            LegType::Tcp,
+        )
+    }
+
+    /// A `Timeout` from the transport is final: the wrapper wakes a reader parked on
+    /// the peer, and refuses every later write without passing it to the transport,
+    /// which may have left a frame cut part-way through on the wire.
+    #[tokio::test]
+    async fn a_timeout_from_the_transport_ends_reading_and_writing_through_it() {
+        let transport = Arc::new(observed(CoreError::Timeout));
+        let reader = {
+            let transport = transport.clone();
+            tokio::spawn(async move {
+                let given_up = transport.given_up();
+                tokio::pin!(given_up);
+                tokio::select! {
+                    _ = transport.recv_bytes() => "the read completed",
+                    () = &mut given_up => "woken by the give-up",
+                }
+            })
+        };
+        // Let the reader park before the write fails, so the wake-up is what ends it.
+        tokio::task::yield_now().await;
+        assert!(!transport.has_given_up());
+
+        let first = transport.send_bytes(b"stalls").await;
+        assert!(matches!(first, Err(CoreError::Timeout)), "{first:?}");
+        assert!(transport.has_given_up());
+        let woken = tokio::time::timeout(std::time::Duration::from_secs(5), reader)
+            .await
+            .expect("a reader parked on the peer was never woken")
+            .expect("reader task");
+        assert_eq!(woken, "woken by the give-up");
+
+        let second = transport.send_bytes(b"after").await;
+        assert!(matches!(second, Err(CoreError::Timeout)), "{second:?}");
+        assert_eq!(
+            transport.inner.writes.load(Ordering::SeqCst),
+            1,
+            "a write after the give-up reached the transport"
+        );
+        // Resolves at once for a waiter that arrives late.
+        tokio::time::timeout(std::time::Duration::from_secs(5), transport.given_up())
+            .await
+            .expect("given_up() must resolve immediately once the transport has given up");
+    }
+
+    /// Any other write failure is the transport's own business — a datagram socket out
+    /// of buffer, say — and the next write is still passed through.
+    #[tokio::test]
+    async fn other_transport_errors_do_not_count_as_giving_up() {
+        let transport = observed(CoreError::NetworkError("no buffer space".into()));
+        for _ in 0..2 {
+            let r = transport.send_bytes(b"x").await;
+            assert!(matches!(r, Err(CoreError::NetworkError(_))), "{r:?}");
+        }
+        assert!(!transport.has_given_up());
+        assert_eq!(transport.inner.writes.load(Ordering::SeqCst), 2);
+    }
+
     /// EPS-02 (symmetric CID rotation) — when the **server** (the demuxing side)
     /// detects a client migration (a new authenticated `path_id`, post-AEAD), it
     /// must rotate its OWN outbound (server→client) CID so that direction also
@@ -12169,6 +12349,175 @@ mod tests {
             "an accepted session reaped by the liveness timer must say why; last_error() gave \
              {:?}",
             session.last_error().await
+        );
+    }
+
+    /// How much a test hands a session whose peer has stopped reading its socket. Far more
+    /// than the shrunken socket buffers of `connection_whose_far_end_never_reads` hold, so
+    /// the pump is left holding most of it.
+    const UNREAD_BACKLOG: usize = 16 << 20;
+
+    /// A session over a real TCP connection whose peer never reads its socket, driven until
+    /// the pump is parked inside a transport write.
+    ///
+    /// This is a different wedge from `wedge_a_session_behind_a_peer_that_never_reads`: there
+    /// the peer's *application* stops reading and its protocol stack goes on acknowledging, so
+    /// the pump is merely refused by a closed window and keeps turning. Here the peer's socket
+    /// stops draining, so the kernel's buffers fill and the write that finds them full waits
+    /// for the peer — inside an arm of the pump's loop, where nothing else, the local close
+    /// included, gets a turn until it returns.
+    ///
+    /// The writes are unreliable ones on an opened stream: neither congestion- nor
+    /// flow-controlled, so the pump hands every one of them to the transport, and a peer that
+    /// acknowledges nothing cannot hold them back. The witness that the pump is parked is that
+    /// the bytes it has put on the wire stop growing while most of the backlog is unsent.
+    ///
+    /// Returns the session and its observability handle, whose active-sessions gauge is the
+    /// pump's record of having exited. The far end of the connection stays with the caller,
+    /// which keeps it alive and never reads it.
+    async fn wedge_a_session_on_a_socket_its_peer_never_reads(
+        transport: crate::api::tcp_transport::TcpSessionTransport,
+    ) -> (Arc<PhantomSession>, Arc<Observability>) {
+        let session_id = fixed_session_id();
+        let (inner, _peer_inner) = paired_sessions(session_id);
+        inner.set_state(SessionState::Connected);
+        let session =
+            PhantomSession::from_accepted_server_session("closing".into(), transport, inner);
+        let obs = session.observability();
+
+        let stream = session.open_stream();
+        stream
+            .send_unreliable(vec![0xE7; UNREAD_BACKLOG])
+            .await
+            .expect("the pump takes the write in");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut last = obs.snapshot().bytes_sent;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let now = obs.snapshot().bytes_sent;
+            if now > 0 && now == last {
+                break;
+            }
+            last = now;
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the harness never parked the pump: {now} bytes went out and kept going"
+            );
+        }
+        assert!(
+            (last as usize) < UNREAD_BACKLOG / 2,
+            "{last} of {UNREAD_BACKLOG} bytes went out, so the socket was not what stopped the \
+             pump and this harness proves nothing"
+        );
+        assert_eq!(obs.snapshot().active_sessions, 1, "the pump is running");
+        (session, obs)
+    }
+
+    /// Wait up to `bound` for the pump behind `obs` to exit, and say whether it did.
+    async fn pump_exits_within(obs: &Arc<Observability>, bound: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + bound;
+        while obs.snapshot().active_sessions != 0 {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        true
+    }
+
+    /// A TCP transport over a connection whose peer never reads, with a write-stall
+    /// deadline of `stall`. Returns the far end too, which the caller keeps alive.
+    async fn tcp_transport_whose_peer_never_reads(
+        stall: std::time::Duration,
+    ) -> (
+        crate::api::tcp_transport::TcpSessionTransport,
+        tokio::net::TcpStream,
+    ) {
+        let (near, far) =
+            crate::api::tcp_transport::test_support::connection_whose_far_end_never_reads().await;
+        let transport = crate::api::tcp_transport::TcpSessionTransport::new(near)
+            .with_write_stall_timeout(stall);
+        (transport, far)
+    }
+
+    /// `disconnect()` ends a session whose peer stopped reading its socket.
+    ///
+    /// The close is a request the pump reads between turns of its loop, and this pump is
+    /// in the middle of one — a write the peer will never take. Before the transport had a
+    /// write deadline that write never returned, so the close was never read: the pump,
+    /// its buffers and the connection stayed up for as long as the peer kept its socket
+    /// open. The deadline here is long enough that the harness finds the pump parked well
+    /// before it fires, so what ends the session is the close being read once the write
+    /// gives up — within the deadline, not never.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn disconnect_ends_a_session_whose_peer_stopped_reading_its_socket() {
+        let stall = std::time::Duration::from_secs(2);
+        let (transport, _far) = tcp_transport_whose_peer_never_reads(stall).await;
+        let (closing, obs) = wedge_a_session_on_a_socket_its_peer_never_reads(transport).await;
+
+        closing.disconnect().await.expect("disconnect");
+        let bound = stall + std::time::Duration::from_secs(8);
+        assert!(
+            pump_exits_within(&obs, bound).await,
+            "the pump was still running {bound:?} after the close was requested: it is parked \
+             in a write its peer will never take"
+        );
+    }
+
+    /// Dropping the handle is the same request with no await to make, and it ends the same
+    /// session the same way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dropping_the_handle_ends_a_session_whose_peer_stopped_reading_its_socket() {
+        let stall = std::time::Duration::from_secs(2);
+        let (transport, _far) = tcp_transport_whose_peer_never_reads(stall).await;
+        let (closing, obs) = wedge_a_session_on_a_socket_its_peer_never_reads(transport).await;
+
+        drop(closing);
+        let bound = stall + std::time::Duration::from_secs(8);
+        assert!(
+            pump_exits_within(&obs, bound).await,
+            "the pump was still running {bound:?} after the handle was dropped: it is parked \
+             in a write its peer will never take"
+        );
+    }
+
+    /// A session whose peer stopped reading its socket ends by itself, as a death with a
+    /// cause, with nobody asking it to.
+    ///
+    /// Nothing else would end it: the liveness sweep runs between turns of the pump's
+    /// loop, and so could not run while the pump waited on the write — and these writes
+    /// are unreliable, so they leave nothing in flight for it to judge anyway. The cause
+    /// has to be readable everywhere a caller looks for one, and `recv()` is where an
+    /// echo-style handler looks: its channel closes as the session ends, and what it
+    /// reports then is whatever the slot held at that moment.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_session_whose_peer_stopped_reading_its_socket_dies_with_a_timeout() {
+        let stall = std::time::Duration::from_millis(1500);
+        let (transport, _far) = tcp_transport_whose_peer_never_reads(stall).await;
+        let (session, obs) = wedge_a_session_on_a_socket_its_peer_never_reads(transport).await;
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(10), session.recv())
+            .await
+            .expect("recv() was still waiting 10 s later: the session never ended");
+        assert!(
+            matches!(received, Err(CoreError::Timeout)),
+            "recv() should report the transport's Timeout once the session ends; got \
+             {received:?}"
+        );
+        assert!(
+            pump_exits_within(&obs, std::time::Duration::from_secs(5)).await,
+            "the pump was still running after recv() reported the session over"
+        );
+        assert_eq!(session.connection_state(), ConnectionState::Dead);
+        assert!(
+            matches!(session.last_error().await, Some(CoreError::Timeout)),
+            "last_error() should name the cause; got {:?}",
+            session.last_error().await
+        );
+        assert!(
+            matches!(session.send(b"x".to_vec()).await, Err(CoreError::Timeout)),
+            "send() on a dead session should report the cause"
         );
     }
 

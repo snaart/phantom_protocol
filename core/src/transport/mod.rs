@@ -92,6 +92,8 @@ pub mod types;
 pub mod framing;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub mod phantom_udp;
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+pub(crate) mod write_stall;
 
 // Re-exports for convenience
 #[cfg(feature = "std")]

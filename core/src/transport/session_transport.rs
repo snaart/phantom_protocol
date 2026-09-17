@@ -72,6 +72,38 @@ pub trait SessionTransport: Send + Sync + 'static {
     /// so the `+ Send` bound on the returned future is explicit. This is
     /// what lets the data pump spawn its task generically over any
     /// `T: SessionTransport` without an AFIT `return_type_notation` hack.
+    ///
+    /// # A write must not wait on the peer forever
+    ///
+    /// On a byte-stream transport a write can wait on the peer: once the peer
+    /// stops reading, the buffers between the two ends fill and stay full. The
+    /// session's data pump is the writer, and while one of its writes waits, the
+    /// rest of the pump waits with it — no liveness sweep, and no local close,
+    /// since `disconnect()` and dropping the handle are requests the pump reads
+    /// between writes. A peer could hold the session for as long as it liked.
+    ///
+    /// So an implementation whose write can wait on the peer bounds it: once a
+    /// write has made **no progress** for a bounded time, fail it with
+    /// [`CoreError::Timeout`]. Progress is the point — a peer still taking bytes,
+    /// however slowly, is a slow link and must not be cut off; only one that has
+    /// stopped. After such a failure, refuse every later write with the same error
+    /// without touching the connection, because the write that gave up may have
+    /// left a frame cut part-way through, and any byte written after it would be
+    /// read by the peer as the rest of that frame.
+    ///
+    /// The session treats `Timeout` from either I/O method as the transport
+    /// having given up on the peer, and nothing short of that: it writes nothing
+    /// more, stops reading, and ends in `ConnectionState::Dead`, reporting the
+    /// `Timeout` from `last_error()` and `recv()`. Any other error from a write is
+    /// the transport's own business and the session carries on.
+    ///
+    /// How each shipped transport stands:
+    ///
+    /// - `TcpSessionTransport` bounds every write by a progress deadline, thirty
+    ///   seconds unless set otherwise.
+    /// - The PhantomUDP transports and the browser WebSocket leg never wait on the
+    ///   peer: a datagram send completes or fails locally, and a browser WebSocket
+    ///   buffers whatever it is given.
     fn send_bytes(
         &self,
         data: &[u8],
