@@ -986,9 +986,11 @@ impl PhantomSession {
             // every accepted session.
             observability: observability.clone(),
             incoming_stream_rx: Arc::new(Mutex::new(incoming_stream_rx)),
-            // Server-side sessions never go through client-side handshake;
-            // terminal_error stays None (no failure), ready is already Connected.
-            terminal_error: Arc::new(parking_lot::Mutex::new(None)),
+            // The same slot the pump is handed below. A server-side session runs no
+            // handshake to fail, but its pump can still end it with a cause — the
+            // liveness timer — and a fresh slot here would leave `last_error()` and
+            // `recv()` reading one nobody writes.
+            terminal_error: terminal_error.clone(),
             ready_tx: Arc::new(ready_tx),
             ready_rx,
             migration_capable,
@@ -1933,6 +1935,15 @@ fn apply_drain_outcome(
     }
 }
 
+/// Write `cause` into a session's terminal-error slot, unless a cause is already
+/// there: an earlier, more specific failure is the better answer.
+fn record_terminal_cause(slot: &parking_lot::Mutex<Option<CoreError>>, cause: CoreError) {
+    let mut slot = slot.lock();
+    if slot.is_none() {
+        *slot = Some(cause);
+    }
+}
+
 /// Shared client/server data pump.
 ///
 /// After the handshake completes (client side) or after the server `Session` is
@@ -2531,20 +2542,10 @@ async fn run_data_pump<T: SessionTransport>(
                 // Liveness sweep (P4.3): the 10 ms heartbeat is the reliable place to
                 // evaluate inbound silence vs. outstanding data and surface
                 // Migrating / recover / Dead. A `Dead` verdict ends the pump.
-                if apply_liveness(&crypto_session, &state, &mut migrating_since) {
-                    // A death decided here has no failing call site to carry a
-                    // cause, so it is recorded now, before anyone can read the
-                    // state. `Timeout` is the honest variant: the session went
-                    // unanswered for the whole configured window and was reaped,
-                    // which is a deadline elapsing rather than a transport
-                    // error. Written only if the slot is empty — an earlier,
-                    // more specific failure is the better answer.
-                    {
-                        let mut slot = terminal_error.lock();
-                        if slot.is_none() {
-                            *slot = Some(CoreError::Timeout);
-                        }
-                    }
+                // A death decided there has no failing call site to carry a cause, so
+                // `apply_liveness` records one itself, before it publishes the state.
+                if apply_liveness(&crypto_session, &state, &terminal_error, &mut migrating_since)
+                {
                     died = true;
                     break;
                 }
@@ -3007,9 +3008,16 @@ async fn take_command<T: SessionTransport>(
 /// both the internal [`SessionState`] and the FFI-visible [`ConnectionState`]. Returns
 /// `true` when the session has died (idle-timeout in `Migrating`), so the caller ends
 /// the pump. `migrating_since` is the pump-local truth for the keep-alive window.
+///
+/// A death is recorded in `terminal_error` as [`CoreError::Timeout`] — the session went
+/// unanswered for the whole configured window and was reaped, which is a deadline
+/// elapsing rather than a transport error — and recorded *before* `Dead` is published,
+/// so a caller that sees the state and then asks `last_error()` why finds the answer
+/// already there.
 fn apply_liveness(
     crypto_session: &Arc<Session>,
     state: &Arc<AtomicU8>,
+    terminal_error: &parking_lot::Mutex<Option<CoreError>>,
     migrating_since: &mut Option<std::time::Instant>,
 ) -> bool {
     use crate::transport::liveness::{liveness_verdict, LivenessVerdict};
@@ -3056,6 +3064,7 @@ fn apply_liveness(
             false
         }
         LivenessVerdict::Dead => {
+            record_terminal_cause(terminal_error, CoreError::Timeout);
             crypto_session.set_state(SessionState::Closed);
             state.store(ConnectionState::Dead as u8, Ordering::Relaxed);
             log::warn!("PhantomSession: migration idle-timeout elapsed — session dead");
@@ -12116,6 +12125,51 @@ mod tests {
 
         drop(closing);
         assert_the_session_let_go(&obs, &peer_inner, writer).await;
+    }
+
+    /// An accepted session reaped by the liveness timer reports why, as a client does.
+    ///
+    /// The pump has always written the cause into the slot it was handed; the accepted
+    /// session's handle was built with a fresh slot of its own instead, so on the server
+    /// side `last_error()` answered `None` for a death the pump had recorded, and `recv()`
+    /// fell back to an untyped "closed". The client path never had the defect, which is
+    /// why the liveness integration tests — both client-side — did not see it.
+    #[tokio::test]
+    async fn an_accepted_session_reaped_by_the_liveness_timer_reports_the_cause() {
+        let session_id = fixed_session_id();
+        let (inner, _peer_inner) = paired_sessions(session_id);
+        inner.set_state(SessionState::Connected);
+        // The far end of the pipe is held and never read: nothing this session sends is
+        // acknowledged, and nothing arrives.
+        let (transport, _silent_peer) = ChannelTransport::pair();
+        let session =
+            PhantomSession::from_accepted_server_session("reaped".into(), transport, inner);
+        assert!(
+            session
+                .set_liveness_config(crate::transport::liveness::LivenessConfig::for_test())
+                .await
+        );
+        // Something in flight, so the silence counts against the path.
+        session
+            .send(b"never acknowledged".to_vec())
+            .await
+            .expect("send");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while session.connection_state() != ConnectionState::Dead {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the liveness timer never reaped the session; state {:?}",
+                session.connection_state()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            matches!(session.last_error().await, Some(CoreError::Timeout)),
+            "an accepted session reaped by the liveness timer must say why; last_error() gave \
+             {:?}",
+            session.last_error().await
+        );
     }
 
     /// A write handed to `send()` and then a `disconnect()` — or a dropped handle — in
