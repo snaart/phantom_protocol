@@ -16,7 +16,7 @@
 //! be, and that is the application's decision rather than the transport's.
 //!
 //! Used by the two tokio stream transports, `TcpSessionTransport` and the
-//! `mimicry` leg.
+//! `mimicry` leg. The WASI leg applies the same rule through `wasi:io/poll`.
 
 use std::io;
 use std::time::Duration;

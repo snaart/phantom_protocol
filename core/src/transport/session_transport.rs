@@ -103,6 +103,7 @@ pub trait SessionTransport: Send + Sync + 'static {
     ///   seconds unless set otherwise.
     /// - The TLS-mimicry leg does the same once its prelude is done; the prelude's
     ///   writes already sit under the prelude's own deadline.
+    /// - The WASI leg does the same through `wasi:io/poll`.
     /// - The PhantomUDP transports and the browser WebSocket leg never wait on the
     ///   peer: a datagram send completes or fails locally, and a browser WebSocket
     ///   buffers whatever it is given.

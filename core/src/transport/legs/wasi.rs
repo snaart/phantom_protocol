@@ -7,14 +7,26 @@
 //! Phantom Protocol session machinery without code-level branching.
 //!
 //! **Single-task model.** WASI Preview 2 has no native thread
-//! primitive, so this leg uses the `wasi:io/streams` blocking
-//! variants (`blocking_read` / `blocking_write_and_flush`). Those
-//! internally call `wasi:io/poll::poll`, so the WASI host can park
-//! the instance while waiting on the kernel without spin-busy-waiting
+//! primitive, so this leg blocks the instance on `wasi:io/poll::poll`
+//! while it waits on the kernel — `blocking_read` for reads, and for
+//! writes an explicit poll on the output stream's readiness (below) —
+//! so the WASI host can park the instance without spin-busy-waiting
 //! Rust-side. Concurrent sessions inside one WASI instance therefore
 //! serialise at the I/O layer; that matches the
 //! [`crate::runtime::WasiRuntime`] single-task scheduler and is
 //! sufficient for the client-side embedder use cases.
+//!
+//! **A peer that stops reading.** A write waits for the output stream to
+//! accept bytes, and a peer that has stopped reading its socket lets it
+//! accept none. Blocking on that without a bound would hold the whole
+//! instance — the session's pump, its close, and anything else the guest
+//! runs — for as long as the peer chose. So each wait is a poll on the
+//! stream's readiness *and* a monotonic-clock timer, and a write that sees
+//! no progress for [`WasiLeg::DEFAULT_WRITE_STALL_TIMEOUT`] (adjustable with
+//! [`WasiLeg::with_write_stall_timeout`]) fails with [`CoreError::Timeout`],
+//! the same rule `TcpSessionTransport` follows: every byte accepted restarts
+//! the clock, and after a stall every later send is refused without touching
+//! the stream, since the stalled frame may be cut part-way through.
 //!
 //! **Client-only.** Connection establishment runs through
 //! `tcp_create_socket → start_connect → subscribe / poll →
@@ -36,10 +48,14 @@
 #![allow(unsafe_code)]
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use wasi::io::poll;
+use wasi::clocks::monotonic_clock;
+use wasi::io::poll::{self, Pollable};
+use wasi::io::streams::StreamError;
 use wasi::sockets::instance_network::instance_network;
 use wasi::sockets::network::{
     IpAddressFamily, IpSocketAddress, Ipv4SocketAddress, Ipv6SocketAddress,
@@ -80,6 +96,11 @@ pub struct WasiLeg {
     /// buffer lifetime tracks the reader's exactly (same shape as
     /// `TcpSessionTransport` Phase 2.1).
     read: Mutex<(InputStream, BytesMut)>,
+    /// How long one write may wait without the stream accepting a byte.
+    write_stall_timeout: Duration,
+    /// Set by the first write that stalls out, and never cleared: that write may
+    /// have left a frame cut part-way through, so nothing may follow it.
+    write_stalled: AtomicBool,
     /// Keep the `TcpSocket` alive — dropping it closes the underlying
     /// host file descriptor, which would invalidate the streams. WIT
     /// resource semantics: streams are derived from the socket and
@@ -160,8 +181,26 @@ impl WasiLeg {
         Ok(Self {
             output: Mutex::new(output),
             read: Mutex::new((input, BytesMut::with_capacity(RECV_BUF_INITIAL_CAPACITY))),
+            write_stall_timeout: Self::DEFAULT_WRITE_STALL_TIMEOUT,
+            write_stalled: AtomicBool::new(false),
             _socket: socket,
         })
+    }
+
+    /// How long a write may go without the output stream accepting a byte before
+    /// the leg gives up on its peer, unless
+    /// [`with_write_stall_timeout`](Self::with_write_stall_timeout) says otherwise.
+    /// The same thirty seconds as `TcpSessionTransport`.
+    pub const DEFAULT_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Replace the write-stall deadline: how long a single write may wait without
+    /// the stream accepting a byte before `send_bytes` fails with
+    /// [`CoreError::Timeout`] and the leg gives up on its peer. The clock restarts
+    /// with every byte accepted — it bounds how long the peer may stop reading,
+    /// not how slowly it may read.
+    pub fn with_write_stall_timeout(mut self, timeout: Duration) -> Self {
+        self.write_stall_timeout = timeout;
+        self
     }
 }
 
@@ -174,17 +213,28 @@ impl SessionTransport for WasiLeg {
                 MAX_FRAME_BYTES
             )));
         }
+        if self.write_stalled.load(Ordering::Acquire) {
+            return Err(CoreError::Timeout);
+        }
         // PANIC-SAFETY: the mutex is private and only held by this
         // method; a poison would only arise from a panic inside an
         // earlier `send_bytes` call, an unrecoverable state.
         #[allow(clippy::expect_used)]
         let out = self.output.lock().expect("WasiLeg output mutex poisoned");
+        // Checked again under the lock: the send this one queued behind may be the
+        // one that stalled, and what it left on the wire is not a frame boundary.
+        if self.write_stalled.load(Ordering::Acquire) {
+            return Err(CoreError::Timeout);
+        }
         let len = (data.len() as u32).to_be_bytes();
-        out.blocking_write_and_flush(&len)
-            .map_err(|e| CoreError::NetworkError(format!("write length: {:?}", e)))?;
-        out.blocking_write_and_flush(data)
-            .map_err(|e| CoreError::NetworkError(format!("write payload: {:?}", e)))?;
-        Ok(())
+        match write_all_making_progress(&out, &[&len, data], self.write_stall_timeout) {
+            Ok(()) => Ok(()),
+            Err(WriteFailure::Stalled) => {
+                self.write_stalled.store(true, Ordering::Release);
+                Err(CoreError::Timeout)
+            }
+            Err(WriteFailure::Stream(e)) => Err(CoreError::NetworkError(format!("write: {e:?}"))),
+        }
     }
 
     async fn recv_bytes(&self) -> Result<Bytes, CoreError> {
@@ -250,6 +300,68 @@ fn read_exact(input: &InputStream, dest: &mut [u8]) -> Result<(), CoreError> {
         filled += take;
     }
     Ok(())
+}
+
+/// Why [`write_all_making_progress`] did not finish.
+enum WriteFailure {
+    /// The stream accepted nothing for the whole deadline.
+    Stalled,
+    /// The stream reported an error.
+    Stream(StreamError),
+}
+
+/// Write every byte of `parts`, in order, then flush — failing with
+/// [`WriteFailure::Stalled`] as soon as one wait for the stream has lasted
+/// `stall` without the stream accepting anything.
+///
+/// Uses the non-blocking half of `wasi:io/streams` — `check-write` for how much
+/// the stream will take now, `write` for exactly that much — and waits through
+/// `wasi:io/poll`, so each wait can be bounded by a timer. The blocking
+/// convenience call cannot be bounded, and is specified for at most 4096 bytes
+/// a call besides; this takes a frame of any size.
+fn write_all_making_progress(
+    out: &OutputStream,
+    parts: &[&[u8]],
+    stall: Duration,
+) -> Result<(), WriteFailure> {
+    // A child of the stream: it must be dropped before the stream is, which it is,
+    // at the end of this call.
+    let writable = out.subscribe();
+    for part in parts {
+        let mut rest: &[u8] = part;
+        while !rest.is_empty() {
+            let permit = out.check_write().map_err(WriteFailure::Stream)?;
+            if permit == 0 {
+                wait_for_progress(&writable, stall)?;
+                continue;
+            }
+            let n = usize::try_from(permit).map_or(rest.len(), |p| p.min(rest.len()));
+            let (now, later) = rest.split_at(n);
+            out.write(now).map_err(WriteFailure::Stream)?;
+            rest = later;
+        }
+    }
+    // A flush holds further writes until it completes, and reports completion
+    // through the same readiness: `check-write` answers 0 until then.
+    out.flush().map_err(WriteFailure::Stream)?;
+    while out.check_write().map_err(WriteFailure::Stream)? == 0 {
+        wait_for_progress(&writable, stall)?;
+    }
+    Ok(())
+}
+
+/// Block until the stream behind `writable` can take bytes again, or `stall`
+/// passes first.
+fn wait_for_progress(writable: &Pollable, stall: Duration) -> Result<(), WriteFailure> {
+    let nanos = u64::try_from(stall.as_nanos()).unwrap_or(u64::MAX);
+    let deadline = monotonic_clock::subscribe_duration(nanos);
+    // `poll` answers with the indices of the pollables that are ready; index 0 is
+    // the stream. Ready together with the timer still counts as progress.
+    if poll::poll(&[writable, &deadline]).contains(&0) {
+        Ok(())
+    } else {
+        Err(WriteFailure::Stalled)
+    }
 }
 
 /// Convert a `std::net::SocketAddr` to the
