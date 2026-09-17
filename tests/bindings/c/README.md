@@ -20,11 +20,11 @@ first-class generators for Kotlin, Swift, Python, and Ruby; pure-C is
 | Approach | Outcome |
 |---|---|
 | `cbindgen` (Rust→C header generator that walks the AST) | Produces ~70 lines of constants — `WINDOW_BITS`, `AEAD_OVERHEAD`, `EARLY_DATA_MAX_LEN`, etc. It cannot see through `setup_scaffolding!()`'s proc-macro expansion, so it emits **zero function declarations**. We extracted the constants and re-include them in `phantom_protocol.h`. |
-| `uniffi-bindgen-cs` / `uniffi-bindgen-c` | The C# generator targets a different ABI (P/Invoke marshalling); no actively-maintained pure-C UniFFI generator exists for 0.31. |
-| Hand-curate from the dylib's exported symbol table | The chosen approach. `nm -gU` on `libphantom_protocol.dylib` lists all 185 `extern "C"` symbols UniFFI emits (71 `uniffi_phantom_protocol_fn_*`, 61 `uniffi_phantom_protocol_checksum_*`, 53 `ffi_phantom_protocol_*` runtime symbols). We catalogue each one with its calling-convention contract. |
+| `uniffi-bindgen-cs` / `uniffi-bindgen-c` | The C# generator targets a different ABI (P/Invoke marshalling); no actively-maintained pure-C UniFFI generator exists for 0.32. |
+| Hand-curate from the dylib's exported symbol table | The chosen approach. `nm -gU` on `libphantom_protocol.dylib` lists all 189 `extern "C"` symbols UniFFI emits (74 `uniffi_phantom_protocol_fn_*`, 62 `uniffi_phantom_protocol_checksum_*`, 53 `ffi_phantom_protocol_*` runtime symbols). We catalogue each one with its calling-convention contract. |
 
 The header is therefore generated from the dylib + the published UniFFI
-0.31 calling convention; see `../generate_c.sh` for the procedure.
+0.32 calling convention; see `../generate_c.sh` for the procedure.
 
 ## Linking against `libphantom_protocol`
 
@@ -155,8 +155,8 @@ apply — please read before committing to a C-side integration:
    `connect_pinned_udp_with_config`), and key material crosses as bytes via
    `generate_signing_key` / `verifying_key_from_signing_key` /
    `verifying_key_bytes`. `CoreError` variants are lowered with a 1-based
-   discriminant (18 = ServerIdentityMismatch, 19 = ProtocolRejected,
-   20 = Unsupported).
+   discriminant (15 = ServerIdentityMismatch, 16 = ProtocolRejected,
+   17 = Unsupported).
 3. **Stale on UniFFI bump.** Contract version 30 (UniFFI 0.32) is current
    as of phantom_protocol 0.3.0. If you upgrade UniFFI, re-run
    `tests/bindings/generate_c.sh` and reconcile changes.
@@ -166,7 +166,7 @@ apply — please read before committing to a C-side integration:
    are present in the dylib and follow the identical pattern — re-declare
    on demand. There is no `_pointer` variant: UniFFI 0.32 returns exported
    objects as `u64` handles.
-5. **Checksums.** All 61 `uniffi_phantom_protocol_checksum_*` symbols are
+5. **Checksums.** All 62 `uniffi_phantom_protocol_checksum_*` symbols are
    exported but not declared. Higher-level bindings call them at load
    time; for C callers they are optional. Signature is
    `uint16_t uniffi_phantom_protocol_checksum_<name>(void);`.

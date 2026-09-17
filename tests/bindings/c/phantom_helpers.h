@@ -143,7 +143,7 @@ static inline void *phantom_blocking_connect_pinned(const char *host, uint16_t p
     }
     /* The RustBuffer args are consumed by the call — do not free them. */
     uint64_t fut = uniffi_phantom_protocol_fn_func_connect_pinned(host_buf, port, key_buf);
-    /* An object future completes to a `u64` handle (UniFFI 0.31 — no `_pointer`
+    /* An object future completes to a `u64` handle (UniFFI 0.32 — no `_pointer`
      * variant); the handle is the `void *` the object methods/free take. */
     phantom__block_on(fut, ffi_phantom_protocol_rust_future_poll_u64);
     PhantomRustCallStatus cst = {0};

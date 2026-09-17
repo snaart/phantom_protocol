@@ -2,7 +2,7 @@
  * phantom_protocol.h — C-language FFI declarations for Phantom Protocol (libphantom_protocol)
  *
  * Phantom Protocol is a post-quantum-secure L4/L6 transport library (Rust).
- * It exposes a foreign-function-interface through Mozilla UniFFI 0.31's
+ * It exposes a foreign-function-interface through Mozilla UniFFI 0.32's
  * `setup_scaffolding!()` macro, which emits a stable `extern "C"` surface
  * in the produced `cdylib`. This file declares the symbols of that surface
  * for use from C / C++ programs that link against the produced
@@ -16,7 +16,7 @@
  * intended for low-level / embedded callers (or as a starting point for
  * a custom generator).
  *
- * The calling convention follows UniFFI 0.31 "contract version 30". The
+ * The calling convention follows UniFFI 0.32 "contract version 30". The
  * runtime contract version reported by the dylib MUST match what the
  * caller expects; check it via `ffi_phantom_protocol_uniffi_contract_version`
  * at startup.
@@ -233,12 +233,12 @@ PhantomRustBuffer ffi_phantom_protocol_rustbuffer_reserve(
  *      _rust_buffer _void
  *
  * Production builds emit ALL of the above. There is NO `_pointer` variant:
- * UniFFI 0.31 represents exported objects as `u64` handles. The four
+ * UniFFI 0.32 represents exported objects as `u64` handles. The four
  * most-used variants are declared here as exemplars; consumers needing the
  * integer variants can re-declare them following the pattern.
  */
 
-/* `_u64` future variant. NOTE: UniFFI 0.31 represents an exported **object**
+/* `_u64` future variant. NOTE: UniFFI 0.32 represents an exported **object**
  * (e.g. the `Arc<PhantomSession>` an async `connect_pinned` returns) as a `u64`
  * handle — there is no `_pointer` future variant in the dylib. Complete returns
  * the handle; cast it to the `void *` the object methods/free take. */
@@ -382,7 +382,7 @@ typedef struct PhantomMetricsSnapshotFfi {
 /* ====================================================================
  * SECTION 4 — Domain API surface (Phantom Protocol exported objects)
  *
- * Five UniFFI-exported objects:
+ * Six UniFFI-exported objects:
  *
  *   PhantomListener     — TCP server. 3 constructors + 7 methods.
  *   PhantomUdpListener  — UDP server. 3 constructors + 7 methods.
@@ -392,6 +392,8 @@ typedef struct PhantomMetricsSnapshotFfi {
  *                         PhantomSession::accept_stream).
  *   AcceptOutcome       — returned by PhantomListener::accept or
  *                         PhantomUdpListener::accept; 4 methods.
+ *   ResumptionHint      — 0-RTT resumption material. Constructor + 2
+ *                         accessor methods.
  *
  * Convention:
  *   - Each object has a `_clone_*` (increment refcount) and `_free_*`
@@ -1069,12 +1071,12 @@ uint64_t uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_resumption(
  *      Unsupported(msg)        — the requested operation is not available on
  *                                this transport type (e.g. migrate() on TCP);
  *                                use the appropriate transport.
- *    These map to error discriminant codes 18, 19, and 20 respectively in
- *    the lowered RustBuffer carried by a call_status code of 1.
+ *    These map to error discriminant codes 15, 16, and 17 respectively in
+ *    the lowered RustBuffer carried by a call_status code of 1 (UniFFI
+ *    numbers the variants from 1 in declaration order).
  *
- *  - The shape (UniFFI 0.31, contract 30) is current as of phantom_protocol
- *    0.2.2. If you bump the UniFFI dependency,
- *    regenerate this header.
+ *  - The shape (UniFFI 0.32, contract 30) is current as of phantom_protocol
+ *    0.3.0. If you bump the UniFFI dependency, regenerate this header.
  * ==================================================================== */
 
 #ifdef __cplusplus
