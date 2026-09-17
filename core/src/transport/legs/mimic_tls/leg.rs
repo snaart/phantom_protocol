@@ -5,6 +5,16 @@
 //! TLS 1.3 prelude, after which `send_bytes` / `recv_bytes` carry Phantom messages
 //! inside TLS ApplicationData records. The outer TLS is anti-DPI obfuscation only —
 //! see the module head in [`super`].
+//!
+//! Writes after the prelude follow the same rule as `TcpSessionTransport`, for the
+//! same reason — this is a TCP socket, and a peer that stops reading it would
+//! otherwise hold the session's pump: a write that makes no progress for
+//! [`MimicTlsLeg::DEFAULT_WRITE_STALL_TIMEOUT`] (adjustable with
+//! [`MimicTlsLeg::with_write_stall_timeout`]) fails with
+//! [`CoreError::Timeout`](crate::errors::CoreError::Timeout), every later write is
+//! refused without touching the socket, and the connection is set to end with a
+//! reset. The prelude is not affected: its writes already sit under the prelude's
+//! own deadline.
 
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -12,7 +22,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
 use super::record::{frame_message, RecordDeframer, CT_HANDSHAKE};
@@ -21,6 +31,9 @@ use super::{client_hello, theater};
 use crate::crypto::rng::OsRng;
 use crate::errors::CoreError;
 use crate::transport::session_transport::{FramePhase, SessionTransport};
+use crate::transport::write_stall::{
+    reset_on_close, write_all_making_progress, WriteFailure, DEFAULT_WRITE_STALL_TIMEOUT,
+};
 
 /// Send-side cap, mirroring `TcpSessionTransport`'s steady-state cap — a single
 /// `send_bytes` larger than this is rejected (the peer's de-framer caps the inner
@@ -84,6 +97,11 @@ pub struct MimicTlsLeg {
     read: Mutex<ReadState>,
     /// 0 = handshake phase, 1 = established (drives the de-framer's inner cap).
     phase: AtomicU8,
+    /// How long one write may wait without the socket accepting a byte.
+    write_stall_timeout: Duration,
+    /// Set by the first write that stalls out, and never cleared: that write may
+    /// have left a record cut part-way through on the wire, so nothing may follow it.
+    write_stalled: AtomicBool,
 }
 
 fn net_err(e: std::io::Error) -> CoreError {
@@ -125,7 +143,25 @@ impl MimicTlsLeg {
                 scratch: vec![0u8; READ_SCRATCH],
             }),
             phase: AtomicU8::new(0),
+            write_stall_timeout: Self::DEFAULT_WRITE_STALL_TIMEOUT,
+            write_stalled: AtomicBool::new(false),
         }
+    }
+
+    /// How long a write after the prelude may go without the socket accepting a
+    /// byte before the leg gives up on its peer, unless
+    /// [`with_write_stall_timeout`](Self::with_write_stall_timeout) says otherwise.
+    /// The same thirty seconds as `TcpSessionTransport`.
+    pub const DEFAULT_WRITE_STALL_TIMEOUT: Duration = DEFAULT_WRITE_STALL_TIMEOUT;
+
+    /// Replace the write-stall deadline: how long a single write may wait without
+    /// the socket accepting a byte before `send_bytes` fails with
+    /// [`CoreError::Timeout`] and the leg gives up on its peer. The clock restarts
+    /// with every byte accepted — it bounds how long the peer may stop reading,
+    /// not how slowly it may read.
+    pub fn with_write_stall_timeout(mut self, timeout: Duration) -> Self {
+        self.write_stall_timeout = timeout;
+        self
     }
 
     /// Client side: open the TLS-mimic prelude over `stream`, then return a leg
@@ -256,11 +292,29 @@ impl SessionTransport for MimicTlsLeg {
                 SEND_CAP
             )));
         }
+        if self.write_stalled.load(Ordering::Acquire) {
+            return Err(CoreError::Timeout);
+        }
         let records = frame_message(data)?;
         let mut w = self.write_half.lock().await;
-        w.write_all(&records).await.map_err(net_err)?;
-        w.flush().await.map_err(net_err)?;
-        Ok(())
+        // Checked again under the lock: the write this one queued behind may be the
+        // one that stalled, and what it left on the wire is not a record boundary.
+        if self.write_stalled.load(Ordering::Acquire) {
+            return Err(CoreError::Timeout);
+        }
+        match write_all_making_progress(&mut *w, &[&records], self.write_stall_timeout).await {
+            Ok(()) => Ok(()),
+            Err(WriteFailure::Io(e)) => Err(net_err(e)),
+            Err(WriteFailure::Stalled) => {
+                self.write_stalled.store(true, Ordering::Release);
+                reset_on_close((*w).as_ref());
+                log::warn!(
+                    "MimicTlsLeg: the peer accepted no bytes for {:?}; giving up on it",
+                    self.write_stall_timeout
+                );
+                Err(CoreError::Timeout)
+            }
+        }
     }
 
     async fn recv_bytes(&self) -> Result<Bytes, CoreError> {
@@ -342,6 +396,47 @@ mod tests {
         let (s, r) = tokio::join!(client.send_bytes(&big), server.recv_bytes());
         s.expect("client send big");
         assert_eq!(r.expect("server recv big").len(), big.len());
+    }
+
+    /// After the prelude, a write the peer never takes fails with `Timeout` instead of
+    /// waiting forever, and nothing is written after it.
+    ///
+    /// Not `#[ignore]`d like the round-trip above, although it runs over real loopback
+    /// too: it is the regression test for a peer holding the session's pump by not
+    /// reading, and it has to run wherever the feature is tested.
+    #[tokio::test]
+    async fn a_write_the_peer_never_takes_fails_and_nothing_follows_it() {
+        use crate::api::tcp_transport::test_support::connection_whose_far_end_never_reads;
+        const STALL: Duration = Duration::from_millis(250);
+
+        let (near, far) = connection_whose_far_end_never_reads().await;
+        let server_config = MimicConfig::new("server-ignored");
+        let client_config = MimicConfig::new("cover.example.com");
+        let (near, far) = tokio::join!(
+            MimicTlsLeg::accept(near, &server_config),
+            MimicTlsLeg::connect(far, &client_config),
+        );
+        let near = near
+            .expect("server prelude")
+            .with_write_stall_timeout(STALL);
+        let _far = far.expect("client prelude");
+        near.set_frame_phase(FramePhase::Established);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            near.send_bytes(&vec![0x42_u8; 1024 * 1024]),
+        )
+        .await;
+        assert!(
+            matches!(outcome, Ok(Err(CoreError::Timeout))),
+            "a write the peer never takes must fail with Timeout; got {outcome:?}"
+        );
+        let next = near.send_bytes(b"after the stall").await;
+        assert!(
+            matches!(next, Err(CoreError::Timeout)),
+            "a write after a stall must be refused, not appended to a cut-off record; got \
+             {next:?}"
+        );
     }
 
     /// A peer that sends non-TLS garbage instead of a ClientHello is black-holed:

@@ -15,7 +15,8 @@
 //! Bounding the total time instead would be a policy about how fast a peer has to
 //! be, and that is the application's decision rather than the transport's.
 //!
-//! Used by `TcpSessionTransport`.
+//! Used by the two tokio stream transports, `TcpSessionTransport` and the
+//! `mimicry` leg.
 
 use std::io;
 use std::time::Duration;
