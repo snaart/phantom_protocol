@@ -284,8 +284,10 @@ RustCrypto FIPS-203 / FIPS-204 implementations. The crate compiles on
 The formal architecture spec is
 [`docs/architecture/ARCHITECTURE.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/architecture/ARCHITECTURE.md);
 the unified wire protocol (incl. 0-RTT) is
-[`docs/protocol/PROTOCOL.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/protocol/PROTOCOL.md). Per-subsystem
-security invariants are catalogued in
+[`docs/protocol/PROTOCOL.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/protocol/PROTOCOL.md). The eleven
+numbered security invariants cited throughout the code are listed in
+[`docs/security/invariants.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/security/invariants.md),
+and the threat model is
 [`docs/security/threat-model.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/security/threat-model.md).
 
 ## Transport features
@@ -822,7 +824,7 @@ carry **SLSA-3 OIDC build-provenance attestations** via
     in either direction is a property of the path rather than a ranking.
 - **Negative-security suite: 73 always-on tests** in
   `core/tests/security_invariants.rs`, covering most — not all — of the eleven
-  numbered security invariants: identity pinning, the unencrypted-packet receive
+  numbered security invariants (listed in `docs/security/invariants.md`): identity pinning, the unencrypted-packet receive
   gate, replay rejection, rekey and epoch handling, path validation, transcript
   binding of the 0-RTT verdict, and 0-RTT ticket handling. Three are pinned
   elsewhere and deliberately not here: the two FIPS invariants (build-mode

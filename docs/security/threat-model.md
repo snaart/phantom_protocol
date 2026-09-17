@@ -523,7 +523,10 @@ changes no Phantom security invariant; the inner session is unchanged.)
 ## 7. Mitigation traceability
 
 Each mitigation listed above is implemented or documented in the codebase
-and the specialist docs in this directory. Cross-reference quick map:
+and the specialist docs in this directory. The numbered security invariants
+that source comments and tests cite ("Invariant 6") are listed, with where each
+is enforced and which tests pin it, in [`invariants.md`](invariants.md).
+Cross-reference quick map:
 
 - STRIDE-S (server identity) → Phase 1.1, 1.2, May 2026 Vuln-1 fix.
 - STRIDE-T (tampering) → AEAD AAD construction in `transport::session`,

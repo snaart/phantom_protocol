@@ -1,10 +1,12 @@
 //! Formal negative-security tests for the documented invariants.
 //!
-//! Each test pins a specific property from `SECURITY.md` / `docs/security/threat-model.md` so that
-//! a future regression which silently weakens one of them surfaces as a hard
-//! red here. These run on every `cargo test --test security_invariants` path —
-//! they are NOT `#[ignore]`-gated. Most are pure (no sockets); the PhantomUDP
-//! pre-auth DoS-bound tests bind a loopback `UdpSocket` (fast + deterministic).
+//! "Invariant N" below refers to the numbered list in `docs/security/invariants.md`, which
+//! states each invariant, where it is enforced, and which tests here pin it. Each test pins a
+//! specific property from that list or from `docs/security/threat-model.md` so that a future
+//! regression which silently weakens one of them surfaces as a hard red here. These run on
+//! every `cargo test --test security_invariants` path — they are NOT `#[ignore]`-gated. Most
+//! are pure (no sockets); the PhantomUDP pre-auth DoS-bound tests bind a loopback `UdpSocket`
+//! (fast + deterministic).
 //!
 //! Coverage map:
 //!   - AEAD authenticated decryption rejects bit-flipped ciphertext.

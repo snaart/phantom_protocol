@@ -69,7 +69,11 @@ build is `--no-default-features --features fips,bindings,compression-zstd`. See
 
 ## Security invariants
 
-The implementation enforces (and integration tests verify) the following invariants:
+The implementation enforces eleven numbered security invariants. Source
+comments, tests and documents cite them by number ("Invariant 9"); the full
+list, with where each is enforced and which tests pin it, is
+[`docs/security/invariants.md`](docs/security/invariants.md). The first three,
+which most directly shape how the library may be deployed, are:
 
 1. **Server identity pinning.** `PhantomSession::connect_with_transport` requires
    the client to supply the expected `HybridVerifyingKey`. Mismatch aborts the
@@ -91,8 +95,8 @@ The implementation enforces (and integration tests verify) the following invaria
    [`docs/security/threat-model.md`](docs/security/threat-model.md) §6.1 for the
    honest residuals and SAFE/UNSAFE guidance.
 
-Future edits must preserve these. See [`docs/security/threat-model.md`](docs/security/threat-model.md)
-for the full STRIDE / LINDDUN analysis and per-mitigation file:line traceability.
+Future edits must preserve all eleven. See [`docs/security/threat-model.md`](docs/security/threat-model.md)
+for the full STRIDE / LINDDUN analysis and per-mitigation traceability.
 
 ## Disclosure timeline (template)
 

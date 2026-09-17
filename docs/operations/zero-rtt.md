@@ -119,4 +119,4 @@ is the recommended posture for any multi-node deployment that has not deliberate
 - `docs/security/threat-model.md` — the STRIDE-S rows for 0-RTT replay and the at-most-once
   property.
 - `docs/protocol/PROTOCOL.md` §6.6 — the 0-RTT early-data wire path and resumption binder.
-- Security Invariant 9 (`SECURITY.md`) — one-shot early-data, best-effort acceptance.
+- Security Invariant 9 (`docs/security/invariants.md`) — one-shot early-data, best-effort acceptance.

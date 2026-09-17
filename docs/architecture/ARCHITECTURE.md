@@ -1,6 +1,7 @@
 # Phantom Protocol Architecture
 
-Companion to `PROTOCOL.md` (wire format) and `SECURITY.md` (invariants).
+Companion to `PROTOCOL.md` (wire format) and `docs/security/invariants.md` (the
+numbered security invariants cited below).
 This document covers the **internal** structure: modules, data flow,
 concurrency, and ownership. It is current as of Phase 8 (OpenTelemetry) +
 Phase 4 (connection migration & liveness, P4.0–P4.4) — the native **PhantomUDP**

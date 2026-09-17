@@ -2319,8 +2319,9 @@ deployment guidance.
 
 ## 10. Compliance with documented invariants
 
-The invariants from `SECURITY.md` and `docs/security/threat-model.md` map onto
-this spec as follows:
+The numbered security invariants — stated in full, with their enforcement
+points and tests, in `docs/security/invariants.md` — map onto this spec as
+follows:
 
 | Invariant | Spec section |
 | --- | --- |
@@ -2328,7 +2329,7 @@ this spec as follows:
 | 2 — Post-handshake ENCRYPTED flag | § 4.3 / § 4.11 / § 5 |
 | 3 — Anti-DPI obfuscation carries no confidentiality of its own (framing-only `mimicry` leg) | § 9.1 |
 | 4 — Replay rejection after AEAD verify | § 5 / § 4.11 |
-| 5 — Rekey via HKDF `"phantom-rekey-v1"`, saturating epoch | § 5 |
+| 5 — Rekey via HKDF `"phantom-rekey-v1"`; the epoch never wraps | § 5 |
 | 6 — Constant-time path-validation responses | § 4.3 (`PATH_VALIDATION`) / § 12.1 |
 | 7 — Transcript-bound version | § 1 / § 6.5 |
 | 8 — AEAD nonce-exhaustion guard at 2^48 | § 5 |
@@ -2337,7 +2338,8 @@ this spec as follows:
 | 11 — FIPS POST runs before any handshake | § 6.7 |
 
 Removing or weakening any of these requires a deliberate `WIRE_VERSION` /
-`PROTOCOL_VERSION` bump (§ 1) and a corresponding update to `SECURITY.md`.
+`PROTOCOL_VERSION` bump (§ 1) and a corresponding update to
+`docs/security/invariants.md`.
 
 ---
 
