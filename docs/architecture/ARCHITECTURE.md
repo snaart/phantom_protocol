@@ -139,9 +139,17 @@ Both client and server, after their handshakes, spawn the **same** `run_data_pum
   - `close_requested.changed()` — the local close, raised by `disconnect()` or by
     dropping the handle. A `watch` signal rather than a command, and never gated: the
     command arm below is disabled while the pump holds a write the send buffer refused,
-    which a peer that stops reading can make last indefinitely. The arm takes in the
-    commands queued ahead of the close for as long as the send buffers admit them,
-    pushes what the windows allow, announces the close and exits.
+    which a peer that stops reading can make last indefinitely. The arm first carries
+    out the control commands queued ahead of it (so a migration requested before the
+    close decides which path the final flush takes), then takes in the commands queued
+    ahead of the close for as long as the send buffers admit them, pushes what the
+    windows allow, announces the close and exits.
+  - `control_rx.recv()` — `ControlCommand`s, the ones that write nothing:
+    **`Migrate(local_addr)`**, **`MigrateServer(local_addr)`**, `SetStreamPriority`.
+    Never gated, for the close's reason: a path that dies mid-upload leaves refused
+    writes held until acknowledgements return, and a migration is what brings them
+    back. Carried out in the order sent, but not ordered against the writes on the
+    command channel.
   - `released_rx.recv()` — a `PhantomStream` handle dropped by the application,
     reported from its `Drop` on an unbounded channel of its own. Never gated. The pump
     records how many commands are in the command channel at that moment and acts only
@@ -151,8 +159,7 @@ Both client and server, after their handshakes, spawn the **same** `run_data_pum
     stream leaves the table once that close is acknowledged, whether or not the peer
     ever closes its half.
   - `cmd_rx.recv()` — `SessionCommand`s: `Send`, `SendStreamReliable/Unreliable`,
-    `CloseStream`, `SetStreamPriority`, **`Migrate(local_addr)`**,
-    **`MigrateServer(local_addr)`**, `Close`. Disabled while a refused write is held.
+    `CloseStream`, `Close`. Disabled while a refused write is held.
   - `recv_done_rx` — exit when the reader ends (transport closed).
 
 ---

@@ -1515,7 +1515,13 @@ public protocol PhantomSessionProtocol: AnyObject, Sendable {
      * switch then complete asynchronously. The keys and session persist — **no
      * re-handshake**. A failed rebind never tears the session down: it keeps running
      * on the existing socket (broken-rebind safety). `Err` here means only that the
-     * session was already closed (the command channel is gone).
+     * session was already closed (the pump is gone).
+     *
+     * **It does not wait behind queued writes.** A path that has died leaves the
+     * application's writes waiting for acknowledgements that cannot arrive until the
+     * session has moved, so the request travels apart from them and the pump acts on
+     * it at once, however much is queued. Writes already accepted go out on the new
+     * path, and what was sent on the old one is retransmitted there.
      *
      * **Transport requirement:** seamless migration (Wi-Fi ↔ LTE without
      * re-handshake) requires the session to be backed by
@@ -2114,7 +2120,13 @@ open func metricsSnapshot() -> MetricsSnapshotFfi  {
      * switch then complete asynchronously. The keys and session persist — **no
      * re-handshake**. A failed rebind never tears the session down: it keeps running
      * on the existing socket (broken-rebind safety). `Err` here means only that the
-     * session was already closed (the command channel is gone).
+     * session was already closed (the pump is gone).
+     *
+     * **It does not wait behind queued writes.** A path that has died leaves the
+     * application's writes waiting for acknowledgements that cannot arrive until the
+     * session has moved, so the request travels apart from them and the pump acts on
+     * it at once, however much is queued. Writes already accepted go out on the new
+     * path, and what was sent on the old one is retransmitted there.
      *
      * **Transport requirement:** seamless migration (Wi-Fi ↔ LTE without
      * re-handshake) requires the session to be backed by
@@ -2550,6 +2562,10 @@ public protocol PhantomStreamProtocol: AnyObject, Sendable {
     /**
      * Set this stream's scheduler priority (higher = drained first). Takes
      * effect on the next drain pass.
+     *
+     * The request does not wait behind writes queued on the session, so it
+     * applies to whatever the stream holds at that pass — writes made before
+     * this call included, even if they are still waiting for room.
      */
     func setPriority(priority: UInt32) async throws 
     
@@ -2783,6 +2799,10 @@ open func sendUnreliable(data: Data)async throws   {
     /**
      * Set this stream's scheduler priority (higher = drained first). Takes
      * effect on the next drain pass.
+     *
+     * The request does not wait behind writes queued on the session, so it
+     * applies to whatever the stream holds at that pass — writes made before
+     * this call included, even if they are still waiting for room.
      */
 open func setPriority(priority: UInt32)async throws   {
     return
@@ -5324,7 +5344,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_method_phantomsession_metrics_snapshot() != 13889) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_migrate() != 51241) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_migrate() != 13926) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomsession_open_stream() != 57628) {
@@ -5372,7 +5392,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable() != 18144) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomstream_set_priority() != 18532) {
+    if (uniffi_phantom_protocol_checksum_method_phantomstream_set_priority() != 63660) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomstream_stream_id() != 46486) {

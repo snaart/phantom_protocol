@@ -5,7 +5,7 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
-use crate::api::session::{ConnectionState, SessionCommand, StreamLink};
+use crate::api::session::{ConnectionState, ControlCommand, SessionCommand, StreamLink};
 use crate::errors::CoreError;
 use crate::transport::multiplexer::{StreamHandle, StreamMessage};
 
@@ -39,8 +39,8 @@ use crate::transport::multiplexer::{StreamHandle, StreamMessage};
 #[cfg_attr(feature = "bindings", derive(uniffi::Object))]
 pub struct PhantomStream {
     stream_id: u32,
-    /// The channels to the session's data pump: writes, the close and the priority,
-    /// and the report this handle makes when it is dropped.
+    /// The channels to the session's data pump: writes and the close, control that
+    /// writes nothing, and the report this handle makes when it is dropped.
     link: StreamLink,
     /// Receiver for incoming demultiplexed stream data
     rx: Mutex<mpsc::Receiver<StreamMessage>>,
@@ -206,10 +206,14 @@ impl PhantomStream {
 
     /// Set this stream's scheduler priority (higher = drained first). Takes
     /// effect on the next drain pass.
+    ///
+    /// The request does not wait behind writes queued on the session, so it
+    /// applies to whatever the stream holds at that pass — writes made before
+    /// this call included, even if they are still waiting for room.
     pub async fn set_priority(&self, priority: u32) -> Result<(), CoreError> {
         self.link
-            .commands
-            .send(SessionCommand::SetStreamPriority {
+            .control
+            .send(ControlCommand::SetStreamPriority {
                 stream_id: self.stream_id,
                 priority,
             })
@@ -268,8 +272,13 @@ mod tests {
 
     /// A link whose writes go to `commands` and whose other channels lead nowhere.
     fn link_to(commands: mpsc::Sender<SessionCommand>) -> StreamLink {
+        let (control, _) = mpsc::channel(1);
         let (released, _) = mpsc::unbounded_channel();
-        StreamLink { commands, released }
+        StreamLink {
+            commands,
+            control,
+            released,
+        }
     }
 
     /// Build a minimal PhantomStream with a test-controlled channel.

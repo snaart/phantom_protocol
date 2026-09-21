@@ -637,6 +637,10 @@ pub struct PhantomSession {
     /// for room in the channel waited with it. Raising this never waits, and the pump
     /// reads it whatever else it is holding.
     close_request: watch::Sender<bool>,
+    /// Control that writes nothing — [`migrate`](Self::migrate), `migrate_server()` and
+    /// every stream's `set_priority()` — on a channel the pump never stops reading, for the
+    /// same reason the close has a signal of its own. See `ControlCommand`.
+    control_tx: mpsc::Sender<ControlCommand>,
     /// Where a dropped [`PhantomStream`](crate::api::stream::PhantomStream) tells the pump
     /// that it is gone. See `StreamLink::released`.
     released_tx: mpsc::UnboundedSender<u32>,
@@ -732,7 +736,14 @@ pub struct PhantomSession {
     recv_tuning: Arc<SharedRecvTuning>,
 }
 
-/// Commands for the background session task
+/// Commands for the background session task that write, or that have to stay in order
+/// with the writes: the application's data, and a stream's close.
+///
+/// This channel is read on an arm the pump disables while it holds a write a send buffer
+/// refused, which is what carries backpressure back to the caller. Anything that must be
+/// acted on while the session is in that state travels elsewhere: control that writes
+/// nothing — a migration, a stream's priority — on a channel of its own, the drop of a
+/// stream handle on another, and the session's own close on a signal of its own.
 pub enum SessionCommand {
     /// Queue data for sending
     Send(Vec<u8>),
@@ -742,6 +753,34 @@ pub enum SessionCommand {
     SendStreamUnreliable { stream_id: u32, data: bytes::Bytes },
     /// Close a specific stream
     CloseStream { stream_id: u32 },
+    /// Close the session. Honoured when it arrives, but `disconnect()` and a dropped
+    /// handle do not send it: their close travels on a signal of its own, which the
+    /// pump reads even while it has stopped reading this channel.
+    Close,
+}
+
+/// Commands for the background session task that write nothing, carried apart from the
+/// application's writes.
+///
+/// The command channel is disabled while the pump holds a write a send buffer refused, and
+/// nothing bounds how long it holds one: on a path that died in the middle of an upload no
+/// acknowledgement arrives to free a slot. A migration requested then is what would bring
+/// the acknowledgements back, so queued behind the stalled writes it waited for them while
+/// they waited for it — `migrate()` blocked once the channel filled, and the session sat in
+/// `Migrating` until the liveness timer declared it dead. These commands therefore have a
+/// channel of their own, read on an arm nothing disables.
+///
+/// **What ordering holds.** Control commands are carried out in the order they were sent,
+/// one at a time, and each migration is carried out whole: the rebind, then the `path_id`
+/// and connection-id rotation, with no send in between. They are *not* ordered against the
+/// writes on the command channel — a migration can take effect before a write issued ahead
+/// of it has been admitted to its stream's send buffer. That costs nothing the migration
+/// design depends on: a segment goes out on whichever path is current when it is sent, and
+/// whatever was sent on the old path is retransmitted on the new one. A priority is a
+/// property of the stream, applied to whatever it holds at the next drain. A local close
+/// takes in the control commands queued ahead of it before it flushes, so a migration
+/// requested before `disconnect()` decides which path the final flush goes out on.
+pub(crate) enum ControlCommand {
     /// Migrate to a new local address (Phase 4 / P4.2 — embedder-triggered). Carries
     /// the new local bind address as a `String`; the pump rebinds the transport and
     /// bumps the send `path_id` (best-effort, never fatal to the session).
@@ -757,19 +796,21 @@ pub enum SessionCommand {
     /// Takes effect on the next drain pass; no notify needed since priority only
     /// reorders an already-scheduled drain.
     SetStreamPriority { stream_id: u32, priority: u32 },
-    /// Close the session. Honoured when it arrives, but `disconnect()` and a dropped
-    /// handle do not send it: their close travels on a signal of its own, which the
-    /// pump reads even while it has stopped reading this channel.
-    Close,
 }
+
+/// How many [`ControlCommand`]s may wait for the pump at once. The arm that reads them is
+/// never disabled, so this bounds a burst from the application rather than a backlog the
+/// peer can build: a caller waits for room only while the pump is inside another arm.
+const CONTROL_CHANNEL_DEPTH: usize = 32;
 
 /// What a [`PhantomStream`](crate::api::stream::PhantomStream) holds to reach the pump that
 /// owns its stream.
 #[derive(Clone)]
 pub(crate) struct StreamLink {
-    /// Writes, the stream's close and its priority, in order with the rest of the
-    /// session's writes.
+    /// Writes and the stream's close, in order with the rest of the session's writes.
     pub(crate) commands: mpsc::Sender<SessionCommand>,
+    /// Control that writes nothing — the stream's priority. See [`ControlCommand`].
+    pub(crate) control: mpsc::Sender<ControlCommand>,
     /// Where a handle reports, as it is dropped, that it is gone.
     ///
     /// Unbounded because `Drop` can neither wait for room nor fail usefully, and a
@@ -862,6 +903,7 @@ impl PhantomSession {
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (close_request, close_requested) = watch::channel(false);
+        let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_DEPTH);
         let (released_tx, released_rx) = mpsc::unbounded_channel();
         let (recv_tx, recv_rx) = mpsc::channel(RAW_APP_RECV_CHANNEL_DEPTH);
         // Channel for peer-initiated streams exposed via accept_stream().
@@ -911,6 +953,7 @@ impl PhantomSession {
             send_queue: send_queue.clone(),
             cmd_tx: cmd_tx.clone(),
             close_request,
+            control_tx: control_tx.clone(),
             released_tx: released_tx.clone(),
             cmd_rx: Mutex::new(None), // taken by background task
             recv_rx: Mutex::new(recv_rx),
@@ -941,6 +984,7 @@ impl PhantomSession {
             cmd_tx.clone(),
             cmd_rx,
             close_requested,
+            control_rx,
             released_rx,
             recv_tx,
             transport,
@@ -957,6 +1001,7 @@ impl PhantomSession {
             liveness,
             StreamLink {
                 commands: cmd_tx,
+                control: control_tx,
                 released: released_tx,
             },
             incoming_stream_tx,
@@ -1005,6 +1050,7 @@ impl PhantomSession {
     ) -> Arc<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (close_request, close_requested) = watch::channel(false);
+        let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_DEPTH);
         let (released_tx, released_rx) = mpsc::unbounded_channel();
         let (recv_tx, recv_rx) = mpsc::channel(RAW_APP_RECV_CHANNEL_DEPTH);
         // Channel for peer-initiated streams exposed via accept_stream().
@@ -1050,6 +1096,7 @@ impl PhantomSession {
             send_queue: send_queue.clone(),
             cmd_tx: cmd_tx.clone(),
             close_request,
+            control_tx: control_tx.clone(),
             released_tx: released_tx.clone(),
             cmd_rx: Mutex::new(None),
             recv_rx: Mutex::new(recv_rx),
@@ -1102,6 +1149,7 @@ impl PhantomSession {
             send_queue,
             cmd_rx,
             close_requested,
+            control_rx,
             released_rx,
             recv_tx,
             demux,
@@ -1111,6 +1159,7 @@ impl PhantomSession {
             leg,
             StreamLink {
                 commands: cmd_tx,
+                control: control_tx,
                 released: released_tx,
             },
             incoming_stream_tx,
@@ -1130,6 +1179,7 @@ impl PhantomSession {
         _cmd_tx: mpsc::Sender<SessionCommand>,
         cmd_rx: mpsc::Receiver<SessionCommand>,
         close_requested: watch::Receiver<bool>,
+        control_rx: mpsc::Receiver<ControlCommand>,
         released_rx: mpsc::UnboundedReceiver<u32>,
         recv_tx: mpsc::Sender<Bytes>,
         transport: T,
@@ -1315,6 +1365,7 @@ impl PhantomSession {
             send_queue,
             cmd_rx,
             close_requested,
+            control_rx,
             released_rx,
             recv_tx,
             demux,
@@ -2063,6 +2114,9 @@ async fn run_data_pump<T: SessionTransport>(
     // The local close request (`PhantomSession::close_request`), read beside the command
     // channel rather than through it.
     mut close_requested: watch::Receiver<bool>,
+    // Control that writes nothing (`ControlCommand`), read beside the command channel for
+    // the same reason.
+    mut control_rx: mpsc::Receiver<ControlCommand>,
     // Stream handles the application has dropped (`StreamLink::released`).
     mut released_rx: mpsc::UnboundedReceiver<u32>,
     recv_tx: mpsc::Sender<Bytes>,
@@ -2073,8 +2127,8 @@ async fn run_data_pump<T: SessionTransport>(
     leg: LegType,
     // The channels a `PhantomStream` handle needs, cloned for the handles built on
     // peer-initiated streams (passed through to `handle_packet` → new-stream branch).
-    // Holding it also keeps the release channel open for as long as the pump runs, so its
-    // arm below never sees it close.
+    // Holding it also keeps the control and release channels open for as long as the pump
+    // runs, so their arms below never see them close.
     stream_link: StreamLink,
     // Sink for newly-registered peer-initiated streams (`accept_stream()`).
     incoming_stream_tx: mpsc::Sender<Arc<crate::api::stream::PhantomStream>>,
@@ -2759,6 +2813,17 @@ async fn run_data_pump<T: SessionTransport>(
             _ = close_requested.changed() => {
                 log::info!("PhantomSession: closing");
                 if !crypto_session.peer_closed() {
+                    // Control queued ahead of the close is carried out first, so a
+                    // migration requested before it decides which path the flush below
+                    // goes out on. The two arms can be ready at once, and nothing else
+                    // would read that channel again.
+                    for _ in 0..control_rx.len() {
+                        let Ok(control) = control_rx.try_recv() else {
+                            break;
+                        };
+                        take_control(control, &transport, &crypto_session, &streams, &observability)
+                            .await;
+                    }
                     flush_deferred_sends(
                         &mut deferred, &transport, &crypto_session, session_id, &streams,
                         &demux, &stream_gauge, &observability,
@@ -2793,6 +2858,16 @@ async fn run_data_pump<T: SessionTransport>(
                     );
                 }
                 break;
+            }
+            // Control that writes nothing — a migration, a stream's priority. On an arm of
+            // its own and not gated on `deferred`, for the reason the local close is: the
+            // command arm below stops while a refused write is held, and on a path that has
+            // died a refused write is held until a migration brings the acknowledgements
+            // back. `ControlCommand` says what ordering this keeps and what it gives up.
+            // Not disabled while draining either: the command arm never refused these.
+            Some(control) = control_rx.recv() => {
+                take_control(control, &transport, &crypto_session, &streams, &observability)
+                    .await;
             }
             // A stream handle the application dropped. Only recorded here, with the number
             // of commands the pump has to take before every write that handle queued is in
@@ -3049,14 +3124,6 @@ async fn take_command<T: SessionTransport>(
                 }
             }
         }
-        SessionCommand::SetStreamPriority {
-            stream_id,
-            priority,
-        } => {
-            if let Some(stream) = streams.get(&stream_id) {
-                stream.set_priority(priority);
-            }
-        }
         SessionCommand::CloseStream { stream_id } => {
             // Reliable FIN over ARQ: enqueue a zero-length reliable
             // FIN sentinel rather than firing a bare (unreliable) FIN.
@@ -3106,7 +3173,33 @@ async fn take_command<T: SessionTransport>(
                 crypto_session.notify_outbound_ready();
             }
         }
-        SessionCommand::Migrate(local_addr) => {
+        SessionCommand::Close => return true,
+    }
+    false
+}
+
+/// Carry out one [`ControlCommand`].
+///
+/// Two callers: the control arm, one command per turn, and the local close, which takes
+/// in the ones queued ahead of it before it flushes. Neither is gated on the writes the
+/// pump holds, which is the whole point — see [`ControlCommand`].
+async fn take_control<T: SessionTransport>(
+    control: ControlCommand,
+    transport: &Arc<T>,
+    crypto_session: &Arc<Session>,
+    streams: &Arc<DashMap<u32, Arc<Stream>>>,
+    observability: &Observability,
+) {
+    match control {
+        ControlCommand::SetStreamPriority {
+            stream_id,
+            priority,
+        } => {
+            if let Some(stream) = streams.get(&stream_id) {
+                stream.set_priority(priority);
+            }
+        }
+        ControlCommand::Migrate(local_addr) => {
             // Embedder-triggered connection migration (Phase 4 / P4.2).
             // Rebind the transport to the new local socket FIRST (it keeps
             // the old socket for the overlap); only on a successful rebind
@@ -3149,7 +3242,7 @@ async fn take_command<T: SessionTransport>(
                 }
             }
         }
-        SessionCommand::MigrateServer(local_addr) => {
+        ControlCommand::MigrateServer(local_addr) => {
             // Server-side migration (the mirror of `Migrate`). Rebind the
             // server's SEND socket to the new local address FIRST (its receive
             // keeps flowing on the old address through the listener demux during
@@ -3183,9 +3276,7 @@ async fn take_command<T: SessionTransport>(
                 }
             }
         }
-        SessionCommand::Close => return true,
     }
-    false
 }
 
 /// Act on every dropped stream handle whose own writes the pump has now taken in (see
@@ -5923,7 +6014,9 @@ impl PhantomSession {
     #[cfg_attr(feature = "bindings", uniffi::constructor)]
     pub fn connect(peer_addr: String) -> Arc<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
-        // No pump reads it; a dropped stream's report goes nowhere.
+        // No pump reads either; a command sent on one fails, and a dropped stream's
+        // report goes nowhere.
+        let (control_tx, _control_rx) = mpsc::channel(CONTROL_CHANNEL_DEPTH);
         let (released_tx, _released_rx) = mpsc::unbounded_channel();
         let (_recv_tx, recv_rx) = mpsc::channel(256);
         let (_incoming_tx, incoming_rx) = mpsc::channel(128);
@@ -5947,6 +6040,7 @@ impl PhantomSession {
             cmd_tx,
             // No pump to read it; raising it is a harmless no-op.
             close_request: watch::channel(false).0,
+            control_tx,
             released_tx,
             cmd_rx: Mutex::new(Some(cmd_rx)),
             recv_rx: Mutex::new(recv_rx),
@@ -5994,6 +6088,7 @@ impl PhantomSession {
             handle,
             StreamLink {
                 commands: self.cmd_tx.clone(),
+                control: self.control_tx.clone(),
                 released: self.released_tx.clone(),
             },
             self.state.clone(),
@@ -6348,7 +6443,13 @@ impl PhantomSession {
     /// switch then complete asynchronously. The keys and session persist — **no
     /// re-handshake**. A failed rebind never tears the session down: it keeps running
     /// on the existing socket (broken-rebind safety). `Err` here means only that the
-    /// session was already closed (the command channel is gone).
+    /// session was already closed (the pump is gone).
+    ///
+    /// **It does not wait behind queued writes.** A path that has died leaves the
+    /// application's writes waiting for acknowledgements that cannot arrive until the
+    /// session has moved, so the request travels apart from them and the pump acts on
+    /// it at once, however much is queued. Writes already accepted go out on the new
+    /// path, and what was sent on the old one is retransmitted there.
     ///
     /// **Transport requirement:** seamless migration (Wi-Fi ↔ LTE without
     /// re-handshake) requires the session to be backed by
@@ -6363,8 +6464,8 @@ impl PhantomSession {
                     .into(),
             ));
         }
-        self.cmd_tx
-            .send(SessionCommand::Migrate(local_addr))
+        self.control_tx
+            .send(ControlCommand::Migrate(local_addr))
             .await
             .map_err(|_| CoreError::NetworkError("Session closed".into()))
     }
@@ -6498,7 +6599,8 @@ impl PhantomSession {
     /// The server keeps RECEIVING client→server traffic on the established (listen) address
     /// through the overlap, so the session stays bidirectional immediately. Best-effort: a
     /// failed rebind leaves the session on the old send socket and never tears it down.
-    /// `Err` here means only that the session was already closed.
+    /// `Err` here means only that the session was already closed. Like `migrate`, the
+    /// request does not wait behind the session's queued writes.
     ///
     /// **Rust-only** (deliberately not on the UniFFI/FFI surface): server migration is a
     /// native-deployment operation, not a mobile-client one. The peer follows
@@ -6515,8 +6617,8 @@ impl PhantomSession {
                     .into(),
             ));
         }
-        self.cmd_tx
-            .send(SessionCommand::MigrateServer(local_addr))
+        self.control_tx
+            .send(ControlCommand::MigrateServer(local_addr))
             .await
             .map_err(|_| CoreError::NetworkError("Session closed".into()))
     }
@@ -7359,8 +7461,13 @@ mod tests {
     /// dropped, and every command it sends fails.
     fn detached_stream_link() -> StreamLink {
         let (commands, _) = mpsc::channel(1);
+        let (control, _) = mpsc::channel(1);
         let (released, _) = mpsc::unbounded_channel();
-        StreamLink { commands, released }
+        StreamLink {
+            commands,
+            control,
+            released,
+        }
     }
 
     /// The published-state handle a direct `handle_packet` call needs. `Connected`,
@@ -13044,6 +13151,266 @@ mod tests {
         );
     }
 
+    /// One end of an in-memory pipe whose path can be cut — every frame in either direction
+    /// then disappears, as on a network that has gone away — and which `migrate()` or
+    /// `migrate_server()` restores, standing in for a rebind onto a path that works.
+    struct CuttableTransport {
+        inner: ChannelTransport,
+        cut: Arc<AtomicBool>,
+        migrations: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl SessionTransport for CuttableTransport {
+        async fn send_bytes(&self, data: &[u8]) -> Result<(), CoreError> {
+            if self.cut.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            self.inner.send_bytes(data).await
+        }
+
+        async fn recv_bytes(&self) -> Result<Bytes, CoreError> {
+            loop {
+                let frame = self.inner.recv_bytes().await?;
+                if !self.cut.load(Ordering::SeqCst) {
+                    return Ok(frame);
+                }
+            }
+        }
+
+        fn supports_migration(&self) -> bool {
+            true
+        }
+
+        async fn migrate(&self, _local_addr: String) -> Result<(), CoreError> {
+            self.migrations.fetch_add(1, Ordering::SeqCst);
+            self.cut.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn migrate_server(&self, _local_addr: String) -> Result<(), CoreError> {
+            self.migrations.fetch_add(1, Ordering::SeqCst);
+            self.cut.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// An upload larger than the send buffer is under way when the path dies, and the
+    /// migration that would save the session has to go through while the upload is stalled.
+    ///
+    /// Nothing is acknowledged on a dead path, so the stream's send buffer stays full, the
+    /// pump keeps holding the writes it refused, and it stops reading its command channel —
+    /// which a second writer then fills. `migrate()` used to travel on that channel: it
+    /// blocked for room in it, and had it found room the pump would still never have read it,
+    /// so the session sat in `Migrating` until the liveness timer declared it dead, at exactly
+    /// the moment a migration was what it needed. With `server_side` the migrating session
+    /// holds the accepting end's keys and calls `migrate_server()`; otherwise it holds the
+    /// connecting end's and calls `migrate()`.
+    async fn migration_goes_through_while_an_upload_is_stalled_on_a_dead_path(server_side: bool) {
+        const UPLOAD: usize = 2 << 20;
+        let session_id = fixed_session_id();
+        let (client_inner, server_inner) = paired_sessions(session_id);
+        client_inner.set_state(SessionState::Connected);
+        server_inner.set_state(SessionState::Connected);
+        let (migrating_inner, peer_inner) = if server_side {
+            (server_inner, client_inner)
+        } else {
+            (client_inner, server_inner)
+        };
+        let (migrating_t, peer_t) = ChannelTransport::pair();
+        let cut = Arc::new(AtomicBool::new(false));
+        let migrations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let migrating = PhantomSession::from_accepted_server_session(
+            "migrating".into(),
+            CuttableTransport {
+                inner: migrating_t,
+                cut: cut.clone(),
+                migrations: migrations.clone(),
+            },
+            migrating_inner,
+        );
+        let peer = PhantomSession::from_accepted_server_session("peer".into(), peer_t, peer_inner);
+
+        // The peer reads everything it is sent, so once the path is back nothing but the
+        // path stands between the upload and its end.
+        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reader = {
+            let peer = peer.clone();
+            let received = received.clone();
+            tokio::spawn(async move {
+                while let Ok(bytes) = peer.recv().await {
+                    received.fetch_add(bytes.len(), Ordering::SeqCst);
+                }
+            })
+        };
+
+        cut.store(true, Ordering::SeqCst);
+        migrating
+            .send(vec![0x5A; UPLOAD])
+            .await
+            .expect("the pump takes the upload in");
+        // A second writer keeps handing the session small writes until told to stop, which
+        // fills the command channel once the pump stops reading it. It counts what it handed
+        // over, since all of that is owed to the peer as well.
+        let stop = Arc::new(AtomicBool::new(false));
+        let written = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writer = {
+            let migrating = migrating.clone();
+            let stop = stop.clone();
+            let written = written.clone();
+            tokio::spawn(async move {
+                while !stop.load(Ordering::SeqCst) && migrating.send(vec![0xC3; 64]).await.is_ok() {
+                    written.fetch_add(64, Ordering::SeqCst);
+                }
+            })
+        };
+
+        // Witness: the upload's send buffer is full of segments nobody acknowledges, and the
+        // command channel is full behind the writes the pump refused.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let buffer_full = migrating
+                .streams
+                .get(&RAW_APP_STREAM_ID)
+                .is_some_and(|s| s.send_buffer_full());
+            if buffer_full && migrating.cmd_tx.capacity() == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the upload never stalled: send buffer full = {buffer_full}, command-channel \
+                 room = {}",
+                migrating.cmd_tx.capacity()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // The liveness sweep notices the silence: the state an embedder migrates on.
+        while migrating.connection_state() != ConnectionState::Migrating {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dead path was never noticed; state {:?}",
+                migrating.connection_state()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let bound = std::time::Duration::from_secs(2);
+        let call = if server_side {
+            tokio::time::timeout(bound, migrating.migrate_server("0.0.0.0:0".into())).await
+        } else {
+            tokio::time::timeout(bound, migrating.migrate("0.0.0.0:0".into())).await
+        };
+        assert!(
+            matches!(call, Ok(Ok(()))),
+            "the migration request did not return within {bound:?}: {call:?}"
+        );
+        let deadline = std::time::Instant::now() + bound;
+        while migrations.load(Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the migration was accepted but not carried out within {bound:?}: the pump \
+                 never read it while the upload was stalled"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        stop.store(true, Ordering::SeqCst);
+        tokio::time::timeout(std::time::Duration::from_secs(30), writer)
+            .await
+            .expect("the second writer was never let through once the path was back")
+            .expect("writer task");
+
+        // And the session goes on: everything handed to it arrives over the restored path,
+        // and the liveness sweep sees the path come back rather than declaring it dead.
+        let owed = UPLOAD + written.load(Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while received.load(Ordering::SeqCst) < owed {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} of {owed} bytes arrived after the migration; state {:?}",
+                received.load(Ordering::SeqCst),
+                migrating.connection_state()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(received.load(Ordering::SeqCst), owed);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while migrating.connection_state() != ConnectionState::Connected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the session never recovered from the migration; state {:?}",
+                migrating.connection_state()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        reader.abort();
+        let _ = migrating.disconnect().await;
+        let _ = peer.disconnect().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn migrate_goes_through_while_an_upload_is_stalled_on_a_dead_path() {
+        migration_goes_through_while_an_upload_is_stalled_on_a_dead_path(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn migrate_server_goes_through_while_an_upload_is_stalled_on_a_dead_path() {
+        migration_goes_through_while_an_upload_is_stalled_on_a_dead_path(true).await;
+    }
+
+    /// A migration requested and then a `disconnect()`, back to back, is carried out before
+    /// the close — so the close's final flush goes out on the path the application moved
+    /// to rather than on the one it moved away from.
+    ///
+    /// The two travel on different channels and the pump can find both waiting at once. On
+    /// a single-threaded runtime nothing runs between the two calls, so the pump wakes to
+    /// exactly that and picks between the arms at random; a close that did not take in the
+    /// control queued ahead of it would skip the migration in about half of these rounds.
+    #[tokio::test]
+    async fn a_migration_requested_before_a_close_is_carried_out_first() {
+        for round in 0..32 {
+            let session_id = fixed_session_id();
+            let (client_inner, server_inner) = paired_sessions(session_id);
+            client_inner.set_state(SessionState::Connected);
+            server_inner.set_state(SessionState::Connected);
+            let (migrating_t, peer_t) = ChannelTransport::pair();
+            let migrations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let migrating = PhantomSession::from_accepted_server_session(
+                "migrating".into(),
+                CuttableTransport {
+                    inner: migrating_t,
+                    cut: Arc::new(AtomicBool::new(false)),
+                    migrations: migrations.clone(),
+                },
+                client_inner,
+            );
+            let _peer =
+                PhantomSession::from_accepted_server_session("peer".into(), peer_t, server_inner);
+            let obs = migrating.observability();
+            // Let the pump start and park, so the two requests below meet it together.
+            tokio::task::yield_now().await;
+
+            migrating
+                .migrate("0.0.0.0:0".into())
+                .await
+                .expect("the migration request is taken");
+            migrating.disconnect().await.expect("disconnect");
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while obs.snapshot().active_sessions != 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "round {round}: the pump never exited"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert_eq!(
+                migrations.load(Ordering::SeqCst),
+                1,
+                "round {round}: the close went ahead of the migration requested before it"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn v2_recv_handles_coalesced_bundle_and_routes_each_subpayload() {
         use crate::transport::packet_coalescer::{CoalescerConfig, PacketCoalescer};
@@ -14333,11 +14700,9 @@ mod tests {
 
     // ── PhantomStream::set_priority ──────────────────────────────────────────────
 
-    /// Verify that `SessionCommand::SetStreamPriority` reaches `Stream::set_priority`
-    /// and that the stored value is observable via `Stream::priority()`.
-    ///
-    /// We drive the pump directly via a `ChannelTransport` pair so no network I/O
-    /// is involved — the test is fully deterministic.
+    /// Verify that `ControlCommand::SetStreamPriority`, carried out by the pump's control
+    /// arm, reaches `Stream::set_priority` and that the stored value is observable via
+    /// `Stream::priority()`.
     #[tokio::test]
     async fn set_priority_command_reaches_stream() {
         use crate::transport::stream::Stream as TransportStream;
@@ -14354,20 +14719,19 @@ mod tests {
             "default priority should be 0"
         );
 
-        // Simulate the pump arm: look up the stream and call set_priority.
-        let cmd = SessionCommand::SetStreamPriority {
-            stream_id,
-            priority: 99,
-        };
-        if let SessionCommand::SetStreamPriority {
-            stream_id: sid,
-            priority,
-        } = cmd
-        {
-            if let Some(stream) = streams.get(&sid) {
-                stream.set_priority(priority);
-            }
-        }
+        let (session, _peer) = paired_sessions(fixed_session_id());
+        let (transport, _far_end) = ChannelTransport::pair();
+        take_control(
+            ControlCommand::SetStreamPriority {
+                stream_id,
+                priority: 99,
+            },
+            &Arc::new(transport),
+            &session,
+            &streams,
+            &Observability::new(ObservabilityConfig::default()),
+        )
+        .await;
 
         assert_eq!(
             transport_stream.priority(),

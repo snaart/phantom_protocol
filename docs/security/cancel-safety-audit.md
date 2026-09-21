@@ -58,6 +58,15 @@
 > arm count went 6 → 7. The new primitive is an `mpsc` receive, which is
 > cancel-safe, and its body follows the teardown-only argument below, so the
 > verdict stands.
+>
+> **Amended when control left the command channel.** A migration requested while
+> an upload was stalled on a dead path sat behind the refused writes on the gated
+> command arm, so `migrate()` blocked once the channel filled and the session died
+> instead of moving. `Migrate`, `MigrateServer` and `SetStreamPriority` now travel
+> as `ControlCommand`s on a channel of their own, read on an ungated arm. The arm
+> count went 7 → 8. The new primitive is again an `mpsc` receive, and its body —
+> the socket rebind that used to run in the command arm — follows the same
+> argument, so the verdict stands.
 
 A `select!` arm that fires before its sibling completes effectively
 **cancels** the unfinished future. If that future was carrying
@@ -85,7 +94,7 @@ moved or removed.
 
 | # | File (under `core/src/`) | Enclosing function | Arms | Section |
 | --- | --- | --- | --- | --- |
-| 1 | `api/session.rs` | `run_data_pump` (main loop) | 7, three of them guarded | [data pump](#apisessionrsrun_data_pump-main-loop-7-arm) |
+| 1 | `api/session.rs` | `run_data_pump` (main loop) | 8, three of them guarded | [data pump](#apisessionrsrun_data_pump-main-loop-8-arm) |
 | 2 | `api/session.rs` | `PhantomSession::background_task` | 2 (handshake vs deadline) | [client handshake](#apisessionrsphantomsessionbackground_task-handshake-deadline) |
 | 3 | `api/listener.rs` | `PhantomListener::accept` | 2, `biased` | [TCP listener](#apilistenerrsphantomlisteneraccept--the-h4-acceptor-task) |
 | 4 | `api/listener.rs` | `run_acceptor` | 2, `biased` | [TCP listener](#apilistenerrsphantomlisteneraccept--the-h4-acceptor-task) |
@@ -106,7 +115,7 @@ loop iteration enters exactly one of them.
 
 ## Inventory
 
-### `api/session.rs::run_data_pump` main loop (7-arm)
+### `api/session.rs::run_data_pump` main loop (8-arm)
 
 ```rust
 // api/session.rs::run_data_pump — main loop
@@ -126,8 +135,13 @@ tokio::select! {
         // pacing wake: drain
     }
     _ = close_requested.changed() => {
-        // never gated: take in the commands queued ahead of the close
-        // (try_recv, bounded), finish_and_announce, break
+        // never gated: take_control for the control commands queued ahead of the
+        // close, take in the commands queued ahead of it (try_recv, bounded),
+        // finish_and_announce, break
+    }
+    Some(control) = control_rx.recv() => {
+        // never gated: take_control(control): Migrate | MigrateServer
+        //                                   | SetStreamPriority
     }
     Some(stream_id) = released_rx.recv() => {
         // never gated: record (stream_id, commands_taken + cmd_rx.len()),
@@ -135,15 +149,14 @@ tokio::select! {
     }
     cmd_opt = cmd_rx.recv(), if deferred.is_empty() => {
         take_command(cmd): Send | SendStreamReliable | SendStreamUnreliable
-                         | SetStreamPriority | CloseStream | Migrate
-                         | MigrateServer | Close;  None -> finish_and_announce, break
+                         | CloseStream | Close;  None -> finish_and_announce, break
         // then release_due_streams
     }
     _ = &mut recv_done_rx => { /* receive task ended -> break */ }
 }
 ```
 
-**Primitive cancel-safety (the seven arms):**
+**Primitive cancel-safety (the eight arms):**
 - `tokio::time::sleep_until()`: **cancel-safe** — it is a deadline, not an interval, so
   dropping and recreating the future does not lose or extend the wait. Recreated each
   iteration from `paced_until`, which is plain state the drain wrote; a lost poll costs
@@ -173,14 +186,15 @@ tokio::select! {
   mechanism (a full send buffer stops the pump reading commands, so the caller's
   `send()` blocks on the bounded channel instead of the pump parking), and it also
   means a `Close` is read only once every earlier write has been admitted.
-- `tokio::sync::mpsc::UnboundedReceiver::recv()` on the release channel:
-  **cancel-safe** for the same reason — a dropped `recv` consumes nothing. It is not
+- `tokio::sync::mpsc::Receiver::recv()` on the control channel and
+  `tokio::sync::mpsc::UnboundedReceiver::recv()` on the release channel:
+  **cancel-safe** for the same reason — a dropped `recv` consumes nothing. Neither is
   gated, so a stalled upload, a full command channel or the draining window cannot keep
-  a dropped stream handle from being read. The `Some(..)` pattern cannot fail while the
-  pump runs, because the pump itself holds a sender. The arm only *records* the report;
-  acting on it waits for the commands counted ahead of it, which the command arm
-  consumes one at a time, so a cancel between the two steps loses nothing that the next
-  turn does not redo.
+  a migration or a dropped stream handle from being read. The `Some(..)` patterns
+  cannot fail while the pump runs, because the pump itself holds a sender on each.
+  The release arm only *records* the report; acting on it waits for the commands
+  counted ahead of it, which the command arm consumes one at a time, so a cancel
+  between the two steps loses nothing that the next turn does not redo.
 - `tokio::sync::oneshot::Receiver` (`&mut recv_done_rx`): **cancel-safe** — polling
   does not consume the value.
 
@@ -193,12 +207,12 @@ once chosen, runs its body to completion *unless the whole task is cancelled*. T
 bodies do await: `flush_deferred_sends`, `flush_pending_window_updates`,
 `drain_streams_priority_ordered`, `maybe_send_keepalive` and `maybe_send_cover` in
 the tick / notify / paced arms; in the command arm, `flush_deferred_sends`,
-`Stream::send_unreliable`, `transport.migrate(..)` / `migrate_server(..)`, and
-`finish_and_announce` for `Close` and the channel-closed `None`; and in the release
-arm and after each command, `release_due_streams`, which awaits
-`Stream::is_retirable` (the send buffer's lock) and `flush_deferred_sends`. So the
-question is **whether the pump task can be cancelled mid-body**, and **what is lost
-if it is**.
+`Stream::send_unreliable`, and `finish_and_announce` for `Close` and the
+channel-closed `None`; in the control arm (and the close arm's intake of it),
+`transport.migrate(..)` / `migrate_server(..)`; and in the release arm and after
+each command, `release_due_streams`, which awaits `Stream::is_retirable` (the send
+buffer's lock) and `flush_deferred_sends`. So the question is **whether the pump
+task can be cancelled mid-body**, and **what is lost if it is**.
 
 1. **The pump is never aborted mid-`await` in normal operation.** Both spawn sites
    detach the handle: the server's `PhantomSession::from_accepted_server_session_with_runtime`
@@ -286,8 +300,9 @@ if it is**.
      that hears none falls back to its liveness timer, exactly as before WIRE v8.
 
 3. **The `Migrate` / `MigrateServer` arms await `transport.migrate(..)` /
-   `transport.migrate_server(..)`** (the two `SessionCommand` arms of the command
-   branch in `run_data_pump`). A teardown cancel there abandons a socket rebind on a
+   `transport.migrate_server(..)`** (the two `ControlCommand` arms of
+   `take_control`, reached from the control arm and from the close arm's intake in
+   `run_data_pump`). A teardown cancel there abandons a socket rebind on a
    session that is being torn down anyway; the rebind is already best-effort (a
    failed rebind leaves the session on the old socket by design), and the path-id /
    outbound-CID rotation that follows it is synchronous, so a cancel can never leave
