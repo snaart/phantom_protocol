@@ -1687,6 +1687,15 @@ impl Stream {
             && !self.remote_finished.swap(true, Ordering::SeqCst)
     }
 
+    /// Record a FIN from the peer that did not come through the reliable stream — one
+    /// carried on an unreliable frame or on an acknowledgement, which have no offset to
+    /// order it by. Returns `true` if this is what ended the peer's half, and `false` if
+    /// it had already ended, so the caller hands the application at most one EOF however
+    /// many FINs arrive, and whichever shape the first one took.
+    pub fn note_unordered_remote_fin(&self) -> bool {
+        !self.remote_finished.swap(true, Ordering::SeqCst)
+    }
+
     /// Queue data for unreliable sending. Fire-and-forget; the wire packet number
     /// is assigned at send time by the data pump (WIRE v3).
     pub async fn send_unreliable(&self, data: Bytes) {

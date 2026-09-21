@@ -5313,27 +5313,26 @@ async fn handle_packet<T: SessionTransport>(
             if !result.lost.is_empty() || !result.retired.is_empty() {
                 crypto_recv.notify_outbound_ready();
             }
+            // The acknowledgement goes no further than the stream's send side. In
+            // particular it is not queued to the stream's application channel: nothing reads
+            // it there, and a stream only ever written to would fill that bounded channel
+            // with its own acknowledgements, after which the delivery task — which serves
+            // every stream in turn — would wait on that stream's next item for good. A FIN
+            // riding the ACK ends the peer's half, and goes through the delivery channel so
+            // it is ordered after any in-flight data frames.
+            if packet.header.flags.contains(PacketFlags::FIN) {
+                take_unordered_remote_fin(&stream, stream_id, deliver_tx, undelivered_bytes);
+            }
             // Reliable FIN teardown. An acknowledged FIN finishes this side's half of
-            // the stream and nothing more: the peer's half stays open until its own FIN is
-            // released in order, and until then the stream keeps receiving — unless the
-            // application has let go of the stream, in which case nobody is left to receive
-            // anything. It is dropped when both are done, which this acknowledgement, the
-            // peer's FIN (the reliable branch below) or the release in the pump can be the
-            // one to complete.
+            // the stream and nothing more: the peer's half stays open until its own FIN has
+            // ended it, and until then the stream keeps receiving — unless the application
+            // has let go of the stream, in which case nobody is left to receive anything.
+            // It is dropped when both are done, which this acknowledgement, the peer's FIN
+            // (the reliable branch below) or the release in the pump can be the one to
+            // complete.
             if stream.is_retirable().await {
                 retire_stream(stream_id, streams_recv, deliver_tx, &scratch.stream_gauge);
             }
-        }
-        // The acknowledgement goes no further than the stream's send side. In particular it
-        // is not queued to the stream's application channel: nothing reads it there, and
-        // a stream only ever written to would fill that bounded channel with its own
-        // acknowledgements, after which the delivery task — which serves every stream in
-        // turn — would wait on that stream's next item for good. A FIN riding the ACK goes
-        // through the delivery channel so it is ordered after any in-flight data frames.
-        if packet.header.flags.contains(PacketFlags::FIN)
-            && deliver_tx.send(DeliverItem::Close(stream_id)).is_ok()
-        {
-            undelivered_bytes.fetch_add(delivery_charge(0), Ordering::AcqRel);
         }
         return;
     }
@@ -5768,11 +5767,40 @@ async fn handle_packet<T: SessionTransport>(
         }
     }
 
+    // A FIN outside the reliable stream: a bare `ENCRYPTED | FIN`, which a sender falls back
+    // to once a stream's offset space is exhausted. It ends the peer's half as surely as the
+    // in-order one does, so it is recorded the same way — otherwise a stream closed from
+    // both ends this way would never be dropped. A stream the table no longer holds has
+    // nothing left to end.
     if packet.header.flags.contains(PacketFlags::FIN) {
-        // Route FIN through the delivery channel (ordered after any data above).
-        if deliver_tx.send(DeliverItem::Close(stream_id)).is_ok() {
-            undelivered_bytes.fetch_add(delivery_charge(0), Ordering::AcqRel);
+        let stream = streams_recv.get(&stream_id).map(|s| s.clone());
+        if let Some(stream) = stream {
+            take_unordered_remote_fin(&stream, stream_id, deliver_tx, undelivered_bytes);
+            if stream.is_retirable().await {
+                retire_stream(stream_id, streams_recv, deliver_tx, &scratch.stream_gauge);
+            }
         }
+    }
+}
+
+/// Record a FIN the peer sent outside the reliable stream — on an unreliable frame or on an
+/// acknowledgement — and hand the application its EOF through the delivery channel, ordered
+/// after any data already queued there.
+///
+/// The EOF goes out only if this FIN is what ended the peer's half. One that arrives after
+/// the half has already ended, however it ended, delivers nothing: the application has had
+/// its EOF. Ids 0 and 1 have no application channel a FIN could end.
+fn take_unordered_remote_fin(
+    stream: &Stream,
+    stream_id: u32,
+    deliver_tx: &mpsc::UnboundedSender<DeliverItem>,
+    undelivered_bytes: &AtomicU64,
+) {
+    if stream_id > RAW_APP_STREAM_ID
+        && stream.note_unordered_remote_fin()
+        && deliver_tx.send(DeliverItem::Close(stream_id)).is_ok()
+    {
+        undelivered_bytes.fetch_add(delivery_charge(0), Ordering::AcqRel);
     }
 }
 
@@ -9894,6 +9922,46 @@ mod tests {
             self.feed(decode_recv_frame(&wire, self.session_id)).await;
         }
 
+        /// The peer closes its half of `stream_id` with a FIN outside the reliable stream: a
+        /// bare `ENCRYPTED | FIN` carrying no offset, which is what a sender falls back to
+        /// once the stream's offset space is exhausted.
+        async fn peer_bare_fin(&mut self, stream_id: u32) {
+            let header = PacketHeader::new(
+                self.session_id,
+                stream_id as TransportStreamId,
+                self.take_pn(),
+                PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::FIN),
+            )
+            .with_epoch(self.client.current_epoch());
+            let ciphertext = self
+                .client
+                .encrypt_packet(&header, &[], &[])
+                .expect("encrypt");
+            let wire = PhantomPacket::new(header, ciphertext).to_wire();
+            self.feed(decode_recv_frame(&wire, self.session_id)).await;
+        }
+
+        /// The peer acknowledges offsets `0..=upto` on `stream_id` with `FIN` set on the
+        /// acknowledgement itself.
+        async fn peer_ack_with_fin(&mut self, stream_id: u32, upto: u32) {
+            let sack = crate::transport::sack::Sack::from_inclusive_ranges(vec![(0, upto)], 0)
+                .expect("a non-empty range")
+                .to_wire();
+            let header = PacketHeader::new(
+                self.session_id,
+                stream_id as TransportStreamId,
+                self.take_pn(),
+                PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::ACK | PacketFlags::FIN),
+            )
+            .with_epoch(self.client.current_epoch());
+            let ciphertext = self
+                .client
+                .encrypt_packet(&header, &sack, &[])
+                .expect("encrypt");
+            let wire = PhantomPacket::new(header, ciphertext).to_wire();
+            self.feed(decode_recv_frame(&wire, self.session_id)).await;
+        }
+
         /// Every SACK this side has emitted since the last call, decoded as the peer
         /// would decode it, with the stream it was stamped on.
         async fn emitted_sacks(&self) -> Vec<(u32, crate::transport::sack::Sack)> {
@@ -10194,6 +10262,70 @@ mod tests {
         assert!(
             handle.rx.try_recv().is_err(),
             "an acknowledgement was queued to the stream's application channel"
+        );
+    }
+
+    /// A FIN that arrives outside the reliable stream closes the peer's half as surely as
+    /// one inside it, so a stream this side has closed too is dropped there and then.
+    ///
+    /// Two shapes carry one: a bare `ENCRYPTED | FIN`, which a sender falls back to once a
+    /// stream's offset space is exhausted, and `FIN` set on an acknowledgement. Both handed
+    /// the application its EOF and recorded nothing else, so under the rule that a stream is
+    /// dropped once both halves are closed, such a stream never was — it stayed in the table,
+    /// counted against [`MAX_STREAMS`], until the session ended.
+    #[tokio::test]
+    async fn a_fin_outside_the_reliable_stream_completes_the_close() {
+        let mut rig = RecvRig::new();
+
+        let bare = rig.open_local();
+        let bare_id = bare.stream_id;
+        rig.close_local(bare_id).await;
+        rig.peer_ack(bare_id, 0).await;
+        let _ = rig.delivered();
+        rig.peer_bare_fin(bare_id).await;
+        assert_eq!(
+            rig.delivered(),
+            vec![Delivered::Close(bare_id), Delivered::Retire(bare_id)],
+            "a bare FIN on a stream whose own FIN is acknowledged must end it"
+        );
+        assert!(!rig.streams.contains_key(&bare_id));
+
+        let riding = rig.open_local();
+        let riding_id = riding.stream_id;
+        rig.close_local(riding_id).await;
+        rig.peer_ack_with_fin(riding_id, 0).await;
+        assert_eq!(
+            rig.delivered(),
+            vec![Delivered::Close(riding_id), Delivered::Retire(riding_id)],
+            "a FIN on the acknowledgement that settles this side's FIN must end the stream"
+        );
+        assert!(!rig.streams.contains_key(&riding_id));
+    }
+
+    /// A FIN outside the reliable stream, after the peer's half has already ended in order,
+    /// hands the application no second EOF.
+    ///
+    /// The in-order FIN delivers its EOF exactly once; the other shapes delivered theirs
+    /// every time one arrived, so a stream could end twice on the reading side.
+    #[tokio::test]
+    async fn a_second_fin_delivers_no_second_eof() {
+        let mut rig = RecvRig::new();
+        let peer_id = 3;
+        rig.peer_segment(peer_id, 0, b"hello", false).await;
+        rig.peer_segment(peer_id, 1, b"", true).await;
+        assert_eq!(
+            rig.delivered(),
+            vec![
+                Delivered::Data(peer_id, b"hello".to_vec()),
+                Delivered::Close(peer_id)
+            ]
+        );
+
+        rig.peer_bare_fin(peer_id).await;
+        assert_eq!(
+            rig.delivered(),
+            Vec::new(),
+            "the peer's half had already ended, so there is no EOF left to deliver"
         );
     }
 

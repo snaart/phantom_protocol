@@ -498,7 +498,9 @@ detail. A receiver dispatches in this order, each step consuming the packet:
    claim a frame that ever set both.
 7. `COVER` → drop after the liveness bookkeeping; it carries no application data.
 8. `ACK` → the plaintext is a `Sack` (§ 4.5); a `FIN` riding the same packet
-   closes the stream behind the data already queued for delivery.
+   closes the peer's half of the stream behind the data already queued for
+   delivery — once: a `FIN` for a half that has already ended delivers no second
+   end-of-stream.
 9. `WINDOW_UPDATE` → exactly 8 bytes of cumulative limit (§ 4.5).
 10. `PATH_VALIDATION` → exactly 32 bytes of challenge or echo. The two are
     wire-identical; which one this is follows from the local path registry's state
@@ -508,8 +510,8 @@ detail. A receiver dispatches in this order, each step consuming the packet:
     `stream_offset` prefix and is acknowledged (§ 4.5), and a `FIN` on it
     half-closes the stream only once the in-order cursor has passed the FIN's own
     offset — so a FIN that overtakes a gap cannot truncate the data behind it.
-    Anything else is delivered as it arrives, with a `FIN` closing the stream
-    immediately after this packet's bytes.
+    Anything else is delivered as it arrives, with a `FIN` closing the peer's half
+    of the stream immediately after this packet's bytes, once, as in step 8.
 
 A bit this implementation does not recognise — today only `0x8000` (§ 7) — takes
 no branch and causes no rejection: the packet is dispatched on the bits that *are*
@@ -724,9 +726,10 @@ end-of-stream to its application only once the in-order cursor has passed the
 FIN's own offset (§ 4.3, step 12), which is what stops a FIN that overtook a gap
 from truncating the data behind it. A FIN closes one direction and nothing more: the
 side that sent it keeps receiving until the peer's own FIN, and each side drops the
-stream only once both have happened — its own FIN acknowledged, the peer's released
-in order. Frames that arrive for it after that are answered as § 4.4 describes, not
-taken for a new stream. Note the near-collision with the persist probe
+stream only once both have happened — its own FIN acknowledged, the peer's half
+ended (released in order, or carried outside the reliable stream as in § 4.3,
+steps 8 and 12). Frames that arrive for it after that are answered as § 4.4
+describes, not taken for a new stream. Note the near-collision with the persist probe
 described below, and that the flag is the whole difference: a `RELIABLE` frame
 with an empty payload and **no** `FIN` is a window probe, delivers nothing, and
 consumes no offset.
