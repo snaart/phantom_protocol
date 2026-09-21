@@ -118,7 +118,12 @@ Both client and server, after their handshakes, spawn the **same** `run_data_pum
   Task A's or Task B's (also unbounded) queue, so no hand-off ever blocks the reader.
 - **Reader task** — loops `transport.recv_bytes() → Session::parse_protected` (unmask the
   header-protected frame, reconstruct the off-wire `session_id`) → drop anything whose
-  `header.version != WIRE_VERSION` → `handle_packet()`.
+  `header.version != WIRE_VERSION` → `handle_packet()`. It also stops when the transport
+  gives up on the peer: a `CoreError::Timeout` from either I/O method — on a stream
+  transport, a write that went its whole stall deadline without the socket taking a
+  byte — is latched by `ObservedTransport`, which refuses every later write and wakes
+  the reader out of a read the same peer is not answering. The session then ends
+  `Dead` with that cause.
   `handle_packet` binds every frame to the negotiated `session_id`, decrypts (the
   `ENCRYPTED` gate, with an authenticated forward-rekey catch-up of up to
   `MAX_REKEY_CATCHUP` = 16 epochs — a forward epoch without the `REKEY` flag is rejected
@@ -347,7 +352,10 @@ are now wiped (T5.1), closing the former audit gap.
   `PATH_MTU = 1200`; reassembled before parsing the inner `PhantomPacket`.
 - **TCP** (`TcpSessionTransport`): a 4-byte big-endian length prefix per `PhantomPacket`,
   capped per phase — `HANDSHAKE_FRAME_CAP = 64 KiB` bounds the unauthenticated handshake
-  frame, `STEADY_STATE_FRAME_CAP = 4 MiB` once established. *(The legacy KCP and FakeTLS
+  frame, `STEADY_STATE_FRAME_CAP = 4 MiB` once established. A write that goes
+  `DEFAULT_WRITE_STALL_TIMEOUT` (30 s) without the socket accepting a byte fails with
+  `CoreError::Timeout`, after which nothing more is written — the frame it stopped in may
+  be cut part-way — and the connection is reset rather than closed. *(The legacy KCP and FakeTLS
   legs were removed; TLS HTTP-mimicry shipped as the optional `mimicry` feature —
   `MimicTlsLeg` / `bind_mimic` / `connect_pinned_mimic` — a framing-only, anti-DPI-only
   outer wrapper detectable by active probing; see PROTOCOL.md § 9.1.)*

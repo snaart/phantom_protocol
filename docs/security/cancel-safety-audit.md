@@ -40,6 +40,16 @@
 > arm count went 5 → 6. The new primitive is cancel-safe and its body follows
 > the same teardown-only cancellation argument as the others, so the verdict
 > stands.
+>
+> **Amended when stream-transport writes gained a stall deadline.** A peer that
+> stops reading its socket used to hold the pump inside a transport write for as
+> long as it liked, and the local close with it, since the close is read between
+> arm bodies. `TcpSessionTransport` and the mimicry leg now bound each write by
+> the time it goes without the socket accepting a byte, and fail it with
+> `CoreError::Timeout`; `ObservedTransport` treats that as the transport giving up
+> on the peer. The receive task gained its first `select!` so that a give-up on
+> the send side ends it (production sites 11 → 12), and the bounded write is
+> inventoried below. Both are cancel-safe; the verdict stands.
 
 A `select!` arm that fires before its sibling completes effectively
 **cancels** the unfinished future. If that future was carrying
@@ -55,10 +65,10 @@ cancel-safe by tokio's stated guarantees.
 tokio's [cancellation-safety documentation](https://docs.rs/tokio/latest/tokio/macro.select.html#cancellation-safety)
 and checked for the "what if the other arm fires first" scenario; every
 long-held `.await` on the same paths is checked for what a cancel at that
-point would lose. At commit `e5b23d8b`, `grep -rn 'tokio::select!' core/src`
-returns 15 invocations: the 11 production sites indexed below, plus four
-inside `#[cfg(test)] mod tests` blocks — two in `api/udp_transport.rs` and two
-in `api/udp_listener.rs` — which are out of scope.
+point would lose. `grep -rn 'tokio::select!' core/src` returns 17
+invocations: the 12 production sites indexed below, plus five inside
+`#[cfg(test)] mod tests` blocks — two in `api/udp_transport.rs`, two in
+`api/udp_listener.rs` and one in `api/session.rs` — which are out of scope.
 
 **Sites are keyed on file and enclosing function, never on a line number.**
 Re-checking this file is therefore mechanical: the grep above must return the
@@ -78,6 +88,7 @@ moved or removed.
 | 9 | `api/udp_listener.rs` | `PhantomUdpListener::accept` | 2, `biased` | [PhantomUDP listener](#apiudp_listenerrs--accept-the-demux-loop-and-the-handshake-task) |
 | 10 | `api/udp_listener.rs` | `run_udp_demux` | 7, `biased` | [PhantomUDP listener](#apiudp_listenerrs--accept-the-demux-loop-and-the-handshake-task) |
 | 11 | `api/udp_listener.rs` | `spawn_handshake_task` (inside the spawned task) | 2 (handshake vs deadline) | [PhantomUDP listener](#apiudp_listenerrs--accept-the-demux-loop-and-the-handshake-task) |
+| 12 | `api/session.rs` | `run_data_pump` (receive task) | 2 (read vs the transport giving up) | [receive task](#the-receive-task-in-run_data_pump) |
 
 `UdpClientTransport::recv_bytes` is the `SessionTransport` impl's method; the
 three sites are the three branches of one `if` / `else if` / `else`, and each
@@ -325,21 +336,41 @@ accept loses at most one socket; clients reconnect.
 
 ```rust
 // api/session.rs::run_data_pump — the receive task (`recv_handle`)
+let given_up = transport_recv.given_up(); // created and pinned once, before the loop
+tokio::pin!(given_up);
 loop {
     // backlog cap check (synchronous)
-    let data = match transport_recv.recv_bytes().await { Ok(b) => b, Err(_) => break };
+    let data = tokio::select! {
+        received = transport_recv.recv_bytes() => match received { Ok(b) => b, Err(_) => break },
+        () = &mut given_up => break,
+    };
     // frame-size gate, parse_protected, WIRE_VERSION gate (all synchronous)
     handle_packet(packet, ..).await;
     // WIRE v8: on a recorded peer close, publish Draining, take the drain
     // deadline once, and `break` when it has passed (all synchronous)
 }
+// transport gave up on a peer that had not announced its close: record `Timeout`
 drop(deliver_tx);
 let _ = recv_done_tx.send(());
 ```
 
-- No `select!` here. The loop awaits the next transport read and then
-  `handle_packet`; when the transport closes, `recv_bytes` returns `Err` and the
-  loop breaks cleanly.
+- One `select!`, two arms: the next transport read, and
+  `ObservedTransport::given_up`, which resolves once the transport has reported
+  `CoreError::Timeout` — given up on a peer that stopped taking bytes, almost
+  always on one of the send loop's writes while this loop sat in a read the same
+  peer was not answering. The given-up future is created once and polled by
+  reference, so its `Notify` waiter is registered once rather than per packet; it
+  registers before it checks the flag, so a give-up landing between the two is
+  still seen, and it is never polled after completing because its arm breaks.
+- When the given-up arm wins, the pending `recv_bytes` is dropped, which on a
+  stream transport can abandon a read part-way through a frame. That is harmless
+  by construction: the transport is never read again, because the loop breaks and
+  the session ends. When the read arm wins, the given-up future is untouched.
+  When the transport closes, `recv_bytes` returns `Err` and the loop breaks as
+  before.
+- The cause is written into the session's terminal-error slot *before*
+  `deliver_tx` is dropped, because dropping it is what eventually closes the
+  channel `recv()` waits on, and a `recv()` woken by that reads the slot at once.
 - `handle_packet` awaits in two kinds of place: tokio `Mutex` acquisitions on a
   stream's buffers (`Stream::on_sack`, `Stream::accept_in_order`,
   `Stream::received_sack`, `Stream::is_fin_acked`), and best-effort transport sends
@@ -465,6 +496,28 @@ the read half through `black_hole` under a second `tokio::time::timeout` sized t
 what is left of the same deadline, and writes nothing. Cancel mid-`.await` leaves
 the TCP connection in a state where the next attempt resets; the inner Phantom
 session has not yet been established, so no session state can be stranded.
+
+**Verdict:** ✅ cancel-safe.
+
+### Bounded stream-transport writes (`transport/write_stall.rs::write_all_making_progress`)
+
+Called from `TcpSessionTransport::send_bytes` (`api/tcp_transport.rs`) and
+`MimicTlsLeg::send_bytes` (`transport/legs/mimic_tls/leg.rs`), under the
+transport's write-half lock. No `select!`: each `AsyncWriteExt::write` is wrapped
+in its own `tokio::time::timeout`, and so is the final `flush`.
+
+- The deadline cancels a single `write` call, and tokio documents `write` as
+  cancel-safe — a cancelled call wrote nothing. The bytes of earlier calls were
+  written, so a stall can leave a frame cut part-way through on the wire. That is
+  handled rather than tolerated: the transport latches the stall and refuses every
+  later write without touching the socket, and `ObservedTransport` ends the
+  session, so nothing is ever appended to the cut-off frame.
+- A cancel of the whole `send_bytes` future (a runtime teardown) behaves like any
+  other cancelled write on a connection that is being torn down; the lock is a
+  tokio `Mutex` and is released on drop.
+- The WASI leg bounds its writes the same way through `wasi:io/poll` rather than
+  a tokio timer (`transport/legs/wasi.rs`); it is synchronous inside `send_bytes`,
+  so it has no cancel point of its own.
 
 **Verdict:** ✅ cancel-safe.
 
@@ -633,7 +686,8 @@ Inventory of `&mut`-held locks across `.await`:
 | `transport/stream.rs::Stream::poll_send` | tokio Mutex (`unreliable_buffer`, `send_buffer`) | brief — scan + mark `sent_at`, released before `send_app_data` runs | None |
 | `transport/stream.rs::Stream::try_send_reliable` / `Stream::try_queue_fin` | tokio Semaphore (`try_acquire`) + tokio Mutex (`send_buffer`) | `try_acquire` never waits; the buffer lock is a single `push_back` | None |
 | `transport/stream.rs::Stream::send_reliable` / `Stream::queue_fin` (test callers only) | tokio Semaphore + tokio Mutex (`send_buffer`) | acquire is cancel-safe; the buffer lock is a single `push_back` | None |
-| `api/tcp_transport.rs::TcpSessionTransport::send_bytes` | tokio Mutex (write half) | yes — write + flush | Low: serialises sends, the intended semantics |
+| `api/tcp_transport.rs::TcpSessionTransport::send_bytes` | tokio Mutex (write half) | yes — write + flush, each step under the write-stall deadline | Low: serialises sends, the intended semantics. A writer queued behind a stalled one waits at most the deadline, then finds the transport given up and returns at once |
+| `transport/legs/mimic_tls/leg.rs::MimicTlsLeg::send_bytes` | tokio Mutex (write half) | yes — write + flush, each step under the write-stall deadline | Same shape as the TCP transport |
 | `api/tcp_transport.rs::TcpSessionTransport::recv_bytes` | tokio Mutex (read half + accumulator) | yes — length + body read | Low: reads are sequential by construction |
 | `api/listener.rs::PhantomListener::accept` | tokio Mutex (`accepted_rx`) | yes — across `rx.recv()` | Low: serialises concurrent `accept()` callers, the intended semantics; `mpsc::Receiver::recv` is cancel-safe and the lock releases on Drop |
 | `api/udp_listener.rs::PhantomUdpListener::accept` | tokio Mutex (`accepted_rx`) | yes — across `rx.recv()` | Same shape as the TCP listener |

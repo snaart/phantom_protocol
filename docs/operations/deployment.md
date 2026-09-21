@@ -260,6 +260,15 @@ abusive IP can still trigger (cheap, PoW/cookie-gated) handshakes that are then
 rejected. Pre-handshake per-IP rate limiting belongs at the edge (LB / nftables
 `ct count` / a reverse proxy).
 
+**A client that stops reading does not keep its slot.** A slot comes free when
+its session ends, and a session whose client has stopped reading its socket
+ends within thirty seconds of the first server write the socket will not take:
+the TCP transport fails a write that makes no progress for that long, resets
+the connection, and ends the session as `Dead` with `CoreError::Timeout`, which
+the echo handler logs as a warning. A client that keeps reading, however
+slowly, is a slow link and keeps its slot; the per-IP and global caps above are
+what bound how many of those one source can hold.
+
 ## Startup, health & telemetry resilience
 
 - **Power-on self-test gates the bind.** Before opening the listen socket the
