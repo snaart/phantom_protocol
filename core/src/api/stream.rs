@@ -5,24 +5,43 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
-use crate::api::session::{ConnectionState, SessionCommand};
+use crate::api::session::{ConnectionState, SessionCommand, StreamLink};
 use crate::errors::CoreError;
 use crate::transport::multiplexer::{StreamHandle, StreamMessage};
 
 /// A single multiplexed stream inside an established [`PhantomSession`].
 ///
 /// Created by the session's stream multiplexer (one per logical stream id).
-/// Outbound data is queued to the session's data pump over the `tx` command
-/// channel (`send_reliable` / `send_unreliable`); inbound demultiplexed data
-/// arrives on `rx`. The session owns all encryption and transport — a
-/// `PhantomStream` is just the per-stream send/recv handle exposed over FFI.
+/// Outbound data is queued to the session's data pump (`send_reliable` /
+/// `send_unreliable`); inbound demultiplexed data arrives on `recv`. The session
+/// owns all encryption and transport — a `PhantomStream` is just the per-stream
+/// send/recv handle exposed over FFI.
+///
+/// # Letting go of a stream
+///
+/// Dropping the last reference to this handle — letting it go out of scope, or
+/// releasing it in a garbage-collected binding — closes the stream's writing half
+/// exactly as [`disconnect`](Self::disconnect) would, **after** every write already
+/// made on the handle: nothing the handle sent is lost to the drop, and the peer reads
+/// those bytes and then its EOF. A stream this side opened and never wrote a reliable
+/// byte on has not reached the peer at all, and simply goes.
+///
+/// Once this side's close is acknowledged the session forgets the stream, whether or
+/// not the peer has closed its own half — nobody is left here to read what that half
+/// carries. Anything the peer sends on it afterwards is acknowledged and discarded, so
+/// its writes still complete, up to the receive window this side last advertised; a
+/// peer that keeps writing past that is held at it, as it would be by a reader that
+/// stopped reading. To read the peer's side to its end, keep the handle until
+/// [`recv`](Self::recv) returns `Ok(None)`: a held handle keeps its stream for as long
+/// as the peer's half is open.
 ///
 /// [`PhantomSession`]: crate::api::session::PhantomSession
 #[cfg_attr(feature = "bindings", derive(uniffi::Object))]
 pub struct PhantomStream {
     stream_id: u32,
-    /// Channel to send data to the session to be packaged and sent
-    tx: mpsc::Sender<SessionCommand>,
+    /// The channels to the session's data pump: writes, the close and the priority,
+    /// and the report this handle makes when it is dropped.
+    link: StreamLink,
     /// Receiver for incoming demultiplexed stream data
     rx: Mutex<mpsc::Receiver<StreamMessage>>,
     /// The owning session's published [`ConnectionState`], shared with the session
@@ -37,14 +56,14 @@ pub struct PhantomStream {
 }
 
 impl PhantomStream {
-    pub fn new(
+    pub(crate) fn new(
         handle: StreamHandle,
-        tx: mpsc::Sender<SessionCommand>,
+        link: StreamLink,
         session_state: Arc<AtomicU8>,
     ) -> Self {
         Self {
             stream_id: handle.stream_id,
-            tx,
+            link,
             rx: Mutex::new(handle.rx),
             session_state,
         }
@@ -99,7 +118,8 @@ impl PhantomStream {
     /// `data` on the wire.
     pub async fn send_reliable(&self, data: Vec<u8>) -> Result<(), CoreError> {
         self.refuse_while_draining()?;
-        self.tx
+        self.link
+            .commands
             .send(SessionCommand::SendStreamReliable {
                 stream_id: self.stream_id,
                 data: Bytes::from(data),
@@ -132,7 +152,8 @@ impl PhantomStream {
     /// for the same reason as [`send_reliable`](Self::send_reliable).
     pub async fn send_unreliable(&self, data: Vec<u8>) -> Result<(), CoreError> {
         self.refuse_while_draining()?;
-        self.tx
+        self.link
+            .commands
             .send(SessionCommand::SendStreamUnreliable {
                 stream_id: self.stream_id,
                 data: Bytes::from(data),
@@ -186,7 +207,8 @@ impl PhantomStream {
     /// Set this stream's scheduler priority (higher = drained first). Takes
     /// effect on the next drain pass.
     pub async fn set_priority(&self, priority: u32) -> Result<(), CoreError> {
-        self.tx
+        self.link
+            .commands
             .send(SessionCommand::SetStreamPriority {
                 stream_id: self.stream_id,
                 priority,
@@ -200,8 +222,10 @@ impl PhantomStream {
     /// Only the writing half closes. [`recv`](Self::recv) on this handle keeps
     /// returning what the peer sends until the peer closes its half as well, and the
     /// session holds the stream — counting it against its limit on concurrent
-    /// streams — until both halves are closed. Anything written on this stream after
-    /// this call is discarded rather than sent: the peer has been told it ended.
+    /// streams — until both halves are closed, or until this close is acknowledged
+    /// and the handle has been let go of (see the type's documentation). Anything
+    /// written on this stream after this call is discarded rather than sent: the peer
+    /// has been told it ended.
     ///
     /// Named `disconnect` rather than `close` for the same reason as
     /// `PhantomSession::disconnect` — UniFFI's Kotlin generator emits
@@ -213,7 +237,8 @@ impl PhantomStream {
     /// never see the EOF, and the stream is about to end with the session anyway.
     pub async fn disconnect(&self) -> Result<(), CoreError> {
         self.refuse_while_draining()?;
-        self.tx
+        self.link
+            .commands
             .send(SessionCommand::CloseStream {
                 stream_id: self.stream_id,
             })
@@ -222,11 +247,30 @@ impl PhantomStream {
     }
 }
 
+/// Tell the session's pump that nobody holds this stream any more.
+///
+/// The report travels on a channel of its own, because `Drop` can neither wait for room in
+/// the command channel nor fail usefully. The pump acts on it only once it has taken in
+/// every write this handle queued before it went — see the type's documentation for what
+/// it does then. A session that has already ended has no pump to tell, and the send fails
+/// harmlessly.
+impl Drop for PhantomStream {
+    fn drop(&mut self) {
+        let _ = self.link.released.send(self.stream_id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::transport::multiplexer::StreamHandle;
     use tokio::sync::mpsc;
+
+    /// A link whose writes go to `commands` and whose other channels lead nowhere.
+    fn link_to(commands: mpsc::Sender<SessionCommand>) -> StreamLink {
+        let (released, _) = mpsc::unbounded_channel();
+        StreamLink { commands, released }
+    }
 
     /// Build a minimal PhantomStream with a test-controlled channel.
     fn make_stream(
@@ -245,7 +289,7 @@ mod tests {
         };
         let ps = PhantomStream::new(
             handle,
-            cmd_tx.clone(),
+            link_to(cmd_tx.clone()),
             Arc::new(AtomicU8::new(ConnectionState::Connected as u8)),
         );
         (ps, stream_msg_tx, cmd_tx)
@@ -273,7 +317,7 @@ mod tests {
             stream_id: 3,
             rx: stream_msg_rx,
         };
-        let ps = PhantomStream::new(handle, cmd_tx, state.clone());
+        let ps = PhantomStream::new(handle, link_to(cmd_tx), state.clone());
 
         ps.send_reliable(b"connected".to_vec())
             .await

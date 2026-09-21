@@ -1143,7 +1143,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_shutdown() != 63939) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_verifying_key_bytes() != 11496) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_verifying_key_bytes() != 25789) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_accept_stream() != 18738) {
@@ -1179,7 +1179,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_migrate() != 51241) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_open_stream() != 23438) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_open_stream() != 57628) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_peer_addr() != 8519) {
@@ -1197,13 +1197,13 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_send() != 6054) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 18955) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 13691) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_supports_migration() != 35412) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping() != 60362) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping() != 8496) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_resumptionhint_resumption_secret() != 61611) {
@@ -1212,7 +1212,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_method_resumptionhint_session_id() != 23596) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 49054) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 493) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_recv() != 45283) {
@@ -1260,7 +1260,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_signing_key_bytes() != 31864) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomsession_connect() != 43760) {
+    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomsession_connect() != 53390) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_constructor_resumptionhint_new() != 30264) {
@@ -3006,7 +3006,12 @@ public interface PhantomSessionInterface {
     suspend fun `migrate`(`localAddr`: kotlin.String)
     
     /**
-     * Open a new multiplexed stream
+     * Open a new multiplexed stream.
+     *
+     * Nothing reaches the peer until the first reliable write. Dropping the returned
+     * handle closes the stream's writing half behind everything written on it; see
+     * [`PhantomStream`](crate::api::stream::PhantomStream) for when the stream then
+     * leaves the session.
      */
     fun `openStream`(): PhantomStream
     
@@ -3666,7 +3671,12 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
 
     
     /**
-     * Open a new multiplexed stream
+     * Open a new multiplexed stream.
+     *
+     * Nothing reaches the peer until the first reliable write. Dropping the returned
+     * handle closes the stream's writing half behind everything written on it; see
+     * [`PhantomStream`](crate::api::stream::PhantomStream) for when the stream then
+     * leaves the session.
      */override fun `openStream`(): PhantomStream {
             return FfiConverterTypePhantomStream.lift(
     callWithHandle {
@@ -4126,10 +4136,28 @@ public object FfiConverterTypePhantomSession: FfiConverter<PhantomSession, Long>
  * A single multiplexed stream inside an established [`PhantomSession`].
  *
  * Created by the session's stream multiplexer (one per logical stream id).
- * Outbound data is queued to the session's data pump over the `tx` command
- * channel (`send_reliable` / `send_unreliable`); inbound demultiplexed data
- * arrives on `rx`. The session owns all encryption and transport — a
- * `PhantomStream` is just the per-stream send/recv handle exposed over FFI.
+ * Outbound data is queued to the session's data pump (`send_reliable` /
+ * `send_unreliable`); inbound demultiplexed data arrives on `recv`. The session
+ * owns all encryption and transport — a `PhantomStream` is just the per-stream
+ * send/recv handle exposed over FFI.
+ *
+ * # Letting go of a stream
+ *
+ * Dropping the last reference to this handle — letting it go out of scope, or
+ * releasing it in a garbage-collected binding — closes the stream's writing half
+ * exactly as [`disconnect`](Self::disconnect) would, **after** every write already
+ * made on the handle: nothing the handle sent is lost to the drop, and the peer reads
+ * those bytes and then its EOF. A stream this side opened and never wrote a reliable
+ * byte on has not reached the peer at all, and simply goes.
+ *
+ * Once this side's close is acknowledged the session forgets the stream, whether or
+ * not the peer has closed its own half — nobody is left here to read what that half
+ * carries. Anything the peer sends on it afterwards is acknowledged and discarded, so
+ * its writes still complete, up to the receive window this side last advertised; a
+ * peer that keeps writing past that is held at it, as it would be by a reader that
+ * stopped reading. To read the peer's side to its end, keep the handle until
+ * [`recv`](Self::recv) returns `Ok(None)`: a held handle keeps its stream for as long
+ * as the peer's half is open.
  *
  * [`PhantomSession`]: crate::api::session::PhantomSession
  */
@@ -4141,8 +4169,10 @@ public interface PhantomStreamInterface {
      * Only the writing half closes. [`recv`](Self::recv) on this handle keeps
      * returning what the peer sends until the peer closes its half as well, and the
      * session holds the stream — counting it against its limit on concurrent
-     * streams — until both halves are closed. Anything written on this stream after
-     * this call is discarded rather than sent: the peer has been told it ended.
+     * streams — until both halves are closed, or until this close is acknowledged
+     * and the handle has been let go of (see the type's documentation). Anything
+     * written on this stream after this call is discarded rather than sent: the peer
+     * has been told it ended.
      *
      * Named `disconnect` rather than `close` for the same reason as
      * `PhantomSession::disconnect` — UniFFI's Kotlin generator emits
@@ -4234,10 +4264,28 @@ public interface PhantomStreamInterface {
  * A single multiplexed stream inside an established [`PhantomSession`].
  *
  * Created by the session's stream multiplexer (one per logical stream id).
- * Outbound data is queued to the session's data pump over the `tx` command
- * channel (`send_reliable` / `send_unreliable`); inbound demultiplexed data
- * arrives on `rx`. The session owns all encryption and transport — a
- * `PhantomStream` is just the per-stream send/recv handle exposed over FFI.
+ * Outbound data is queued to the session's data pump (`send_reliable` /
+ * `send_unreliable`); inbound demultiplexed data arrives on `recv`. The session
+ * owns all encryption and transport — a `PhantomStream` is just the per-stream
+ * send/recv handle exposed over FFI.
+ *
+ * # Letting go of a stream
+ *
+ * Dropping the last reference to this handle — letting it go out of scope, or
+ * releasing it in a garbage-collected binding — closes the stream's writing half
+ * exactly as [`disconnect`](Self::disconnect) would, **after** every write already
+ * made on the handle: nothing the handle sent is lost to the drop, and the peer reads
+ * those bytes and then its EOF. A stream this side opened and never wrote a reliable
+ * byte on has not reached the peer at all, and simply goes.
+ *
+ * Once this side's close is acknowledged the session forgets the stream, whether or
+ * not the peer has closed its own half — nobody is left here to read what that half
+ * carries. Anything the peer sends on it afterwards is acknowledged and discarded, so
+ * its writes still complete, up to the receive window this side last advertised; a
+ * peer that keeps writing past that is held at it, as it would be by a reader that
+ * stopped reading. To read the peer's side to its end, keep the handle until
+ * [`recv`](Self::recv) returns `Ok(None)`: a held handle keeps its stream for as long
+ * as the peer's half is open.
  *
  * [`PhantomSession`]: crate::api::session::PhantomSession
  */
@@ -4349,8 +4397,10 @@ open class PhantomStream: Disposable, AutoCloseable, PhantomStreamInterface
      * Only the writing half closes. [`recv`](Self::recv) on this handle keeps
      * returning what the peer sends until the peer closes its half as well, and the
      * session holds the stream — counting it against its limit on concurrent
-     * streams — until both halves are closed. Anything written on this stream after
-     * this call is discarded rather than sent: the peer has been told it ended.
+     * streams — until both halves are closed, or until this close is acknowledged
+     * and the handle has been let go of (see the type's documentation). Anything
+     * written on this stream after this call is discarded rather than sent: the peer
+     * has been told it ended.
      *
      * Named `disconnect` rather than `close` for the same reason as
      * `PhantomSession::disconnect` — UniFFI's Kotlin generator emits

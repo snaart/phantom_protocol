@@ -637,6 +637,9 @@ pub struct PhantomSession {
     /// for room in the channel waited with it. Raising this never waits, and the pump
     /// reads it whatever else it is holding.
     close_request: watch::Sender<bool>,
+    /// Where a dropped [`PhantomStream`](crate::api::stream::PhantomStream) tells the pump
+    /// that it is gone. See `StreamLink::released`.
+    released_tx: mpsc::UnboundedSender<u32>,
     /// Command receiver — taken by the background task when spawned
     #[allow(dead_code)]
     cmd_rx: Mutex<Option<mpsc::Receiver<SessionCommand>>>,
@@ -677,9 +680,11 @@ pub struct PhantomSession {
     /// has not seen before), the recv task registers it in the demux, wraps it
     /// in an `Arc<PhantomStream>`, and sends it here. The embedder calls
     /// `accept_stream()` to pick it up. Bounded at 128 so a peer that opens
-    /// many unaccepted streams does not grow this buffer unboundedly (the
-    /// stream still exists in the demux; only the *accept* notification is
-    /// dropped if the embedder is not consuming).
+    /// many unaccepted streams does not grow this buffer unboundedly. A stream
+    /// that finds it full is not held for an application that will never see
+    /// it: its handle is dropped on the spot, which closes this side's half of
+    /// it like any dropped handle, and the stream leaves the table once that
+    /// close is acknowledged.
     incoming_stream_rx: Arc<Mutex<mpsc::Receiver<Arc<crate::api::stream::PhantomStream>>>>,
     /// Captured terminal error from a failed handshake. Written once by the
     /// background task on `Err(e)`, then readable via `last_error()`. Never
@@ -756,6 +761,23 @@ pub enum SessionCommand {
     /// handle do not send it: their close travels on a signal of its own, which the
     /// pump reads even while it has stopped reading this channel.
     Close,
+}
+
+/// What a [`PhantomStream`](crate::api::stream::PhantomStream) holds to reach the pump that
+/// owns its stream.
+#[derive(Clone)]
+pub(crate) struct StreamLink {
+    /// Writes, the stream's close and its priority, in order with the rest of the
+    /// session's writes.
+    pub(crate) commands: mpsc::Sender<SessionCommand>,
+    /// Where a handle reports, as it is dropped, that it is gone.
+    ///
+    /// Unbounded because `Drop` can neither wait for room nor fail usefully, and a
+    /// notice that did not arrive would leave the stream in the table for the life of the
+    /// session. It holds at most one notice per handle, and the pump reads it on an arm
+    /// nothing disables, so what waits in it is a burst of drops the pump has not reached
+    /// yet rather than anything that accumulates.
+    pub(crate) released: mpsc::UnboundedSender<u32>,
 }
 
 impl PhantomSession {
@@ -840,6 +862,7 @@ impl PhantomSession {
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (close_request, close_requested) = watch::channel(false);
+        let (released_tx, released_rx) = mpsc::unbounded_channel();
         let (recv_tx, recv_rx) = mpsc::channel(RAW_APP_RECV_CHANNEL_DEPTH);
         // Channel for peer-initiated streams exposed via accept_stream().
         let (incoming_stream_tx, incoming_stream_rx) = mpsc::channel(128);
@@ -888,6 +911,7 @@ impl PhantomSession {
             send_queue: send_queue.clone(),
             cmd_tx: cmd_tx.clone(),
             close_request,
+            released_tx: released_tx.clone(),
             cmd_rx: Mutex::new(None), // taken by background task
             recv_rx: Mutex::new(recv_rx),
             demux: demux.clone(),
@@ -917,6 +941,7 @@ impl PhantomSession {
             cmd_tx.clone(),
             cmd_rx,
             close_requested,
+            released_rx,
             recv_tx,
             transport,
             peer,
@@ -930,7 +955,10 @@ impl PhantomSession {
             resumption_request,
             observability,
             liveness,
-            cmd_tx,
+            StreamLink {
+                commands: cmd_tx,
+                released: released_tx,
+            },
             incoming_stream_tx,
             terminal_error,
             ready_tx,
@@ -977,6 +1005,7 @@ impl PhantomSession {
     ) -> Arc<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (close_request, close_requested) = watch::channel(false);
+        let (released_tx, released_rx) = mpsc::unbounded_channel();
         let (recv_tx, recv_rx) = mpsc::channel(RAW_APP_RECV_CHANNEL_DEPTH);
         // Channel for peer-initiated streams exposed via accept_stream().
         let (incoming_stream_tx, incoming_stream_rx) = mpsc::channel(128);
@@ -1021,6 +1050,7 @@ impl PhantomSession {
             send_queue: send_queue.clone(),
             cmd_tx: cmd_tx.clone(),
             close_request,
+            released_tx: released_tx.clone(),
             cmd_rx: Mutex::new(None),
             recv_rx: Mutex::new(recv_rx),
             demux: demux.clone(),
@@ -1072,13 +1102,17 @@ impl PhantomSession {
             send_queue,
             cmd_rx,
             close_requested,
+            released_rx,
             recv_tx,
             demux,
             streams,
             runtime_for_pump,
             observability,
             leg,
-            cmd_tx,
+            StreamLink {
+                commands: cmd_tx,
+                released: released_tx,
+            },
             incoming_stream_tx,
             stream_gauge,
             recv_tuning_for_pump,
@@ -1096,6 +1130,7 @@ impl PhantomSession {
         _cmd_tx: mpsc::Sender<SessionCommand>,
         cmd_rx: mpsc::Receiver<SessionCommand>,
         close_requested: watch::Receiver<bool>,
+        released_rx: mpsc::UnboundedReceiver<u32>,
         recv_tx: mpsc::Sender<Bytes>,
         transport: T,
         peer: String,
@@ -1109,7 +1144,7 @@ impl PhantomSession {
         resumption_request: Option<([u8; 32], [u8; 32], Vec<u8>)>,
         observability: Arc<Observability>,
         liveness: Option<crate::transport::liveness::LivenessConfig>,
-        cmd_tx_for_stream: mpsc::Sender<SessionCommand>,
+        stream_link: StreamLink,
         incoming_stream_tx: mpsc::Sender<Arc<crate::api::stream::PhantomStream>>,
         // Terminal-error capture + readiness signal
         terminal_error: Arc<parking_lot::Mutex<Option<CoreError>>>,
@@ -1280,13 +1315,14 @@ impl PhantomSession {
             send_queue,
             cmd_rx,
             close_requested,
+            released_rx,
             recv_tx,
             demux,
             streams,
             runtime,
             observability,
             leg,
-            cmd_tx_for_stream,
+            stream_link,
             incoming_stream_tx,
             stream_gauge,
             recv_tuning,
@@ -1761,8 +1797,9 @@ enum DeliverItem {
     /// Peer sent FIN on `stream_id`. Ordered after any `Data` items already
     /// queued for that stream so the consumer sees EOF last.
     Close(u32),
-    /// Both halves of `stream_id` are closed and the reader has dropped it from the
-    /// stream table: release its demultiplexer route.
+    /// The reader has dropped `stream_id` from the stream table — both halves are closed,
+    /// or this side's is and the application has let go of the stream: release its
+    /// demultiplexer route.
     ///
     /// The route is the sender behind the application's channel, and the reader cannot
     /// release it itself — the stream's last data and its EOF may still be queued ahead of
@@ -1806,6 +1843,12 @@ enum Deferred {
     Data { stream: Arc<Stream>, data: Bytes },
     /// The reliable FIN sentinel for `stream_id` awaiting a slot.
     Fin { stream_id: u32, stream: Arc<Stream> },
+    /// The application dropped its handle to `stream_id`: close the writing half if
+    /// nothing has closed it yet, behind every write the handle queued. Queued rather than
+    /// acted on at once for the same reason a FIN is — it has to land after those writes —
+    /// and resolved when it reaches the head of the queue, where all of them are in the
+    /// send buffer (see [`flush_deferred_sends`]).
+    Release { stream_id: u32, stream: Arc<Stream> },
 }
 
 /// Maximum segments one [`drain_streams_priority_ordered`] pass puts on the wire
@@ -2020,15 +2063,19 @@ async fn run_data_pump<T: SessionTransport>(
     // The local close request (`PhantomSession::close_request`), read beside the command
     // channel rather than through it.
     mut close_requested: watch::Receiver<bool>,
+    // Stream handles the application has dropped (`StreamLink::released`).
+    mut released_rx: mpsc::UnboundedReceiver<u32>,
     recv_tx: mpsc::Sender<Bytes>,
     demux: Arc<StreamDemultiplexer>,
     streams: Arc<DashMap<u32, Arc<Stream>>>,
     runtime: Arc<dyn Runtime>,
     observability: Arc<Observability>,
     leg: LegType,
-    // Command channel cloned for building `PhantomStream` handles on
+    // The channels a `PhantomStream` handle needs, cloned for the handles built on
     // peer-initiated streams (passed through to `handle_packet` → new-stream branch).
-    cmd_tx_for_stream: mpsc::Sender<SessionCommand>,
+    // Holding it also keeps the release channel open for as long as the pump runs, so its
+    // arm below never sees it close.
+    stream_link: StreamLink,
     // Sink for newly-registered peer-initiated streams (`accept_stream()`).
     incoming_stream_tx: mpsc::Sender<Arc<crate::api::stream::PhantomStream>>,
     // Balanced active-streams gauge shared with the outer `PhantomSession`
@@ -2078,6 +2125,19 @@ async fn run_data_pump<T: SessionTransport>(
     // on an arm of its own for exactly this reason: nothing bounds how long this
     // queue stays non-empty except the peer.
     let mut deferred: VecDeque<Deferred> = VecDeque::new();
+
+    // Stream handles the application has dropped, each waiting until the pump has taken in
+    // every write that handle queued. A drop is reported on a channel of its own — `Drop`
+    // can neither wait for room in the command channel nor ride it — so the report can
+    // arrive while the handle's last writes are still in that channel, and closing the
+    // stream then would put its FIN ahead of them. Every such write was queued before the
+    // drop, and so before the report, so all of them are among the commands in the channel
+    // when the report is read: the release is due once that many more have been taken.
+    // `commands_taken` counts every command the command arm takes; the queue is in
+    // non-decreasing order of `due`, because a later report can only find the earlier
+    // one's commands still ahead of it in the channel.
+    let mut releases: VecDeque<(u32, u64)> = VecDeque::new();
+    let mut commands_taken: u64 = 0;
 
     // ── Flush queued early-data onto the raw-app stream ──
     // Routed through the stream (not a one-shot direct send) so queued
@@ -2296,7 +2356,7 @@ async fn run_data_pump<T: SessionTransport>(
     let observability_recv = observability.clone();
     let stream_gauge_recv = stream_gauge.clone();
     // Clones moved into the recv task for new-stream registration.
-    let cmd_tx_recv = cmd_tx_for_stream.clone();
+    let stream_link_recv = stream_link.clone();
     let incoming_stream_tx_recv = incoming_stream_tx.clone();
     let terminal_error_recv = terminal_error.clone();
     // Completion signal for the receive task. `SpawnHandle` from the
@@ -2409,7 +2469,7 @@ async fn run_data_pump<T: SessionTransport>(
                 &mut scratch,
                 &observability_recv,
                 leg,
-                &cmd_tx_recv,
+                &stream_link_recv,
                 &incoming_stream_tx_recv,
                 &state_recv,
             )
@@ -2734,11 +2794,27 @@ async fn run_data_pump<T: SessionTransport>(
                 }
                 break;
             }
+            // A stream handle the application dropped. Only recorded here, with the number
+            // of commands the pump has to take before every write that handle queued is in
+            // (see `releases`); acted on as soon as that many have been — at once, if the
+            // channel holds nothing. Never gated: a report that waited on the command arm
+            // could wait as long as that arm does, and the channel it arrives on grows.
+            Some(stream_id) = released_rx.recv() => {
+                releases.push_back((stream_id, commands_taken + cmd_rx.len() as u64));
+                release_due_streams(
+                    &mut releases, commands_taken, &mut deferred, &transport, &crypto_session,
+                    session_id, &streams, &demux, &stream_gauge, &observability,
+                )
+                .await;
+            }
             // Disabled while `deferred` holds work: the queue must clear in FIFO
             // order before another command is taken, which is what preserves
             // per-stream byte ordering and lets the bounded command channel carry
             // the backpressure back to the caller.
             cmd_opt = cmd_rx.recv(), if deferred.is_empty() => {
+                if cmd_opt.is_some() {
+                    commands_taken += 1;
+                }
                 // Draining (WIRE v8): the local side may still hand this pump writes
                 // after the peer has announced its close. They are refused rather than
                 // queued — the peer's session is over, so a byte accepted here would
@@ -2764,6 +2840,12 @@ async fn run_data_pump<T: SessionTransport>(
                         "PhantomSession: refusing an application write while draining the \
                          peer's close"
                     );
+                    release_due_streams(
+                        &mut releases, commands_taken, &mut deferred, &transport,
+                        &crypto_session, session_id, &streams, &demux, &stream_gauge,
+                        &observability,
+                    )
+                    .await;
                     continue;
                 }
                 let Some(cmd) = cmd_opt else {
@@ -2800,6 +2882,13 @@ async fn run_data_pump<T: SessionTransport>(
                     .await;
                     break;
                 }
+                // Behind the command just taken, which may have been the last write of a
+                // handle whose drop is waiting on it.
+                release_due_streams(
+                    &mut releases, commands_taken, &mut deferred, &transport, &crypto_session,
+                    session_id, &streams, &demux, &stream_gauge, &observability,
+                )
+                .await;
             }
             _ = &mut recv_done_rx => {
                 if crypto_session.peer_closed() {
@@ -3099,6 +3188,57 @@ async fn take_command<T: SessionTransport>(
     false
 }
 
+/// Act on every dropped stream handle whose own writes the pump has now taken in (see
+/// `releases` in [`run_data_pump`]).
+///
+/// The stream is marked released, so from here on nobody is left to read it and an
+/// acknowledged FIN is enough to drop it. Then either that is already true and the stream
+/// goes now, or a [`Deferred::Release`] is queued behind the writes still waiting for room
+/// — the handle's own among them — to close the writing half once they are in.
+#[allow(clippy::too_many_arguments)]
+async fn release_due_streams<T: SessionTransport>(
+    releases: &mut VecDeque<(u32, u64)>,
+    commands_taken: u64,
+    deferred: &mut VecDeque<Deferred>,
+    transport: &Arc<T>,
+    crypto_session: &Arc<Session>,
+    session_id: SessionId,
+    streams: &Arc<DashMap<u32, Arc<Stream>>>,
+    demux: &Arc<StreamDemultiplexer>,
+    stream_gauge: &Arc<StreamGauge>,
+    observability: &Observability,
+) {
+    while let Some(&(stream_id, due)) = releases.front() {
+        if due > commands_taken {
+            break;
+        }
+        releases.pop_front();
+        // Clone the Arc out so no table guard is held across the awaits below. A stream
+        // already gone was dropped from both ends while its handle was on its way out.
+        let Some(stream) = streams.get(&stream_id).map(|s| s.clone()) else {
+            continue;
+        };
+        stream.release_app_handle();
+        if stream.is_retirable().await {
+            retire_released_stream(stream_id, streams, demux, stream_gauge);
+            continue;
+        }
+        deferred.push_back(Deferred::Release { stream_id, stream });
+        flush_deferred_sends(
+            deferred,
+            transport,
+            crypto_session,
+            session_id,
+            streams,
+            demux,
+            stream_gauge,
+            observability,
+        )
+        .await;
+        crypto_session.notify_outbound_ready();
+    }
+}
+
 /// Evaluate path liveness once (Phase 4 / P4.3) and apply the resulting transition to
 /// both the internal [`SessionState`] and the FFI-visible [`ConnectionState`]. Returns
 /// `true` when the session has died (idle-timeout in `Migrating`), so the caller ends
@@ -3384,37 +3524,64 @@ async fn flush_deferred_sends<T: SessionTransport>(
                     deferred.pop_front();
                 }
             },
-            Deferred::Fin { stream_id, stream } => match stream.try_queue_fin().await {
-                Ok(true) => {
-                    admitted = true;
-                    deferred.pop_front();
+            // A dropped handle whose stream's writing half is already closed — by a
+            // `disconnect()` whose FIN was ahead of this in the queue. There is no second
+            // FIN to send. What drops the stream now that nobody holds it is that FIN's
+            // acknowledgement (the receive path asks `is_retirable`), unless it has
+            // already arrived, which is checked here.
+            Deferred::Release { stream_id, stream } if stream.is_local_finished() => {
+                deferred.pop_front();
+                if stream.is_retirable().await {
+                    retire_released_stream(stream_id, streams, demux, stream_gauge);
                 }
-                Ok(false) => break,
-                Err(e) => {
-                    // Same offset exhaustion, on the FIN sentinel. Fall back to
-                    // a bare (still ENCRYPTED — Invariant 2) FIN and retire the
-                    // stream, exactly as the inline path used to.
-                    log::error!(
-                        "PhantomSession: queue_fin failed for stream {stream_id}: {e}; \
-                         sending bare FIN (best-effort)"
-                    );
-                    let _ = send_app_data(
-                        transport,
-                        crypto_session,
-                        session_id,
-                        stream_id as TransportStreamId,
-                        &[],
-                        PacketFlags::FIN,
-                        None,
-                        observability,
-                    )
-                    .await;
-                    streams.remove(&stream_id);
-                    demux.close_stream(stream_id);
-                    stream_gauge.closed(stream_id);
-                    deferred.pop_front();
+            }
+            // A dropped handle to a stream this side opened and never put a reliable
+            // byte on: nothing has reached the peer that could have told it the stream
+            // exists, since only a reliable segment opens one there. A FIN would open it
+            // on the peer only to end it, so the stream just goes. Every write the handle
+            // made was ahead of this in the queue, so none of them is still to come.
+            Deferred::Release { stream_id, stream }
+                if demux.is_local_stream_id(stream_id) && !stream.has_sent_reliable() =>
+            {
+                deferred.pop_front();
+                retire_released_stream(stream_id, streams, demux, stream_gauge);
+            }
+            // Otherwise a dropped handle closes the writing half exactly as `disconnect()`
+            // does: the FIN follows every write the handle queued, and once it is
+            // acknowledged the stream goes whether or not the peer ever closes its half.
+            Deferred::Fin { stream_id, stream } | Deferred::Release { stream_id, stream } => {
+                match stream.try_queue_fin().await {
+                    Ok(true) => {
+                        admitted = true;
+                        deferred.pop_front();
+                    }
+                    Ok(false) => break,
+                    Err(e) => {
+                        // Same offset exhaustion, on the FIN sentinel. Fall back to
+                        // a bare (still ENCRYPTED — Invariant 2) FIN and retire the
+                        // stream, exactly as the inline path used to.
+                        log::error!(
+                            "PhantomSession: queue_fin failed for stream {stream_id}: {e}; \
+                             sending bare FIN (best-effort)"
+                        );
+                        let _ = send_app_data(
+                            transport,
+                            crypto_session,
+                            session_id,
+                            stream_id as TransportStreamId,
+                            &[],
+                            PacketFlags::FIN,
+                            None,
+                            observability,
+                        )
+                        .await;
+                        streams.remove(&stream_id);
+                        demux.close_stream(stream_id);
+                        stream_gauge.closed(stream_id);
+                        deferred.pop_front();
+                    }
                 }
-            },
+            }
         }
     }
     if admitted {
@@ -4712,10 +4879,10 @@ async fn handle_packet<T: SessionTransport>(
     scratch: &mut RecvScratch,
     observability: &Observability,
     leg: LegType,
-    // Session command channel used to build `PhantomStream` for
-    // newly-registered peer-initiated streams (same sender the embedder uses
-    // for `send_reliable` / `close_stream` etc.).
-    cmd_tx_for_stream: &mpsc::Sender<SessionCommand>,
+    // The channels a `PhantomStream` needs, used to build one for each
+    // newly-registered peer-initiated stream (the same ones a locally opened
+    // stream's handle holds).
+    stream_link: &StreamLink,
     // Sink where newly-registered peer-initiated streams are
     // pushed so `accept_stream()` can hand them to the embedder.
     incoming_stream_tx: &mpsc::Sender<Arc<crate::api::stream::PhantomStream>>,
@@ -5057,10 +5224,12 @@ async fn handle_packet<T: SessionTransport>(
             }
             // Reliable FIN teardown. An acknowledged FIN finishes this side's half of
             // the stream and nothing more: the peer's half stays open until its own FIN is
-            // released in order, and until then the stream keeps receiving. It is dropped
-            // when both are done, which either this acknowledgement or the peer's FIN (the
-            // reliable branch below) can be the one to complete.
-            if stream.is_fully_closed().await {
+            // released in order, and until then the stream keeps receiving — unless the
+            // application has let go of the stream, in which case nobody is left to receive
+            // anything. It is dropped when both are done, which this acknowledgement, the
+            // peer's FIN (the reliable branch below) or the release in the pump can be the
+            // one to complete.
+            if stream.is_retirable().await {
                 retire_stream(stream_id, streams_recv, deliver_tx, &scratch.stream_gauge);
             }
         }
@@ -5395,13 +5564,14 @@ async fn handle_packet<T: SessionTransport>(
                 // the demux so Task B can route data to this stream, then push a
                 // PhantomStream handle onto the incoming-stream channel so the
                 // embedder can pick it up via `accept_stream()`. `try_send` is
-                // non-blocking: if the 128-slot channel is full the push is silently
-                // dropped (the stream is still in `streams_recv` and the demux, so
-                // data continues to flow — only the *accept notification* is lost;
-                // consistent with the MAX_STREAMS cap semantics). Only streams with
-                // id ≥ 2 are user-visible; id 1 is the raw-app reserved stream
-                // (never accepted via this path). Registration happens exactly ONCE
-                // per stream_id (the `None` arm here), guarded by the DashMap entry.
+                // non-blocking: if the 128-slot channel is full the handle is dropped
+                // right here, and a dropped handle is a released stream like any
+                // other — this side closes its half, and the stream leaves the table
+                // once that close is acknowledged, instead of sitting in it with no
+                // reader for the life of the session. Only streams with id ≥ 2 are
+                // user-visible; id 1 is the raw-app reserved stream (never accepted
+                // via this path). Registration happens exactly ONCE per stream_id
+                // (the `None` arm here), guarded by the DashMap entry.
                 if stream_id > RAW_APP_STREAM_ID {
                     // From here on a frame for this id finds either the stream or the
                     // record that it existed, never an id free to open again.
@@ -5409,20 +5579,21 @@ async fn handle_packet<T: SessionTransport>(
                     // Peer-initiated user stream — count it on the active-streams
                     // gauge exactly once (this `None` arm runs once per stream id,
                     // guarded by the DashMap entry and the record above). The matching
-                    // retire is `retire_stream`, or the session-teardown drain.
+                    // retire is `retire_stream` or `retire_released_stream`, or the
+                    // session-teardown drain.
                     scratch.stream_gauge.opened(stream_id);
                     let handle = demux_recv.register_stream(stream_id, STREAM_RECV_CHANNEL_DEPTH);
                     let phantom_stream = Arc::new(crate::api::stream::PhantomStream::new(
                         handle,
-                        cmd_tx_for_stream.clone(),
+                        stream_link.clone(),
                         session_state.clone(),
                     ));
                     // Non-blocking push: a full incoming channel is a backpressure
                     // signal from the embedder (not consuming); don't block the reader.
                     if incoming_stream_tx.try_send(phantom_stream).is_err() {
                         log::debug!(
-                            "PhantomSession: incoming_stream_tx full or closed; \
-                             accept notification for stream {stream_id} dropped"
+                            "PhantomSession: incoming_stream_tx full or closed; stream \
+                             {stream_id} was never handed to the application and is released"
                         );
                     }
                 }
@@ -5485,7 +5656,7 @@ async fn handle_packet<T: SessionTransport>(
             }
             // The peer's half just ended. If this side's FIN was already acknowledged, both
             // halves are done and this frame is the one that completes the close.
-            if local.is_fin_acked().await {
+            if local.is_retirable().await {
                 retire_stream(stream_id, streams_recv, deliver_tx, &scratch.stream_gauge);
             }
         }
@@ -5588,14 +5759,16 @@ async fn send_stream_sack<T: SessionTransport>(
     true
 }
 
-/// Drop a stream whose two halves are both closed: this side's FIN acknowledged, and the
-/// peer's released in order.
+/// Drop a stream from the receive path once [`Stream::is_retirable`] says it can go: this
+/// side's FIN acknowledged, and either the peer's half ended or the application's handle
+/// gone.
 ///
 /// The stream leaves the table and the active-streams gauge here and now. Its
 /// demultiplexer route is released by the delivery task instead, behind whatever it still
 /// has to hand to the application for this stream (see [`DeliverItem::Retire`]). The ids
 /// 0 and 1 are never dropped, and a stream already gone is left alone, so the gauge is
-/// retired exactly once per stream.
+/// retired exactly once per stream — whichever of this and [`retire_released_stream`]
+/// gets there first.
 fn retire_stream(
     stream_id: u32,
     streams: &DashMap<u32, Arc<Stream>>,
@@ -5609,7 +5782,28 @@ fn retire_stream(
     // A closed delivery task means the session is ending, and its teardown drops every
     // route with the demultiplexer.
     let _ = deliver_tx.send(DeliverItem::Retire(stream_id));
-    log::debug!("PhantomSession: stream {stream_id} closed from both ends — dropped");
+    log::debug!("PhantomSession: stream {stream_id} closed — dropped");
+}
+
+/// Drop, from the pump, a stream the application has let go of: its handle is gone, and
+/// this side's half is closed and acknowledged, or never reached the peer at all.
+///
+/// The same bookkeeping as [`retire_stream`], guarded the same way so that of the two only
+/// the first to get there acts. The route goes at once rather than behind the delivery
+/// queue: that queue exists so the application reads a stream's last data and its EOF
+/// before its channel closes, and an application that dropped its handle reads nothing.
+fn retire_released_stream(
+    stream_id: u32,
+    streams: &DashMap<u32, Arc<Stream>>,
+    demux: &StreamDemultiplexer,
+    stream_gauge: &StreamGauge,
+) {
+    if stream_id <= RAW_APP_STREAM_ID || streams.remove(&stream_id).is_none() {
+        return;
+    }
+    stream_gauge.closed(stream_id);
+    demux.close_stream(stream_id);
+    log::debug!("PhantomSession: stream {stream_id} let go of by the application — dropped");
 }
 
 /// What a reliable segment on an id with no stream in the table is.
@@ -5729,6 +5923,8 @@ impl PhantomSession {
     #[cfg_attr(feature = "bindings", uniffi::constructor)]
     pub fn connect(peer_addr: String) -> Arc<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
+        // No pump reads it; a dropped stream's report goes nowhere.
+        let (released_tx, _released_rx) = mpsc::unbounded_channel();
         let (_recv_tx, recv_rx) = mpsc::channel(256);
         let (_incoming_tx, incoming_rx) = mpsc::channel(128);
 
@@ -5751,6 +5947,7 @@ impl PhantomSession {
             cmd_tx,
             // No pump to read it; raising it is a harmless no-op.
             close_request: watch::channel(false).0,
+            released_tx,
             cmd_rx: Mutex::new(Some(cmd_rx)),
             recv_rx: Mutex::new(recv_rx),
             demux: Arc::new(demux),
@@ -5772,7 +5969,12 @@ impl PhantomSession {
         })
     }
 
-    /// Open a new multiplexed stream
+    /// Open a new multiplexed stream.
+    ///
+    /// Nothing reaches the peer until the first reliable write. Dropping the returned
+    /// handle closes the stream's writing half behind everything written on it; see
+    /// [`PhantomStream`](crate::api::stream::PhantomStream) for when the stream then
+    /// leaves the session.
     pub fn open_stream(&self) -> Arc<crate::api::stream::PhantomStream> {
         let handle = self.demux.open_stream(STREAM_RECV_CHANNEL_DEPTH);
         let stream_id = handle.stream_id;
@@ -5790,7 +5992,10 @@ impl PhantomSession {
 
         Arc::new(crate::api::stream::PhantomStream::new(
             handle,
-            self.cmd_tx.clone(),
+            StreamLink {
+                commands: self.cmd_tx.clone(),
+                released: self.released_tx.clone(),
+            },
             self.state.clone(),
         ))
     }
@@ -7138,16 +7343,24 @@ mod tests {
 
     // ── No-op sinks for handle_packet calls in tests that don't exercise accept_stream ──
 
-    /// Return a no-op cmd_tx and incoming_stream_tx for test handle_packet calls.
-    /// The receivers are immediately dropped so `try_send` silently fails — which is
-    /// fine; tests that do not exercise `accept_stream()` do not care about these channels.
+    /// Return a no-op stream link and incoming_stream_tx for test handle_packet calls.
+    /// The receivers are immediately dropped so every send on them silently fails — which
+    /// is fine; tests that do not exercise `accept_stream()` do not care about these
+    /// channels.
     fn noop_accept_sinks() -> (
-        mpsc::Sender<SessionCommand>,
+        StreamLink,
         mpsc::Sender<Arc<crate::api::stream::PhantomStream>>,
     ) {
-        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
         let (inc_tx, _inc_rx) = mpsc::channel(1);
-        (cmd_tx, inc_tx)
+        (detached_stream_link(), inc_tx)
+    }
+
+    /// A stream link whose far ends are all gone: a handle built from it can be created and
+    /// dropped, and every command it sends fails.
+    fn detached_stream_link() -> StreamLink {
+        let (commands, _) = mpsc::channel(1);
+        let (released, _) = mpsc::unbounded_channel();
+        StreamLink { commands, released }
     }
 
     /// The published-state handle a direct `handle_packet` call needs. `Connected`,
@@ -9183,7 +9396,7 @@ mod tests {
             Arc::new(PathChallenges::default()),
             connection_budget.clone(),
         );
-        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let link = detached_stream_link();
         let (inc_tx, _inc_rx) = mpsc::channel(4);
         handle_packet(
             v2,
@@ -9198,7 +9411,7 @@ mod tests {
             &mut scratch,
             &obs,
             LegType::Tcp,
-            &cmd_tx,
+            &link,
             &inc_tx,
             &connected_state(),
         )
@@ -9239,7 +9452,7 @@ mod tests {
 
         let obs = Observability::new(ObservabilityConfig::default());
         let mut scratch = test_recv_scratch(&obs, 256);
-        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+        let (no_link, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             v2,
             session_id,
@@ -9253,7 +9466,7 @@ mod tests {
             &mut scratch,
             &obs,
             LegType::Tcp,
-            &no_cmd_tx,
+            &no_link,
             &no_inc_tx,
             &connected_state(),
         )
@@ -9313,7 +9526,7 @@ mod tests {
                 b"x",
             );
             let v2 = decode_recv_frame(&frame, session_id);
-            let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+            let (no_link, no_inc_tx) = noop_accept_sinks();
             handle_packet(
                 v2,
                 session_id,
@@ -9327,7 +9540,7 @@ mod tests {
                 &mut scratch,
                 &obs,
                 LegType::Tcp,
-                &no_cmd_tx,
+                &no_link,
                 &no_inc_tx,
                 &connected_state(),
             )
@@ -9370,7 +9583,7 @@ mod tests {
         let header = PacketHeader::new(session_id, 2, 0, PacketFlags::new(PacketFlags::FIN));
         let forged = PhantomPacket::new(header, Vec::new());
 
-        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+        let (no_link, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             forged,
             session_id,
@@ -9384,7 +9597,7 @@ mod tests {
             &mut scratch,
             &obs,
             LegType::Tcp,
-            &no_cmd_tx,
+            &no_link,
             &no_inc_tx,
             &connected_state(),
         )
@@ -9424,8 +9637,9 @@ mod tests {
         transport: Arc<ChannelTransport>,
         scratch: RecvScratch,
         obs: Arc<Observability>,
-        cmd_tx: mpsc::Sender<SessionCommand>,
-        _cmd_rx: mpsc::Receiver<SessionCommand>,
+        link: StreamLink,
+        /// Where the handles of the peer's streams report being dropped.
+        released_rx: mpsc::UnboundedReceiver<u32>,
         inc_tx: mpsc::Sender<Arc<crate::api::stream::PhantomStream>>,
         inc_rx: mpsc::Receiver<Arc<crate::api::stream::PhantomStream>>,
         /// The peer's next packet number. Each frame it sends takes a fresh one, as a
@@ -9435,6 +9649,12 @@ mod tests {
 
     impl RecvRig {
         fn new() -> Self {
+            Self::with_accept_depth(8192)
+        }
+
+        /// A rig whose `accept_stream` channel holds `depth` streams the application has
+        /// not taken yet.
+        fn with_accept_depth(depth: usize) -> Self {
             let session_id = fixed_session_id();
             let (client, server) = paired_sessions(session_id);
             let (demux, _ctrl_rx) = StreamDemultiplexer::new_with_role(16, false);
@@ -9443,8 +9663,12 @@ mod tests {
             let (ack_tx, ack_rx) = mpsc::channel::<Vec<u8>>(8192);
             let obs = Observability::new(ObservabilityConfig::default());
             let scratch = test_recv_scratch(&obs, 256);
-            let (cmd_tx, _cmd_rx) = mpsc::channel(4);
-            let (inc_tx, inc_rx) = mpsc::channel(8192);
+            let (released, released_rx) = mpsc::unbounded_channel();
+            let link = StreamLink {
+                released,
+                ..detached_stream_link()
+            };
+            let (inc_tx, inc_rx) = mpsc::channel(depth);
             Self {
                 session_id,
                 client,
@@ -9460,8 +9684,8 @@ mod tests {
                 }),
                 scratch,
                 obs,
-                cmd_tx,
-                _cmd_rx,
+                link,
+                released_rx,
                 inc_tx,
                 inc_rx,
                 next_pn: 0,
@@ -9510,7 +9734,7 @@ mod tests {
                 &mut self.scratch,
                 &self.obs,
                 LegType::Tcp,
-                &self.cmd_tx,
+                &self.link,
                 &self.inc_tx,
                 &connected_state(),
             )
@@ -9863,6 +10087,104 @@ mod tests {
         assert!(
             handle.rx.try_recv().is_err(),
             "an acknowledgement was queued to the stream's application channel"
+        );
+    }
+
+    /// A stream the application has let go of is dropped as soon as this side's FIN is
+    /// acknowledged, with the peer's half still open; what the peer sends on it afterwards
+    /// is acknowledged and goes nowhere.
+    ///
+    /// The peer's half is the peer's to close, and a peer that never closes it used to keep
+    /// the stream in this side's table for the life of the session. With the handle gone
+    /// there is nobody here to read that half, so there is nothing to keep it for — and the
+    /// acknowledgement is what lets the peer's writes on it complete instead of stalling.
+    #[tokio::test]
+    async fn a_released_stream_goes_once_its_own_close_is_acknowledged() {
+        let mut rig = RecvRig::new();
+        let local = rig.open_local();
+        let id = local.stream_id;
+        rig.close_local(id).await;
+        rig.streams
+            .get(&id)
+            .expect("the stream is in the table")
+            .release_app_handle();
+        let _ = rig.delivered();
+
+        rig.peer_ack(id, 0).await;
+        assert!(
+            !rig.streams.contains_key(&id),
+            "the stream's own close is acknowledged and nobody holds it, so it must go"
+        );
+        assert_eq!(rig.delivered(), vec![Delivered::Retire(id)]);
+
+        let _ = rig.emitted_sacks().await;
+        rig.peer_segment(id, 0, b"to nobody", false).await;
+        rig.peer_segment(id, 1, b"", true).await;
+        assert_eq!(
+            rig.accepted(),
+            Vec::<u32>::new(),
+            "a dropped stream was reopened"
+        );
+        assert_eq!(rig.delivered(), Vec::new(), "a dropped stream delivered");
+        let sacks = rig.emitted_sacks().await;
+        assert_eq!(
+            sacks.len(),
+            2,
+            "each of the peer's segments must be acknowledged, or its writes stall"
+        );
+        assert!(sacks.iter().all(|(sid, _)| *sid == id));
+        assert!(sacks[1].1.acks(0) && sacks[1].1.acks(1));
+    }
+
+    /// Letting go of the handle alone drops nothing: a stream whose own close has not been
+    /// acknowledged still has a FIN to deliver, and the peer's acknowledgement of it is
+    /// what drops the stream.
+    #[tokio::test]
+    async fn a_released_stream_stays_until_its_own_close_is_acknowledged() {
+        let mut rig = RecvRig::new();
+        let local = rig.open_local();
+        let id = local.stream_id;
+        rig.streams
+            .get(&id)
+            .expect("the stream is in the table")
+            .release_app_handle();
+        rig.peer_segment(id, 0, b"", true).await;
+        assert!(
+            rig.streams.contains_key(&id),
+            "the peer closed its half, but this side's FIN has not even been sent"
+        );
+
+        rig.close_local(id).await;
+        rig.peer_ack(id, 0).await;
+        assert!(!rig.streams.contains_key(&id));
+    }
+
+    /// Every handle to a peer's stream reports being dropped — the one the application took
+    /// and let go of, and the one that never reached it because the accept queue was full.
+    ///
+    /// The second used to sit in the table for the life of the session with no reader:
+    /// delivered data was thrown away at the channel, acknowledged all the same, and the
+    /// stream counted against [`MAX_STREAMS`].
+    #[tokio::test]
+    async fn every_dropped_handle_to_a_peer_stream_reports_its_release() {
+        let mut rig = RecvRig::with_accept_depth(1);
+        rig.peer_segment(3, 0, b"taken", false).await;
+        rig.peer_segment(5, 0, b"never seen", false).await;
+        assert_eq!(
+            rig.released_rx.try_recv().ok(),
+            Some(5),
+            "the handle the accept queue had no room for was dropped unreported"
+        );
+        assert!(
+            rig.streams.contains_key(&5),
+            "the pump decides when it goes"
+        );
+
+        assert_eq!(rig.accepted(), vec![3]);
+        assert_eq!(
+            rig.released_rx.try_recv().ok(),
+            Some(3),
+            "a handle the application let go of went unreported"
         );
     }
 
@@ -10616,7 +10938,7 @@ mod tests {
         let obs = Observability::new(ObservabilityConfig::default());
         let mut scratch = test_recv_scratch(&obs, 256);
 
-        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+        let (no_link, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             frame,
             session_id,
@@ -10630,7 +10952,7 @@ mod tests {
             &mut scratch,
             &obs,
             LegType::Tcp,
-            &no_cmd_tx,
+            &no_link,
             &no_inc_tx,
             &connected_state(),
         )
@@ -10714,7 +11036,7 @@ mod tests {
         let obs = Observability::new(ObservabilityConfig::default());
         let mut scratch = test_recv_scratch(&obs, 256);
 
-        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+        let (no_link, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             frame,
             session_id,
@@ -10728,7 +11050,7 @@ mod tests {
             &mut scratch,
             &obs,
             LegType::Udp,
-            &no_cmd_tx,
+            &no_link,
             &no_inc_tx,
             &connected_state(),
         )
@@ -10832,7 +11154,7 @@ mod tests {
         let obs = Observability::new(ObservabilityConfig::default());
         let mut scratch = test_recv_scratch(&obs, 256);
 
-        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+        let (no_link, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             frame,
             session_id,
@@ -10846,7 +11168,7 @@ mod tests {
             &mut scratch,
             &obs,
             LegType::Udp,
-            &no_cmd_tx,
+            &no_link,
             &no_inc_tx,
             &connected_state(),
         )
@@ -10972,7 +11294,7 @@ mod tests {
         });
         let obs = Observability::new(ObservabilityConfig::default());
         let mut scratch = test_recv_scratch(&obs, 64);
-        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+        let (no_link, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             pkt,
             session_id,
@@ -10986,7 +11308,7 @@ mod tests {
             &mut scratch,
             &obs,
             LegType::Tcp,
-            &no_cmd_tx,
+            &no_link,
             &no_inc_tx,
             &connected_state(),
         )
@@ -11586,7 +11908,7 @@ mod tests {
         });
         let obs = Observability::new(ObservabilityConfig::default());
         let mut scratch = test_recv_scratch(&obs, 64);
-        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+        let (no_link, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             data_pkt,
             session_id,
@@ -11600,7 +11922,7 @@ mod tests {
             &mut scratch,
             &obs,
             LegType::Tcp,
-            &no_cmd_tx,
+            &no_link,
             &no_inc_tx,
             &connected_state(),
         )
@@ -11696,7 +12018,7 @@ mod tests {
 
         let obs = Observability::new(ObservabilityConfig::default());
         let mut scratch = test_recv_scratch(&obs, 256);
-        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+        let (no_link, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             bad_packet,
             session_id,
@@ -11710,7 +12032,7 @@ mod tests {
             &mut scratch,
             &obs,
             LegType::Tcp,
-            &no_cmd_tx,
+            &no_link,
             &no_inc_tx,
             &connected_state(),
         )
@@ -11785,7 +12107,7 @@ mod tests {
         });
         let obs = Observability::new(ObservabilityConfig::default());
         let mut scratch = test_recv_scratch(&obs, 64);
-        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+        let (no_link, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             pkt,
             session_id,
@@ -11799,7 +12121,7 @@ mod tests {
             &mut scratch,
             &obs,
             LegType::Tcp,
-            &no_cmd_tx,
+            &no_link,
             &no_inc_tx,
             &connected_state(),
         )
@@ -11835,7 +12157,7 @@ mod tests {
         });
         let obs = Observability::new(ObservabilityConfig::default());
         let mut scratch = test_recv_scratch(&obs, 64);
-        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+        let (no_link, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             pkt,
             session_id,
@@ -11849,7 +12171,7 @@ mod tests {
             &mut scratch,
             &obs,
             LegType::Tcp,
-            &no_cmd_tx,
+            &no_link,
             &no_inc_tx,
             &connected_state(),
         )
@@ -12601,6 +12923,127 @@ mod tests {
         }
     }
 
+    /// A connecting session and the session that accepted it, handshaken for real over an
+    /// in-memory link with no delay.
+    ///
+    /// The stream tests need the two roles: stream ids are allocated by parity, and a pair of
+    /// accepted sessions — [`live_session_pair`] — allocates from the same half on both ends,
+    /// so the peer takes each other's streams for ones of its own that it never opened.
+    async fn connected_client_and_server() -> (Arc<PhantomSession>, Arc<PhantomSession>) {
+        let (client, server, _) =
+            crate::api::full_duplex_tests::establish_counted(std::time::Duration::ZERO, 1 << 40)
+                .await;
+        (client, server)
+    }
+
+    /// Wait, for at most ten seconds, until the send buffer of `closing`'s stream `id` is
+    /// full — the point at which the pump holds refused writes and stops reading commands.
+    async fn wait_until_send_buffer_full(closing: &PhantomSession, id: u32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !closing
+            .streams
+            .get(&id)
+            .is_some_and(|s| s.send_buffer_full())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stream {id}'s send buffer never filled, so the pump never stopped reading \
+                 commands and the case under test was never reached"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Assert that exactly `waiting` commands are sitting unread in `closing`'s command
+    /// channel, and still are a moment later — so the pump has stopped reading it.
+    async fn assert_commands_waiting(closing: &PhantomSession, waiting: usize) {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            closing.cmd_tx.max_capacity() - closing.cmd_tx.capacity(),
+            waiting,
+            "the commands under test have to be waiting in the command channel, or this test \
+             is not testing the case it is for"
+        );
+    }
+
+    /// Everything the peer reads on `stream` up to its EOF, as `(bytes of filler, anything
+    /// else in arrival order)`. Each read has ten seconds to arrive.
+    async fn read_to_eof(
+        stream: &crate::api::stream::PhantomStream,
+        filler: u8,
+    ) -> (usize, Vec<Vec<u8>>) {
+        let mut bulk = 0usize;
+        let mut rest = Vec::new();
+        loop {
+            let read = tokio::time::timeout(std::time::Duration::from_secs(10), stream.recv())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "stream {}: recv() stalled after {bulk} bytes and {} other read(s), \
+                         with no EOF",
+                        stream.stream_id(),
+                        rest.len()
+                    )
+                })
+                .expect("the read half ends cleanly");
+            match read {
+                Some(bytes) if rest.is_empty() && bytes.iter().all(|&b| b == filler) => {
+                    bulk += bytes.len()
+                }
+                Some(bytes) => rest.push(bytes),
+                None => return (bulk, rest),
+            }
+        }
+    }
+
+    /// Writes a stream handle queued before it was dropped reach the peer ahead of the EOF
+    /// the drop sends — including writes that were still waiting in the command channel,
+    /// behind a write the send buffer refused, when the handle went.
+    ///
+    /// Dropping a handle closes its stream's writing half, but a drop cannot wait for room in
+    /// the command channel and does not travel through it, so the pump can hear of it before
+    /// it has read the handle's last writes. Closing the stream at that moment would put the
+    /// FIN ahead of them, and the pump would then discard them as writes made after the
+    /// close. The peer here does not read until everything is queued: its window closes, the
+    /// stream's send buffer fills, and the pump stops reading commands — which is what keeps
+    /// the last two writes in the channel.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn writes_queued_before_a_stream_handle_is_dropped_reach_the_peer_before_its_eof() {
+        const BULK: usize = 4 << 20;
+        let (closing, peer) = connected_client_and_server().await;
+
+        let stream = closing.open_stream();
+        let id = stream.stream_id();
+        stream
+            .send_reliable(vec![0x5A; BULK])
+            .await
+            .expect("the pump takes the bulk in");
+        wait_until_send_buffer_full(&closing, id).await;
+        stream
+            .send_reliable(b"tail-one".to_vec())
+            .await
+            .expect("the command channel takes the write");
+        stream
+            .send_reliable(b"tail-two".to_vec())
+            .await
+            .expect("the command channel takes the write");
+        assert_commands_waiting(&closing, 2).await;
+        drop(stream);
+
+        let theirs = tokio::time::timeout(std::time::Duration::from_secs(10), peer.accept_stream())
+            .await
+            .expect("the peer never saw the stream")
+            .expect("accept_stream");
+        assert_eq!(theirs.stream_id(), id);
+        let (bulk, rest) = read_to_eof(&theirs, 0x5A).await;
+        assert_eq!(bulk, BULK, "the bulk arrived short");
+        assert_eq!(
+            rest,
+            vec![b"tail-one".to_vec(), b"tail-two".to_vec()],
+            "the writes queued before the drop must reach the peer, in order, ahead of the EOF"
+        );
+    }
+
     #[tokio::test]
     async fn v2_recv_handles_coalesced_bundle_and_routes_each_subpayload() {
         use crate::transport::packet_coalescer::{CoalescerConfig, PacketCoalescer};
@@ -12639,7 +13082,7 @@ mod tests {
 
         let obs = Observability::new(ObservabilityConfig::default());
         let mut scratch = test_recv_scratch(&obs, 256);
-        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+        let (no_link, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             v2,
             session_id,
@@ -12653,7 +13096,7 @@ mod tests {
             &mut scratch,
             &obs,
             LegType::Tcp,
-            &no_cmd_tx,
+            &no_link,
             &no_inc_tx,
             &connected_state(),
         )
@@ -12751,7 +13194,7 @@ mod tests {
 
         let obs = Observability::new(ObservabilityConfig::default());
         let mut scratch = test_recv_scratch(&obs, 256);
-        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+        let (no_link, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             packet,
             session_id,
@@ -12765,7 +13208,7 @@ mod tests {
             &mut scratch,
             &obs,
             LegType::Tcp,
-            &no_cmd_tx,
+            &no_link,
             &no_inc_tx,
             &connected_state(),
         )
@@ -12839,7 +13282,7 @@ mod tests {
         let mut scratch = test_recv_scratch(&obs, 256);
 
         for pkt in [coalesced, normal] {
-            let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+            let (no_link, no_inc_tx) = noop_accept_sinks();
             handle_packet(
                 pkt,
                 session_id,
@@ -12853,7 +13296,7 @@ mod tests {
                 &mut scratch,
                 &obs,
                 LegType::Tcp,
-                &no_cmd_tx,
+                &no_link,
                 &no_inc_tx,
                 &connected_state(),
             )
@@ -12906,7 +13349,7 @@ mod tests {
 
         // Deliver OUT OF ORDER on the wire: seq 1 first, then seq 0.
         for pkt in [f1, f0] {
-            let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+            let (no_link, no_inc_tx) = noop_accept_sinks();
             handle_packet(
                 pkt,
                 session_id,
@@ -12920,7 +13363,7 @@ mod tests {
                 &mut scratch,
                 &obs,
                 LegType::Tcp,
-                &no_cmd_tx,
+                &no_link,
                 &no_inc_tx,
                 &connected_state(),
             )
@@ -12978,7 +13421,7 @@ mod tests {
         let mut scratch = test_recv_scratch(&obs, 256);
 
         for pkt in [a, b] {
-            let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+            let (no_link, no_inc_tx) = noop_accept_sinks();
             handle_packet(
                 pkt,
                 session_id,
@@ -12992,7 +13435,7 @@ mod tests {
                 &mut scratch,
                 &obs,
                 LegType::Tcp,
-                &no_cmd_tx,
+                &no_link,
                 &no_inc_tx,
                 &connected_state(),
             )
@@ -13446,7 +13889,7 @@ mod tests {
             });
             let obs = Observability::new(ObservabilityConfig::default());
             let mut scratch = test_recv_scratch(&obs, 256);
-            let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+            let (no_link, no_inc_tx) = noop_accept_sinks();
 
             // A reliable frame with an empty payload: the probe, exactly as the drain above
             // puts it on the wire.
@@ -13471,7 +13914,7 @@ mod tests {
                 &mut scratch,
                 &obs,
                 LegType::Tcp,
-                &no_cmd_tx,
+                &no_link,
                 &no_inc_tx,
                 &connected_state(),
             )
@@ -13613,7 +14056,7 @@ mod tests {
         let obs = Observability::new(ObservabilityConfig::default());
         let mut scratch = test_recv_scratch(&obs, 256);
 
-        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+        let (no_link, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             v2,
             session_id,
@@ -13627,7 +14070,7 @@ mod tests {
             &mut scratch,
             &obs,
             LegType::Tcp,
-            &no_cmd_tx,
+            &no_link,
             &no_inc_tx,
             &connected_state(),
         )
@@ -14204,7 +14647,7 @@ mod tests {
         });
         let obs = Observability::new(ObservabilityConfig::default());
         let mut scratch = test_recv_scratch(&obs, 256);
-        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+        let (no_link, no_inc_tx) = noop_accept_sinks();
 
         // A reliable frame: `[stream_offset: u32 BE][payload]`, the live sender's framing.
         let reliable = decode_recv_frame(
@@ -14224,7 +14667,7 @@ mod tests {
             &mut scratch,
             &obs,
             LegType::Tcp,
-            &no_cmd_tx,
+            &no_link,
             &no_inc_tx,
             &connected_state(),
         )
@@ -14259,7 +14702,7 @@ mod tests {
             &mut scratch,
             &obs,
             LegType::Tcp,
-            &no_cmd_tx,
+            &no_link,
             &no_inc_tx,
             &connected_state(),
         )
@@ -14312,7 +14755,7 @@ mod tests {
             &build_app_frame(&client_session, session_id, 3, 0, b"opened-only"),
             session_id,
         );
-        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+        let (no_link, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             opened_frame,
             session_id,
@@ -14326,7 +14769,7 @@ mod tests {
             &mut scratch,
             &obs,
             LegType::Tcp,
-            &no_cmd_tx,
+            &no_link,
             &no_inc_tx,
             &connected_state(),
         )
@@ -14368,7 +14811,7 @@ mod tests {
             &build_app_frame_with_offset(&client_session, session_id, 1, 1, 0, b"raw-only"),
             session_id,
         );
-        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+        let (no_link, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             raw_frame,
             session_id,
@@ -14382,7 +14825,7 @@ mod tests {
             &mut scratch,
             &obs,
             LegType::Tcp,
-            &no_cmd_tx,
+            &no_link,
             &no_inc_tx,
             &connected_state(),
         )
@@ -14863,7 +15306,7 @@ mod tests {
             rx: Mutex::new(ack_b),
         });
         let mut scratch = test_recv_scratch(&recv_obs, 256);
-        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+        let (no_link, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             pkt,
             session_id,
@@ -14877,7 +15320,7 @@ mod tests {
             &mut scratch,
             &recv_obs,
             LegType::Tcp,
-            &no_cmd_tx,
+            &no_link,
             &no_inc_tx,
             &connected_state(),
         )

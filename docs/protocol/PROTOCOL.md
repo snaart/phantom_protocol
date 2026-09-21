@@ -553,18 +553,20 @@ accepting side).
 
 The parity is an **allocation** discipline, and a receiver reads it for one
 purpose: telling a stream the peer is opening from a late frame for a stream
-that has gone. A stream is dropped once both of its halves are closed (§ 4.5),
-and frames for it can still arrive afterwards — a `FIN` is retransmitted whenever
-its acknowledgement is lost. So a `RELIABLE` segment on an id greater than 1 that
-names no stream the receiver holds is one of three things:
+that has gone. A stream is dropped once both of its halves are closed (§ 4.5) — or,
+on a side whose application has let go of it, once that side's own half is closed
+and acknowledged — and frames for it can still arrive afterwards: a `FIN` is
+retransmitted whenever its acknowledgement is lost, and a peer writing on a stream
+whose reader let go keeps sending on its own half. So a `RELIABLE` segment on an id
+greater than 1 that names no stream the receiver holds is one of three things:
 
 - **An id of the peer's parity that it has never held:** the peer opening a
   stream. The receiver creates it.
 - **An id whose stream the receiver has already dropped** — one of the peer's
   parity that it held before, or one of its own that it allocated: a copy of a
-  segment it already took. The receiver acknowledges every offset up to the one
-  the segment carries, which all arrived before the stream closed, and does
-  nothing else — no stream is created and nothing is delivered.
+  segment it already took, or data for a half nobody on the receiving side will
+  read any more. The receiver acknowledges every offset up to the one the segment
+  carries and does nothing else — no stream is created and nothing is delivered.
 - **An id of the receiver's own parity that it never allocated:** refused and,
   being unrecorded, not acknowledged, exactly like a segment past the cap below.
 
@@ -654,7 +656,7 @@ the SACK is cumulative and a sender's loss detection reads only what a SACK
 covers, but nothing here waits for it. The exceptions are the segments § 4.4
 refuses — one that would open a stream past the cap, or one on the receiver's own
 parity that it never allocated — which are not acknowledged, and a segment for a
-stream already closed from both ends, whose reorder state is gone: its SACK
+stream the receiver has already dropped, whose reorder state is gone: its SACK
 covers every offset from zero up to the segment's own.
 
 Nothing else is acknowledged: unreliable data, `COALESCED` bundles (their
@@ -728,6 +730,15 @@ taken for a new stream. Note the near-collision with the persist probe
 described below, and that the flag is the whole difference: a `RELIABLE` frame
 with an empty payload and **no** `FIN` is a window probe, delivers nothing, and
 consumes no offset.
+
+One exception to that rule is local to the receiving side and changes nothing on the
+wire: a side whose application has let go of a stream — in this implementation,
+dropped its last handle to it — drops the stream as soon as its own FIN is
+acknowledged, with the peer's half still open, because nothing on that side will ever
+read what the half carries. The peer sees only acknowledgements: what it sends on that
+stream afterwards is acknowledged and discarded (§ 4.4), and no further
+`WINDOW_UPDATE` comes for it, so a peer that keeps writing past the last limit it was
+given stops there, exactly as it would against a reader that stopped reading.
 
 **`COALESCED` bundle plaintext** (`core/src/transport/packet_coalescer.rs`,
 wrapped via `packet_coalescer_codec.rs`). A packet with `COALESCED` set (§ 4.3)

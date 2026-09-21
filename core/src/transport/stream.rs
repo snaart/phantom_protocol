@@ -795,6 +795,10 @@ pub struct Stream {
     /// in order (see [`Stream::take_in_order_fin`]), so a FIN that arrives over a
     /// gap never delivers EOF ahead of the gap-filling data.
     remote_fin_offset: AtomicU32,
+    /// Whether the application has let go of this stream: its handle is gone, so nothing
+    /// will be written on it again and nothing delivered on it will be read. Raised by the
+    /// data pump ([`Stream::release_app_handle`]), never lowered.
+    app_released: AtomicBool,
     /// Priority (higher = more important)
     priority: AtomicU32,
     /// Backpressure semaphore
@@ -903,6 +907,7 @@ impl Stream {
             local_finished: AtomicBool::new(false),
             remote_finished: AtomicBool::new(false),
             remote_fin_offset: AtomicU32::new(u32::MAX),
+            app_released: AtomicBool::new(false),
             priority: AtomicU32::new(0),
             send_semaphore: Arc::new(Semaphore::new(MAX_PENDING_PACKETS)),
             bytes_sent: AtomicU64::new(0),
@@ -1616,6 +1621,37 @@ impl Stream {
     /// the half that is still open.
     pub async fn is_fully_closed(&self) -> bool {
         self.remote_finished.load(Ordering::SeqCst) && self.is_fin_acked().await
+    }
+
+    /// Record that the application has let go of this stream — its handle is gone — so
+    /// nothing will be written on it again and nothing delivered on it will be read.
+    pub fn release_app_handle(&self) {
+        self.app_released.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether [`release_app_handle`](Self::release_app_handle) has been called.
+    pub fn is_app_released(&self) -> bool {
+        self.app_released.load(Ordering::SeqCst)
+    }
+
+    /// Returns `true` once the stream can be dropped: this side's FIN has been acknowledged
+    /// ([`is_fin_acked`](Self::is_fin_acked)), and either the peer's half has ended too or
+    /// the application has let go of the stream.
+    ///
+    /// The second arm is what bounds a stream whose peer never closes its half. With the
+    /// handle gone there is nobody left here to read what that half carries, so keeping
+    /// the stream would keep a table entry — counted against the session's stream cap —
+    /// for data that can only be discarded.
+    pub async fn is_retirable(&self) -> bool {
+        (self.remote_finished.load(Ordering::SeqCst) || self.app_released.load(Ordering::SeqCst))
+            && self.is_fin_acked().await
+    }
+
+    /// Whether any reliable offset has been taken on this stream — by data or by a FIN —
+    /// which is the only way the peer can have learned that a stream this side opened
+    /// exists.
+    pub fn has_sent_reliable(&self) -> bool {
+        self.reliable_offset.load(Ordering::SeqCst) > 0
     }
 
     /// Hold the send buffer's lock, standing in for the drain path in the middle of a pass,

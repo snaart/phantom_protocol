@@ -142,6 +142,14 @@ Both client and server, after their handshakes, spawn the **same** `run_data_pum
     which a peer that stops reading can make last indefinitely. The arm takes in the
     commands queued ahead of the close for as long as the send buffers admit them,
     pushes what the windows allow, announces the close and exits.
+  - `released_rx.recv()` — a `PhantomStream` handle dropped by the application,
+    reported from its `Drop` on an unbounded channel of its own. Never gated. The pump
+    records how many commands are in the command channel at that moment and acts only
+    once it has taken that many more, because the handle's last writes can still be
+    among them; it then closes the stream's writing half behind them (or, for a stream
+    this side opened and never wrote a reliable byte on, drops it outright), and the
+    stream leaves the table once that close is acknowledged, whether or not the peer
+    ever closes its half.
   - `cmd_rx.recv()` — `SessionCommand`s: `Send`, `SendStreamReliable/Unreliable`,
     `CloseStream`, `SetStreamPriority`, **`Migrate(local_addr)`**,
     **`MigrateServer(local_addr)`**, `Close`. Disabled while a refused write is held.
