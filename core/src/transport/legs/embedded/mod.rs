@@ -33,14 +33,31 @@ pub mod framing;
 use crate::errors::CoreError;
 use async_lock::Mutex;
 use bytes::Bytes;
-use embedded_io_async::{Error, Read, Write};
+use core::sync::atomic::{AtomicBool, Ordering};
+use embedded_io_async::{Error, ErrorKind, Read, Write};
 
 /// Length-prefix transport over `embedded-io-async` byte streams.
 ///
 /// See the [module docs](self) for the `SessionTransport` hook-up story.
+///
+/// # A peer that stops reading
+///
+/// The leg has no clock — a bare-metal target has no timer it could assume — so it
+/// cannot put a deadline on a write by itself, and a writer that can block
+/// indefinitely would otherwise hold the session's pump for as long as the peer
+/// chose: a USB CDC link whose host has stopped reading, or a UART under hardware
+/// flow control whose peer holds CTS off. Such a writer should bound its writes
+/// with its executor's timeout and report `ErrorKind::TimedOut` when one runs out
+/// with nothing accepted. The leg turns that into [`CoreError::Timeout`], which
+/// the session treats as the transport having given up on the peer, and refuses
+/// every later send without touching the writer, since the write that timed out
+/// may have stopped part-way through a frame. A UART without flow control never
+/// waits on its peer and needs none of this.
 pub struct EmbeddedLeg<R, W, const N: usize> {
     rx: Mutex<(R, [u8; N])>,
     tx: Mutex<W>,
+    /// Set by the first write the writer reports as timed out; never cleared.
+    write_timed_out: AtomicBool,
 }
 
 impl<R, W, const N: usize> EmbeddedLeg<R, W, N> {
@@ -51,6 +68,7 @@ impl<R, W, const N: usize> EmbeddedLeg<R, W, N> {
         Self {
             rx: Mutex::new((reader, [0u8; N])),
             tx: Mutex::new(writer),
+            write_timed_out: AtomicBool::new(false),
         }
     }
 
@@ -69,21 +87,38 @@ where
 {
     /// Send one framed message: 4-byte big-endian length prefix + payload.
     /// Errors if `data.len()` exceeds the leg's buffer `N` or `u32::MAX`, or
-    /// on any transport error from `W`.
+    /// on any transport error from `W` — [`CoreError::Timeout`] when the writer
+    /// reports `ErrorKind::TimedOut`, after which every send is refused the same
+    /// way (see [`EmbeddedLeg`]).
     pub async fn send_frame(&self, data: &[u8]) -> Result<(), CoreError> {
         let header = framing::encode_header(data.len(), N)
             .map_err(|e| CoreError::NetworkError(format!("framing: {:?}", e)))?;
+        if self.write_timed_out.load(Ordering::Acquire) {
+            return Err(CoreError::Timeout);
+        }
         let mut w = self.tx.lock().await;
-        w.write_all(&header)
-            .await
-            .map_err(|e| CoreError::NetworkError(format!("write header: {:?}", e.kind())))?;
-        w.write_all(data)
-            .await
-            .map_err(|e| CoreError::NetworkError(format!("write payload: {:?}", e.kind())))?;
-        w.flush()
-            .await
-            .map_err(|e| CoreError::NetworkError(format!("flush: {:?}", e.kind())))?;
-        Ok(())
+        // Checked again under the lock: the send this one queued behind may be the
+        // one that timed out, and what it left on the wire is not a frame boundary.
+        if self.write_timed_out.load(Ordering::Acquire) {
+            return Err(CoreError::Timeout);
+        }
+        let written = async {
+            w.write_all(&header)
+                .await
+                .map_err(|e| ("write header", e.kind()))?;
+            w.write_all(data)
+                .await
+                .map_err(|e| ("write payload", e.kind()))?;
+            w.flush().await.map_err(|e| ("flush", e.kind()))
+        };
+        match written.await {
+            Ok(()) => Ok(()),
+            Err((_, ErrorKind::TimedOut)) => {
+                self.write_timed_out.store(true, Ordering::Release);
+                Err(CoreError::Timeout)
+            }
+            Err((what, kind)) => Err(CoreError::NetworkError(format!("{what}: {kind:?}"))),
+        }
     }
 
     /// Receive one framed message. Returns the payload as a fresh `Bytes`.
@@ -281,7 +316,101 @@ mod tests {
         }
     }
 
+    /// A writer that takes `budget` bytes and then reports its own deadline as run out —
+    /// what a HAL writer wrapped in an executor timeout does once the far end stops
+    /// reading. Counts every call, so a test can tell whether the leg touched it again.
+    struct TimingOutWriter {
+        budget: usize,
+        taken: Vec<u8>,
+        calls: usize,
+    }
+
+    impl embedded_io_async::ErrorType for TimingOutWriter {
+        type Error = ErrorKind;
+    }
+
+    impl Write for TimingOutWriter {
+        async fn write(&mut self, data: &[u8]) -> Result<usize, ErrorKind> {
+            self.calls += 1;
+            if self.budget == 0 {
+                return Err(ErrorKind::TimedOut);
+            }
+            let n = data.len().min(self.budget);
+            self.budget -= n;
+            self.taken.extend_from_slice(&data[..n]);
+            Ok(n)
+        }
+        async fn flush(&mut self) -> Result<(), ErrorKind> {
+            Ok(())
+        }
+    }
+
     // ── Tests ───────────────────────────────────────────────────────────
+
+    /// A writer reporting `TimedOut` is the leg's peer having stopped taking bytes: the
+    /// send fails with `Timeout`, which the session treats as final, and every later
+    /// send is refused without reaching the writer — the frame it was writing stopped
+    /// part-way, and anything written after it would be read as the rest of that frame.
+    #[tokio::test]
+    async fn a_writer_that_times_out_ends_sending_with_timeout() {
+        let ((reader, _w), _other_end) = duplex_pair();
+        let writer = TimingOutWriter {
+            budget: 6,
+            taken: Vec::new(),
+            calls: 0,
+        };
+        let leg: EmbeddedLeg<MockReader, TimingOutWriter, 1024> = EmbeddedLeg::new(reader, writer);
+
+        let first = leg.send_frame(b"0123456789").await;
+        assert!(matches!(first, Err(CoreError::Timeout)), "{first:?}");
+        let second = leg.send_frame(b"after").await;
+        assert!(matches!(second, Err(CoreError::Timeout)), "{second:?}");
+
+        let (_reader, writer) = leg.into_inner();
+        assert_eq!(
+            writer.taken,
+            [0, 0, 0, 10, b'0', b'1'],
+            "the timed-out frame stops where the writer stopped taking it"
+        );
+        let calls_during_first = 3; // header, then two payload writes, the second refused
+        assert_eq!(
+            writer.calls, calls_during_first,
+            "a send after the timeout reached the writer"
+        );
+    }
+
+    /// Any other writer error is reported as a network error and does not end sending.
+    #[tokio::test]
+    async fn other_writer_errors_are_not_taken_for_a_timeout() {
+        struct BrokenWriter {
+            calls: usize,
+        }
+        impl embedded_io_async::ErrorType for BrokenWriter {
+            type Error = ErrorKind;
+        }
+        impl Write for BrokenWriter {
+            async fn write(&mut self, _data: &[u8]) -> Result<usize, ErrorKind> {
+                self.calls += 1;
+                Err(ErrorKind::BrokenPipe)
+            }
+            async fn flush(&mut self) -> Result<(), ErrorKind> {
+                Ok(())
+            }
+        }
+
+        let ((reader, _w), _other_end) = duplex_pair();
+        let leg: EmbeddedLeg<MockReader, BrokenWriter, 1024> =
+            EmbeddedLeg::new(reader, BrokenWriter { calls: 0 });
+        for _ in 0..2 {
+            let r = leg.send_frame(b"x").await;
+            assert!(
+                matches!(&r, Err(CoreError::NetworkError(m)) if m.contains("write header")),
+                "{r:?}"
+            );
+        }
+        let (_reader, writer) = leg.into_inner();
+        assert_eq!(writer.calls, 2, "each send reached the writer");
+    }
 
     /// `send_frame` writes the 4-byte big-endian length prefix followed by
     /// the payload, byte-identical to `TcpSessionTransport`'s wire format.

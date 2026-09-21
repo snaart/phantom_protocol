@@ -104,6 +104,12 @@ pub trait SessionTransport: Send + Sync + 'static {
     /// - The TLS-mimicry leg does the same once its prelude is done; the prelude's
     ///   writes already sit under the prelude's own deadline.
     /// - The WASI leg does the same through `wasi:io/poll`.
+    /// - `EmbeddedLeg` has no clock of its own on a bare-metal target, so the bound
+    ///   is its writer's to impose: a writer that can block indefinitely (a USB
+    ///   CDC link whose host stopped reading, a UART under hardware flow control)
+    ///   should wrap its writes in the executor's timeout and report
+    ///   `ErrorKind::TimedOut`, which the leg turns into `Timeout` and treats as
+    ///   final. A UART without flow control never waits on its peer at all.
     /// - The PhantomUDP transports and the browser WebSocket leg never wait on the
     ///   peer: a datagram send completes or fails locally, and a browser WebSocket
     ///   buffers whatever it is given.
