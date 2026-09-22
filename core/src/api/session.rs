@@ -167,8 +167,18 @@ pub enum ConnectionState {
     /// (keys retained, outbound buffered) awaiting a `migrate()` or the path's
     /// return. The embedder reacts by calling `migrate()` (Phase 4 / P4.3).
     Migrating = 7,
-    /// The session is dead: the path stayed down past the migration idle-timeout
-    /// with no recovery. Terminal — `recv()` errors instead of hanging (P4.3).
+    /// The session is dead: its peer stopped answering and the session gave up on
+    /// it. Terminal — `recv()` errors instead of hanging.
+    ///
+    /// Two things reach it. The path stayed down past the migration idle-timeout with
+    /// no recovery; or a stream transport gave up on a peer that stopped reading its
+    /// socket: a write went the transport's write deadline without the socket taking a
+    /// byte — on TCP and the TLS-mimicry leg thirty seconds, unless
+    /// [`PhantomConfig::write_stall_timeout`](crate::config::PhantomConfig::write_stall_timeout)
+    /// says otherwise — after which the transport writes nothing more. Either way
+    /// `last_error()`, `recv()` and `send()` report [`CoreError::Timeout`]. A session
+    /// closed with `disconnect()` while such a write was stuck ends here too, rather
+    /// than in [`Closed`](Self::Closed), because the close never reached the peer.
     Dead = 8,
     /// The peer announced its own close (WIRE v8) and this side is reading out
     /// whatever was still in flight behind it before letting go.
@@ -6678,6 +6688,19 @@ impl PhantomSession {
     /// transport-level signal that could be waited on here: the close announcement is
     /// itself unacknowledged. Have the peer say it received the data, at the
     /// application level, and close after that answer arrives.
+    ///
+    /// **On a stream socket its peer has stopped reading** — TCP or the TLS-mimicry
+    /// leg — the pump can be parked inside a single transport write that the peer is
+    /// not taking, and nothing, this request included, is read until that write
+    /// returns. If the peer starts reading again, the close is carried out and
+    /// announced as usual. If it does not, the write gives up once it has
+    /// gone the transport's write deadline without progress (thirty seconds unless
+    /// [`PhantomConfig::write_stall_timeout`](crate::config::PhantomConfig::write_stall_timeout)
+    /// says otherwise), and the session ends [`ConnectionState::Dead`], with
+    /// [`CoreError::Timeout`] from `last_error()` and `recv()` — **not announced**: the
+    /// transport refuses every write after the one that stalled, the close frame
+    /// included, and resets the connection. This call has returned long before; the
+    /// `Closed` it published gives way to `Dead` when that happens.
     ///
     /// The announcement is a best-effort `CONTROL` frame carrying
     /// [`ControlSubtype::CLOSE`]: it is not acknowledged and not retransmitted, so a
