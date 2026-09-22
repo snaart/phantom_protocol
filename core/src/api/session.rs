@@ -2572,8 +2572,19 @@ async fn run_data_pump<T: SessionTransport>(
         // A peer that announced its own close is the exception: the session is ending
         // in the orderly way, and a write that failed during its drain is no failure
         // of the session's.
+        //
+        // `Dead` is published here too, after the cause, for the same reason: the send
+        // loop's teardown publishes it as well, but only once it has noticed this task
+        // finish, and until then `connection_state()` would go on reading `Connected`
+        // while `recv()` already reports the session over — and `send()`, which reads
+        // the state, would go on accepting writes the transport refuses. Nothing walks
+        // it back: the only later writers are the teardown, which publishes the same
+        // `Dead` on the same condition (the give-up is never cleared, and nothing but
+        // this task records a peer close), and the liveness verdict, which leaves an
+        // ended session alone (`publish_unless_ended`).
         if transport_recv.has_given_up() && !crypto_recv.peer_closed() {
             record_terminal_cause(&terminal_error_recv, CoreError::Timeout);
+            state_recv.store(ConnectionState::Dead as u8, Ordering::Relaxed);
         }
         // Reader exiting → drop `deliver_tx` so the delivery task drains any
         // queued items and then sees the channel closed and exits.
@@ -3382,7 +3393,7 @@ fn apply_liveness(
         LivenessVerdict::PathDown => {
             *migrating_since = Some(std::time::Instant::now());
             crypto_session.set_state(SessionState::Migrating);
-            state.store(ConnectionState::Migrating as u8, Ordering::Relaxed);
+            publish_unless_ended(state, ConnectionState::Migrating);
             log::info!(
                 "PhantomSession: path down (no inbound for {silence:?} with data in flight) \
                  — entering Migrating; the embedder should migrate()"
@@ -3392,7 +3403,7 @@ fn apply_liveness(
         LivenessVerdict::Recovered => {
             *migrating_since = None;
             crypto_session.set_state(SessionState::Connected);
-            state.store(ConnectionState::Connected as u8, Ordering::Relaxed);
+            publish_unless_ended(state, ConnectionState::Connected);
             log::info!("PhantomSession: path recovered — back to Connected");
             false
         }
@@ -3405,6 +3416,29 @@ fn apply_liveness(
         }
         LivenessVerdict::Unchanged => false,
     }
+}
+
+/// Publish `next` — a state the session can still leave, `Connected` or `Migrating` —
+/// unless the session has already reached one it cannot: an end (`Closed`, `Failed`,
+/// `Dead`) or the peer's announced close (`Draining`).
+///
+/// The liveness verdict is not the only writer of the state. The receive task publishes
+/// `Dead` when the transport gives up and `Draining` when the peer's close arrives, and
+/// `disconnect()` publishes `Closed` from the caller's thread, each of them possibly
+/// between the moment the send loop read the path's signals and the moment it publishes
+/// what they said. A verdict landing after one of them must not walk it back: a caller
+/// that read `Dead`, then `Connected`, then `Dead` again was told the session recovered.
+/// The check and the write are one atomic step, so no end published in between is lost.
+fn publish_unless_ended(state: &AtomicU8, next: ConnectionState) {
+    let _ = state.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        match ConnectionState::from_u8(current) {
+            ConnectionState::Closed
+            | ConnectionState::Failed
+            | ConnectionState::Dead
+            | ConnectionState::Draining => None,
+            _ => Some(next as u8),
+        }
+    });
 }
 
 /// How long an unanswered PATH_CHALLENGE is allowed to stay outstanding before
@@ -13404,6 +13438,146 @@ mod tests {
         assert!(
             matches!(session.send(b"x".to_vec()).await, Err(CoreError::Timeout)),
             "send() on a dead session should report the cause"
+        );
+    }
+
+    /// A transport whose writes never return and whose reads give up on the peer when
+    /// told to. It orders the two events the way a pump cannot hide: the send loop is
+    /// parked in a write, so its teardown — the other place the cause is recorded and
+    /// `Dead` published — is not coming, and whatever `recv()`, `connection_state()` and
+    /// `send()` report once the read gives up, the receive task reported on its way out.
+    struct GivesUpWhileAWriteIsParked {
+        write_parked: Arc<std::sync::atomic::AtomicBool>,
+        read_gives_up: Arc<tokio::sync::Notify>,
+    }
+
+    impl SessionTransport for GivesUpWhileAWriteIsParked {
+        async fn send_bytes(&self, _data: &[u8]) -> Result<(), CoreError> {
+            self.write_parked.store(true, Ordering::Release);
+            std::future::pending().await
+        }
+
+        async fn recv_bytes(&self) -> Result<Bytes, CoreError> {
+            self.read_gives_up.notified().await;
+            Err(CoreError::Timeout)
+        }
+    }
+
+    /// When the transport gives up, the session reads as dead with its cause at once —
+    /// not only after the send loop has wound down.
+    ///
+    /// The receive task is usually the first part of the pump to hear of a give-up, and
+    /// it ends the channel `recv()` waits on as it goes. If it left the cause and the
+    /// state to the send loop's teardown, `recv()` could wake to an untyped "closed"
+    /// while the cause was still unwritten, and `connection_state()` could go on reading
+    /// `Connected` — with `send()` accepting writes for a transport that refuses every
+    /// one — for as long as the send loop took to notice. Here it never notices, so both
+    /// have to come from the receive task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_whose_transport_gives_up_reads_as_dead_before_its_pump_tears_down() {
+        let session_id = fixed_session_id();
+        let (inner, _peer_inner) = paired_sessions(session_id);
+        inner.set_state(SessionState::Connected);
+        let write_parked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let read_gives_up = Arc::new(tokio::sync::Notify::new());
+        let transport = GivesUpWhileAWriteIsParked {
+            write_parked: write_parked.clone(),
+            read_gives_up: read_gives_up.clone(),
+        };
+        let session =
+            PhantomSession::from_accepted_server_session("parked".into(), transport, inner);
+        let obs = session.observability();
+
+        session
+            .send(b"parks the send loop".to_vec())
+            .await
+            .expect("the pump takes the write in");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !write_parked.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pump never reached the transport"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        read_gives_up.notify_one();
+        let received = tokio::time::timeout(std::time::Duration::from_secs(5), session.recv())
+            .await
+            .expect("recv() was still waiting 5 s after the transport gave up");
+        assert!(
+            matches!(received, Err(CoreError::Timeout)),
+            "recv() must report the transport's Timeout, not a bare close; got {received:?}"
+        );
+        assert_eq!(
+            session.connection_state(),
+            ConnectionState::Dead,
+            "recv() reported the session over while its state still said otherwise"
+        );
+        assert!(!session.is_data_ready());
+        assert!(
+            matches!(session.last_error().await, Some(CoreError::Timeout)),
+            "last_error() should name the cause; got {:?}",
+            session.last_error().await
+        );
+        assert!(
+            matches!(session.send(b"x".to_vec()).await, Err(CoreError::Timeout)),
+            "send() on a session whose transport gave up must report the cause, not queue"
+        );
+        assert_eq!(
+            obs.snapshot().active_sessions,
+            1,
+            "the send loop is still parked in its write, so none of the above came from its \
+             teardown"
+        );
+    }
+
+    /// A liveness verdict computed on the send loop never walks back a state the session
+    /// cannot leave.
+    ///
+    /// The verdict is not the only writer of the state: the receive task publishes `Dead`
+    /// when the transport gives up and `Draining` when the peer's close arrives, and
+    /// `disconnect()` publishes `Closed` from the caller's thread — each of them while the
+    /// send loop may be between reading the path's signals and publishing what they say.
+    /// A `Recovered` verdict landing after any of them would tell a caller who had
+    /// already seen the session end that it was `Connected` again.
+    #[test]
+    fn a_liveness_verdict_does_not_overwrite_a_state_the_session_cannot_leave() {
+        let session_id = fixed_session_id();
+        let (inner, _peer_inner) = paired_sessions(session_id);
+        inner.set_state(SessionState::Connected);
+        for ended in [
+            ConnectionState::Dead,
+            ConnectionState::Closed,
+            ConnectionState::Failed,
+            ConnectionState::Draining,
+        ] {
+            let state = Arc::new(AtomicU8::new(ended as u8));
+            let terminal_error = parking_lot::Mutex::new(None);
+            // Migrating, with inbound heard just now: the verdict is `Recovered`, which
+            // publishes `Connected`.
+            let mut migrating_since = Some(std::time::Instant::now());
+            let died = apply_liveness(&inner, &state, &terminal_error, &mut migrating_since);
+            assert!(!died);
+            assert!(
+                migrating_since.is_none(),
+                "the verdict under test was not `Recovered`"
+            );
+            assert_eq!(
+                ConnectionState::from_u8(state.load(Ordering::Relaxed)),
+                ended,
+                "a `Recovered` verdict overwrote {ended:?}"
+            );
+        }
+
+        // The ordinary transition still happens.
+        let state = Arc::new(AtomicU8::new(ConnectionState::Migrating as u8));
+        let terminal_error = parking_lot::Mutex::new(None);
+        let mut migrating_since = Some(std::time::Instant::now());
+        apply_liveness(&inner, &state, &terminal_error, &mut migrating_since);
+        assert_eq!(
+            ConnectionState::from_u8(state.load(Ordering::Relaxed)),
+            ConnectionState::Connected
         );
     }
 

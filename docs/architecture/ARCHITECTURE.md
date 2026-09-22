@@ -123,7 +123,9 @@ Both client and server, after their handshakes, spawn the **same** `run_data_pum
   transport, a write that went its whole stall deadline without the socket taking a
   byte — is latched by `ObservedTransport`, which refuses every later write and wakes
   the reader out of a read the same peer is not answering. The session then ends
-  `Dead` with that cause.
+  `Dead` with that cause, and the reader records the cause and publishes `Dead` itself
+  as it exits — before the channel `recv()` waits on closes, and without waiting for
+  the main loop to notice.
   `handle_packet` binds every frame to the negotiated `session_id`, decrypts (the
   `ENCRYPTED` gate, with an authenticated forward-rekey catch-up of up to
   `MAX_REKEY_CATCHUP` = 16 epochs — a forward epoch without the `REKEY` flag is rejected

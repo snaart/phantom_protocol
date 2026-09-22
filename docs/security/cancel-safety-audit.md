@@ -74,6 +74,14 @@
 > `handle_packet`, so that the peer's writes complete instead of stopping its whole
 > session at the last limit it had. That adds one best-effort send to the receive
 > task's list below and no `select!`; the count and the verdict stand.
+>
+> **Amended when the receive task began publishing `Dead`.** A transport that gave
+> up on its peer left `connection_state()` reading `Connected` until the send loop
+> reached its teardown, while `recv()` already reported `Timeout`. The receive
+> task now publishes `Dead` beside the cause it already recorded on its way out,
+> and the liveness verdict stopped overwriting an ended or draining state. Both are
+> synchronous stores with no await, so no primitive was added and the verdict
+> stands.
 
 A `select!` arm that fires before its sibling completes effectively
 **cancels** the unfinished future. If that future was carrying
@@ -397,7 +405,8 @@ loop {
     // WIRE v8: on a recorded peer close, publish Draining, take the drain
     // deadline once, and `break` when it has passed (all synchronous)
 }
-// transport gave up on a peer that had not announced its close: record `Timeout`
+// transport gave up on a peer that had not announced its close: record `Timeout`,
+// then publish `Dead`
 drop(deliver_tx);
 let _ = recv_done_tx.send(());
 ```
@@ -419,6 +428,15 @@ let _ = recv_done_tx.send(());
 - The cause is written into the session's terminal-error slot *before*
   `deliver_tx` is dropped, because dropping it is what eventually closes the
   channel `recv()` waits on, and a `recv()` woken by that reads the slot at once.
+  `ConnectionState::Dead` is published right after the cause, from the same
+  place, so the state never trails what `recv()` reports while the send loop is
+  still on its way to its teardown. Both are plain synchronous writes with no
+  await between them, so a cancel cannot separate them. The teardown publishes the
+  same `Dead` on the same condition, and the liveness verdict — the only other
+  writer on the send loop — publishes `Connected` or `Migrating` through
+  `publish_unless_ended`, a single `fetch_update` that leaves `Dead`, `Closed`,
+  `Failed` and `Draining` alone, so no verdict computed before the give-up can
+  walk the state back afterwards.
 - `handle_packet` awaits in two kinds of place: tokio `Mutex` acquisitions on a
   stream's buffers (`Stream::on_sack`, `Stream::accept_in_order`,
   `Stream::received_sack`, `Stream::is_fin_acked`), and best-effort transport sends
