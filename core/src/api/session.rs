@@ -13292,14 +13292,16 @@ mod tests {
     /// acknowledges nothing cannot hold them back. The witness that the pump is parked is that
     /// the bytes it has put on the wire stop growing while most of the backlog is unsent.
     ///
-    /// Returns the session and its observability handle, whose active-sessions gauge is the
-    /// pump's record of having exited. The far end of the connection stays with the caller,
-    /// which keeps it alive and never reads it.
+    /// Returns the session, its observability handle, whose active-sessions gauge is the
+    /// pump's record of having exited, and the inner session holding the keys of its peer —
+    /// the one that can open what the wedged session writes, for a test that goes on to
+    /// read the socket. The far end of the connection stays with the caller, which keeps
+    /// it alive and does not read it until it chooses to.
     async fn wedge_a_session_on_a_socket_its_peer_never_reads(
         transport: crate::api::tcp_transport::TcpSessionTransport,
-    ) -> (Arc<PhantomSession>, Arc<Observability>) {
+    ) -> (Arc<PhantomSession>, Arc<Observability>, Arc<InnerSession>) {
         let session_id = fixed_session_id();
-        let (inner, _peer_inner) = paired_sessions(session_id);
+        let (inner, peer_inner) = paired_sessions(session_id);
         inner.set_state(SessionState::Connected);
         let session =
             PhantomSession::from_accepted_server_session("closing".into(), transport, inner);
@@ -13331,7 +13333,7 @@ mod tests {
              pump and this harness proves nothing"
         );
         assert_eq!(obs.snapshot().active_sessions, 1, "the pump is running");
-        (session, obs)
+        (session, obs, peer_inner)
     }
 
     /// Wait up to `bound` for the pump behind `obs` to exit, and say whether it did.
@@ -13361,20 +13363,135 @@ mod tests {
         (transport, far)
     }
 
-    /// `disconnect()` ends a session whose peer stopped reading its socket.
+    /// Read length-prefixed frames off `far` until the connection ends, and count the
+    /// session-close announcements among them.
+    ///
+    /// It never gives up on a quiet connection by itself: letting go of `far` would end
+    /// the connection from this side, and a session that ended because its transport
+    /// closed would pass for one that honoured its close. The caller bounds the wait.
+    ///
+    /// `peer_inner` holds the keys of the session on the far side, so it can strip header
+    /// protection from every frame and open the ones flagged `CONTROL`; a frame counts
+    /// only if the AEAD opens it and its subtype is `CLOSE`.
+    async fn count_close_announcements(
+        mut far: tokio::net::TcpStream,
+        peer_inner: &InnerSession,
+    ) -> usize {
+        use tokio::io::AsyncReadExt;
+        let mut closes = 0usize;
+        loop {
+            let mut len = [0u8; 4];
+            if far.read_exact(&mut len).await.is_err() {
+                return closes;
+            }
+            let mut frame = vec![0u8; u32::from_be_bytes(len) as usize];
+            if far.read_exact(&mut frame).await.is_err() {
+                return closes;
+            }
+            let Ok(packet) = peer_inner.parse_protected(&frame) else {
+                continue;
+            };
+            if !packet.header.flags.contains(PacketFlags::CONTROL) {
+                continue;
+            }
+            let opened =
+                peer_inner.decrypt_packet(&packet.header, &packet.payload, &packet.extensions);
+            if opened.is_ok_and(|plain| plain.first() == Some(&ControlSubtype::CLOSE)) {
+                closes += 1;
+            }
+        }
+    }
+
+    /// A close requested while the pump is parked in a write the peer is not taking is
+    /// read, carried out and announced as soon as that write returns — not held until
+    /// the write deadline ends the session regardless.
     ///
     /// The close is a request the pump reads between turns of its loop, and this pump is
-    /// in the middle of one — a write the peer will never take. Before the transport had a
-    /// write deadline that write never returned, so the close was never read: the pump,
-    /// its buffers and the connection stayed up for as long as the peer kept its socket
-    /// open. The deadline here is long enough that the harness finds the pump parked well
-    /// before it fires, so what ends the session is the close being read once the write
-    /// gives up — within the deadline, not never.
+    /// in the middle of one. The deadline here is far longer than the test, so nothing
+    /// but the close can end this session within the bound: once the peer starts reading
+    /// again the write completes, and the pump must then take the close, push what it
+    /// still holds, announce the close and exit. What it leaves behind has to be the
+    /// orderly end — `Closed` with no cause — and the far end has to find the
+    /// announcement on the wire.
+    async fn a_close_requested_during_a_parked_write_is_honoured_once_it_returns(drop_it: bool) {
+        let stall = std::time::Duration::from_secs(120);
+        let (transport, far) = tcp_transport_whose_peer_never_reads(stall).await;
+        let (closing, obs, peer_inner) =
+            wedge_a_session_on_a_socket_its_peer_never_reads(transport).await;
+
+        let closing = if drop_it {
+            drop(closing);
+            None
+        } else {
+            closing.disconnect().await.expect("disconnect");
+            Some(closing)
+        };
+        // Nothing can act on the close while the write is parked: the harness has already
+        // watched the pump stop making progress, and the peer still is not reading.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            obs.snapshot().active_sessions,
+            1,
+            "the pump exited while parked in a write its peer was not taking, so this harness \
+             is not testing a parked pump"
+        );
+
+        let reader = tokio::spawn(async move { count_close_announcements(far, &peer_inner).await });
+        let bound = std::time::Duration::from_secs(20);
+        assert!(
+            pump_exits_within(&obs, bound).await,
+            "the pump was still running {bound:?} after the peer started reading again: the \
+             close requested while its write was parked was never carried out"
+        );
+        if let Some(closing) = closing {
+            assert_eq!(
+                closing.connection_state(),
+                ConnectionState::Closed,
+                "a close carried out once the write returned is an orderly end"
+            );
+            assert!(
+                closing.last_error().await.is_none(),
+                "an orderly end has no cause; last_error() gave {:?}",
+                closing.last_error().await
+            );
+        }
+        let closes = tokio::time::timeout(std::time::Duration::from_secs(30), reader)
+            .await
+            .expect("the far end's reader never finished")
+            .expect("reader");
+        assert!(
+            closes > 0,
+            "the close was carried out but never announced to the peer"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn disconnect_ends_a_session_whose_peer_stopped_reading_its_socket() {
+    async fn a_disconnect_during_a_parked_write_is_honoured_once_the_write_returns() {
+        a_close_requested_during_a_parked_write_is_honoured_once_it_returns(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_handle_dropped_during_a_parked_write_is_honoured_once_the_write_returns() {
+        a_close_requested_during_a_parked_write_is_honoured_once_it_returns(true).await;
+    }
+
+    /// A close requested while the pump is parked in a write its peer never takes does
+    /// not keep the session alive past the write deadline, and does not turn a death into
+    /// an orderly end: the session ends `Dead`, with `Timeout`, once the deadline passes.
+    ///
+    /// This does not show the close being read — the deadline ends this session whether
+    /// or not anyone asked, which is what the harness is for, and
+    /// `a_disconnect_during_a_parked_write_is_honoured_once_the_write_returns` is the test
+    /// of the close itself. What this pins is the other half of `disconnect()`'s contract
+    /// on a stream socket that stays full: the call returns at once, nothing it does
+    /// cancels or outlasts the deadline, and the outcome is reported as the death it is,
+    /// since a close that could not be announced has not ended anything in order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_disconnect_on_a_socket_that_stays_full_ends_the_session_dead_at_the_deadline() {
         let stall = std::time::Duration::from_secs(2);
         let (transport, _far) = tcp_transport_whose_peer_never_reads(stall).await;
-        let (closing, obs) = wedge_a_session_on_a_socket_its_peer_never_reads(transport).await;
+        let (closing, obs, _peer_inner) =
+            wedge_a_session_on_a_socket_its_peer_never_reads(transport).await;
 
         closing.disconnect().await.expect("disconnect");
         let bound = stall + std::time::Duration::from_secs(8);
@@ -13383,15 +13500,27 @@ mod tests {
             "the pump was still running {bound:?} after the close was requested: it is parked \
              in a write its peer will never take"
         );
+        assert_eq!(
+            closing.connection_state(),
+            ConnectionState::Dead,
+            "a close that could not be carried out must not read as an orderly end"
+        );
+        assert!(
+            matches!(closing.last_error().await, Some(CoreError::Timeout)),
+            "last_error() should name the stalled write; got {:?}",
+            closing.last_error().await
+        );
     }
 
-    /// Dropping the handle is the same request with no await to make, and it ends the same
-    /// session the same way.
+    /// Dropping the handle is the same request with no await to make; it too leaves the
+    /// deadline to end the session, and nothing about the drop keeps the pump running
+    /// past it. Like the test above, this proves the bound, not that the request was read.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn dropping_the_handle_ends_a_session_whose_peer_stopped_reading_its_socket() {
+    async fn a_handle_dropped_on_a_socket_that_stays_full_lets_the_pump_end_at_the_deadline() {
         let stall = std::time::Duration::from_secs(2);
         let (transport, _far) = tcp_transport_whose_peer_never_reads(stall).await;
-        let (closing, obs) = wedge_a_session_on_a_socket_its_peer_never_reads(transport).await;
+        let (closing, obs, _peer_inner) =
+            wedge_a_session_on_a_socket_its_peer_never_reads(transport).await;
 
         drop(closing);
         let bound = stall + std::time::Duration::from_secs(8);
@@ -13415,7 +13544,8 @@ mod tests {
     async fn a_session_whose_peer_stopped_reading_its_socket_dies_with_a_timeout() {
         let stall = std::time::Duration::from_millis(1500);
         let (transport, _far) = tcp_transport_whose_peer_never_reads(stall).await;
-        let (session, obs) = wedge_a_session_on_a_socket_its_peer_never_reads(transport).await;
+        let (session, obs, _peer_inner) =
+            wedge_a_session_on_a_socket_its_peer_never_reads(transport).await;
 
         let received = tokio::time::timeout(std::time::Duration::from_secs(10), session.recv())
             .await
