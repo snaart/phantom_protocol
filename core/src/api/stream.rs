@@ -221,15 +221,21 @@ impl PhantomStream {
             .map_err(|_| CoreError::NetworkError("Session closed".into()))
     }
 
-    /// Close this side of the stream; the peer will see EOF on its read half.
+    /// Close this side of the stream; the peer will see EOF on its read half,
+    /// after everything written on this handle before the call.
     ///
     /// Only the writing half closes. [`recv`](Self::recv) on this handle keeps
     /// returning what the peer sends until the peer closes its half as well, and the
     /// session holds the stream — counting it against its limit on concurrent
     /// streams — until both halves are closed, or until this close is acknowledged
-    /// and the handle has been let go of (see the type's documentation). Anything
-    /// written on this stream after this call is discarded rather than sent: the peer
-    /// has been told it ended.
+    /// and the handle has been let go of (see the type's documentation).
+    ///
+    /// A write made on this handle after this call, reliable or unreliable, is never
+    /// sent. The call still returns `Ok` — the session takes the command in as it
+    /// takes any other — and the pump discards it when it reaches it. It reaches it
+    /// only once this close has taken its place in the stream, which may be some time
+    /// if the stream's send buffer is full, so the write cannot reach the wire ahead
+    /// of the close either: the peer is told the stream ended, and nothing follows.
     ///
     /// Named `disconnect` rather than `close` for the same reason as
     /// `PhantomSession::disconnect` — UniFFI's Kotlin generator emits

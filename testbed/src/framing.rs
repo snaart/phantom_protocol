@@ -57,9 +57,11 @@ const MAX_MESSAGE: usize = MAX_FRAME_BODY + 1;
 
 /// Ceiling on a graceful close, wherever one is attempted.
 ///
-/// Teardown flushes pending reliable data, so a link holding a large
-/// unacknowledged backlog can block for a long time. By the time anything calls
-/// this the samples are already recorded; waiting on a clean close buys nothing.
+/// `PhantomSession::disconnect()` raises a close signal and returns at once —
+/// it does not wait for a backlog to flush, and the pump discards what it cannot
+/// push. The ceiling guards against a close that ever waits again. By the time
+/// anything calls this the samples are already recorded; waiting on a clean
+/// close buys nothing.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A boxed future — what makes [`MsgLink`] usable as a trait object.

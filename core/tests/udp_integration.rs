@@ -2558,7 +2558,7 @@ async fn udp_integration_close_overtaking_data_does_not_discard_it() {
 /// that fits the wire is not lost to the call that follows it.
 ///
 /// This pins the half of `disconnect()`'s contract that is real. The method makes no
-/// delivery guarantee and its documentation says so: it queues the request and
+/// delivery guarantee and its documentation says so: it raises a close signal and
 /// returns, and the pump then pushes until the socket, the congestion window or the
 /// peer's flow-control limit refuses the next byte, without waiting for an
 /// acknowledgement — so a payload larger than one window is mostly discarded. What is

@@ -1155,7 +1155,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_connection_state() != 5175) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_disconnect() != 16367) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_disconnect() != 55165) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_early_data_accepted() != 46386) {
@@ -1212,7 +1212,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_method_resumptionhint_session_id() != 23596) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 493) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 57646) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_recv() != 45283) {
@@ -2874,17 +2874,23 @@ public interface PhantomSessionInterface {
      * Ask the background pump to push out what it can, tell the peer this session is
      * over, and shut it down.
      *
-     * **What a caller can rely on.** That the session ends, and that this returns
-     * promptly — it queues the request and returns; the work happens on the pump
-     * afterwards. Nothing here is a delivery guarantee. The pump pushes queued bytes
-     * until the socket, the congestion window or the peer's flow-control limit
-     * refuses the next one, and then stops; it does not wait for an acknowledgement,
-     * so "pushed" means "handed to the transport", not "the peer has it". A payload
-     * larger than one congestion window is therefore mostly discarded — half a
-     * mebibyte handed to `send()` immediately before this call arrives as a few
-     * kibibytes — and a process that exits right afterwards can leave before any of
-     * it, or the announcement, reaches the wire. Dropping the handle is the same path
-     * with no await to hold the process still.
+     * **What a caller can rely on.** That the session ends, and that this returns at
+     * once — it raises a close signal and returns without waiting for anything; the work
+     * happens on the pump afterwards. The signal does not queue behind the application's
+     * writes: the pump reads it even while those writes are stalled, so a peer that has
+     * stopped reading cannot hold the close back. The pump then takes in, in order, the
+     * writes queued ahead of the close for as long as the send buffers admit them, so
+     * `send(x)` followed by this call still pushes `x`.
+     *
+     * Nothing here is a delivery guarantee. The pump pushes queued bytes until the
+     * socket, the congestion window or the peer's flow-control limit refuses the next
+     * one, and then stops; it does not wait for an acknowledgement, so "pushed" means
+     * "handed to the transport", not "the peer has it". A write still refused at that
+     * point is discarded, so a payload larger than one congestion window is mostly
+     * discarded — half a mebibyte handed to `send()` immediately before this call
+     * arrives as a few kibibytes — and a process that exits right afterwards can leave
+     * before any of it, or the announcement, reaches the wire. Dropping the handle is
+     * the same path with no await to hold the process still.
      *
      * **If delivery matters, do not use this to obtain it.** There is no
      * transport-level signal that could be waited on here: the close announcement is
@@ -3416,17 +3422,23 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
      * Ask the background pump to push out what it can, tell the peer this session is
      * over, and shut it down.
      *
-     * **What a caller can rely on.** That the session ends, and that this returns
-     * promptly — it queues the request and returns; the work happens on the pump
-     * afterwards. Nothing here is a delivery guarantee. The pump pushes queued bytes
-     * until the socket, the congestion window or the peer's flow-control limit
-     * refuses the next one, and then stops; it does not wait for an acknowledgement,
-     * so "pushed" means "handed to the transport", not "the peer has it". A payload
-     * larger than one congestion window is therefore mostly discarded — half a
-     * mebibyte handed to `send()` immediately before this call arrives as a few
-     * kibibytes — and a process that exits right afterwards can leave before any of
-     * it, or the announcement, reaches the wire. Dropping the handle is the same path
-     * with no await to hold the process still.
+     * **What a caller can rely on.** That the session ends, and that this returns at
+     * once — it raises a close signal and returns without waiting for anything; the work
+     * happens on the pump afterwards. The signal does not queue behind the application's
+     * writes: the pump reads it even while those writes are stalled, so a peer that has
+     * stopped reading cannot hold the close back. The pump then takes in, in order, the
+     * writes queued ahead of the close for as long as the send buffers admit them, so
+     * `send(x)` followed by this call still pushes `x`.
+     *
+     * Nothing here is a delivery guarantee. The pump pushes queued bytes until the
+     * socket, the congestion window or the peer's flow-control limit refuses the next
+     * one, and then stops; it does not wait for an acknowledgement, so "pushed" means
+     * "handed to the transport", not "the peer has it". A write still refused at that
+     * point is discarded, so a payload larger than one congestion window is mostly
+     * discarded — half a mebibyte handed to `send()` immediately before this call
+     * arrives as a few kibibytes — and a process that exits right afterwards can leave
+     * before any of it, or the announcement, reaches the wire. Dropping the handle is
+     * the same path with no await to hold the process still.
      *
      * **If delivery matters, do not use this to obtain it.** There is no
      * transport-level signal that could be waited on here: the close announcement is
@@ -4176,15 +4188,21 @@ public object FfiConverterTypePhantomSession: FfiConverter<PhantomSession, Long>
 public interface PhantomStreamInterface {
     
     /**
-     * Close this side of the stream; the peer will see EOF on its read half.
+     * Close this side of the stream; the peer will see EOF on its read half,
+     * after everything written on this handle before the call.
      *
      * Only the writing half closes. [`recv`](Self::recv) on this handle keeps
      * returning what the peer sends until the peer closes its half as well, and the
      * session holds the stream — counting it against its limit on concurrent
      * streams — until both halves are closed, or until this close is acknowledged
-     * and the handle has been let go of (see the type's documentation). Anything
-     * written on this stream after this call is discarded rather than sent: the peer
-     * has been told it ended.
+     * and the handle has been let go of (see the type's documentation).
+     *
+     * A write made on this handle after this call, reliable or unreliable, is never
+     * sent. The call still returns `Ok` — the session takes the command in as it
+     * takes any other — and the pump discards it when it reaches it. It reaches it
+     * only once this close has taken its place in the stream, which may be some time
+     * if the stream's send buffer is full, so the write cannot reach the wire ahead
+     * of the close either: the peer is told the stream ended, and nothing follows.
      *
      * Named `disconnect` rather than `close` for the same reason as
      * `PhantomSession::disconnect` — UniFFI's Kotlin generator emits
@@ -4408,15 +4426,21 @@ open class PhantomStream: Disposable, AutoCloseable, PhantomStreamInterface
 
     
     /**
-     * Close this side of the stream; the peer will see EOF on its read half.
+     * Close this side of the stream; the peer will see EOF on its read half,
+     * after everything written on this handle before the call.
      *
      * Only the writing half closes. [`recv`](Self::recv) on this handle keeps
      * returning what the peer sends until the peer closes its half as well, and the
      * session holds the stream — counting it against its limit on concurrent
      * streams — until both halves are closed, or until this close is acknowledged
-     * and the handle has been let go of (see the type's documentation). Anything
-     * written on this stream after this call is discarded rather than sent: the peer
-     * has been told it ended.
+     * and the handle has been let go of (see the type's documentation).
+     *
+     * A write made on this handle after this call, reliable or unreliable, is never
+     * sent. The call still returns `Ok` — the session takes the command in as it
+     * takes any other — and the pump discards it when it reaches it. It reaches it
+     * only once this close has taken its place in the stream, which may be some time
+     * if the stream's send buffer is full, so the write cannot reach the wire ahead
+     * of the close either: the peer is told the stream ended, and nothing follows.
      *
      * Named `disconnect` rather than `close` for the same reason as
      * `PhantomSession::disconnect` — UniFFI's Kotlin generator emits

@@ -6501,17 +6501,23 @@ impl PhantomSession {
     /// Ask the background pump to push out what it can, tell the peer this session is
     /// over, and shut it down.
     ///
-    /// **What a caller can rely on.** That the session ends, and that this returns
-    /// promptly — it queues the request and returns; the work happens on the pump
-    /// afterwards. Nothing here is a delivery guarantee. The pump pushes queued bytes
-    /// until the socket, the congestion window or the peer's flow-control limit
-    /// refuses the next one, and then stops; it does not wait for an acknowledgement,
-    /// so "pushed" means "handed to the transport", not "the peer has it". A payload
-    /// larger than one congestion window is therefore mostly discarded — half a
-    /// mebibyte handed to `send()` immediately before this call arrives as a few
-    /// kibibytes — and a process that exits right afterwards can leave before any of
-    /// it, or the announcement, reaches the wire. Dropping the handle is the same path
-    /// with no await to hold the process still.
+    /// **What a caller can rely on.** That the session ends, and that this returns at
+    /// once — it raises a close signal and returns without waiting for anything; the work
+    /// happens on the pump afterwards. The signal does not queue behind the application's
+    /// writes: the pump reads it even while those writes are stalled, so a peer that has
+    /// stopped reading cannot hold the close back. The pump then takes in, in order, the
+    /// writes queued ahead of the close for as long as the send buffers admit them, so
+    /// `send(x)` followed by this call still pushes `x`.
+    ///
+    /// Nothing here is a delivery guarantee. The pump pushes queued bytes until the
+    /// socket, the congestion window or the peer's flow-control limit refuses the next
+    /// one, and then stops; it does not wait for an acknowledgement, so "pushed" means
+    /// "handed to the transport", not "the peer has it". A write still refused at that
+    /// point is discarded, so a payload larger than one congestion window is mostly
+    /// discarded — half a mebibyte handed to `send()` immediately before this call
+    /// arrives as a few kibibytes — and a process that exits right afterwards can leave
+    /// before any of it, or the announcement, reaches the wire. Dropping the handle is
+    /// the same path with no await to hold the process still.
     ///
     /// **If delivery matters, do not use this to obtain it.** There is no
     /// transport-level signal that could be waited on here: the close announcement is
@@ -13281,6 +13287,52 @@ mod tests {
             vec![b"tail-one".to_vec(), b"tail-two".to_vec()],
             "the writes queued before the drop must reach the peer, in order, ahead of the EOF"
         );
+    }
+
+    /// A write made on a stream after its `disconnect()` never reaches the peer — reliable
+    /// or not — including while the FIN is still waiting for room in the send buffer.
+    ///
+    /// This pins what `PhantomStream::disconnect` promises. The write returns `Ok`, because
+    /// the command channel takes it; it is then discarded when the pump reaches it, which it
+    /// does only once the FIN ahead of it has been admitted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_write_after_a_stream_close_is_discarded_while_the_close_waits_for_room() {
+        const BULK: usize = 4 << 20;
+        let (closing, peer) = connected_client_and_server().await;
+
+        let stream = closing.open_stream();
+        let id = stream.stream_id();
+        stream
+            .send_reliable(vec![0x5A; BULK])
+            .await
+            .expect("the pump takes the bulk in");
+        wait_until_send_buffer_full(&closing, id).await;
+        stream.disconnect().await.expect("close the writing half");
+        stream
+            .send_unreliable(b"unreliable-after-the-close".to_vec())
+            .await
+            .expect("the command channel takes the write");
+        stream
+            .send_reliable(b"reliable-after-the-close".to_vec())
+            .await
+            .expect("the command channel takes the write");
+        assert_commands_waiting(&closing, 3).await;
+
+        let theirs = tokio::time::timeout(std::time::Duration::from_secs(10), peer.accept_stream())
+            .await
+            .expect("the peer never saw the stream")
+            .expect("accept_stream");
+        let (bulk, rest) = read_to_eof(&theirs, 0x5A).await;
+        assert_eq!(bulk, BULK, "the bulk arrived short");
+        assert!(
+            rest.is_empty(),
+            "the peer read {rest:?} on a stream that had been closed before it was written"
+        );
+        if let Ok(read) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), theirs.recv()).await
+        {
+            panic!("the peer read {read:?} after the EOF");
+        }
     }
 
     /// One end of an in-memory pipe whose path can be cut — every frame in either direction

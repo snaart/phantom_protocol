@@ -41,9 +41,14 @@ pub const OP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Close a session without letting teardown hang the run.
 ///
-/// `disconnect()` flushes pending reliable data, so a session holding a large
-/// unacknowledged backlog can block for a long time. The run has already
-/// recorded its samples by this point; waiting on a clean close buys nothing.
+/// `disconnect()` raises a close signal and returns at once; it does not wait
+/// for pending data to be flushed or acknowledged. The session's pump then
+/// pushes what the congestion and flow-control windows admit, announces the
+/// close, and discards whatever is still queued; nothing already sent is
+/// retransmitted after that. The run has already recorded its samples by this
+/// point, so nothing it measures depends on that tail reaching the peer. The
+/// timeout is a guard against a `disconnect()` that ever waits again, not a
+/// wait this one is known to need.
 pub async fn close_session(session: &Arc<PhantomSession>) {
     let _ = tokio::time::timeout(Duration::from_secs(5), session.disconnect()).await;
 }
