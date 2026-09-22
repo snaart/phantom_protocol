@@ -28,10 +28,12 @@ use crate::transport::multiplexer::{StreamHandle, StreamMessage};
 ///
 /// Once this side's close is acknowledged the session forgets the stream, whether or
 /// not the peer has closed its own half — nobody is left here to read what that half
-/// carries. Anything the peer sends on it afterwards is acknowledged and discarded, so
-/// its writes still complete, up to the receive window this side last advertised; a
-/// peer that keeps writing past that is held at it, as it would be by a reader that
-/// stopped reading. To read the peer's side to its end, keep the handle until
+/// carries. Anything the peer sends on it afterwards is acknowledged and discarded, and
+/// the session keeps granting the peer flow-control room on it, so the peer's writes
+/// complete however much it goes on writing, and its other streams are not held up
+/// behind this one. Nothing tells the peer its bytes went unread; if that matters, say
+/// so at the application level before letting go. To read the peer's side to its end,
+/// keep the handle until
 /// [`recv`](Self::recv) returns `Ok(None)`: a held handle keeps its stream for as long
 /// as the peer's half is open.
 ///

@@ -157,7 +157,9 @@ Both client and server, after their handshakes, spawn the **same** `run_data_pum
     among them; it then closes the stream's writing half behind them (or, for a stream
     this side opened and never wrote a reliable byte on, drops it outright), and the
     stream leaves the table once that close is acknowledged, whether or not the peer
-    ever closes its half.
+    ever closes its half. What the peer writes on it afterwards is acknowledged,
+    discarded and granted room for by the receive task, which keeps no state for the
+    stream to do it, so the peer's writes complete rather than stopping its session.
   - `cmd_rx.recv()` — `SessionCommand`s: `Send`, `SendStreamReliable/Unreliable`,
     `CloseStream`, `Close`. Disabled while a refused write is held.
   - `recv_done_rx` — exit when the reader ends (transport closed).

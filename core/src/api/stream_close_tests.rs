@@ -14,7 +14,9 @@
 //! * nothing written after a stream's own close reaches the peer behind its EOF;
 //! * a stream whose handle this side has dropped closes its writing half behind what it
 //!   wrote, and leaves the table once that close is acknowledged, whether or not the peer
-//!   ever closes its own half — while a handle still held keeps its stream until it does.
+//!   ever closes its own half — while a handle still held keeps its stream until it does;
+//! * a peer still writing on a stream this side has let go of is granted room as well as
+//!   acknowledged, so neither that stream nor the peer's others stop.
 //!
 //! The link has a real, if short, delay. Every defect pinned here depends on the order in
 //! which a peer's acknowledgement and its next frame arrive, and a FIFO delay line fixes
@@ -30,7 +32,9 @@ use std::time::Duration;
 use tokio::time::{timeout, Instant};
 
 use crate::api::full_duplex_tests::{establish_counted, shutdown};
-use crate::api::session::{PhantomSession, MAX_STREAMS, STREAM_RECV_CHANNEL_DEPTH};
+use crate::api::session::{
+    ConnectionState, PhantomSession, MAX_STREAMS, STREAM_RECV_CHANNEL_DEPTH,
+};
 use crate::api::stream::PhantomStream;
 use crate::errors::CoreError;
 use crate::transport::mtu::MAX_APP_CHUNK;
@@ -663,6 +667,166 @@ async fn a_stream_dropped_before_it_was_written_leaves_without_a_trace() {
 
     wait_until_no_streams(&client, "client").await;
     assert_nothing_accepted(&server, "a stream the client opened and dropped unused").await;
+
+    shutdown(&client, &server).await;
+}
+
+/// Wait until `session` no longer routes `stream_id`: it has been dropped, which for a stream
+/// whose handle is still held means both of its halves are closed and settled.
+async fn wait_until_gone(session: &PhantomSession, stream_id: u32, who: &str) {
+    let deadline = Instant::now() + STEP;
+    while session.demux().has_stream(stream_id) {
+        assert!(
+            Instant::now() < deadline,
+            "{who}: stream {stream_id} is still routed — what was written on it never settled"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Writes that must each be taken by the session, one after another: more than its command
+/// channel holds, so a session that has stopped taking commands blocks one of these calls
+/// rather than merely leaving the writes queued.
+const WRITES_BEHIND: usize = 320;
+
+/// `writer` opens a second stream of its own and writes a burst on it, behind whatever it has
+/// queued already, and every byte of the burst has to reach `reader`.
+///
+/// Every one of the writer's `send_reliable` calls has to return, and the burst has to arrive
+/// whole and in order. Nothing here is timed beyond the generous per-step budget: the failure
+/// this guards against is a session that never takes the writes at all.
+async fn a_second_stream_still_delivers(
+    writer: &PhantomSession,
+    reader: &PhantomSession,
+    who: &str,
+) {
+    let other = writer.open_stream();
+    let mut expected = Vec::new();
+    for n in 0..WRITES_BEHIND {
+        let message = format!("elsewhere {n};").into_bytes();
+        expected.extend_from_slice(&message);
+        timeout(STEP, other.send_reliable(message))
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{who}: write {n} on a second stream did not return — the session stopped \
+                     taking writes"
+                )
+            })
+            .expect("write on a second stream");
+    }
+    let here = accept(reader, "reader").await;
+    assert_eq!(here.stream_id(), other.stream_id());
+    let mut received = Vec::with_capacity(expected.len());
+    while received.len() < expected.len() {
+        match next_read(&here, "reader")
+            .await
+            .expect("read the second stream")
+        {
+            Some(bytes) => received.extend_from_slice(&bytes),
+            None => panic!("EOF after {} of {} bytes", received.len(), expected.len()),
+        }
+    }
+    assert!(
+        received == expected,
+        "{who}: the second stream arrived altered"
+    );
+    other.disconnect().await.expect("close the second stream");
+    assert_eq!(next_read(&here, "reader").await.expect("read EOF"), None);
+    here.disconnect().await.expect("close the reader's half");
+}
+
+/// Bytes the peer writes on a stream this side has let go of: several times what one stream
+/// can have outstanding — the most window this side ever grants, a full delivery queue, and
+/// everything the peer's send buffer holds — so that a peer stopped at its last grant is left
+/// holding writes it has nowhere to put.
+const TO_NOBODY: usize = 8 * 1024 * 1024;
+
+/// A stream this side lets go of while the peer is still writing on it does not stop the
+/// peer's session.
+///
+/// Once this side's close of a stream it has let go of is acknowledged, the stream leaves the
+/// table, and what the peer writes on it afterwards is acknowledged and discarded. But the
+/// peer's writes are bounded by the flow-control limit this side grants, and a dropped stream
+/// granted nothing more: the peer stopped at the last limit it had. Its refused writes then
+/// sat at the head of the queue its session keeps for every stream, and while that queue
+/// holds a write the session takes no further command — so every write on every other stream
+/// of the peer's session waited behind the one stream nobody would ever read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_let_go_of_while_the_peer_writes_does_not_stall_the_peer() {
+    let (client, server) = establish().await;
+
+    let ours = client.open_stream();
+    ours.send_reliable(b"open".to_vec())
+        .await
+        .expect("open the stream on the wire");
+    let theirs = accept(&server, "server").await;
+    assert_eq!(
+        next_read(&theirs, "server").await.expect("read open"),
+        Some(b"open".to_vec())
+    );
+    drop(ours);
+    assert_eq!(
+        next_read(&theirs, "server")
+            .await
+            .expect("the client's dropped handle closes its half"),
+        None
+    );
+    // The client's close is acknowledged and nobody holds the stream, so it is gone from the
+    // client's table before the server writes another byte on it.
+    wait_until_no_streams(&client, "client").await;
+
+    theirs
+        .send_reliable(vec![0xA5; TO_NOBODY])
+        .await
+        .expect("write on the server's half");
+    a_second_stream_still_delivers(&server, &client, "server").await;
+
+    // And the writes on the stream the client let go of complete: the server's close follows
+    // them in its send buffer, so the stream leaves the server's table only once every one of
+    // them has been acknowledged.
+    theirs.disconnect().await.expect("close the server's half");
+    wait_until_gone(&server, theirs.stream_id(), "server").await;
+    assert_nothing_accepted(&client, "a write on a stream the client let go of").await;
+    assert_eq!(server.connection_state(), ConnectionState::Connected);
+    assert_eq!(client.connection_state(), ConnectionState::Connected);
+
+    shutdown(&client, &server).await;
+}
+
+/// The same, with the peer already stopped on this side's window when the handle is let go
+/// of: the application here never read the stream, so the peer is waiting on the limit it was
+/// last given, and the rest of what it writes arrives after the stream has left the table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_let_go_of_mid_upload_does_not_stall_the_peer() {
+    let (client, server) = establish().await;
+
+    let ours = client.open_stream();
+    ours.send_reliable(b"open".to_vec())
+        .await
+        .expect("open the stream on the wire");
+    let theirs = accept(&server, "server").await;
+    assert_eq!(
+        next_read(&theirs, "server").await.expect("read open"),
+        Some(b"open".to_vec())
+    );
+
+    // The client holds its handle and reads nothing, so the server fills the stream's
+    // delivery queue and stops on the window the client granted for it.
+    theirs
+        .send_reliable(vec![0x5A; TO_NOBODY])
+        .await
+        .expect("write on the server's half");
+    tokio::time::sleep(QUIET).await;
+    drop(ours);
+    wait_until_no_streams(&client, "client").await;
+
+    a_second_stream_still_delivers(&server, &client, "server").await;
+
+    theirs.disconnect().await.expect("close the server's half");
+    wait_until_gone(&server, theirs.stream_id(), "server").await;
+    assert_eq!(server.connection_state(), ConnectionState::Connected);
+    assert_eq!(client.connection_state(), ConnectionState::Connected);
 
     shutdown(&client, &server).await;
 }

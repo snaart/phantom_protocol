@@ -412,8 +412,10 @@ acknowledged like any other segment. It closes one direction only. Send nothing 
 a stream after your own `FIN`; the other direction stays open, and this
 implementation keeps delivering what you send on a stream it has closed until your
 `FIN` arrives — unless its application lets go of the stream first, after which what
-you send on it is acknowledged and discarded and no further `WINDOW_UPDATE` comes for
-it, so a write past the last limit you were given stalls there (PROTOCOL.md § 4.5).
+you send on it is acknowledged and discarded, and `WINDOW_UPDATE` limits keep coming
+for it, worked out from the offsets you send rather than from any count it keeps, so
+your writes on it complete (PROTOCOL.md § 4.5, *A stream nobody reads*). Apply those
+limits like any other; nothing tells you the bytes went unread.
 Mind the near-collision with the persist
 probe — a `RELIABLE` frame with an empty payload and no `FIN` is a window probe,
 delivers nothing, and consumes no offset.

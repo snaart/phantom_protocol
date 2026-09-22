@@ -5601,12 +5601,21 @@ async fn handle_packet<T: SessionTransport>(
                 match classify_unheld_stream(stream_id, demux_recv, &scratch.peer_streams) {
                     UnheldStream::Opens => {}
                     UnheldStream::Retired => {
-                        // Closed from both ends and dropped. What arrives now is a copy of
-                        // a segment this side already took — usually the peer's FIN, resent
-                        // because the acknowledgement of it was lost — so the answer is that
-                        // acknowledgement again and nothing else. It covers every offset up
-                        // to this one, all of which arrived before the stream was dropped:
-                        // that is what its read half having closed means.
+                        // Dropped, in one of two ways. Closed from both ends: what arrives
+                        // now is a copy of a segment this side already took — usually the
+                        // peer's FIN, resent because the acknowledgement of it was lost — and
+                        // every offset up to it arrived before the stream was dropped, since
+                        // that is what its read half having closed means. Or let go of by
+                        // this side's application once its own FIN was acknowledged, with the
+                        // peer's half still open: the peer may still be writing, and nobody
+                        // is left here to read what it writes.
+                        //
+                        // Either way the answer acknowledges every offset up to this one. In
+                        // the second case that deliberately includes offsets this side never
+                        // received and bytes it throws away unread: there is no reader to owe
+                        // them to, and an acknowledgement is what lets the peer's writes on
+                        // the stream complete instead of being resent for the life of the
+                        // session.
                         if let Some(sack) = crate::transport::sack::Sack::from_inclusive_ranges(
                             vec![(0, stream_offset)],
                             0,
@@ -5619,6 +5628,27 @@ async fn handle_packet<T: SessionTransport>(
                                 crypto_recv,
                                 transport_send_ack,
                                 &mut scratch.ack_buf,
+                                observability,
+                            )
+                            .await;
+                        }
+                        // Completing needs room as well as acknowledgements: the peer writes
+                        // no further than the last limit it was granted, and a sender queues
+                        // the writes it cannot place ahead of every other stream's. So a
+                        // stream that granted nothing more would stop the peer's whole
+                        // session. See `released_stream_grant` for what is granted and how
+                        // often.
+                        if let Some(limit) = released_stream_grant(
+                            stream_offset,
+                            is_persist_probe,
+                            packet.header.flags.contains(PacketFlags::FIN),
+                        ) {
+                            send_window_update(
+                                transport_send_ack,
+                                crypto_recv,
+                                session_id,
+                                stream_id as TransportStreamId,
+                                limit,
                                 observability,
                             )
                             .await;
@@ -5929,7 +5959,10 @@ fn retire_released_stream(
 enum UnheldStream {
     /// The peer opening a new stream.
     Opens,
-    /// A stream that was held here, closed from both ends, and dropped.
+    /// A stream that was held here and has been dropped: closed from both ends, or let go
+    /// of by the application once this side's own half was closed and acknowledged — in
+    /// which case the peer's half may still be open and the peer still writing on it — or,
+    /// for one this side opened, let go of before a byte of it reached the peer.
     Retired,
     /// An id of this side's parity that this side never opened, which the peer has no
     /// business sending on.
@@ -5959,6 +5992,66 @@ fn classify_unheld_stream(
     } else {
         UnheldStream::Opens
     }
+}
+
+/// The most reliable application bytes one segment can carry past the receive gate: the
+/// largest plaintext a frame may hold, less the offset prefix every reliable one leads with.
+///
+/// This is a bound on any peer, not a figure about how this build chunks: a larger frame is
+/// dropped before it is opened (see [`MAX_RECV_FRAME`]), so no segment that reaches the
+/// receive path carries more.
+const MAX_RECV_RELIABLE_CHUNK: u64 =
+    (MAX_RECV_PAYLOAD - crate::transport::mtu::RELIABLE_OFFSET_LEN) as u64;
+
+/// How many offsets of a dropped stream one flow-control grant covers: a grant goes out for
+/// every segment whose offset is a multiple of this, and for no other data segment.
+///
+/// The peer can put at most this many segments on the wire between two grants, so the room a
+/// grant leaves has to cover them with plenty to spare — held below — or the peer would stop
+/// between two of them and wait out a persist probe.
+const RELEASED_GRANT_STRIDE: u32 = 16;
+
+const _: () = assert!(
+    RELEASED_GRANT_STRIDE as u64 * MAX_RECV_RELIABLE_CHUNK
+        + crate::transport::stream::INITIAL_STREAM_WINDOW as u64
+        <= crate::transport::stream::MAX_RECV_WINDOW as u64
+);
+
+/// The flow-control limit to grant the peer for a reliable segment on a stream this side no
+/// longer holds, or `None` when the segment calls for none.
+///
+/// Such a stream keeps no receive state, so the limit is worked out from the arriving offset
+/// alone. Offsets are gap-free and every one carries at most [`MAX_RECV_RELIABLE_CHUNK`]
+/// bytes, so `(offset + 1) × MAX_RECV_RELIABLE_CHUNK` is at least everything the peer can
+/// have sent up to and including this segment, whatever size it chunks at. One
+/// [`MAX_RECV_WINDOW`](crate::transport::stream::MAX_RECV_WINDOW) of room goes on top — the
+/// most any stream is ever granted, and a sender of this build honours no more than that
+/// beyond what it has already sent. Granting a stream nobody reads the largest window there
+/// is costs nothing: what arrives on it is acknowledged and discarded, never held.
+///
+/// What bounds the work is how often a grant goes out, not how large it is:
+///
+/// * a data segment is answered with one only at every [`RELEASED_GRANT_STRIDE`]th offset, so
+///   a peer writing on a stream nobody reads draws one grant for that many acknowledgements;
+/// * the peer's persist probe — an empty segment that is not a FIN, sent when it is stopped
+///   on its limit with nothing in flight — is always answered, because it is the one frame
+///   that says the peer has nothing left to send until it hears one; the peer paces its
+///   probes by its retransmission timer;
+/// * a FIN is never answered with one: the peer's writing half has ended and needs no room.
+///
+/// Nothing a peer can send draws more than one grant, and nothing grows on this side for it
+/// — no state is kept, however long the peer writes. The limit is a total like any other, so
+/// a grant that is lost, reordered or superseded costs nothing, and a peer that stated
+/// offsets it never sent is granted room on a stream whose every byte is thrown away.
+fn released_stream_grant(stream_offset: u32, is_persist_probe: bool, fin: bool) -> Option<u64> {
+    if fin || (!is_persist_probe && !stream_offset.is_multiple_of(RELEASED_GRANT_STRIDE)) {
+        return None;
+    }
+    Some(
+        (u64::from(stream_offset) + 1)
+            .saturating_mul(MAX_RECV_RELIABLE_CHUNK)
+            .saturating_add(u64::from(crate::transport::stream::MAX_RECV_WINDOW)),
+    )
 }
 
 // Internal-only methods — deliberately NOT on the `#[uniffi::export]` surface.
@@ -10014,6 +10107,40 @@ mod tests {
             }
             out
         }
+
+        /// Every frame this side has emitted since the last call, opened as the peer would
+        /// open it: the header it carried and its plaintext.
+        async fn emitted_frames(&self) -> Vec<(PacketHeader, Vec<u8>)> {
+            let mut out = Vec::new();
+            let mut rx = self.transport.rx.lock().await;
+            while let Ok(frame) = rx.try_recv() {
+                let packet = self
+                    .client
+                    .parse_protected(&frame)
+                    .expect("parse an emitted frame");
+                let plaintext = self
+                    .client
+                    .decrypt_packet(&packet.header, &packet.payload, &[])
+                    .expect("decrypt an emitted frame");
+                out.push((packet.header, plaintext));
+            }
+            out
+        }
+
+        /// Every flow-control limit this side has granted since the last call, with the
+        /// stream it was stamped on. Other frames are read and dropped.
+        async fn emitted_window_updates(&self) -> Vec<(u32, u64)> {
+            self.emitted_frames()
+                .await
+                .into_iter()
+                .filter(|(header, _)| header.flags.contains(PacketFlags::WINDOW_UPDATE))
+                .map(|(header, plaintext)| {
+                    let limit = <[u8; WINDOW_UPDATE_PAYLOAD_LEN]>::try_from(&plaintext[..])
+                        .expect("a WINDOW_UPDATE carries an 8-byte limit");
+                    (u32::from(header.stream_id), u64::from_be_bytes(limit))
+                })
+                .collect()
+        }
     }
 
     fn stream_offset_prefix(offset: u32) -> Vec<u8> {
@@ -10402,6 +10529,102 @@ mod tests {
         rig.close_local(id).await;
         rig.peer_ack(id, 0).await;
         assert!(!rig.streams.contains_key(&id));
+    }
+
+    /// A stream this side has let go of keeps granting the peer room for what it writes on
+    /// it after the stream has left the table, a grant per stretch of offsets rather than
+    /// one per segment, and none once the peer has closed its half.
+    ///
+    /// With the stream dropped there was no receive window left to advance, and all the peer
+    /// heard back was the acknowledgement. Its writes stopped at the last limit this side had
+    /// granted — and a sender keeps a single queue of refused writes for every stream of its
+    /// session, so the whole of the peer's session stopped behind the one stream nobody would
+    /// ever read.
+    #[tokio::test]
+    async fn a_released_stream_keeps_granting_room_for_what_the_peer_sends_on_it() {
+        const STRIDE: u32 = RELEASED_GRANT_STRIDE;
+        let mut rig = RecvRig::new();
+        let local = rig.open_local();
+        let id = local.stream_id;
+        rig.close_local(id).await;
+        rig.streams
+            .get(&id)
+            .expect("the stream is in the table")
+            .release_app_handle();
+        rig.peer_ack(id, 0).await;
+        assert!(
+            !rig.streams.contains_key(&id),
+            "released and closed, so gone"
+        );
+        let _ = rig.delivered();
+        let _ = rig.emitted_frames().await;
+
+        // The peer writes on, in the largest chunks the receive gate lets through: the case in
+        // which a grant worked out from the offset alone has the least to spare.
+        let chunk = vec![0x33; MAX_RECV_PAYLOAD - crate::transport::mtu::RELIABLE_OFFSET_LEN];
+        let segments = 4 * STRIDE;
+        let mut granted = 0u64;
+        let mut grants = 0u32;
+        for offset in 0..segments {
+            rig.peer_segment(id, offset, &chunk, false).await;
+            for (sid, limit) in rig.emitted_window_updates().await {
+                assert_eq!(sid, id, "a grant stamped on the wrong stream");
+                grants += 1;
+                granted = granted.max(limit);
+            }
+            let sent = u64::from(offset + 1) * chunk.len() as u64;
+            assert!(
+                granted >= sent + u64::from(crate::transport::stream::INITIAL_STREAM_WINDOW),
+                "after offset {offset} the peer has sent {sent} B and holds a limit of \
+                 {granted} B: less room than a stream is opened with"
+            );
+        }
+        assert!(
+            grants <= segments / STRIDE,
+            "{grants} grants for {segments} segments — the answer to a stream nobody reads \
+             must not be a frame for every frame"
+        );
+
+        // Far along the stream the grant still covers every byte the peer can have sent: the
+        // per-segment bound is the receive gate's, not this build's own chunk size, or a
+        // peer chunking larger would fall behind it by a little on every segment.
+        let far = 1 << 20;
+        rig.peer_segment(id, far, &chunk, false).await;
+        let far_grant = rig.emitted_window_updates().await;
+        assert_eq!(far_grant.len(), 1, "offset {far} is on a stride");
+        assert!(
+            far_grant[0].1
+                >= u64::from(far + 1) * chunk.len() as u64
+                    + u64::from(crate::transport::stream::INITIAL_STREAM_WINDOW),
+            "at offset {far} the grant {} fell behind what the peer can have sent",
+            far_grant[0].1
+        );
+
+        // The peer runs out of things in flight and asks with its persist probe, which repeats
+        // the highest offset already acknowledged. A probe is answered whatever its offset.
+        let sent = u64::from(segments) * chunk.len() as u64;
+        rig.peer_segment(id, segments - 1, b"", false).await;
+        let answer = rig.emitted_window_updates().await;
+        assert_eq!(
+            answer.len(),
+            1,
+            "the persist probe must be answered with a grant"
+        );
+        assert!(
+            answer[0].1 > sent,
+            "the answer to a probe must let the peer move"
+        );
+
+        // A FIN is the peer's writing half closing: it needs no more room.
+        rig.peer_segment(id, segments, b"", true).await;
+        assert!(rig.emitted_window_updates().await.is_empty());
+
+        assert_eq!(
+            rig.accepted(),
+            Vec::<u32>::new(),
+            "a dropped stream was reopened"
+        );
+        assert_eq!(rig.delivered(), Vec::new(), "a dropped stream delivered");
     }
 
     /// Every handle to a peer's stream reports being dropped — the one the application took

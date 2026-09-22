@@ -568,7 +568,9 @@ greater than 1 that names no stream the receiver holds is one of three things:
   parity that it held before, or one of its own that it allocated: a copy of a
   segment it already took, or data for a half nobody on the receiving side will
   read any more. The receiver acknowledges every offset up to the one the segment
-  carries and does nothing else — no stream is created and nothing is delivered.
+  carries and, since the peer may still be writing, keeps granting it
+  flow-control room on that stream (§ 4.5); it does nothing else — no stream is
+  created and nothing is delivered.
 - **An id of the receiver's own parity that it never allocated:** refused and,
   being unrecorded, not acknowledged, exactly like a segment past the cap below.
 
@@ -738,10 +740,15 @@ One exception to that rule is local to the receiving side and changes nothing on
 wire: a side whose application has let go of a stream — in this implementation,
 dropped its last handle to it — drops the stream as soon as its own FIN is
 acknowledged, with the peer's half still open, because nothing on that side will ever
-read what the half carries. The peer sees only acknowledgements: what it sends on that
-stream afterwards is acknowledged and discarded (§ 4.4), and no further
-`WINDOW_UPDATE` comes for it, so a peer that keeps writing past the last limit it was
-given stops there, exactly as it would against a reader that stopped reading.
+read what the half carries. The peer sees acknowledgements and room: what it sends on
+that stream afterwards is acknowledged and discarded (§ 4.4), and the receiver goes on
+granting `WINDOW_UPDATE` limits for it (see *A stream nobody reads* under the
+`WINDOW_UPDATE` codec below), so the peer's writes on it complete as though an
+application were reading them. The grant is not optional in practice. A receiver that
+stopped granting would leave the peer stopped at the last limit it was given, which the
+peer cannot tell from a reader that stopped reading — and a sender that holds the writes
+it cannot place in one queue for all of its streams, as this implementation's does, then
+stops sending on every stream of the session, not just this one.
 
 **`COALESCED` bundle plaintext** (`core/src/transport/packet_coalescer.rs`,
 wrapped via `packet_coalescer_codec.rs`). A packet with `COALESCED` set (§ 4.3)
@@ -809,7 +816,9 @@ match them or the room it grants is silently discarded:
     limit as zero deadlocks, because the first frame is only emitted once the peer's
     application has consumed bytes it would never have been sent;
   * a receiver MUST NOT advertise more than `consumed + MAX_RECV_WINDOW`, with
-    `MAX_RECV_WINDOW = 1 MiB` the ceiling its auto-tuning may not grant past;
+    `MAX_RECV_WINDOW = 1 MiB` the ceiling its auto-tuning may not grant past — on every
+    stream it still holds; a stream nobody on the receiving side will read any more is
+    the one exception, and is covered below;
   * a sender honours at most `MAX_SEND_WINDOW = 1 MiB` — the same figure — beyond the bytes
     it has already sent, whatever number arrives. A conforming peer is never clamped by
     this; it exists so that a peer advertising `u64::MAX` buys exactly one window of
@@ -818,6 +827,31 @@ match them or the room it grants is silently discarded:
 When to emit is a local choice (this implementation emits when unreported consumption
 crosses half the initial window, when the advertised window grows, and in answer to a
 persist probe); what the number means is not.
+
+**A stream nobody reads.** A receiver that has dropped a stream while the peer's half is
+still open (see *Closing a stream consumes an offset* above) throws away everything that
+arrives on it and
+keeps no count of it, so it has no `consumed` to state a limit from. It states a bound
+instead, worked out from the arriving segment alone. Offsets are gap-free (a frame
+counter, above) and no segment that passes this implementation's receive gate (§ 4.10)
+carries more than 1300 application bytes, so
+
+```text
+limit = (stream_offset + 1) × 1300 + MAX_RECV_WINDOW
+```
+
+is at least one full window beyond everything the peer can have sent up to and including
+that segment, however it chunks. This is the one limit that may exceed
+`consumed + MAX_RECV_WINDOW`, and the ceiling does not apply to it for a reason rather than
+by fiat: the ceiling bounds memory a receiver commits to holding, and this receiver holds
+none. This implementation sends one for every data segment on such a stream whose offset
+is a multiple of 16, and in answer to every persist probe, and never for a `FIN`, whose
+sender needs no more room; nothing is stored to decide either. What bounds the work a
+peer can cause this way is therefore one small frame per sixteen segments it sends, plus
+one per probe it sends — never more than one frame for any frame received. A sender needs
+to know nothing of this: the limit is applied as a maximum like any other, and a sender of
+this build honours no more than `MAX_SEND_WINDOW` beyond what it has already sent,
+whatever number arrives.
 
 **Persist probe.** A `WINDOW_UPDATE` is emitted once, in a frame nothing acknowledges or
 retransmits. A lost one is repaired by the next — *provided there is a next*, and the case

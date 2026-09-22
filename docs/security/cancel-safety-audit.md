@@ -67,6 +67,13 @@
 > count went 7 → 8. The new primitive is again an `mpsc` receive, and its body —
 > the socket rebind that used to run in the command arm — follows the same
 > argument, so the verdict stands.
+>
+> **Amended when a stream nobody reads kept granting room.** Once a stream whose
+> handle was dropped has left the table, a segment the peer still sends on it is
+> now answered with a `WINDOW_UPDATE` as well as the acknowledgement, from inside
+> `handle_packet`, so that the peer's writes complete instead of stopping its whole
+> session at the last limit it had. That adds one best-effort send to the receive
+> task's list below and no `select!`; the count and the verdict stand.
 
 A `select!` arm that fires before its sibling completes effectively
 **cancels** the unfinished future. If that future was carrying
@@ -415,8 +422,10 @@ let _ = recv_done_tx.send(());
   `Stream::received_sack`, `Stream::is_fin_acked`), and best-effort transport sends
   of the replies a packet can call for (the SACK acknowledgement, the keep-alive
   PONG through `send_keepalive`, the path-validation echo through
-  `send_path_validation`, and a `PATH_CHALLENGE` to a migration candidate through
-  `send_to_candidate`). Each of those stream methods awaits only its lock
+  `send_path_validation`, a `PATH_CHALLENGE` to a migration candidate through
+  `send_to_candidate`, and the flow-control grant for a stream this side has
+  dropped with the peer's half still open, through `send_window_update`). Each of
+  those stream methods awaits only its lock
   acquisition and then runs synchronously, so a cancel lands before any buffer is
   touched, never halfway through an update; a cancelled send is a lost control
   frame — for a challenge, one that `sweep_path_validation_timeouts` already
