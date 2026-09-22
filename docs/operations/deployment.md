@@ -264,10 +264,24 @@ rejected. Pre-handshake per-IP rate limiting belongs at the edge (LB / nftables
 its session ends, and a session whose client has stopped reading its socket
 ends within thirty seconds of the first server write the socket will not take:
 the TCP transport fails a write that makes no progress for that long, resets
-the connection, and ends the session as `Dead` with `CoreError::Timeout`, which
-the echo handler logs as a warning. A client that keeps reading, however
+the connection, and ends the session as `Dead` with `CoreError::Timeout`.
+`phantom-server` binds without a `PhantomConfig`, so thirty seconds is what it
+runs with; an embedder binding its own listener chooses the figure with
+`PhantomConfig::write_stall_timeout`. A client that keeps reading, however
 slowly, is a slow link and keeps its slot; the per-IP and global caps above are
 what bound how many of those one source can hold.
+
+Do not look for the stall in the echo handler's log. What the handler sees
+depends on where it was waiting when the session ended. Waiting in `recv()`, it
+gets the `Timeout` and logs `session recv failed` at WARN. But the usual place
+is `send()`: a client that stops reading and keeps sending leaves the handler
+echoing into a session whose pump is stuck in the stalled write and takes no
+further commands, so the handler's `send()` waits for room in the command
+channel — and when the session ends, that `send()` fails with
+`NetworkError("Session closed")`, which the handler takes for the peer closing
+and logs at DEBUG. The dependable signal is the session count:
+`phantom.session.active` falls when the session ends, whichever way the handler
+heard of it.
 
 ## Startup, health & telemetry resilience
 
