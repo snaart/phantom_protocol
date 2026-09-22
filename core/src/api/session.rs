@@ -1561,8 +1561,12 @@ const RAW_APP_STREAM_ID: u32 = 1;
 /// - [`Self::opened`] is called where a user stream enters the session's stream
 ///   table: `PhantomSession::open_stream` (local) and the receive path's
 ///   new-peer-stream branch (remote, surfaced via `accept_stream`).
-/// - [`Self::closed`] is called where one leaves it (`retire_stream`, once both
-///   halves are closed, or the `queue_fin` fallback teardown).
+/// - [`Self::closed`] is called where one leaves it: `retire_stream`, once both
+///   halves are closed; `retire_released_stream`, once the application has let go
+///   of the stream and this side's own half is closed; or the offset-exhaustion
+///   fallback in `flush_deferred_sends`, which drops the stream after a bare FIN.
+///   Each of them acts only when it is the one that takes the stream out of the
+///   table, so a stream is counted out exactly once.
 /// - [`Self::drain`] retires whatever is still open when the session ends. It
 ///   runs both at data-pump exit **and** in `Drop for PhantomSession` — the
 ///   `swap(0)` is atomic, so whichever runs first retires the streams and the
@@ -3132,8 +3136,9 @@ async fn take_command<T: SessionTransport>(
             // be delivered in order and acknowledged by the peer even under
             // packet loss. It closes this side's half only: the stream stays
             // in `streams` and `demux` — still receiving — until the FIN is
-            // acknowledged AND the peer's own FIN has been released in order,
-            // and the receive path drops it when both are true.
+            // acknowledged AND either the peer's own FIN has been released in
+            // order or the application has dropped its handle, and the receive
+            // path or the pump drops it then.
             //
             // Invariant 2 is preserved: the FIN packet is sealed with
             // ENCRYPTED | RELIABLE | FIN — a forged unencrypted one is
@@ -3149,11 +3154,12 @@ async fn take_command<T: SessionTransport>(
             // fallback (bare ENCRYPTED FIN + retire) that used to live
             // inline here.
             //
-            // A stream no longer in the table was closed from both ends and
-            // dropped, and there is nothing to do: its route is released by
-            // the delivery task behind whatever it still had to deliver, and
-            // releasing it here — on a second `disconnect()`, say — could
-            // cut that short.
+            // A stream no longer in the table has been dropped — closed from
+            // both ends, or by the offset-exhaustion fallback on an earlier
+            // close — and there is nothing to do: its route is released by the
+            // delivery task behind whatever it still had to deliver, or was
+            // released with the fallback's bare FIN, and releasing it here — on
+            // a second `disconnect()`, say — could cut the first short.
             let stream = streams.get(&stream_id).map(|s| s.clone());
             if let Some(stream) = stream {
                 deferred.push_back(Deferred::Fin { stream_id, stream });
@@ -3305,7 +3311,8 @@ async fn release_due_streams<T: SessionTransport>(
         }
         releases.pop_front();
         // Clone the Arc out so no table guard is held across the awaits below. A stream
-        // already gone was dropped from both ends while its handle was on its way out.
+        // already gone was dropped while its handle was on its way out — closed from both
+        // ends, or by the offset-exhaustion fallback behind a `disconnect()`.
         let Some(stream) = streams.get(&stream_id).map(|s| s.clone()) else {
             continue;
         };
@@ -5704,7 +5711,8 @@ async fn handle_packet<T: SessionTransport>(
                     // Peer-initiated user stream — count it on the active-streams
                     // gauge exactly once (this `None` arm runs once per stream id,
                     // guarded by the DashMap entry and the record above). The matching
-                    // retire is `retire_stream` or `retire_released_stream`, or the
+                    // retire is `retire_stream`, `retire_released_stream`, the
+                    // offset-exhaustion fallback in `flush_deferred_sends`, or the
                     // session-teardown drain.
                     scratch.stream_gauge.opened(stream_id);
                     let handle = demux_recv.register_stream(stream_id, STREAM_RECV_CHANNEL_DEPTH);
@@ -6205,9 +6213,12 @@ impl PhantomSession {
         ));
         self.streams.insert(stream_id, transport_stream);
         // Count the stream on the active-streams gauge. The matching retire is
-        // `retire_stream`, once both halves are closed, or — for a stream still
-        // open when the session ends (including one opened after the pump already
-        // exited) — the drain in `Drop for PhantomSession` / at pump exit.
+        // `retire_stream`, once both halves are closed; `retire_released_stream`,
+        // once the handle has been dropped and this side's half is closed (at once,
+        // for a stream dropped before a reliable byte was written on it); the
+        // offset-exhaustion fallback in `flush_deferred_sends`; or — for a stream
+        // still open when the session ends (including one opened after the pump
+        // already exited) — the drain in `Drop for PhantomSession` / at pump exit.
         self.stream_gauge.opened(stream_id);
 
         Arc::new(crate::api::stream::PhantomStream::new(
