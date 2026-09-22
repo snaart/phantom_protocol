@@ -500,7 +500,7 @@ A peer is wire-conformant with the default build of this repository when:
 - [ ] Its hybrid-KEM combiner is Extract-then-Expand over all **four** inputs — both shared secrets, the classical ciphertext, the recipient's classical public key — under `HybridKEM_X25519_Kyber768` (PROTOCOL.md § 3, Rung 4).
 - [ ] `encode(value)` equals each packet `.bin`, and `decode(.bin)` equals the value, for the four packet fixtures (Rung 1).
 - [ ] It frames packets for its transport — the 9-byte PhantomUDP envelope with zeroed reserved bits, or the 4-byte big-endian message prefix every stream leg except WebSocket carries (Rung 1b).
-- [ ] It allocates stream ids in its own parity — odd from 3 as the initiator, even from 2 as the responder, with 0 and 1 reserved (PROTOCOL.md § 4.4).
+- [ ] It allocates stream ids in its own parity — odd from 3 as the initiator, even from 2 as the responder, with 0 and 1 reserved — uses each at most once per session, and refuses to open a stream past 65535 / 65534 rather than wrapping (PROTOCOL.md § 4.4).
 - [ ] The same holds for all borsh handshake / sub-struct fixtures (Rung 2).
 - [ ] It treats the cookie `HelloRetryRequest` as the normal first answer, replies with the *same* hello (only `cookie` / `pow_solution` replaced), and — on PhantomUDP — retransmits its own flight on a bounded timer (Rung 2, PROTOCOL.md § 6.1 / § 6.8).
 - [ ] While connecting, it discards every datagram that is not a handshake datagram carrying its own bootstrap `ConnId`, before reassembling it, and without disturbing its retransmit timer (Rung 2, PROTOCOL.md § 6.1 rule 6).

@@ -649,10 +649,13 @@ uint64_t uniffi_phantom_protocol_fn_method_phantomsession_migrate(
     void                    *ptr,
     PhantomRustBuffer        local_addr);
 
-/* open_stream() -> PhantomStream (sync). Opens a new locally-initiated
- * multiplexed stream and returns its object handle directly — there is no
- * future to drive. Cast the returned handle to `void *` for the PhantomStream
- * methods / `_free_phantomstream`. */
+/* open_stream() -> Result<PhantomStream, CoreError> (sync). Opens a new
+ * locally-initiated multiplexed stream and returns its object handle directly —
+ * there is no future to drive. Check `call_status` first: once this side has
+ * opened every stream id its half of the 16-bit id space holds (32 767 per
+ * session), the call fails with CoreError::StreamError there and the returned
+ * value is not a handle. Otherwise cast the returned handle to `void *` for the
+ * PhantomStream methods / `_free_phantomstream`. */
 uint64_t uniffi_phantom_protocol_fn_method_phantomsession_open_stream(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);

@@ -2085,7 +2085,15 @@ pub async fn streams(
 
     let mut handles = Vec::with_capacity(stream_count);
     for i in 0..stream_count {
-        let stream = framed.session().open_stream();
+        let stream = match framed.session().open_stream() {
+            Ok(stream) => stream,
+            Err(e) => {
+                // The session has handed out every stream id it can; the streams already
+                // running are still measured.
+                out.error_after(leg, "streams", "open_stream", &e, t0);
+                break;
+            }
+        };
         // Spread priorities so the scheduler has something to differentiate.
         let priority = (i as u32 % 4) * 8;
         let _ = stream.set_priority(priority).await;

@@ -6203,8 +6203,20 @@ impl PhantomSession {
     /// handle closes the stream's writing half behind everything written on it; see
     /// [`PhantomStream`](crate::api::stream::PhantomStream) for when the stream then
     /// leaves the session.
-    pub fn open_stream(&self) -> Arc<crate::api::stream::PhantomStream> {
-        let handle = self.demux.open_stream(STREAM_RECV_CHANNEL_DEPTH);
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::StreamError`] once this side has opened 32 767 streams in the
+    /// session. A stream id travels in a 16-bit header field and each side allocates
+    /// from its own half of that space, never reusing an id — even one whose stream
+    /// has long since closed, because the peer may still be holding it or the record
+    /// that it closed, and would fold a new stream's bytes into it. Nothing is opened
+    /// and the session is otherwise unaffected: streams already open carry on, and
+    /// `accept_stream()` still takes the peer's. The limit counts every stream opened,
+    /// not the ones open at once, so a long-lived session that opens a stream per
+    /// request reaches it; open a new session to continue.
+    pub fn open_stream(&self) -> Result<Arc<crate::api::stream::PhantomStream>, CoreError> {
+        let handle = self.demux.open_stream(STREAM_RECV_CHANNEL_DEPTH)?;
         let stream_id = handle.stream_id;
 
         let transport_stream = Arc::new(Stream::with_recv_tuning(
@@ -6221,7 +6233,7 @@ impl PhantomSession {
         // already exited) — the drain in `Drop for PhantomSession` / at pump exit.
         self.stream_gauge.opened(stream_id);
 
-        Arc::new(crate::api::stream::PhantomStream::new(
+        Ok(Arc::new(crate::api::stream::PhantomStream::new(
             handle,
             StreamLink {
                 commands: self.cmd_tx.clone(),
@@ -6229,7 +6241,7 @@ impl PhantomSession {
                 released: self.released_tx.clone(),
             },
             self.state.clone(),
-        ))
+        )))
     }
 
     /// Accept the next peer-initiated stream.
@@ -9564,7 +9576,7 @@ mod tests {
 
         // Before the handshake has any chance to complete: the ordering that makes the
         // budget's owner the API layer rather than the negotiated session.
-        let _early = session.open_stream();
+        let _early = session.open_stream().expect("open a stream");
 
         let server_handle = tokio::spawn(async move {
             let client_ip = "127.0.0.1".parse().unwrap();
@@ -9592,7 +9604,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         assert_eq!(session.connection_state(), ConnectionState::Connected);
-        let _late = session.open_stream();
+        let _late = session.open_stream().expect("open a stream");
 
         // The pump inserted its own raw stream (id 1) alongside the two opened here, so
         // this covers all three creation sites the API layer owns.
@@ -9945,7 +9957,10 @@ mod tests {
         /// Open a stream from this side the way `PhantomSession::open_stream` does. The
         /// handle is returned so the stream's delivery channel stays open.
         fn open_local(&self) -> crate::transport::multiplexer::StreamHandle {
-            let handle = self.demux.open_stream(STREAM_RECV_CHANNEL_DEPTH);
+            let handle = self
+                .demux
+                .open_stream(STREAM_RECV_CHANNEL_DEPTH)
+                .expect("an id is free");
             self.streams.insert(
                 handle.stream_id,
                 Arc::new(TransportStream::with_recv_tuning(
@@ -13067,7 +13082,7 @@ mod tests {
             .send(vec![0x5A; 4 << 20])
             .await
             .expect("the pump takes the write in");
-        let stream = closing.open_stream();
+        let stream = closing.open_stream().expect("open a stream");
         let writer =
             tokio::spawn(
                 async move { while stream.send_reliable(vec![0xC3; 64]).await.is_ok() {} },
@@ -13256,7 +13271,7 @@ mod tests {
             PhantomSession::from_accepted_server_session("closing".into(), transport, inner);
         let obs = session.observability();
 
-        let stream = session.open_stream();
+        let stream = session.open_stream().expect("open a stream");
         stream
             .send_unreliable(vec![0xE7; UNREAD_BACKLOG])
             .await
@@ -13561,7 +13576,7 @@ mod tests {
         const BULK: usize = 4 << 20;
         let (closing, peer) = connected_client_and_server().await;
 
-        let stream = closing.open_stream();
+        let stream = closing.open_stream().expect("open a stream");
         let id = stream.stream_id();
         stream
             .send_reliable(vec![0x5A; BULK])
@@ -13604,7 +13619,7 @@ mod tests {
         const BULK: usize = 4 << 20;
         let (closing, peer) = connected_client_and_server().await;
 
-        let stream = closing.open_stream();
+        let stream = closing.open_stream().expect("open a stream");
         let id = stream.stream_id();
         stream
             .send_reliable(vec![0x5A; BULK])
@@ -15240,10 +15255,20 @@ mod tests {
 
         // Open several streams on each side.
         let client_ids: Vec<u32> = (0..5)
-            .map(|_| client_demux.open_stream(8).stream_id)
+            .map(|_| {
+                client_demux
+                    .open_stream(8)
+                    .expect("an id is free")
+                    .stream_id
+            })
             .collect();
         let server_ids: Vec<u32> = (0..5)
-            .map(|_| server_demux.open_stream(8).stream_id)
+            .map(|_| {
+                server_demux
+                    .open_stream(8)
+                    .expect("an id is free")
+                    .stream_id
+            })
             .collect();
 
         // Client must produce odd ids ≥ 3.
@@ -15310,7 +15335,7 @@ mod tests {
         );
 
         // Open a stream (id ≥ 2) on the server so the demux is registered.
-        let stream = server.open_stream();
+        let stream = server.open_stream().expect("open a stream");
         let stream_id = stream.stream_id() as TransportStreamId;
 
         // Drain ACKs from the server so its reader never wedges.
@@ -15393,7 +15418,7 @@ mod tests {
         );
 
         // Open an id-≥2 stream on the server and NEVER consume it.
-        let _unopened = server.open_stream();
+        let _unopened = server.open_stream().expect("open a stream");
         let unopened_id = _unopened.stream_id() as TransportStreamId;
 
         let drain_t = Arc::new(client_t);
@@ -16047,8 +16072,8 @@ mod tests {
         let obs = session.observability();
         assert_eq!(obs.snapshot().active_streams, 0);
 
-        let _a = session.open_stream();
-        let _b = session.open_stream();
+        let _a = session.open_stream().expect("open a stream");
+        let _b = session.open_stream().expect("open a stream");
         assert_eq!(
             obs.snapshot().active_streams,
             2,

@@ -553,6 +553,18 @@ both ends never collide. Source: `transport/multiplexer.rs`
 `api/session.rs` (`is_client = true` for the connecting side, `false` for the
 accepting side).
 
+**An id is used once per session, and the space ends.** The field is 16 bits, so
+each side has 32 767 ids for the life of the session — `3 … 65535` for the
+initiator, `2 … 65534` for the responder — and a side that has handed out its last
+one MUST refuse to open another rather than wrap. It MUST NOT reuse an id either,
+even one whose stream both ends have closed: the peer may still hold that stream,
+or the record that it existed (below), and would take the new stream's bytes as
+more of the old one's or acknowledge and discard them — a loss that neither end
+reports. This implementation refuses the open with `CoreError::StreamError` and
+leaves the session otherwise untouched (`StreamDemultiplexer::open_stream`); a
+side that needs more streams opens a new session. The limit counts every stream a
+side has opened, not the ones open at once, which the cap below bounds.
+
 The parity is an **allocation** discipline, and a receiver reads it for one
 purpose: telling a stream the peer is opening from a late frame for a stream
 that has gone. A stream is dropped once both of its halves are closed (§ 4.5) — or,
@@ -2803,15 +2815,12 @@ building against a real peer.
   a budget. The handshake's own timers are the exception and are specified, in
   § 6.1, because on a datagram transport they are the whole of its loss
   recovery.
-- **A ceiling on stream ids.** § 4.4 fixes the parity rule and the two reserved
-  ids, but not a maximum, and this implementation does not enforce one: its
-  allocator counts in 32 bits while the header field is 16 (§ 4.2), so a session
-  that opens more than about 32 767 streams wraps its ids back onto low values —
-  the reserved `0` and `1` included. Far outside any plausible use (the
-  concurrent cap is 256), but it is a truncation, not a refusal, so nothing
-  reports it: a frame on a reused id reaches whatever either end still keeps
-  for that id's first stream — the stream itself if it is open, otherwise the
-  record that it closed, which acknowledges the frame and discards it (§ 4.4).
+- **Recovering stream ids.** § 4.4 gives each side 32 767 stream ids for the life
+  of a session and forbids reusing one, so a session that opens a stream per
+  request runs out, and the only remedy it states is a new session. Nothing in
+  the format lets two peers agree that an id is free again, and this document
+  defines no such mechanism; QUIC sidesteps the question with a 62-bit id space,
+  which a 16-bit header field cannot.
 - **How to interoperate with a `fips` build.** § 6.7 explains why a fips peer
   and a default peer cannot talk, and § 11 notes the frozen vectors compile to
   nothing under that feature. What a fips-to-fips conformance set would contain

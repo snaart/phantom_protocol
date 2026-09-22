@@ -7,11 +7,17 @@
 //! copying. Stream id 0 is reserved for the session-level control channel;
 //! unknown stream ids are dropped with a log warning.
 
-use crate::transport::types::SequenceNumber;
+use crate::errors::CoreError;
+use crate::transport::types::{SequenceNumber, StreamId};
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::mpsc;
+
+/// The highest stream id a packet header can carry: its `stream_id` field is 16 bits
+/// ([`StreamId`]). Neither side allocates past it — see
+/// [`StreamDemultiplexer::open_stream`].
+pub const LAST_STREAM_ID: u32 = StreamId::MAX as u32;
 
 /// Messages routed to a stream by the demultiplexer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,11 +50,19 @@ pub enum StreamMessage {
 /// stream used by `PhantomSession::send`/`recv`). To avoid collisions when both
 /// peers open streams independently (QUIC-style), allocation is role-stratified:
 ///
-/// - **Client** allocates **odd** ids: 3, 5, 7, …
-/// - **Server** allocates **even** ids: 2, 4, 6, …
+/// - **Client** allocates **odd** ids: 3, 5, 7, …, 65535
+/// - **Server** allocates **even** ids: 2, 4, 6, …, 65534
 ///
 /// Neither side will ever produce an id the other produces, so concurrent
 /// `open_stream()` calls on both ends never clash.
+///
+/// Ids are counted in 32 bits here but travel in the packet header's 16-bit
+/// field, so allocation stops at [`LAST_STREAM_ID`]: 32 767 ids per side for the
+/// life of the session, after which [`open_stream`](Self::open_stream) refuses.
+/// Counting on would put the next id on the wire as its low 16 bits — an id this
+/// side already used, whose stream the peer still holds or has dropped — and the
+/// peer would merge the new stream's bytes into the old one or acknowledge and
+/// discard them, with no error at either end.
 pub struct StreamDemultiplexer {
     /// Active stream senders: stream_id → sender channel
     streams: DashMap<u32, mpsc::Sender<StreamMessage>>,
@@ -114,13 +128,43 @@ impl StreamDemultiplexer {
     /// The allocated id respects the role set at construction time:
     /// clients get odd ids (≥ 3), servers get even ids (≥ 2). Id 1 (the
     /// raw-app stream) is never returned here.
-    pub fn open_stream(&self, buffer_size: usize) -> StreamHandle {
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::StreamError`] once this side's half of the 16-bit id space is
+    /// used up — every id of its parity up to [`LAST_STREAM_ID`] has been handed
+    /// out. Ids are never reused within a session, so this is permanent for the
+    /// session; nothing is registered and the allocator does not move.
+    pub fn open_stream(&self, buffer_size: usize) -> Result<StreamHandle, CoreError> {
         let stream_id = self
             .next_stream_id
-            .fetch_add(self.id_step, Ordering::Relaxed);
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+                // `next + id_step` cannot overflow: `next` never moves past
+                // `LAST_STREAM_ID + id_step`, far below `u32::MAX`.
+                (next <= LAST_STREAM_ID).then_some(next + self.id_step)
+            })
+            .map_err(|_| {
+                CoreError::StreamError(
+                    "stream id space exhausted: this side has opened every stream id the \
+                     16-bit header can carry; open a new session"
+                        .into(),
+                )
+            })?;
         let (tx, rx) = mpsc::channel(buffer_size);
         self.streams.insert(stream_id, tx);
-        StreamHandle { stream_id, rx }
+        Ok(StreamHandle { stream_id, rx })
+    }
+
+    /// Move the allocator so the next id [`open_stream`](Self::open_stream) hands out is
+    /// `next`, as though every id of this side's parity below it had been opened — the way
+    /// a test reaches the top of the id space without opening thirty thousand streams.
+    #[cfg(test)]
+    pub(crate) fn skip_to_stream_id_for_test(&self, next: u32) {
+        assert!(
+            self.is_local_stream_id(next),
+            "{next} is not an id of this side's parity"
+        );
+        self.next_stream_id.store(next, Ordering::Release);
     }
 
     /// Register a stream with a specific ID (e.g., for accepting remote-initiated streams).
@@ -150,7 +194,7 @@ impl StreamDemultiplexer {
     pub fn has_opened(&self, stream_id: u32) -> bool {
         self.is_local_stream_id(stream_id)
             && stream_id >= self.first_stream_id
-            && stream_id < self.next_stream_id.load(Ordering::Relaxed)
+            && stream_id < self.next_stream_id.load(Ordering::Acquire)
     }
 
     /// Remove a stream from the routing table.
@@ -292,7 +336,7 @@ mod tests {
     async fn test_demux_open_and_route() {
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
 
-        let handle = demux.open_stream(16);
+        let handle = demux.open_stream(16).expect("an id is free");
         let sid = handle.stream_id;
         let mut rx = handle.rx;
 
@@ -332,7 +376,7 @@ mod tests {
     async fn test_demux_close_stream() {
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
 
-        let handle = demux.open_stream(16);
+        let handle = demux.open_stream(16).expect("an id is free");
         let sid = handle.stream_id;
         assert!(demux.has_stream(sid));
 
@@ -386,12 +430,57 @@ mod tests {
     async fn test_demux_multiple_streams() {
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
 
-        let h1 = demux.open_stream(16);
-        let h2 = demux.open_stream(16);
-        let h3 = demux.open_stream(16);
+        let h1 = demux.open_stream(16).expect("an id is free");
+        let h2 = demux.open_stream(16).expect("an id is free");
+        let h3 = demux.open_stream(16).expect("an id is free");
 
         assert_ne!(h1.stream_id, h2.stream_id);
         assert_ne!(h2.stream_id, h3.stream_id);
         assert_eq!(demux.active_stream_count(), 3);
+    }
+
+    /// Each side hands out its own parity up to the last id the 16-bit header can carry,
+    /// and then refuses — for good — rather than counting on.
+    ///
+    /// The allocator counted in 32 bits and never stopped, while the id travels as 16: the
+    /// client's id after 65535 was 65537, which goes on the wire as 1, the reserved raw
+    /// application stream, and every id after that lands on one this side has already
+    /// used. The peer then merges the new stream into the old one, or acknowledges and
+    /// discards it, and nothing reports either.
+    #[tokio::test]
+    async fn allocation_stops_at_the_top_of_the_16_bit_id_space() {
+        for (is_client, last) in [(true, LAST_STREAM_ID), (false, LAST_STREAM_ID - 1)] {
+            let (demux, _ctrl) = StreamDemultiplexer::new_with_role(16, is_client);
+            // 32 767 ids for either side, 0 and 1 being reserved.
+            assert_eq!((last - demux.first_stream_id) / 2 + 1, 32_767);
+
+            demux.skip_to_stream_id_for_test(last - 2);
+            let below = demux.open_stream(1).expect("an id below the top");
+            let top = demux.open_stream(1).expect("the top id itself");
+            assert_eq!((below.stream_id, top.stream_id), (last - 2, last));
+            assert_eq!(u32::from(top.stream_id as StreamId), top.stream_id);
+
+            for attempt in 0..3 {
+                match demux.open_stream(1) {
+                    Err(CoreError::StreamError(_)) => {}
+                    Ok(past) => panic!(
+                        "attempt {attempt}: allocated {} past the top of the id space; it \
+                         goes on the wire as {}",
+                        past.stream_id, past.stream_id as StreamId
+                    ),
+                    Err(other) => panic!("attempt {attempt}: refused with {other:?}"),
+                }
+            }
+            assert_eq!(
+                demux.active_stream_count(),
+                2,
+                "a refused open registers nothing"
+            );
+            assert!(demux.has_opened(last), "the top id was handed out");
+            assert!(
+                !demux.has_opened(last + 2),
+                "a refused open does not count as an id handed out"
+            );
+        }
     }
 }

@@ -778,9 +778,26 @@ impl Session {
         *self.state.write() = new_state;
     }
 
-    /// Open a new stream
-    pub fn open_stream(&self) -> Arc<Stream> {
-        let stream_id = self.next_stream_id.fetch_add(1, Ordering::SeqCst) as StreamId;
+    /// Open a new stream, with the next id in sequence counting from 1.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::StreamError`] once every id a [`StreamId`] can hold has been handed
+    /// out. Ids are not reused: counting on would hand out 0, then 1 again, and the new
+    /// stream would silently replace the one this session still holds under that id.
+    pub fn open_stream(&self) -> Result<Arc<Stream>, CoreError> {
+        let exhausted = || {
+            CoreError::StreamError(
+                "stream id space exhausted: every 16-bit stream id has been opened".into(),
+            )
+        };
+        let id = self
+            .next_stream_id
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| {
+                StreamId::try_from(id).ok().map(|_| id + 1)
+            })
+            .map_err(|_| exhausted())?;
+        let stream_id = StreamId::try_from(id).map_err(|_| exhausted())?;
         // Every stream of this session draws its receive-window growth from the session's
         // one allowance, exactly as the streams the `PhantomSession` pump builds do. A
         // `Session` driven on its own is still a session, and a budget handed out per stream
@@ -791,7 +808,7 @@ impl Session {
         ));
 
         self.streams.write().insert(stream_id, stream.clone());
-        stream
+        Ok(stream)
     }
 
     /// Get an existing stream
@@ -2068,5 +2085,42 @@ impl Drop for Session {
         if let Some(mut secret) = self.resumption_secret.write().take() {
             secret.zeroize();
         }
+    }
+}
+
+#[cfg(test)]
+mod stream_id_tests {
+    use super::*;
+
+    /// A session hands out every id a `StreamId` can hold and then refuses, rather than
+    /// wrapping to 0 and replacing a stream it still holds.
+    #[test]
+    fn open_stream_refuses_once_every_stream_id_is_used() {
+        let session = Session::new(SessionId([0x5A; 32]), &[0x11; 32], false).expect("session");
+        let first = session.open_stream().expect("the first id");
+        assert_eq!(first.id(), 1);
+
+        // Skip to the top of the id space rather than open sixty-five thousand streams.
+        session
+            .next_stream_id
+            .store(u32::from(StreamId::MAX), Ordering::SeqCst);
+        let top = session.open_stream().expect("the last id");
+        assert_eq!(top.id(), StreamId::MAX);
+
+        for attempt in 0..3 {
+            match session.open_stream() {
+                Err(CoreError::StreamError(_)) => {}
+                Ok(stream) => panic!(
+                    "attempt {attempt}: handed out id {} past the top of the id space",
+                    stream.id()
+                ),
+                Err(other) => panic!("attempt {attempt}: refused with {other:?}"),
+            }
+        }
+        assert_eq!(session.stream_count(), 2, "a refused open adds nothing");
+        assert!(
+            Arc::ptr_eq(&session.get_stream(1).expect("stream 1"), &first),
+            "the first stream must still be the one under its id"
+        );
     }
 }

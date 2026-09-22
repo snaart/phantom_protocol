@@ -329,7 +329,7 @@ async fn observability_e2e_stream_gauge_returns_to_zero_after_clean_close() {
 
     let mut streams = Vec::with_capacity(STREAMS);
     for i in 0..STREAMS {
-        let stream = client.open_stream();
+        let stream = client.open_stream().expect("open a stream");
         stream
             .send_reliable(format!("stream-{i}-payload").into_bytes())
             .await
@@ -422,7 +422,7 @@ async fn observability_e2e_stream_gauge_returns_to_zero_when_the_peer_dies() {
 
     let mut streams = Vec::with_capacity(STREAMS);
     for i in 0..STREAMS {
-        let stream = client.open_stream();
+        let stream = client.open_stream().expect("open a stream");
         stream
             .send_reliable(format!("doomed-{i}").into_bytes())
             .await

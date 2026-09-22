@@ -115,7 +115,7 @@ async fn wait_until_no_streams(session: &PhantomSession, who: &str) {
 async fn the_end_that_closes_first_still_reads_the_reply() {
     let (client, server) = establish().await;
 
-    let ours = client.open_stream();
+    let ours = client.open_stream().expect("open a stream");
     ours.send_reliable(b"ping".to_vec())
         .await
         .expect("send ping");
@@ -173,7 +173,7 @@ async fn the_end_that_closes_first_still_reads_the_reply() {
 async fn data_the_peer_sends_after_the_first_close_is_not_stranded() {
     let (client, server) = establish().await;
 
-    let ours = client.open_stream();
+    let ours = client.open_stream().expect("open a stream");
     ours.send_reliable(b"ping".to_vec())
         .await
         .expect("send ping");
@@ -264,7 +264,7 @@ async fn streams_closed_from_both_ends_do_not_use_up_the_stream_table() {
         let clean = clean.clone();
         workers.push(tokio::spawn(async move {
             for _ in (first..CYCLES).step_by(WORKERS) {
-                let stream = client.open_stream();
+                let stream = client.open_stream().expect("open a stream");
                 stream
                     .send_reliable(b"x".to_vec())
                     .await
@@ -295,7 +295,7 @@ async fn streams_closed_from_both_ends_do_not_use_up_the_stream_table() {
     }
 
     // After all of that, a stream the server opens is still one the client takes.
-    let late = server.open_stream();
+    let late = server.open_stream().expect("open a stream");
     late.send_reliable(b"after".to_vec())
         .await
         .expect("send on the server's new stream");
@@ -360,7 +360,7 @@ async fn a_stream_that_is_only_written_to_does_not_stall_the_others() {
     const SEGMENTS: usize = STREAM_RECV_CHANNEL_DEPTH + 256;
     let (client, server) = establish().await;
 
-    let upload = client.open_stream();
+    let upload = client.open_stream().expect("open a stream");
     let total = SEGMENTS * MAX_APP_CHUNK;
     upload
         .send_reliable(vec![0x5A; total])
@@ -384,8 +384,8 @@ async fn a_stream_that_is_only_written_to_does_not_stall_the_others() {
     // below the upload's 3: its data would leave ahead of the FIN and reach the client
     // before anything could stall. Spending id 2 puts the second stream after the upload,
     // so the FIN is the first of the two on the wire.
-    let _spent = server.open_stream();
-    let other = server.open_stream();
+    let _spent = server.open_stream().expect("open a stream");
+    let other = server.open_stream().expect("open a stream");
     assert!(other.stream_id() > upload.stream_id());
     other
         .send_reliable(b"elsewhere".to_vec())
@@ -418,7 +418,7 @@ async fn a_stream_that_is_only_written_to_does_not_stall_the_others() {
 async fn a_write_after_close_does_not_follow_the_eof() {
     let (client, server) = establish().await;
 
-    let ours = client.open_stream();
+    let ours = client.open_stream().expect("open a stream");
     ours.send_reliable(b"ping".to_vec())
         .await
         .expect("send ping");
@@ -489,7 +489,7 @@ async fn streams_the_peer_never_closes_leave_the_table_once_let_go() {
         let client = client.clone();
         workers.push(tokio::spawn(async move {
             for _ in (first..CYCLES).step_by(WORKERS) {
-                let stream = client.open_stream();
+                let stream = client.open_stream().expect("open a stream");
                 stream
                     .send_reliable(b"request".to_vec())
                     .await
@@ -517,7 +517,7 @@ async fn streams_the_peer_never_closes_leave_the_table_once_let_go() {
     // point where the cap would have refused them had the closed streams stayed.
     let mut late = Vec::with_capacity(LATE);
     for _ in 0..LATE {
-        let stream = server.open_stream();
+        let stream = server.open_stream().expect("open a stream");
         stream
             .send_reliable(b"late".to_vec())
             .await
@@ -554,7 +554,7 @@ async fn streams_the_peer_never_closes_leave_the_table_once_let_go() {
 async fn a_held_handle_keeps_its_stream_until_the_peer_closes() {
     let (client, server) = establish().await;
 
-    let ours = client.open_stream();
+    let ours = client.open_stream().expect("open a stream");
     ours.send_reliable(b"ping".to_vec())
         .await
         .expect("send ping");
@@ -611,7 +611,7 @@ async fn a_held_handle_keeps_its_stream_until_the_peer_closes() {
 async fn dropping_a_stream_handle_closes_its_writing_half_behind_what_it_wrote() {
     let (client, server) = establish().await;
 
-    let ours = client.open_stream();
+    let ours = client.open_stream().expect("open a stream");
     let id = ours.stream_id();
     let payload: Vec<u8> = (0..64 * MAX_APP_CHUNK + 17).map(|i| i as u8).collect();
     ours.send_reliable(payload.clone())
@@ -661,7 +661,7 @@ async fn dropping_a_stream_handle_closes_its_writing_half_behind_what_it_wrote()
 async fn a_stream_dropped_before_it_was_written_leaves_without_a_trace() {
     let (client, server) = establish().await;
 
-    let unused = client.open_stream();
+    let unused = client.open_stream().expect("open a stream");
     assert!(client.demux().has_stream(unused.stream_id()));
     drop(unused);
 
@@ -700,7 +700,7 @@ async fn a_second_stream_still_delivers(
     reader: &PhantomSession,
     who: &str,
 ) {
-    let other = writer.open_stream();
+    let other = writer.open_stream().expect("open a stream");
     let mut expected = Vec::new();
     for n in 0..WRITES_BEHIND {
         let message = format!("elsewhere {n};").into_bytes();
@@ -756,7 +756,7 @@ const TO_NOBODY: usize = 8 * 1024 * 1024;
 async fn a_stream_let_go_of_while_the_peer_writes_does_not_stall_the_peer() {
     let (client, server) = establish().await;
 
-    let ours = client.open_stream();
+    let ours = client.open_stream().expect("open a stream");
     ours.send_reliable(b"open".to_vec())
         .await
         .expect("open the stream on the wire");
@@ -801,7 +801,7 @@ async fn a_stream_let_go_of_while_the_peer_writes_does_not_stall_the_peer() {
 async fn a_stream_let_go_of_mid_upload_does_not_stall_the_peer() {
     let (client, server) = establish().await;
 
-    let ours = client.open_stream();
+    let ours = client.open_stream().expect("open a stream");
     ours.send_reliable(b"open".to_vec())
         .await
         .expect("open the stream on the wire");
@@ -826,6 +826,68 @@ async fn a_stream_let_go_of_mid_upload_does_not_stall_the_peer() {
     theirs.disconnect().await.expect("close the server's half");
     wait_until_gone(&server, theirs.stream_id(), "server").await;
     assert_eq!(server.connection_state(), ConnectionState::Connected);
+    assert_eq!(client.connection_state(), ConnectionState::Connected);
+
+    shutdown(&client, &server).await;
+}
+
+/// The last stream id this side can open works end to end, and the open after it is
+/// refused with a typed error, leaving the session and its open streams as they were.
+///
+/// Ids are counted in 32 bits but travel in a 16-bit header field. The allocator never
+/// stopped, so the client's next stream after 65535 went on the wire as 1 — the reserved
+/// raw application stream — and every one after that as an id already used, which the peer
+/// merged into a stream it held or acknowledged and discarded as one it had dropped: bytes
+/// lost with success reported on both ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_open_after_the_last_stream_id_is_refused() {
+    let (client, server) = establish().await;
+
+    // Skip the client's allocator to its last id rather than open 32 767 streams.
+    let last = crate::transport::multiplexer::LAST_STREAM_ID;
+    client.demux().skip_to_stream_id_for_test(last);
+    let ours = client.open_stream().expect("the last stream id");
+    assert_eq!(ours.stream_id(), last);
+    ours.send_reliable(b"at the top".to_vec())
+        .await
+        .expect("write on the last stream");
+    let theirs = accept(&server, "server").await;
+    assert_eq!(theirs.stream_id(), last, "the id arrived intact");
+    assert_eq!(
+        next_read(&theirs, "server").await.expect("read"),
+        Some(b"at the top".to_vec())
+    );
+
+    let open = client.observability().snapshot().active_streams;
+    let routed = client.demux().active_stream_count();
+    for attempt in 0..3 {
+        match client.open_stream() {
+            Err(CoreError::StreamError(_)) => {}
+            Ok(stream) => panic!(
+                "attempt {attempt}: opened stream {} past the last id; it goes on the wire as {}",
+                stream.stream_id(),
+                stream.stream_id() as u16
+            ),
+            Err(other) => panic!("attempt {attempt}: refused with {other:?}"),
+        }
+    }
+    assert_eq!(
+        client.observability().snapshot().active_streams,
+        open,
+        "a refused open is not counted"
+    );
+    assert_eq!(
+        client.demux().active_stream_count(),
+        routed,
+        "a refused open routes nothing"
+    );
+    assert_nothing_accepted(&server, "a stream the client could not open").await;
+
+    // The session carries on: the stream already open still works, and so does the
+    // server's side of the id space.
+    ours.disconnect().await.expect("close the last stream");
+    assert_eq!(next_read(&theirs, "server").await.expect("read EOF"), None);
+    a_second_stream_still_delivers(&server, &client, "server").await;
     assert_eq!(client.connection_state(), ConnectionState::Connected);
 
     shutdown(&client, &server).await;

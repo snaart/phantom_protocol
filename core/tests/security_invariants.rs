@@ -2951,7 +2951,7 @@ async fn recv_window_growth_is_bounded_per_session_not_per_stream() {
     for i in 0..SESSIONS {
         let (session, _peer) = make_session_pair([0x40 + i as u8; 32]);
         let streams: Vec<_> = (0..STREAMS_PER_SESSION)
-            .map(|_| session.open_stream())
+            .map(|_| session.open_stream().expect("open a stream"))
             .collect();
         for s in &streams {
             s.record_app_consumed(1, true); // open each measurement interval
@@ -3057,7 +3057,7 @@ async fn the_published_process_growth_figure_is_the_session_cap_times_what_a_ses
     for i in 0..SESSIONS {
         let (session, _peer) = make_session_pair([0x70 + i as u8; 32]);
         let streams: Vec<_> = (0..STREAMS_PER_SESSION)
-            .map(|_| session.open_stream())
+            .map(|_| session.open_stream().expect("open a stream"))
             .collect();
         for s in &streams {
             s.record_app_consumed(1, true); // open each stream's measurement interval
@@ -3397,7 +3397,7 @@ async fn forged_unencrypted_post_handshake_packet_is_dropped_by_the_recv_path() 
     // table the pump reads, both of which the session created before the pump was
     // spawned, so no wire traffic and no cooperation from the server side is needed
     // to make the client route frames stamped with this id to it.
-    let app_stream = session.open_stream();
+    let app_stream = session.open_stream().expect("open a stream");
     let target: u16 = app_stream
         .stream_id()
         .try_into()
@@ -3602,7 +3602,7 @@ async fn forged_unencrypted_close_frame_cannot_end_a_session() {
         .await
         .expect("the pinned handshake completes");
     let session_id = *server_session.id();
-    let app_stream = session.open_stream();
+    let app_stream = session.open_stream().expect("open a stream");
     let target: u16 = app_stream
         .stream_id()
         .try_into()
@@ -3741,7 +3741,7 @@ async fn an_authenticated_close_drains_trailing_data_and_then_ends_the_session()
         .await
         .expect("the pinned handshake completes");
     let session_id = *server_session.id();
-    let app_stream = session.open_stream();
+    let app_stream = session.open_stream().expect("open a stream");
     let target: u16 = app_stream
         .stream_id()
         .try_into()
@@ -3893,7 +3893,7 @@ async fn a_draining_session_refuses_writes_instead_of_discarding_them_behind_an_
     // assertions after it would be satisfied by a session that was never usable.
     assert_eq!(session.connection_state(), ConnectionState::Connected);
     assert!(session.is_data_ready());
-    let app_stream = session.open_stream();
+    let app_stream = session.open_stream().expect("open a stream");
     session
         .send(b"before-the-close".to_vec())
         .await
@@ -4074,7 +4074,7 @@ async fn a_previous_wire_version_frame_is_dropped_before_the_flag_dispatch() {
         .await
         .expect("the pinned handshake completes");
     let session_id = *server_session.id();
-    let app_stream = session.open_stream();
+    let app_stream = session.open_stream().expect("open a stream");
     let target: u16 = app_stream
         .stream_id()
         .try_into()
