@@ -3648,9 +3648,16 @@ async fn flush_deferred_sends<T: SessionTransport>(
                     }
                     Ok(false) => break,
                     Err(e) => {
-                        // Same offset exhaustion, on the FIN sentinel. Fall back to
-                        // a bare (still ENCRYPTED — Invariant 2) FIN and retire the
-                        // stream, exactly as the inline path used to.
+                        deferred.pop_front();
+                        // Same offset exhaustion, on the FIN sentinel. Fall back to a bare
+                        // (still ENCRYPTED — Invariant 2) FIN and drop the stream — once. The
+                        // fallback records no FIN as queued, so a second close queued for
+                        // the same stream — the handle's drop behind a `disconnect()` —
+                        // arrives here too, and finds the stream already gone: it had its
+                        // bare FIN, and has already left the table and the gauge.
+                        if streams.remove(&stream_id).is_none() {
+                            continue;
+                        }
                         log::error!(
                             "PhantomSession: queue_fin failed for stream {stream_id}: {e}; \
                              sending bare FIN (best-effort)"
@@ -3666,10 +3673,8 @@ async fn flush_deferred_sends<T: SessionTransport>(
                             observability,
                         )
                         .await;
-                        streams.remove(&stream_id);
                         demux.close_stream(stream_id);
                         stream_gauge.closed(stream_id);
-                        deferred.pop_front();
                     }
                 }
             }
@@ -10625,6 +10630,71 @@ mod tests {
             "a dropped stream was reopened"
         );
         assert_eq!(rig.delivered(), Vec::new(), "a dropped stream delivered");
+    }
+
+    /// A stream whose offset space is exhausted falls back to a bare FIN once, and leaves the
+    /// active-streams gauge once, however many closes are queued for it.
+    ///
+    /// The fallback drops the stream without ever recording a FIN as queued on it, so a
+    /// `Release` waiting behind a `Fin` that had already fallen back found the FIN still
+    /// refused and fell back again: a second bare FIN on the wire, and a second decrement of
+    /// a gauge that counts streams rather than ids — one more open stream reported closed
+    /// than had been.
+    #[tokio::test]
+    async fn an_exhausted_stream_falls_back_to_a_bare_fin_once() {
+        let rig = RecvRig::new();
+        let exhausted = rig.open_local();
+        let other = rig.open_local();
+        for id in [exhausted.stream_id, other.stream_id] {
+            rig.scratch.stream_gauge.opened(id);
+        }
+        let id = exhausted.stream_id;
+        let stream = rig
+            .streams
+            .get(&id)
+            .map(|s| s.clone())
+            .expect("the stream is in the table");
+        stream.exhaust_reliable_offsets_for_test();
+
+        // `disconnect()` and then the handle's drop, both refused room for their FIN.
+        let mut deferred = VecDeque::from([
+            Deferred::Fin {
+                stream_id: id,
+                stream: stream.clone(),
+            },
+            Deferred::Release {
+                stream_id: id,
+                stream: stream.clone(),
+            },
+        ]);
+        flush_deferred_sends(
+            &mut deferred,
+            &rig.transport,
+            &rig.server,
+            rig.session_id,
+            &rig.streams,
+            &rig.demux,
+            &rig.scratch.stream_gauge,
+            &rig.obs,
+        )
+        .await;
+
+        assert!(deferred.is_empty(), "both closes were taken off the queue");
+        assert!(!rig.streams.contains_key(&id));
+        assert!(!rig.demux.has_stream(id));
+        let fins = rig
+            .emitted_frames()
+            .await
+            .into_iter()
+            .filter(|(header, _)| header.flags.contains(PacketFlags::FIN))
+            .count();
+        assert_eq!(fins, 1, "one stream, one bare FIN");
+        assert_eq!(
+            rig.obs.snapshot().active_streams,
+            1,
+            "stream {} is still open and has to be counted",
+            other.stream_id
+        );
     }
 
     /// Every handle to a peer's stream reports being dropped — the one the application took

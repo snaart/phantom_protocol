@@ -299,8 +299,10 @@ task can be cancelled mid-body**, and **what is lost if it is**.
      and admits it through `flush_deferred_sends` / `Stream::try_queue_fin` as a
      zero-length reliable sentinel, retained and retransmitted like data. Only on
      reliable-offset exhaustion does `flush_deferred_sends` fall back to a bare
-     `ENCRYPTED` FIN through `send_app_data`; a teardown cancel there drops a control
-     FIN on a stream already being torn down — benign.
+     `ENCRYPTED` FIN through `send_app_data`, once per stream however many closes are
+     queued for it — the stream leaves the table before that send is awaited, and a
+     later close that finds it gone sends nothing; a teardown cancel there drops a
+     control FIN on a stream already being torn down — benign.
    - `finish_and_announce` ends with `announce_close`, which sends the WIRE v8
      `CLOSE` frame `CLOSE_FRAME_COPIES` (3) times. A teardown cancel part-way through
      loses some copies; nothing waits for their acknowledgement anyway, and a peer

@@ -1662,6 +1662,13 @@ impl Stream {
         self.send_buffer.lock().await
     }
 
+    /// Spend the stream's whole reliable offset space, so its next write or FIN fails the way
+    /// an exhausted stream's does without four billion segments being sent first.
+    #[cfg(test)]
+    pub(crate) fn exhaust_reliable_offsets_for_test(&self) {
+        self.reliable_offset.store(u32::MAX, Ordering::SeqCst);
+    }
+
     /// Record the peer's FIN reliable offset (set-once; idempotent under FIN
     /// retransmits). The Close/EOF is NOT emitted here — see
     /// [`take_in_order_fin`](Self::take_in_order_fin).
