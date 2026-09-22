@@ -513,6 +513,89 @@ mod tests {
         );
     }
 
+    /// A write queued behind the one that stalls is refused, not appended to the frame
+    /// the stall cut off — even when the peer makes room the moment it gets the socket.
+    ///
+    /// A session has two writers on one transport: the send loop and the receive task,
+    /// which sends acknowledgements. The second can pass the first latch check while
+    /// the first is still waiting, queue on the write-half lock, and take it the moment
+    /// the stalled write lets go. The far end here starts draining as soon as the first
+    /// write has failed, so the queued frame would find all the room it needs and go
+    /// out behind the cut-off one, where the far end reads it as the rest of that frame.
+    /// Only the check made again under the lock stops it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_queued_behind_a_stalled_one_is_refused_rather_than_appended() {
+        const QUEUED: &[u8] = b"queued behind the stalled frame";
+        const FILL: u8 = 0x5A;
+        // Longer than `TEST_STALL`: the steps below have to land inside the first
+        // write's deadline, and a loaded test runner can wake a short sleep late.
+        const STALL: Duration = Duration::from_secs(1);
+        let (near, mut far) = test_support::connection_whose_far_end_never_reads().await;
+        let transport =
+            std::sync::Arc::new(TcpSessionTransport::new(near).with_write_stall_timeout(STALL));
+
+        let stalling = {
+            let transport = transport.clone();
+            tokio::spawn(async move { transport.send_bytes(&vec![FILL; LARGE_FRAME]).await })
+        };
+        // Long enough for the large write to take the lock and fill the buffers, well
+        // short of its deadline, so the second write passes the first latch check and
+        // queues on the lock behind a write that has not given up yet.
+        tokio::time::sleep(STALL / 10).await;
+        assert!(
+            !stalling.is_finished(),
+            "the large write finished before the second one queued behind it"
+        );
+        let queued = {
+            let transport = transport.clone();
+            tokio::spawn(async move { transport.send_bytes(QUEUED).await })
+        };
+        tokio::time::sleep(STALL / 20).await;
+        assert!(
+            !queued.is_finished(),
+            "the second write did not queue behind the stalled one"
+        );
+
+        let stalled = stalling.await.expect("stalling writer");
+        assert!(matches!(stalled, Err(CoreError::Timeout)), "{stalled:?}");
+        // The peer makes room at once, so a queued write that went ahead would complete.
+        let arrived = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut got = Vec::new();
+            let mut buf = vec![0u8; 64 * 1024];
+            while let Ok(Ok(n)) =
+                tokio::time::timeout(Duration::from_millis(500), far.read(&mut buf)).await
+            {
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            got
+        });
+        let queued = queued.await.expect("queued writer");
+        assert!(
+            matches!(queued, Err(CoreError::Timeout)),
+            "a write queued behind a stalled one must be refused; got {queued:?}"
+        );
+
+        let arrived = arrived.await.expect("reader");
+        assert!(
+            arrived.len() > 4 && arrived.len() < 4 + LARGE_FRAME,
+            "the stalled frame should have stopped part-way; {} bytes arrived",
+            arrived.len()
+        );
+        assert_eq!(
+            &arrived[..4],
+            &(LARGE_FRAME as u32).to_be_bytes(),
+            "the stalled frame's prefix"
+        );
+        assert!(
+            arrived[4..].iter().all(|&b| b == FILL),
+            "bytes other than the stalled frame's reached the wire after it was cut off"
+        );
+    }
+
     /// A peer that reads slowly but steadily is never cut off, however long the
     /// write takes in total: the deadline is on the gaps, not on the sum.
     ///

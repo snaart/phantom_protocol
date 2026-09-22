@@ -439,6 +439,64 @@ mod tests {
         );
     }
 
+    /// A write queued behind the one that stalls is refused rather than appended to
+    /// the record the stall cut off, even when the peer starts reading the moment the
+    /// first write gives up — the same two-writer case `TcpSessionTransport` guards
+    /// against, and guarded by the same check made again under the write lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_queued_behind_a_stalled_one_is_refused_rather_than_appended() {
+        use crate::api::tcp_transport::test_support::connection_whose_far_end_never_reads;
+        use std::sync::Arc;
+        const STALL: Duration = Duration::from_secs(1);
+
+        let (near, far) = connection_whose_far_end_never_reads().await;
+        let server_config = MimicConfig::new("server-ignored");
+        let client_config = MimicConfig::new("cover.example.com");
+        let (near, far) = tokio::join!(
+            MimicTlsLeg::accept(near, &server_config),
+            MimicTlsLeg::connect(far, &client_config),
+        );
+        let near = Arc::new(
+            near.expect("server prelude")
+                .with_write_stall_timeout(STALL),
+        );
+        let far = far.expect("client prelude");
+        near.set_frame_phase(FramePhase::Established);
+        far.set_frame_phase(FramePhase::Established);
+
+        let stalling = {
+            let near = near.clone();
+            tokio::spawn(async move { near.send_bytes(&vec![0x42_u8; 1024 * 1024]).await })
+        };
+        tokio::time::sleep(STALL / 10).await;
+        assert!(
+            !stalling.is_finished(),
+            "the large write finished before the second one queued behind it"
+        );
+        let queued = {
+            let near = near.clone();
+            tokio::spawn(async move { near.send_bytes(b"queued behind the stall").await })
+        };
+        tokio::time::sleep(STALL / 20).await;
+        assert!(
+            !queued.is_finished(),
+            "the second write did not queue behind the stalled one"
+        );
+
+        let stalled = stalling.await.expect("stalling writer");
+        assert!(matches!(stalled, Err(CoreError::Timeout)), "{stalled:?}");
+        // The peer starts reading at once. Its de-framer waits for the rest of a
+        // message that will never complete, so this read drains the socket for as long
+        // as the test runs, and a queued write that went ahead would find room.
+        let draining = tokio::spawn(async move { far.recv_bytes().await.map(|b| b.len()) });
+        let queued = queued.await.expect("queued writer");
+        assert!(
+            matches!(queued, Err(CoreError::Timeout)),
+            "a write queued behind a stalled one must be refused; got {queued:?}"
+        );
+        draining.abort();
+    }
+
     /// A peer that sends non-TLS garbage instead of a ClientHello is black-holed:
     /// `accept` errors (no usable session) rather than speaking a distinguishable
     /// alert/RST. The drain returns promptly once the peer closes.
