@@ -446,10 +446,11 @@ uint64_t uniffi_phantom_protocol_fn_constructor_phantomlistener_bind_with_signin
 /* Constructor: bind_with_config_bytes(addr: string, signing_key: Vec<u8>,
  *     config: PhantomConfig) -> async Result<PhantomListener, CoreError>.
  * Like bind_with_signing_key_bytes but also applies a PhantomConfig that controls
- * liveness settings (keepalive_interval, session_timeout) and session-cache
- * sizing (session_cache_capacity, session_ticket_lifetime). The config record is
- * lowered into a RustBuffer. Returns a u64 future handle; complete via
- * `_poll_u64` + `_complete_u64`. */
+ * liveness settings (keepalive_interval, session_timeout), session-cache
+ * sizing (session_cache_capacity, session_ticket_lifetime) and the write
+ * deadline of every accepted connection (write_stall_timeout; zero is refused
+ * with CoreError::ConfigError). The config record is lowered into a RustBuffer.
+ * Returns a u64 future handle; complete via `_poll_u64` + `_complete_u64`. */
 uint64_t uniffi_phantom_protocol_fn_constructor_phantomlistener_bind_with_config_bytes(
     PhantomRustBuffer        addr,
     PhantomRustBuffer        signing_key,
@@ -1041,9 +1042,11 @@ uint64_t uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_resumption(
  *  - `PhantomConfig` IS on the FFI surface (as a UniFFI Record): it is
  *    accepted by `bind_with_config_bytes`, `bind_udp_with_config_bytes`,
  *    `connect_pinned_with_config`, and `connect_pinned_udp_with_config`.
- *    It has four fields: `keepalive_interval` (Duration), `session_timeout`
- *    (Duration), `session_cache_capacity` (u32), `session_ticket_lifetime`
- *    (Duration). The `transport::SessionTransport` trait, `HybridSigningKey`,
+ *    It has five fields, lowered in this order: `keepalive_interval`
+ *    (Duration), `session_timeout` (Duration), `session_cache_capacity` (u32),
+ *    `session_ticket_lifetime` (Duration), `write_stall_timeout` (Duration —
+ *    the TCP write deadline; ignored over UDP, zero refused where it is
+ *    used). The `transport::SessionTransport` trait, `HybridSigningKey`,
  *    `HybridVerifyingKey`, runtime injection, and the network simulator are
  *    NOT on the FFI surface.
  *

@@ -6899,6 +6899,12 @@ impl Drop for PhantomSession {
 /// from raw bytes (Security Invariant 1 — mandatory), and starts the
 /// background handshake + data pump.
 ///
+/// The transport gives up on a server that stops reading once a write has gone
+/// thirty seconds without progress, and the session then ends
+/// [`ConnectionState::Dead`] with [`CoreError::Timeout`]. Use
+/// [`connect_pinned_with_config`] to choose another deadline
+/// ([`PhantomConfig::write_stall_timeout`](crate::config::PhantomConfig::write_stall_timeout)).
+///
 /// Use [`connect_pinned_udp`] instead when you need seamless
 /// connection migration (Wi-Fi ↔ LTE via [`PhantomSession::migrate`]).
 /// TCP sessions return [`CoreError::Unsupported`] from `migrate()`.
@@ -6960,7 +6966,12 @@ pub async fn connect_pinned(
 }
 
 /// Like [`connect_pinned`] but also applies [`PhantomConfig`](crate::config::PhantomConfig)
-/// liveness settings to the session. FFI-exported.
+/// to the session: its liveness settings, and its
+/// [`write_stall_timeout`](crate::config::PhantomConfig::write_stall_timeout) as the TCP
+/// transport's write deadline. FFI-exported.
+///
+/// A zero `write_stall_timeout` is refused with [`CoreError::ConfigError`] before any
+/// socket is opened.
 ///
 /// # ⚠ Returns before the handshake — `Ok` here does not mean the pin matched
 ///
@@ -6995,11 +7006,13 @@ pub async fn connect_pinned_with_config(
         .map_err(|e| CoreError::FipsSelfTestFailure(format!("{e:?}")))?;
     let expected_server_key = HybridVerifyingKey::from_bytes(&pinned_key)
         .map_err(|e| CoreError::CryptoError(format!("invalid pinned key: {}", e)))?;
+    let write_stall_timeout = config.stream_write_stall_timeout()?;
     let addr = format!("{}:{}", host, port);
     let stream = tokio::net::TcpStream::connect(&addr)
         .await
         .map_err(|e| CoreError::NetworkError(format!("connect {}: {}", addr, e)))?;
-    let transport = crate::api::tcp_transport::TcpSessionTransport::new(stream);
+    let transport = crate::api::tcp_transport::TcpSessionTransport::new(stream)
+        .with_write_stall_timeout(write_stall_timeout);
     let liveness = config.liveness();
     let session = PhantomSession::spawn_client(
         &addr,
@@ -7053,6 +7066,11 @@ pub async fn connect_pinned_with_config(
 /// validates a certificate detects it in one round trip — do **not** use this
 /// where active probing is in the threat model. See `docs/security/threat-model.md`.
 ///
+/// Once the prelude is done, a write that goes thirty seconds without the socket
+/// taking a byte gives up on the server, and the session ends
+/// [`ConnectionState::Dead`] with [`CoreError::Timeout`];
+/// [`connect_pinned_mimic_with_config`] chooses another deadline.
+///
 /// Rust-only and native-only, gated on the `mimicry` feature.
 #[cfg(all(not(target_arch = "wasm32"), feature = "mimicry"))]
 pub async fn connect_pinned_mimic(
@@ -7061,12 +7079,52 @@ pub async fn connect_pinned_mimic(
     pinned_key: Vec<u8>,
     sni: String,
 ) -> Result<Arc<PhantomSession>, CoreError> {
+    connect_mimic(host, port, pinned_key, sni, None).await
+}
+
+/// Like [`connect_pinned_mimic`] but also applies a
+/// [`PhantomConfig`](crate::config::PhantomConfig): its liveness settings, and its
+/// [`write_stall_timeout`](crate::config::PhantomConfig::write_stall_timeout) as the
+/// leg's write deadline once the prelude is done. The mimicry analogue of
+/// [`connect_pinned_with_config`], with the same contract — including that it returns
+/// before the Phantom handshake has checked the pin, so call
+/// [`await_ready`](PhantomSession::await_ready) before trusting the session.
+///
+/// A zero `write_stall_timeout` is refused with [`CoreError::ConfigError`] before any
+/// socket is opened.
+///
+/// Rust-only and native-only, gated on the `mimicry` feature.
+#[cfg(all(not(target_arch = "wasm32"), feature = "mimicry"))]
+pub async fn connect_pinned_mimic_with_config(
+    host: String,
+    port: u16,
+    pinned_key: Vec<u8>,
+    sni: String,
+    config: crate::config::PhantomConfig,
+) -> Result<Arc<PhantomSession>, CoreError> {
+    connect_mimic(host, port, pinned_key, sni, Some(config)).await
+}
+
+/// The body both mimicry connects share: `config` is `None` for the one that takes no
+/// config, which keeps the default liveness settings and write deadline.
+#[cfg(all(not(target_arch = "wasm32"), feature = "mimicry"))]
+async fn connect_mimic(
+    host: String,
+    port: u16,
+    pinned_key: Vec<u8>,
+    sni: String,
+    config: Option<crate::config::PhantomConfig>,
+) -> Result<Arc<PhantomSession>, CoreError> {
     #[cfg(feature = "fips")]
     crate::crypto::self_tests::ensure_post_passed()
         .map_err(|e| CoreError::FipsSelfTestFailure(format!("{e:?}")))?;
 
     let expected_server_key = HybridVerifyingKey::from_bytes(&pinned_key)
         .map_err(|e| CoreError::CryptoError(format!("invalid pinned key: {}", e)))?;
+    let write_stall_timeout = match &config {
+        Some(config) => config.stream_write_stall_timeout()?,
+        None => crate::transport::write_stall::DEFAULT_WRITE_STALL_TIMEOUT,
+    };
 
     let addr = format!("{}:{}", host, port);
     let stream = tokio::net::TcpStream::connect(&addr)
@@ -7077,11 +7135,19 @@ pub async fn connect_pinned_mimic(
     // handshake pump (the leg is ready for `send_bytes`/`recv_bytes` once this
     // returns). A prelude failure (e.g. an unreachable / non-mimic server) aborts
     // the connect.
-    let config = crate::transport::legs::mimic_tls::MimicConfig::new(sni);
-    let transport =
-        crate::transport::legs::mimic_tls::MimicTlsLeg::connect(stream, &config).await?;
+    let mimic = crate::transport::legs::mimic_tls::MimicConfig::new(sni);
+    let transport = crate::transport::legs::mimic_tls::MimicTlsLeg::connect(stream, &mimic)
+        .await?
+        .with_write_stall_timeout(write_stall_timeout);
 
-    let session = PhantomSession::connect_with_transport(&addr, transport, expected_server_key);
+    let session = PhantomSession::spawn_client(
+        &addr,
+        transport,
+        expected_server_key,
+        Arc::new(TokioRuntime),
+        None,
+        config.map(|c| c.liveness()),
+    );
     Ok(Arc::new(session))
 }
 
@@ -7125,6 +7191,10 @@ pub async fn connect_pinned_mimic(
 /// (stale/unknown ticket or AEAD failure) the handshake completes 1-RTT — the
 /// caller checks [`PhantomSession::early_data_accepted`] and re-sends over the
 /// normal channel when it is not `Some(true)`.
+///
+/// It takes no [`PhantomConfig`](crate::config::PhantomConfig), so the session keeps
+/// the default liveness settings and the thirty-second write deadline of
+/// [`connect_pinned`].
 ///
 /// Native-only, like [`connect_pinned`]: `TcpSessionTransport` lives
 /// behind `cfg(not(target_arch = "wasm32"))`.
@@ -7476,7 +7546,13 @@ impl<T> SessionBuilder<T> {
         self
     }
 
-    /// Apply a [`PhantomConfig`](crate::config::PhantomConfig) (liveness settings, session-cache size).
+    /// Apply a [`PhantomConfig`](crate::config::PhantomConfig)'s liveness settings.
+    ///
+    /// Only those. The session-cache fields are a server's, and
+    /// [`write_stall_timeout`](crate::config::PhantomConfig::write_stall_timeout) belongs
+    /// to a transport, which here the caller has built: its deadline is the one it was
+    /// built with, so set it there — for example with
+    /// [`TcpSessionTransport::with_write_stall_timeout`](crate::api::tcp_transport::TcpSessionTransport::with_write_stall_timeout).
     pub fn config(mut self, config: crate::config::PhantomConfig) -> Self {
         self.config = Some(config);
         self
@@ -13568,6 +13644,310 @@ mod tests {
         assert!(
             matches!(session.send(b"x".to_vec()).await, Err(CoreError::Timeout)),
             "send() on a dead session should report the cause"
+        );
+    }
+
+    /// The write deadline the configuration tests hand the entry points: short enough
+    /// that a session given it dies well inside `CONFIGURED_DEADLINE_BOUND`, while one
+    /// that ignored it and kept the thirty-second default would still be waiting.
+    const CONFIGURED_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
+    const CONFIGURED_DEADLINE_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// A config whose only departure from the default is the write deadline.
+    fn config_with_write_deadline(deadline: std::time::Duration) -> crate::config::PhantomConfig {
+        crate::config::PhantomConfig {
+            write_stall_timeout: deadline,
+            ..crate::config::PhantomConfig::default()
+        }
+    }
+
+    /// Hand `session` far more than a peer that never reads can absorb, and return what
+    /// `recv()` reports within `CONFIGURED_DEADLINE_BOUND` — `None` if it is still
+    /// waiting then.
+    async fn flood_a_peer_that_never_reads(
+        session: &PhantomSession,
+    ) -> Option<Result<Vec<u8>, CoreError>> {
+        let stream = session.open_stream();
+        stream
+            .send_unreliable(vec![0xE7; UNREAD_BACKLOG])
+            .await
+            .expect("the pump takes the write in");
+        tokio::time::timeout(CONFIGURED_DEADLINE_BOUND, session.recv())
+            .await
+            .ok()
+    }
+
+    /// A listening socket whose accepted connections get a small receive buffer, so a
+    /// peer that stops reading them fills up after a few kibibytes.
+    fn listener_with_small_receive_buffers() -> tokio::net::TcpListener {
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        socket
+            .set_recv_buffer_size(crate::api::tcp_transport::test_support::SMALL_SOCKET_BUFFER)
+            .expect("shrink the receive buffer");
+        socket
+            .bind("127.0.0.1:0".parse().expect("addr"))
+            .expect("bind");
+        socket.listen(16).expect("listen")
+    }
+
+    /// A TCP server that completes the handshake with whoever connects and then never
+    /// reads its socket again. Returns its port and the verifying key a client pins; the
+    /// task holding the accepted connection runs until the test ends.
+    async fn a_tcp_server_that_stops_reading_after_the_handshake() -> (u16, Vec<u8>) {
+        let listener = listener_with_small_receive_buffers();
+        let port = listener.local_addr().expect("addr").port();
+        let hs = HandshakeServer::new().expect("handshake server");
+        let key = hs.verifying_key().to_bytes();
+        tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.expect("accept");
+            let transport = crate::api::tcp_transport::TcpSessionTransport::new(stream);
+            crate::api::listener::drive_server_handshake(&transport, &hs, peer.ip())
+                .await
+                .expect("server handshake");
+            // Hold the connection open and never read it.
+            std::future::pending::<()>().await;
+            drop(transport);
+        });
+        (port, key)
+    }
+
+    /// `connect_pinned_with_config` builds its TCP transport with the config's write
+    /// deadline: a session given one second over a server that stops reading is dead
+    /// within the bound, where the thirty-second default would still be waiting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn connect_pinned_with_config_applies_the_configured_write_deadline() {
+        let (port, key) = a_tcp_server_that_stops_reading_after_the_handshake().await;
+        let session = connect_pinned_with_config(
+            "127.0.0.1".into(),
+            port,
+            key,
+            config_with_write_deadline(CONFIGURED_WRITE_DEADLINE),
+        )
+        .await
+        .expect("connect");
+        session.await_ready().await.expect("handshake");
+
+        let received = flood_a_peer_that_never_reads(&session)
+            .await
+            .unwrap_or_else(|| {
+                panic!(
+                    "recv() was still waiting {CONFIGURED_DEADLINE_BOUND:?} later: the session is \
+                 not using the configured {CONFIGURED_WRITE_DEADLINE:?} write deadline"
+                )
+            });
+        assert!(
+            matches!(received, Err(CoreError::Timeout)),
+            "a write the server never takes should end the session with Timeout; got \
+             {received:?}"
+        );
+        assert_eq!(session.connection_state(), ConnectionState::Dead);
+    }
+
+    /// A TCP listener built with a config gives every accepted connection the config's
+    /// write deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_listener_built_with_a_config_applies_its_write_deadline() {
+        let mut config = crate::config::PhantomConfig::server();
+        config.write_stall_timeout = CONFIGURED_WRITE_DEADLINE;
+        let listener = crate::api::listener::PhantomListener::builder("127.0.0.1:0")
+            .config(config)
+            .bind()
+            .await
+            .expect("bind");
+        let addr: std::net::SocketAddr = listener.local_addr().parse().expect("addr");
+        let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).expect("key");
+
+        // The client completes the handshake and then never reads its socket again.
+        tokio::spawn(async move {
+            let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+            socket
+                .set_recv_buffer_size(crate::api::tcp_transport::test_support::SMALL_SOCKET_BUFFER)
+                .expect("shrink the receive buffer");
+            let stream = socket.connect(addr).await.expect("connect");
+            let transport = crate::api::tcp_transport::TcpSessionTransport::new(stream);
+            run_client_handshake(&transport, &key, None)
+                .await
+                .expect("client handshake");
+            std::future::pending::<()>().await;
+            drop(transport);
+        });
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept())
+            .await
+            .expect("no connection was accepted")
+            .expect("accept");
+        let session = accepted.session();
+
+        let received = flood_a_peer_that_never_reads(&session)
+            .await
+            .unwrap_or_else(|| {
+                panic!(
+                    "recv() was still waiting {CONFIGURED_DEADLINE_BOUND:?} later: the accepted \
+                 session is not using the configured {CONFIGURED_WRITE_DEADLINE:?} write \
+                 deadline"
+                )
+            });
+        assert!(
+            matches!(received, Err(CoreError::Timeout)),
+            "a write the client never takes should end the session with Timeout; got \
+             {received:?}"
+        );
+        assert_eq!(session.connection_state(), ConnectionState::Dead);
+    }
+
+    /// The mimicry connect that takes a config gives its leg the config's write deadline,
+    /// the same as `connect_pinned_with_config` does over plain TCP.
+    #[cfg(feature = "mimicry")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn connect_pinned_mimic_with_config_applies_the_configured_write_deadline() {
+        use crate::transport::legs::mimic_tls::{MimicConfig, MimicTlsLeg};
+
+        let listener = listener_with_small_receive_buffers();
+        let port = listener.local_addr().expect("addr").port();
+        let hs = HandshakeServer::new().expect("handshake server");
+        let key = hs.verifying_key().to_bytes();
+        // A mimicry server that completes the prelude and the handshake, then never reads.
+        tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.expect("accept");
+            let leg = MimicTlsLeg::accept(stream, &MimicConfig::new("server-ignored"))
+                .await
+                .expect("server prelude");
+            crate::api::listener::drive_server_handshake(&leg, &hs, peer.ip())
+                .await
+                .expect("server handshake");
+            std::future::pending::<()>().await;
+            drop(leg);
+        });
+
+        let session = connect_pinned_mimic_with_config(
+            "127.0.0.1".into(),
+            port,
+            key,
+            "cover.example.com".into(),
+            config_with_write_deadline(CONFIGURED_WRITE_DEADLINE),
+        )
+        .await
+        .expect("connect");
+        session.await_ready().await.expect("handshake");
+
+        let received = flood_a_peer_that_never_reads(&session)
+            .await
+            .unwrap_or_else(|| {
+                panic!(
+                    "recv() was still waiting {CONFIGURED_DEADLINE_BOUND:?} later: the mimicry \
+                 session is not using the configured {CONFIGURED_WRITE_DEADLINE:?} write \
+                 deadline"
+                )
+            });
+        assert!(
+            matches!(received, Err(CoreError::Timeout)),
+            "a write the server never takes should end the session with Timeout; got \
+             {received:?}"
+        );
+        assert_eq!(session.connection_state(), ConnectionState::Dead);
+    }
+
+    /// A mimicry listener built with a config gives every accepted leg the config's write
+    /// deadline, the same as the plain TCP listener does.
+    #[cfg(feature = "mimicry")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_mimicry_listener_built_with_a_config_applies_its_write_deadline() {
+        use crate::transport::legs::mimic_tls::{MimicConfig, MimicTlsLeg};
+
+        let mut config = crate::config::PhantomConfig::server();
+        config.write_stall_timeout = CONFIGURED_WRITE_DEADLINE;
+        let listener = crate::api::listener::PhantomListener::builder("127.0.0.1:0")
+            .mimic_sni("mimic")
+            .config(config)
+            .bind()
+            .await
+            .expect("bind");
+        let addr: std::net::SocketAddr = listener.local_addr().parse().expect("addr");
+        let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).expect("key");
+
+        // The client completes the prelude and the handshake, then never reads again.
+        tokio::spawn(async move {
+            let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+            socket
+                .set_recv_buffer_size(crate::api::tcp_transport::test_support::SMALL_SOCKET_BUFFER)
+                .expect("shrink the receive buffer");
+            let stream = socket.connect(addr).await.expect("connect");
+            let leg = MimicTlsLeg::connect(stream, &MimicConfig::new("cover.example.com"))
+                .await
+                .expect("client prelude");
+            run_client_handshake(&leg, &key, None)
+                .await
+                .expect("client handshake");
+            std::future::pending::<()>().await;
+            drop(leg);
+        });
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept())
+            .await
+            .expect("no connection was accepted")
+            .expect("accept");
+        let session = accepted.session();
+
+        let received = flood_a_peer_that_never_reads(&session)
+            .await
+            .unwrap_or_else(|| {
+                panic!(
+                    "recv() was still waiting {CONFIGURED_DEADLINE_BOUND:?} later: the accepted \
+                 mimicry session is not using the configured {CONFIGURED_WRITE_DEADLINE:?} \
+                 write deadline"
+                )
+            });
+        assert!(
+            matches!(received, Err(CoreError::Timeout)),
+            "a write the client never takes should end the session with Timeout; got \
+             {received:?}"
+        );
+        assert_eq!(session.connection_state(), ConnectionState::Dead);
+    }
+
+    /// A zero write deadline is refused where it is supplied, before any I/O: by
+    /// `connect_pinned_with_config` before it opens a socket — here to a listener that
+    /// would accept the connection — and by both ways of binding a TCP listener with a
+    /// config, before the port is bound.
+    #[tokio::test]
+    async fn a_zero_write_deadline_is_refused_before_any_io() {
+        let listening = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listening.local_addr().expect("addr").port();
+        let key = HandshakeServer::new()
+            .expect("handshake server")
+            .verifying_key()
+            .to_bytes();
+        let zero = config_with_write_deadline(std::time::Duration::ZERO);
+
+        let connected =
+            connect_pinned_with_config("127.0.0.1".into(), port, key, zero.clone()).await;
+        assert!(
+            matches!(connected, Err(CoreError::ConfigError(_))),
+            "connect_pinned_with_config must refuse a zero write deadline; got {:?}",
+            connected.map(|_| "a session")
+        );
+
+        let built = crate::api::listener::PhantomListener::builder("127.0.0.1:0")
+            .config(zero.clone())
+            .bind()
+            .await;
+        assert!(
+            matches!(built, Err(CoreError::ConfigError(_))),
+            "a listener builder must refuse a zero write deadline; got {:?}",
+            built.map(|_| "a listener")
+        );
+
+        let seed = crate::api::identity::generate_signing_key().expect("seed");
+        let bound = crate::api::listener::PhantomListener::bind_with_config_bytes(
+            "127.0.0.1:0".into(),
+            seed,
+            zero,
+        )
+        .await;
+        assert!(
+            matches!(bound, Err(CoreError::ConfigError(_))),
+            "bind_with_config_bytes must refuse a zero write deadline; got {:?}",
+            bound.map(|_| "a listener")
         );
     }
 

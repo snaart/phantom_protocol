@@ -372,7 +372,8 @@ are now wiped (T5.1), closing the former audit gap.
 - **TCP** (`TcpSessionTransport`): a 4-byte big-endian length prefix per `PhantomPacket`,
   capped per phase — `HANDSHAKE_FRAME_CAP = 64 KiB` bounds the unauthenticated handshake
   frame, `STEADY_STATE_FRAME_CAP = 4 MiB` once established. A write that goes
-  `DEFAULT_WRITE_STALL_TIMEOUT` (30 s) without the socket accepting a byte fails with
+  `DEFAULT_WRITE_STALL_TIMEOUT` (30 s) — or the `PhantomConfig::write_stall_timeout` the
+  listener or connect was given — without the socket accepting a byte fails with
   `CoreError::Timeout`, after which nothing more is written — the frame it stopped in may
   be cut part-way — and the connection is reset rather than closed. *(The legacy KCP and FakeTLS
   legs were removed; TLS HTTP-mimicry shipped as the optional `mimicry` feature —

@@ -55,8 +55,13 @@ use tokio::net::TcpStream;
 /// writer only once a sizeable share of a full send buffer has drained — about a
 /// third of it on Linux. On a path whose rate has collapsed behind a buffer that
 /// grew while it was fast, the gaps between wake-ups are longer than the byte
-/// rate alone suggests. A deployment that expects such paths raises the deadline
-/// on its transport.
+/// rate alone suggests. A deployment that expects such paths raises the deadline:
+/// through `PhantomConfig::write_stall_timeout` for the transports the listeners and
+/// the config-taking connects build, or with `with_write_stall_timeout` on a
+/// transport it builds itself.
+///
+/// This is the figure an entry point uses when it is given no config, and the
+/// `server()` preset's; the `mobile()` and `iot()` presets give two minutes.
 pub(crate) const DEFAULT_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Why [`write_all_making_progress`] did not finish.

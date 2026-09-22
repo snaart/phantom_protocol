@@ -10,6 +10,7 @@ use crate::transport::handshake::{
     HandshakeServer, ServerReply,
 };
 use crate::transport::types::LegType;
+use crate::transport::write_stall::DEFAULT_WRITE_STALL_TIMEOUT;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -115,6 +116,9 @@ pub struct PhantomListener {
     /// Optional liveness config derived from a `PhantomConfig` supplied at bind time.
     /// When `Some`, applied to every accepted session immediately after the handshake.
     liveness: Option<crate::transport::liveness::LivenessConfig>,
+    /// The write deadline every accepted connection's transport is built with: the
+    /// bind-time `PhantomConfig`'s `write_stall_timeout`, or thirty seconds without one.
+    write_stall_timeout: Duration,
 }
 
 // Rust-only constructors that take a non-UniFFI type (`Arc<dyn Runtime>`).
@@ -173,8 +177,9 @@ impl PhantomListener {
     /// Shared bind path. If `signing_key` is `Some`, the resulting
     /// [`HandshakeServer`] uses that long-lived key. Otherwise the
     /// historical generate-internal-key behavior is preserved.
-    /// If `config` is `Some`, liveness settings and session-cache sizing are
-    /// derived from it and applied to each accepted session.
+    /// If `config` is `Some`, liveness settings, session-cache sizing and the write
+    /// deadline are derived from it and applied to each accepted session; a zero
+    /// write deadline is refused before the port is bound.
     async fn bind_inner(
         addr: String,
         runtime: Arc<dyn Runtime>,
@@ -192,6 +197,10 @@ impl PhantomListener {
         crate::crypto::self_tests::ensure_post_passed()
             .map_err(|e| CoreError::FipsSelfTestFailure(format!("{e:?}")))?;
 
+        let write_stall_timeout = match config.as_ref() {
+            Some(cfg) => cfg.stream_write_stall_timeout()?,
+            None => DEFAULT_WRITE_STALL_TIMEOUT,
+        };
         let listener = Self::bind_with_optional_reuseport(&addr).await?;
         let local_addr = listener
             .local_addr()
@@ -229,6 +238,7 @@ impl PhantomListener {
             acceptor: parking_lot::Mutex::new(None),
             mimic_sni,
             liveness: config.map(|c| c.liveness()),
+            write_stall_timeout,
         }))
     }
 
@@ -330,8 +340,11 @@ impl PhantomListener {
     }
 
     /// Bind a TCP listener using a persisted 64-byte signing seed and a
-    /// [`PhantomConfig`](crate::config::PhantomConfig) that controls liveness settings
-    /// and session-cache sizing. The FFI analogue of the Rust-only
+    /// [`PhantomConfig`](crate::config::PhantomConfig) that controls liveness settings,
+    /// session-cache sizing, and the write deadline of every accepted connection
+    /// ([`write_stall_timeout`](crate::config::PhantomConfig::write_stall_timeout) — a
+    /// zero one is refused with [`CoreError::ConfigError`] before the port is bound).
+    /// The FFI analogue of the Rust-only
     /// [`bind_with_signing_key`](Self::bind_with_signing_key) + config combination.
     #[cfg_attr(feature = "bindings", uniffi::constructor)]
     #[tracing::instrument(name = "phantom.listener.bind_with_config", skip_all, fields(addr = %addr))]
@@ -480,6 +493,7 @@ impl PhantomListener {
             self.observability.clone(),
             self.mimic_sni.clone(),
             self.liveness,
+            self.write_stall_timeout,
         )));
         *guard = Some(handle);
     }
@@ -672,6 +686,7 @@ async fn run_acceptor(
     observability: Arc<Observability>,
     mimic_sni: Option<String>,
     liveness: Option<crate::transport::liveness::LivenessConfig>,
+    write_stall_timeout: Duration,
 ) {
     let mut accept_count: u64 = 0;
     loop {
@@ -725,7 +740,7 @@ async fn run_acceptor(
                 match crate::transport::legs::mimic_tls::MimicTlsLeg::accept(stream, &cfg).await {
                     Ok(leg) => {
                         serve_connection(
-                            leg,
+                            leg.with_write_stall_timeout(write_stall_timeout),
                             &hs,
                             peer,
                             &task_runtime,
@@ -742,7 +757,8 @@ async fn run_acceptor(
             }
             let _ = &mimic_sni; // (feature off: always None; silence unused)
 
-            let transport = TcpSessionTransport::new(stream);
+            let transport =
+                TcpSessionTransport::new(stream).with_write_stall_timeout(write_stall_timeout);
             serve_connection(
                 transport,
                 &hs,
@@ -878,7 +894,11 @@ impl ListenerBuilder {
         self
     }
 
-    /// Apply a [`PhantomConfig`](crate::config::PhantomConfig) (liveness, session-cache).
+    /// Apply a [`PhantomConfig`](crate::config::PhantomConfig): liveness, session-cache
+    /// sizing, and the write deadline every accepted connection's transport is built with
+    /// ([`write_stall_timeout`](crate::config::PhantomConfig::write_stall_timeout)), on
+    /// the plain TCP and the mimicry path alike. `bind()` refuses a zero write deadline
+    /// with [`CoreError::ConfigError`] before the port is bound.
     pub fn config(mut self, config: crate::config::PhantomConfig) -> Self {
         self.config = Some(config);
         self

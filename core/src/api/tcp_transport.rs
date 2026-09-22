@@ -67,7 +67,15 @@
 //! [`with_write_stall_timeout`](TcpSessionTransport::with_write_stall_timeout) —
 //! fails with [`CoreError::Timeout`]. The deadline restarts with every byte the
 //! socket accepts, so a link is never cut off for being slow, only for having
-//! stopped. After a stall every further `send_bytes` fails the same way without
+//! stopped.
+//!
+//! Most callers never build this transport themselves: `PhantomListener` builds one
+//! per accepted connection, and the `connect_pinned*` functions build theirs. Those
+//! take the deadline from
+//! [`PhantomConfig::write_stall_timeout`](crate::config::PhantomConfig::write_stall_timeout)
+//! when they are given a config, and use the thirty seconds otherwise. That field's
+//! documentation says how coarsely the socket reports progress, which is what decides
+//! how long a deadline a slow path needs. After a stall every further `send_bytes` fails the same way without
 //! touching the socket, because the stalled frame may be cut part-way through on
 //! the wire and anything written after it would be read as garbage; and the
 //! connection is set to end with a reset rather than an orderly close, so the
@@ -167,7 +175,13 @@ impl TcpSessionTransport {
     /// the peer may stop reading, not on how slowly it may read. Choose it no
     /// shorter than the longest pause a legitimate peer takes: a figure below the
     /// time the kernel needs to drain a third of a full send buffer on the slowest
-    /// expected path cuts off links that are still moving.
+    /// expected path cuts off links that are still moving. A zero deadline gives up
+    /// on the first write the socket cannot take at once.
+    ///
+    /// For a transport handed to `PhantomSession::builder`, this is the only way to
+    /// set it: the builder's `.config(...)` does not reach a transport it did not
+    /// build. The entry points that build their own take it from
+    /// [`PhantomConfig::write_stall_timeout`](crate::config::PhantomConfig::write_stall_timeout).
     pub fn with_write_stall_timeout(mut self, timeout: Duration) -> Self {
         self.write_stall_timeout = timeout;
         self

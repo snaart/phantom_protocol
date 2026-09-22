@@ -14,7 +14,9 @@
 //! [`CoreError::Timeout`](crate::errors::CoreError::Timeout), every later write is
 //! refused without touching the socket, and the connection is set to end with a
 //! reset. The prelude is not affected: its writes already sit under the prelude's
-//! own deadline.
+//! own deadline. The mimicry listener and `connect_pinned_mimic_with_config` build
+//! their legs with a config's
+//! [`write_stall_timeout`](crate::config::PhantomConfig::write_stall_timeout).
 
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

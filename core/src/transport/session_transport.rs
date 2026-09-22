@@ -100,7 +100,9 @@ pub trait SessionTransport: Send + Sync + 'static {
     /// How each shipped transport stands:
     ///
     /// - `TcpSessionTransport` bounds every write by a progress deadline, thirty
-    ///   seconds unless set otherwise.
+    ///   seconds unless set otherwise — with `with_write_stall_timeout` on a
+    ///   transport the caller builds, or through `PhantomConfig::write_stall_timeout`
+    ///   on the ones the listeners and the config-taking connects build.
     /// - The TLS-mimicry leg does the same once its prelude is done; the prelude's
     ///   writes already sit under the prelude's own deadline.
     /// - The WASI leg does the same through `wasi:io/poll`.
