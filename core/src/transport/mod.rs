@@ -92,7 +92,12 @@ pub mod types;
 pub mod framing;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub mod phantom_udp;
-#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+
+// Every std target, WASI and the browser included: the write-stall deadline is
+// one constant shared by the tokio stream transports, the WASI leg and the
+// `PhantomConfig` presets, and only the tokio write helper inside it is
+// native-only.
+#[cfg(feature = "std")]
 pub(crate) mod write_stall;
 
 // Re-exports for convenience

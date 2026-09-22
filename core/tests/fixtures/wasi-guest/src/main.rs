@@ -100,9 +100,11 @@ fn run_against_a_peer_that_never_reads(addr: SocketAddr) {
 }
 
 /// Default path: drive `WasiLeg` via `futures::executor::block_on`.
-/// `WasiLeg`'s `SessionTransport` futures resolve synchronously
-/// because the WASI Preview 2 `blocking_*` stream calls park the
-/// instance host-side, so no real executor work is needed.
+/// `WasiLeg`'s `SessionTransport` futures resolve on their first poll,
+/// because the leg parks the instance host-side for every wait it makes —
+/// `blocking_read` for a read, and for a write a `wasi:io/poll` on the
+/// output stream's readiness together with the write-stall timer — so no
+/// real executor work is needed.
 fn run_with_block_on(addr: SocketAddr) {
     let leg = WasiLeg::connect(addr).expect("WasiLeg::connect (block_on mode)");
 
@@ -159,11 +161,12 @@ fn run_with_runtime(addr: SocketAddr) {
         }
     }));
 
-    // Drive until the spawned task drains out of the queue. WASI
-    // `blocking_*` calls inside the future cause `drive()` to do the
-    // real work synchronously; `poll_until_progress` is the watchdog
-    // that keeps the loop from spin-busy-waiting on a future that
-    // returns `Pending` without registering a Pollable.
+    // Drive until the spawned task drains out of the queue. The leg's
+    // waits — `blocking_read` on a read, a `wasi:io/poll` on the output
+    // stream and the stall timer on a write — happen inside the future, so
+    // `drive()` does the real work synchronously; `poll_until_progress` is
+    // the watchdog that keeps the loop from spin-busy-waiting on a future
+    // that returns `Pending` without registering a Pollable.
     while rt.tasks_pending() > 0 {
         rt.drive();
         rt.poll_until_progress(Duration::from_millis(100));

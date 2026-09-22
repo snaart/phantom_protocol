@@ -190,8 +190,10 @@ impl WasiLeg {
     /// How long a write may go without the output stream accepting a byte before
     /// the leg gives up on its peer, unless
     /// [`with_write_stall_timeout`](Self::with_write_stall_timeout) says otherwise.
-    /// The same thirty seconds as `TcpSessionTransport`.
-    pub const DEFAULT_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+    /// Thirty seconds, the figure `TcpSessionTransport` and the mimicry leg start
+    /// from too; all three read it from one definition, so they cannot drift apart.
+    pub const DEFAULT_WRITE_STALL_TIMEOUT: Duration =
+        crate::transport::write_stall::DEFAULT_WRITE_STALL_TIMEOUT;
 
     /// Replace the write-stall deadline: how long a single write may wait without
     /// the stream accepting a byte before `send_bytes` fails with

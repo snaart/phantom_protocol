@@ -19,11 +19,21 @@
 //! `mimicry` leg. The WASI leg applies the same rule through `wasi:io/poll`, and
 //! the embedded leg, which has no clock of its own, leaves the bound to its
 //! writer (see `SessionTransport::send_bytes`).
+//!
+//! The module compiles for every `std` target, the WASI guest and the browser
+//! included, because [`DEFAULT_WRITE_STALL_TIMEOUT`] is the one definition of the
+//! deadline every stream leg starts from — the WASI leg builds for a target that
+//! has no tokio sockets, and a second copy of the figure there is one that can
+//! drift. Only the tokio write helper below is native-only.
 
-use std::io;
 use std::time::Duration;
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::io;
+
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::net::TcpStream;
 
 /// How long a write may go without the socket accepting a byte before a stream
@@ -50,6 +60,7 @@ use tokio::net::TcpStream;
 pub(crate) const DEFAULT_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Why [`write_all_making_progress`] did not finish.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 pub(crate) enum WriteFailure {
     /// The socket accepted nothing for the whole deadline.
@@ -69,6 +80,7 @@ pub(crate) enum WriteFailure {
 /// cancelled call was written — but the bytes of earlier calls were. So a stall
 /// can leave a message cut part-way through on the wire, and a caller whose
 /// framing that breaks must not write on the connection again.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn write_all_making_progress<W>(
     writer: &mut W,
     parts: &[&[u8]],
@@ -110,18 +122,20 @@ where
 ///
 /// Best-effort: if the option cannot be set, the connection still ends — with the
 /// orderly close it would have had anyway.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn reset_on_close(stream: &TcpStream) {
     if let Err(e) = socket2::SockRef::from(stream).set_linger(Some(Duration::ZERO)) {
         log::debug!("could not arrange a reset for a stalled connection: {e}");
     }
 }
 
+/// Tests of the deadline itself, kept out of the native-only module below so that
+/// they compile wherever the constant does — the WASI guest and the browser build
+/// included — rather than only on the targets whose sockets tokio drives.
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod every_target {
+    use super::DEFAULT_WRITE_STALL_TIMEOUT;
     use crate::transport::liveness::LivenessConfig;
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
 
     /// The deadline's documentation rests on it being the session's default give-up
     /// horizon; if either moves, the reason written beside this one stops being true.
@@ -132,6 +146,13 @@ mod tests {
             LivenessConfig::default().idle_timeout
         );
     }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
 
     /// A writer that accepts at most `per_call` bytes per call, and none at all
     /// once `budget` is spent — a socket whose peer reads a little and then stops.

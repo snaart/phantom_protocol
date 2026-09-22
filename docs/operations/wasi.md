@@ -37,9 +37,10 @@ fn main() {
     let addr: SocketAddr = "127.0.0.1:4242".parse().unwrap();
     let leg = WasiLeg::connect(addr).expect("WasiLeg::connect");
 
-    // SessionTransport's async fns block via WASI Preview 2's
-    // `wasi:io/streams::blocking_*` under the hood, so the futures
-    // resolve as soon as they are polled.
+    // WasiLeg's SessionTransport futures block the instance inside the
+    // call — a read through `wasi:io/streams::blocking-read`, a write
+    // through `wasi:io/poll` on the stream's readiness and a stall timer —
+    // so they resolve as soon as they are polled.
     futures::executor::block_on(leg.send_bytes(b"hello")).unwrap();
     let echo = futures::executor::block_on(leg.recv_bytes()).unwrap();
     assert_eq!(&echo[..], b"hello");
