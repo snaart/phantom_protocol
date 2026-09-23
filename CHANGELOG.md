@@ -27,8 +27,11 @@ checksums moved while `UNIFFI_CONTRACT_VERSION` stayed at 30 — the coarse gate
 the mismatch lands at import time in the consumer's process. `ResumptionHint` also changed
 from a record to an object in the same release, which changes the C parameter type and
 removes Swift's `Equatable`, and three `ConnectionState` variants were removed, which
-renumbers the value every later variant lowers to across the FFI. All three are detailed
-below.
+renumbers the value every later variant lowers to across the FFI, as removing three
+`CoreError` variants does for errors. `PhantomConfig` gained a fifth field,
+`write_stall_timeout`, which every foreign constructor of the record has to supply, and
+`PhantomSession::open_stream()` can now fail, which Swift callers meet as `throws` and C
+callers as an error in `call_status`. Each is detailed below.
 
 ### Security
 
@@ -65,6 +68,20 @@ Pointers only: each item is set out in full in the entry named.
   for as long as it chose, and `disconnect()` blocked once the command channel was full —
   **Fixed**, "`disconnect()` ends the session promptly even when the peer has stopped
   reading".
+- A peer that stopped reading its TCP or TLS-mimicry socket held the session's data pump
+  inside a write with no deadline, so the session — and on a server, its slot — stayed up
+  for as long as the peer kept the connection open, and neither `disconnect()` nor the
+  liveness timer could end it; on WASI the same write blocked the whole guest — **Fixed**,
+  "A write the peer has stopped taking now fails after a deadline on every stream
+  transport".
+- Letting go of a stream the peer was still writing on stopped every write on every other
+  stream of the peer's session, and a peer that never closed its half of the streams this
+  side opened could fill this side's stream table — **Fixed**, "Dropping a `PhantomStream`
+  closes it, and a stream nobody holds no longer holds up either side".
+- After 32 767 opens on one side of a session, stream ids wrapped onto ids already in use,
+  so a new stream's bytes were merged into an old stream or discarded by the peer while the
+  sender saw them acknowledged — **Fixed**, "`open_stream()` refuses once this side's stream
+  ids are used up, instead of reusing one".
 
 ### Removed
 
@@ -72,6 +89,16 @@ Pointers only: each item is set out in full in the entry named.
   variants no code path constructed. `CoreError` is `#[non_exhaustive]`, so a consumer
   already needed a wildcard arm and these become dead arms rather than broken ones — delete
   them, or leave them to the wildcard.
+
+  Across the FFI the removal renumbers, as the `ConnectionState` removal does: UniFFI
+  lowers an error by its declaration position, so every variant after `Busy` lowers to a
+  smaller number than in 0.2.2 — `ConfigError` through `StreamError` by one or two,
+  `ConnectionClosed`, `Timeout`, `ReplayDetected` and `CipherSuiteUnavailable` by three —
+  and 15, 16 and 17, which were `Timeout`, `ReplayDetected` and `CipherSuiteUnavailable`,
+  now carry the new `ServerIdentityMismatch`, `ProtocolRejected` and `Unsupported`.
+  Regenerated Python, Swift and Kotlin bindings agree with the library; a hand-written C
+  decoder that kept 0.2.2's numbers reads a pin mismatch as a timeout. The hand-curated C
+  header gives the current numbers for the three typed variants (see **Documented**).
 
   Worth recording for how the removal went rather than for the variants themselves.
   `CoreError` carries a hand-written `Display` under `#[cfg(not(feature = "std"))]` that
@@ -287,12 +314,13 @@ Pointers only: each item is set out in full in the entry named.
   Nothing is required to be delivered. The frame is unacknowledged, never retransmitted, and
   takes no part in the SACK machinery; a peer that receives none falls back to concluding the
   same thing from silence, exactly as before. `PhantomSession::disconnect` says so in its own
-  documentation, along with what it does *not* promise: it queues the request and returns,
-  the pump pushes what the socket and the congestion window will take and does not wait for
-  an acknowledgement, so a payload larger than one window is mostly discarded and delivery
-  has to be established at the application level. `docs/protocol/PROTOCOL.md` §4.11 specifies
-  the frame, its draining rule and the subtype registry, and §7 records that registry as the
-  extension point a future in-session signal should take in preference to the last flag bit;
+  documentation, along with what it does *not* promise: it raises the request and returns
+  without waiting for anything, the pump pushes what the socket, the congestion window and
+  the peer's flow-control limit will take and does not wait for an acknowledgement, so a
+  payload larger than one window is mostly discarded and delivery has to be established at
+  the application level. `docs/protocol/PROTOCOL.md` §4.11 specifies the frame, its
+  draining rule and the subtype registry, and §7 records that registry as the extension
+  point a future in-session signal should take in preference to the last flag bit;
   `docs/protocol/INTEROP.md` carries the receiver obligation for a second implementation.
 
 - **`WINDOW_UPDATE` carries a cumulative limit instead of a relative credit —
@@ -374,11 +402,12 @@ Pointers only: each item is set out in full in the entry named.
     absent from it. This release has one that matters — `MAX_SEND_WINDOW` went from 512 KiB
     to 1 MiB, and the new `MAX_RECV_WINDOW` equals it — recorded below.
   * **The FFI ABI.** It reads Rust signatures, and what crosses the FFI is a second,
-    independent compatibility axis. This release moves it three ways the report does not
+    independent compatibility axis. This release moves it five ways the report does not
     hint at: `ResumptionHint` crosses as an object handle rather than a lowered record, the
     value `ConnectionState` lowers to is renumbered for every variant after the three that
-    were removed, and `uniffi` 0.32 moved every exported checksum. Each has its own entry
-    below.
+    were removed, `uniffi` 0.32 moved every exported checksum, the `PhantomConfig` record
+    has a fifth field — the Rust struct is `#[non_exhaustive]`, so the report is right that
+    no Rust caller breaks — and `open_stream()` can now fail. Each has its own entry below.
   * **Traits that belong to a dependency.** A public bound on another crate's trait breaks
     when that crate moves a major version, and the tool compares this crate's items rather
     than the versions they name. `EmbeddedLeg`'s `R: Read` / `W: Write` bounds are
@@ -429,6 +458,9 @@ Pointers only: each item is set out in full in the entry named.
   * `Stream::stage_window_update_credit(credit: u32)` →
     `Stream::stage_window_update_limit(limit: u64)`, and `Stream::take_pending_window_update`
     yields `Option<u64>` to match.
+  * `PhantomStream::new` → `PhantomSession::open_stream` or `accept_stream`, which is where
+    a handle comes from. The constructor is crate-private because it now takes the
+    session's internal channels.
 
   *Enum variants that are gone* — a `match` that named them stops compiling:
 
@@ -437,13 +469,18 @@ Pointers only: each item is set out in full in the entry named.
     wildcard; delete the three arms. See **Removed**, and **Changed** for what the removal
     does to the value the enum lowers to across the FFI.
   * `BbrState::FastRecovery`: loss is a signal, not a phase. See **Fixed**.
+  * `SessionCommand::{Migrate, MigrateServer}`: a migration no longer rides the channel the
+    application's writes use, so it cannot wait behind them. Call `PhantomSession::migrate`
+    or `migrate_server`. See **Fixed**, "A migration requested while an upload was stalled
+    no longer waits behind it".
 
   *Struct fields that are gone* — drop them from any struct literal:
 
   * `PhantomConfig::{max_packet_size, send_buffer_size, recv_buffer_size, auto_fallback,
     fallback_loss_threshold, fallback_failure_threshold, connect_timeout, upgrade_delay}`.
     These are the eight fields nothing read. Start from `PhantomConfig::default()` (or
-    `mobile()` / `server()`) and set only the four that are honoured.
+    `mobile()` / `server()`) and set only the five that are honoured — the four that
+    survive, and `write_stall_timeout`, which is new.
 
   *Struct fields that are new* — breaking only for a struct literal, because a literal has
   to name every field. All five of these types are produced by the library and read by the
@@ -513,9 +550,9 @@ Pointers only: each item is set out in full in the entry named.
     ordered.
   * `DeliverySample::{delivered_at, rtt_sampled}` — built by the ack path.
 
-  *Enum variants that are new* — these three enums are exhaustive, so a `match` without a
-  wildcard needs one more arm: `SessionCommand::SetStreamPriority`,
-  `EarlyDataOutcome::RejectedDisabled`, `PathValidationOutcome::Timeout`.
+  *Enum variants that are new* — these two enums are exhaustive, so a `match` without a
+  wildcard needs one more arm: `EarlyDataOutcome::RejectedDisabled`,
+  `PathValidationOutcome::Timeout`.
 
   *Signatures that changed shape*:
 
@@ -524,9 +561,13 @@ Pointers only: each item is set out in full in the entry named.
   * `Stream::record_app_consumed(n: u32)` → `(n: u32, reliable: bool) -> Option<u64>`. Pass
     `false` for unreliable delivery: it is not flow-controlled, and counting it would walk
     this side's advertised limit ahead of the total the peer keeps.
-  * `PhantomStream::new(handle, tx)` → `(handle, tx, session_state: Arc<AtomicU8>)`. The
-    third argument is the session's published state, which is what lets a write into a
-    `Draining` session be refused rather than queued for a pump that will discard it.
+  * `PhantomSession::open_stream` returns `Result<Arc<PhantomStream>, CoreError>` where it
+    returned `Arc<PhantomStream>`, and likewise `StreamDemultiplexer::open_stream`
+    (`Result<StreamHandle, CoreError>`) and the transport-level `Session::open_stream`
+    (`Result<Arc<Stream>, CoreError>`). Each refuses with `CoreError::StreamError` once the
+    16-bit stream-id space it allocates from is used up; add a `?`. See **Fixed**,
+    "`open_stream()` refuses once this side's stream ids are used up, instead of reusing
+    one".
   * `PhantomUdpListener::accept`: `&Arc<Self>` → `Arc<Self>` — full entry below.
   * `BandwidthEstimator::on_loss(bytes)` and `Session::on_packet_lost(bytes)` keep their
     shape, and a second method now sits beside each: `note_repair_ordered_by(cause)`. The
@@ -819,19 +860,58 @@ Pointers only: each item is set out in full in the entry named.
   number that crosses the FFI, and Kotlin's `ordinal`, are declaration positions and moved.
   Breaking (0.2 → 0.3).
 
-- **Closing a stream closes only its writing half.** `PhantomStream::disconnect()` sends a
-  FIN and nothing more: the handle keeps receiving until the peer closes too, the stream
-  stays in the session's table and counts toward `MAX_STREAMS` until both halves have
-  closed, writes made on it after `disconnect()` are discarded, and a reliable segment on
-  the receiver's own stream-id parity for an id it never opened is refused. The UniFFI
-  checksum of `PhantomStream.disconnect` moved with its documentation. Set out in full under
-  **Fixed**, "A stream closed from both ends no longer comes back through `accept_stream()`
-  or holds a slot in the session's stream limit".
+- **Closing a stream closes only its writing half, and dropping its handle closes it too.**
+  `PhantomStream::disconnect()` sends a FIN and nothing more: a handle that is still held
+  keeps receiving until the peer closes too, and its stream stays in the session's table
+  and counts toward `MAX_STREAMS` until both halves have closed. Writes made on a stream
+  after `disconnect()` still return `Ok` and are discarded, and a reliable segment on the
+  receiver's own stream-id parity for an id it never opened is refused. Dropping the last
+  reference to a handle now closes the writing half behind every write already made on it;
+  the stream then leaves the session once that close is acknowledged, whether or not the
+  peer has closed its half, and a stream opened and dropped without a reliable write never
+  reaches the peer at all. `PhantomStream::new` is crate-private. The UniFFI checksum of
+  `PhantomStream.disconnect` moved with its documentation. Set out in full under **Fixed**,
+  "A stream closed from both ends no longer comes back through `accept_stream()` or holds a
+  slot in the session's stream limit" and "Dropping a `PhantomStream` closes it, and a
+  stream nobody holds no longer holds up either side".
 
 - **`PhantomSession::disconnect()` discards what the send buffer has not admitted when the
   close is seen**, rather than waiting behind it. Against a healthy peer this can drop most
   of a large payload written just before the call. Set out in full under **Fixed**,
-  "`disconnect()` ends the session promptly even when the peer has stopped reading".
+  "`disconnect()` ends the session promptly even when the peer has stopped reading". It also
+  leaves a session that has already ended `Dead` or `Failed` in that state, where it used to
+  overwrite either with `Closed`; see **Fixed**, "`connection_state()` reads `Dead` as soon
+  as the transport gives up, and nothing walks an ended state back".
+
+- **`migrate()`, `migrate_server()` and `PhantomStream::set_priority()` no longer queue
+  behind the application's writes**, and so are no longer ordered against them: a migration
+  can take effect before a write issued ahead of it has been admitted to its send buffer.
+  `SessionCommand` lost `Migrate` and `MigrateServer`. The UniFFI checksums of
+  `PhantomSession.migrate` and `PhantomStream.set_priority` moved with their documentation.
+  Set out in full under **Fixed**, "A migration requested while an upload was stalled no
+  longer waits behind it".
+
+- **`open_stream()` returns a `Result` and can refuse**, in Rust and over every binding: it
+  fails with `CoreError::StreamError` once this side has opened 32 767 streams in the
+  session. Swift callers need `try`, Kotlin and Python callers can now see it raise, and C
+  callers must check `call_status` before treating the return value as a handle; the UniFFI
+  checksum of `PhantomSession.open_stream` moved. Set out in full under **Fixed**,
+  "`open_stream()` refuses once this side's stream ids are used up, instead of reusing one".
+
+- **`PhantomConfig` has a fifth field, `write_stall_timeout`**, so every foreign constructor
+  of the record takes one more argument and a C caller lowers one more `Duration` after
+  `session_ticket_lifetime`. Rust code is unaffected: the struct is `#[non_exhaustive]` and
+  is built from a preset. Over TCP and the TLS-mimicry leg, a write that goes that long
+  without the peer taking a byte now ends the session `Dead` with `CoreError::Timeout`. Set
+  out in full under **Fixed**, "A write the peer has stopped taking now fails after a
+  deadline on every stream transport".
+
+- **`connection_state()` reads `Dead` as soon as the transport gives up**, where it read
+  `Connected` until the session's teardown. A liveness verdict no longer walks an ended or
+  draining session back to `Connected` or `Migrating`, and `disconnect()` no longer
+  overwrites `Dead` or `Failed` with `Closed`. Set out in full under **Fixed**,
+  "`connection_state()` reads `Dead` as soon as the transport gives up, and nothing walks an
+  ended state back".
 
 ### Added
 
@@ -1199,9 +1279,10 @@ Pointers only: each item is set out in full in the entry named.
   collector — `replay_rejected_total` / `aead_failure_total`). A server-accepted session
   reports the owning listener's aggregate (shared handle).
 - **Working tunables via `PhantomConfig`.** `PhantomConfig` was an FFI-exported struct
-  whose fields nothing read; it is now an honest 4-field record
+  whose fields nothing read; it is now an honest record of five fields
   (`keepalive_interval`, `session_timeout`, `session_cache_capacity`,
-  `session_ticket_lifetime`) consumed through new `connect_pinned_with_config` /
+  `session_ticket_lifetime`, and `write_stall_timeout` — the stream-transport write
+  deadline, see **Fixed**) consumed through new `connect_pinned_with_config` /
   `connect_pinned_udp_with_config` and `bind_with_config_bytes` /
   `bind_udp_with_config_bytes`. Keepalive/timeout map to the live `LivenessConfig`;
   cache fields size the server resumption cache. (`session_timeout` is the
@@ -1211,7 +1292,8 @@ Pointers only: each item is set out in full in the entry named.
   streams; `PhantomStream::set_priority()` sets scheduler priority; `PhantomStream::recv()`
   now returns `Option<Vec<u8>>` (`None` = clean peer EOF) instead of a stringly-typed
   error. Stream ids are allocated client-odd / server-even so concurrent opens never
-  collide.
+  collide, and are never reused within a session, so `open_stream()` refuses once a side
+  has used its half of the id space (see **Changed**).
 - **FFI ergonomics.** `AcceptOutcome::peer_addr_string()` (per-peer admission control),
   and `set_early_data_enabled(bool)` is now exported on both listeners.
 - **Builder API (Rust).** `PhantomSession::builder(addr)` / `PhantomListener::builder(addr)` /
@@ -1292,6 +1374,29 @@ Pointers only: each item is set out in full in the entry named.
   "A 0-RTT payload within the last 16 bytes of the limit no longer fails the resumed
   handshake".
 
+- **The controls for the stream-transport write deadline.**
+  `PhantomConfig::write_stall_timeout`; on a transport the caller builds itself,
+  `TcpSessionTransport::with_write_stall_timeout`,
+  `MimicTlsLeg::with_write_stall_timeout` (feature `mimicry`) and
+  `WasiLeg::with_write_stall_timeout` (feature `wasi-leg`), each beside an associated
+  `DEFAULT_WRITE_STALL_TIMEOUT` of thirty seconds; and `connect_pinned_mimic_with_config`,
+  the Rust-only, `mimicry`-gated counterpart of `connect_pinned_with_config`. See **Fixed**,
+  "A write the peer has stopped taking now fails after a deadline on every stream
+  transport".
+
+- **`phantom_protocol::transport::multiplexer::LAST_STREAM_ID`** (65535), the highest stream
+  id a packet header can carry and the point where each side's stream-id allocation stops.
+  See **Fixed**, "`open_stream()` refuses once this side's stream ids are used up, instead
+  of reusing one".
+
+- **`transport::stream::Stream` gains `release_app_handle`, `is_app_released`,
+  `is_retirable`, `has_sent_reliable` and `note_unordered_remote_fin`** — the state the data
+  pump reads to decide when a stream whose handle is gone may leave the session, whether a
+  stream ever reached the peer, and whether a `FIN` that arrived outside the reliable stream
+  is the one that ended the peer's half. See **Fixed**, "Dropping a `PhantomStream` closes
+  it, and a stream nobody holds no longer holds up either side", and "A `FIN` outside the
+  reliable stream left its stream in the table and could end the stream twice".
+
 ### Fixed
 
 - **A stream closed from both ends no longer comes back through `accept_stream()` or holds a
@@ -1304,10 +1409,12 @@ Pointers only: each item is set out in full in the entry named.
   surfaced through `accept_stream()` with this side's own parity, nothing ever closed it,
   and it counted against `MAX_STREAMS` (256), so after a few hundred ordinary
   request/response exchanges the session refused every stream the peer opened and stopped
-  acknowledging their segments. A stream is now dropped only when both halves are closed —
-  its own FIN acknowledged and the peer's released in order — and the handle keeps receiving
-  until the peer closes too. A retransmitted FIN that arrives after the stream is gone is
-  acknowledged and otherwise ignored.
+  acknowledging their segments. A stream whose handle is still held is now dropped only
+  when both halves are closed — its own FIN acknowledged and the peer's half ended — and the
+  handle keeps receiving until the peer closes too; a stream whose handle has been let go
+  of leaves sooner, as the entry "Dropping a `PhantomStream` closes it, and a stream nobody
+  holds no longer holds up either side" sets out. A retransmitted FIN that arrives after the
+  stream is gone is acknowledged and otherwise ignored.
 
   Two more defects in the same table are fixed with it. A stream that was only ever written
   to filled its own bounded channel with the acknowledgements of its writes, which nothing
@@ -1320,12 +1427,15 @@ Pointers only: each item is set out in full in the entry named.
   single-threaded runtime that thread is the one the drain needs. The stream is now cloned
   out of the table before anything is awaited.
 
-  **Behaviour changes.** A stream stays in the session's table, and counts toward
-  `MAX_STREAMS`, until both halves have closed, so a stream this side has closed holds its
-  slot until the peer closes its half as well. Anything written on a stream after its
-  `disconnect()` is discarded rather than sent, reliable or not: the peer has already been
-  told the stream ended. A reliable segment on the receiver's own stream-id parity for an id
-  it never allocated opens nothing and is not acknowledged, where it used to open a stream.
+  **Behaviour changes.** While its handle is held, a stream stays in the session's table,
+  and counts toward `MAX_STREAMS`, until both halves have closed, so a stream this side has
+  closed holds its slot until the peer closes its half as well. Anything written on a
+  stream after its `disconnect()` is discarded rather than sent, reliable or not, and the
+  write still returns `Ok`: the peer has already been told the stream ended. A write made
+  while the FIN waits for room in the send buffer cannot reach the wire ahead of it either,
+  since the pump reads it only once the FIN has taken its place in the stream. A reliable
+  segment on the receiver's own stream-id parity for an id it never allocated opens nothing
+  and is not acknowledged, where it used to open a stream.
   The documentation of `PhantomStream::disconnect` now says it closes the writing half, and
   UniFFI folds documentation into checksums, so Python, Swift or Kotlin bindings generated
   from an earlier build fail at import with a checksum mismatch — regenerate them. No byte,
@@ -1354,6 +1464,14 @@ Pointers only: each item is set out in full in the entry named.
   than be dropped by it. If delivery matters, have the peer confirm receipt at the
   application level and close after that answer.
 
+  Two neighbours of this fix are entries of their own. The signal is read between the
+  pump's turns, and on a TCP or TLS-mimicry socket the peer has stopped reading a single
+  transport write can hold one turn indefinitely; that case is bounded by the stream
+  transports' write deadline — see "A write the peer has stopped taking now fails after a
+  deadline on every stream transport". And a migration and a stream's priority change sat
+  in the same queue behind the refused writes as the close did; see "A migration requested
+  while an upload was stalled no longer waits behind it".
+
 - **A 0-RTT payload within the last 16 bytes of the limit no longer fails the resumed
   handshake.** The client caps early-data plaintext at `EARLY_DATA_MAX_LEN` (16 KiB), and
   sealing adds a 16-byte AES-GCM tag, but the length walk both listeners run before decoding
@@ -1369,6 +1487,234 @@ Pointers only: each item is set out in full in the entry named.
   allows. A blob longer than that is still refused before decode, which no conforming client
   can cause. The wire does not change. **Upgrade servers:** a patched client against an
   unpatched server still fails for those sizes.
+
+- **Dropping a `PhantomStream` closes it, and a stream nobody holds no longer holds up
+  either side.** Three defects with one cause: a stream left the session's table only once
+  both of its halves had closed, the peer's half is the peer's to close, and a handle had
+  no way to give up its reading half.
+
+  A handle dropped without `disconnect()` closed nothing at all: the peer never read an
+  EOF, and the stream kept its table entry and its demux route for the life of the session.
+  Dropping the last reference to a handle — letting it go out of scope, or releasing it in
+  a garbage-collected binding — now closes its writing half behind every write the handle
+  already made, exactly as `disconnect()` would. The drop is reported to the pump on a
+  channel of its own, because `Drop` can neither wait for room on the command channel nor
+  ride it, and the pump acts on the report only once it has taken in the commands that were
+  queued ahead of it, so the handle's last writes reach the peer before its EOF. A stream
+  this side opened and never put a reliable byte on has not reached the peer, and goes
+  without a FIN. A peer-opened stream whose handle never reached the application, because
+  the accept queue was full, is reclaimed the same way instead of sitting in the table
+  with no reader.
+
+  A side whose peer never closed the streams it opened kept a `Stream` and a demux route
+  for each of them, even after closing its own half, and at `MAX_STREAMS` it refused every
+  stream the peer opened next and left their segments unacknowledged. A stream whose handle
+  has been let go of now leaves the table as soon as its own FIN is acknowledged, whether or
+  not the peer ever closes its half — nobody is left to read that half. A held handle keeps
+  its stream until the peer closes, as before, so to read the peer's side to its end, keep
+  the handle until `recv()` returns `Ok(None)`.
+
+  And a stream let go of while the peer was still writing on it stopped the peer's whole
+  session. Once such a stream had left the table, the segments the peer went on sending
+  were acknowledged and nothing more; no further `WINDOW_UPDATE` came, so the peer's writes
+  stopped at the last limit it had been given, and because a sender holds every write its
+  send buffers refuse in one queue for the whole session and takes no further command while
+  that queue holds one, every write on every other stream of the peer's session then waited
+  behind a stream nobody would ever read. A segment on such a stream is now also answered
+  with a flow-control grant, worked out from the arriving offset alone because the stream
+  keeps no receive state once it has left the table: offsets are gap-free and no segment
+  that passes the receive gate carries more than 1300 bytes, so `(offset + 1) × 1300` plus
+  one maximum receive window is at least a full window beyond anything the peer can have
+  sent. A grant goes out for every data segment whose offset is a multiple of 16 and for
+  every persist probe, never for a FIN, so a stream nobody reads costs at most one small
+  frame per frame received, and nothing is stored for it. The peer's writes complete and
+  its other streams are not held up; what arrives on the released stream is discarded, and
+  nothing tells the peer its bytes went unread — if that matters, say so at the application
+  level before letting go.
+
+  End to end over a delayed link: 240 streams closed against a peer that holds every one of
+  them open now leave the client's table empty, where all 240 stayed, and 32 streams the
+  server opens afterwards are all accepted; with a stream's handle dropped while the peer
+  writes 8 MiB on it, all 320 of the peer's writes on a second stream return and arrive
+  whole, where the 257th never returned. `PhantomStream::new` is crate-private, since it now
+  takes the session's internal channels, and the type's documentation says what dropping a
+  handle does. No byte, flag or version on the wire moves; `docs/protocol/PROTOCOL.md` §4.4
+  and §4.5 state the release rule and the grant — the one limit this implementation may
+  advertise beyond what it has consumed plus its maximum window — and `INTEROP.md` tells a
+  second implementation what to expect.
+
+- **A `FIN` outside the reliable stream left its stream in the table and could end the
+  stream twice.** A stream leaves the table once both halves have closed, so the peer's
+  half has to be recorded as closed however its `FIN` arrives, and only the in-order `FIN`
+  on a reliable segment did that. The other two shapes — a `FIN` on a frame outside the
+  reliable stream, such as the bare `ENCRYPTED | FIN` a sender falls back to once a stream's
+  reliable offset space is exhausted, and a `FIN` riding an acknowledgement — handed the
+  application its EOF and recorded nothing, so a stream closed from both ends that way
+  counted against `MAX_STREAMS` until the session ended, and every such frame delivered a
+  fresh EOF. Both now end the peer's half, deliver an EOF only if that is what ended it —
+  at most one per stream, whichever shape arrived first — and drop the stream once this
+  side's own `FIN` is acknowledged, exactly as the in-order `FIN` does; either shape for a
+  stream the table no longer holds does nothing. The bare-`FIN` fallback had a sending-side
+  twin: when a `disconnect()` and the handle's drop both reached a stream with no offsets
+  left, it sent two bare `FIN`s and decremented the active-streams gauge twice, reporting
+  another stream that was still open as closed. It now takes the stream out of the table
+  first and does nothing if it was already gone. Nothing on the wire changes;
+  `docs/protocol/PROTOCOL.md` steps 8 and 12 of the receive order and §4.5 say so.
+
+- **`open_stream()` refuses once this side's stream ids are used up, instead of reusing
+  one.** A side's stream ids were counted in 32 bits and never stopped, while a packet
+  header carries them in 16. After 32 767 opens the client's next id was 65537, which goes
+  on the wire as 1 — the reserved raw-application stream — and every id after that as one
+  already used. The peer then merged the new stream's bytes into a stream it still held
+  under that id, or acknowledged and discarded them as belonging to one it had dropped, and
+  the sender saw every byte acknowledged: data was lost with no error at either end. The
+  transport-level `Session::open_stream` wrapped the same way, from 65535 back to 0,
+  replacing a stream it still held.
+
+  `PhantomSession::open_stream` now returns `Result` and refuses with
+  `CoreError::StreamError` once this side has handed out the last id of its parity —
+  65535 for the connecting side, 65534 for the accepting one, 32 767 streams per side per
+  session — leaving the session untouched: streams already open carry on, and
+  `accept_stream()` still takes the peer's. The limit counts every stream opened, not the
+  ones open at once, because an id is never reused: the peer may still hold the old stream,
+  or the record that it closed. A long-lived session that opens a stream per request
+  therefore reaches it, and has to be replaced by a new session.
+  `StreamDemultiplexer::open_stream` and `Session::open_stream` refuse the same way, no
+  allocator moves on a refusal, and the new public constant
+  `transport::multiplexer::LAST_STREAM_ID` names the highest id a header can carry.
+  `open_stream` is exported, so its signature changes on every binding: Swift callers need
+  `try`, Kotlin and Python callers can see it raise, and C callers must check `call_status`
+  before treating the return value as a handle, which the hand-kept C header now says.
+  `docs/protocol/PROTOCOL.md` §4.4 states the ceiling and the rule against reuse, and
+  `INTEROP.md`'s checklist asks a second implementation for the same. Nothing on the wire
+  changes.
+
+- **A migration requested while an upload was stalled no longer waits behind it.**
+  `migrate()`, `migrate_server()` and `PhantomStream::set_priority()` travelled on the
+  command channel with the application's writes, and the pump stops reading that channel
+  while it holds a write a send buffer refused. On a path that dies in the middle of an
+  upload larger than the send buffer no acknowledgement arrives to free a slot, so the
+  refused write was never admitted, the migration was never read, and once the 256-slot
+  channel filled `migrate()` itself blocked: the session sat in `Migrating` until the
+  liveness timer declared it dead, at exactly the moment a migration was what it needed.
+
+  The three now travel on a small channel of their own, read on an arm of the pump that
+  neither the refused writes nor the draining window disables. They are carried out in the
+  order they were sent, and a migration is still carried out whole — the rebind, then the
+  `path_id` and connection-id rotation, with no send in between. What they give up is order
+  against the writes: a migration can take effect before a write issued ahead of it has
+  been admitted to its send buffer, which costs nothing the migration design depends on,
+  since a segment goes out on whichever path is current when it is sent and whatever went
+  out on the old path is retransmitted on the new one; a priority applies to whatever the
+  stream holds at the next drain. The close takes in the control queued ahead of it before
+  it flushes, so `migrate()` followed by `disconnect()` still moves first. `SessionCommand`
+  loses `Migrate` and `MigrateServer`. Two tests cut the path of an in-memory pair in the
+  middle of a 2 MiB upload and fill the command channel behind the refused writes;
+  `migrate()`, or `migrate_server()` on the accepting end, now returns within two seconds,
+  the transport really rebinds, everything handed to the session arrives, and the session
+  returns to `Connected`. Before, the call did not return.
+
+- **A write the peer has stopped taking now fails after a deadline on every stream
+  transport, and the session ends `Dead` with `Timeout` instead of waiting forever.**
+  `TcpSessionTransport::send_bytes` wrote each frame with no deadline. Once the peer stops
+  reading its socket — a frozen process, or a client that has decided to keep a server's
+  session open — the kernel buffers between the two ends fill and the next write waits for
+  room only the peer can make. The session's data pump is that writer, and a write waits
+  inside one turn of its loop, so nothing else got a turn: no liveness sweep, no
+  acknowledgements, and no local close, because `disconnect()` and a dropped handle are
+  requests the pump reads between turns. A session over such a socket never ended, and on
+  the TCP-only reference server that was a client deciding when its slot came free. The
+  TLS-mimicry leg wrote the same way. The WASI leg's blocking write parked the whole
+  single-task guest — the session, its close and the embedder's own code — and was handed
+  frames larger than the 4096 bytes that call is specified for.
+
+  Every write on those three now runs under a deadline on *progress* rather than on the
+  total: each write call is bounded on its own, and any byte the socket accepts starts the
+  clock again, so a peer that is still reading, however slowly, is a slow link and is not
+  cut off. A write that goes the whole deadline without the socket taking a byte fails with
+  `CoreError::Timeout`, and the transport then refuses every later write without touching
+  the connection, because the stalled write may have left a frame cut part-way through and
+  any byte after it would be read by the peer as the rest of that frame. On TCP and the
+  mimicry leg the connection is also set to end in a reset rather than leave the kernel
+  offering the declined bytes to a closed window. The mimicry prelude is unchanged — it
+  already ran under a deadline of its own — as is everything that makes the leg what it
+  is: no keys, no security claim, the same receive-side parser and caps. The WASI leg now
+  writes through the non-blocking half of `wasi:io/streams` and waits on the stream's
+  readiness together with a monotonic-clock timer through `wasi:io/poll`, so frames of any
+  size go through. `EmbeddedLeg` has no clock on a bare-metal target, so the bound there is
+  its writer's to impose: a writer that can block indefinitely — a USB CDC link whose host
+  stopped reading, a UART under hardware flow control — should wrap its writes in its
+  executor's timeout and report `ErrorKind::TimedOut`, which the leg now turns into
+  `CoreError::Timeout` and treats as final, where it used to report a generic
+  `NetworkError` and let the session go on writing into a cut frame. The PhantomUDP
+  transports and the browser WebSocket leg never wait on the peer and are unchanged.
+
+  The session treats `Timeout` from either I/O method of its transport as the transport
+  giving up on the peer: it writes nothing more, stops reading, and ends in
+  `ConnectionState::Dead`, with `CoreError::Timeout` from `recv()`, `last_error()` and
+  `send()`. A `disconnect()` requested while the write was stuck is carried out and
+  announced if the peer starts reading again; if not, it takes effect when the write gives
+  up, unannounced — the transport refuses the close frame like any other write — and the
+  session ends `Dead`, not `Closed`. `SessionTransport::send_bytes` documents this as the
+  contract a transport follows: a `Timeout` from a transport is final.
+
+  The deadline is set by the new `PhantomConfig::write_stall_timeout`, which every entry
+  point that builds a stream transport from a config reads: the TCP and mimicry listeners
+  through `bind_with_config_bytes` and the builder's `config()`,
+  `connect_pinned_with_config`, and the new Rust-only `connect_pinned_mimic_with_config`.
+  On a transport the caller builds itself it is set with `with_write_stall_timeout` on
+  `TcpSessionTransport`, `MimicTlsLeg` or `WasiLeg`, each beside an associated
+  `DEFAULT_WRITE_STALL_TIMEOUT` of thirty seconds; a config handed to `SessionBuilder` does
+  not reach a transport it did not build. The `server()` preset keeps thirty seconds, the
+  default liveness idle timeout; `mobile()`, and so `default()`, and `iot()` give two
+  minutes, because a TCP connection on a radio link can go that long without progress while
+  the kernel's retransmission back-off brings it back, and slow links are where the socket
+  reports progress most coarsely — a writer waiting on a full send buffer is woken only once
+  a sizeable share of it has drained, about a third on Linux, which behind a 4 MiB buffer
+  is about 11 s at 1 Mbit/s and 44 s at 256 kbit/s. Entry points that read the field refuse
+  a value below one second with `CoreError::ConfigError` before any I/O. PhantomUDP ignores
+  it, and an entry point that takes no config — `phantom-server` binds without one — uses
+  thirty seconds.
+
+  The regression tests run real loopback connections whose far end never reads, with
+  shrunken socket buffers. Before this change a 1 MiB write never returned, and a session
+  parked in one was still running ten seconds after `disconnect()`. Now the write fails
+  with `Timeout`, nothing is written after it even once the peer makes room, a peer reading
+  slowly across several deadlines is not cut off, the far end sees a reset, and the session
+  ends. The threat model's denial-of-service table has a row for this, with its residual —
+  a peer that keeps reading, however slowly, is not cut off — and the cancel-safety audit,
+  the architecture overview and the deployment guide describe the bound. Nothing on the
+  wire changes.
+
+- **`connection_state()` reads `Dead` as soon as the transport gives up, and nothing walks
+  an ended state back.** When a transport gives up on its peer, the receive task is usually
+  the first part of the pump to hear of it. It recorded the cause for `recv()` but left the
+  state to the send loop's teardown, so until that loop noticed, `connection_state()` read
+  `Connected` while `recv()` had already reported `Timeout`, and `send()`, which decides by
+  the state, went on accepting writes the transport refuses. The receive task now publishes
+  `Dead` right after recording the cause. The liveness verdict, the other writer on the send
+  loop, now publishes `Connected` or `Migrating` in one atomic step that leaves `Dead`,
+  `Closed`, `Failed` and `Draining` alone, which also stops a `Recovered` verdict racing
+  `disconnect()` or the peer's announced close from briefly reporting an ended session as
+  `Connected` again. And `disconnect()` stored `Closed` unconditionally, so an application
+  that reacted to a `Dead` session by calling it — the reference server's echo handler does
+  exactly that — turned a death into an orderly close that never happened, and a
+  handshake's `Failed` the same way; it now leaves `Dead` and `Failed`, and the cause
+  `last_error()` reports, as they are. `ConnectionState::Dead`'s documentation names both of
+  its causes — the path staying down past the migration idle timeout, and a stream
+  transport giving up on a peer that stopped reading — and what each reports.
+
+- **A server-side session that its own pump ended reported no cause.** The pump records why
+  it ended a session of its own accord — the liveness timer, and now a transport giving up
+  — in a slot that `last_error()`, `recv()` and `send()` read. A client session shares that
+  slot with its handle; the accepted-session constructor built a fresh one instead,
+  although its comment said the slot was shared, so a session a listener accepted and the
+  liveness timer then reaped answered `None` from `last_error()` and an untyped "Session
+  closed" from `recv()`, while the cause sat in a slot nobody read. Both liveness
+  integration tests are client-side, which is why neither saw it. It now shares the slot
+  and reports `CoreError::Timeout`. The liveness path also recorded its cause only after
+  publishing `Dead`, so a caller could briefly see the state with no reason beside it; the
+  cause is now written first, and still never overwrites an earlier, more specific one.
 
 - **A connection no longer stops ramping above ~10.7% packet loss, because the volume
   bound no longer judges a Startup round.** `BandwidthEstimator::adapt_inflight_bound`
@@ -2379,8 +2725,11 @@ Pointers only: each item is set out in full in the entry named.
   free, in FIFO order so byte ordering and the reliable FIN's position are unchanged.
   While that queue is non-empty the pump stops taking commands, which puts the
   backpressure where it belongs — on the application's own `send()` — instead of on the
-  session's scheduler. The same admission path replaces the pre-handshake queue flush,
-  which ran *before* the loop that transmits and before the receive task existed, so an
+  session's scheduler. (A session's close, a migration and a stream's priority change were
+  later taken off that command channel, so that this pause cannot hold them; see the
+  entries on `disconnect()` and on a migration requested while an upload was stalled.) The
+  same admission path replaces the pre-handshake queue flush, which ran *before* the loop
+  that transmits and before the receive task existed, so an
   application that wrote more than the buffer holds while still connecting stalled the
   session permanently with no acknowledgement able to reach it. One drain pass is also
   now bounded at 32 segments and re-arms the outbound notify, so a stream with a full
@@ -2518,9 +2867,10 @@ Pointers only: each item is set out in full in the entry named.
 - **Inert legacy `connect()` now reports `Failed`** instead of an eternal `Connecting`
   shell, so misuse is observable via `connection_state()` (use `connect_pinned` /
   `connect_pinned_udp`).
-- **Dropping the last `PhantomSession` handle now closes the session** (sends an in-order
-  `Close` so the peer sees EOF), fixing a regression where extra internal command
-  senders kept the pump alive after the handle was dropped.
+- **Dropping the last `PhantomSession` handle now closes the session** (it raises the same
+  close signal `disconnect()` does, so the peer is told the session ended), fixing a
+  regression where extra internal command senders kept the pump alive after the handle
+  was dropped.
 - **Release tarballs contained no library.** The packaging step copied from
   `core/target/<triple>/release/` — a path that does not exist, since `core` is the only
   workspace member and cargo's target directory is the repository root — and the copy was
@@ -2738,6 +3088,60 @@ Pointers only: each item is set out in full in the entry named.
   path sets the bit. Accepting what we never emit is interoperable; the flag doc now states
   which half is which rather than describing a format and leaving the direction to be
   inferred.
+
+- **`docs/security/invariants.md` lists the eleven security invariants that code, tests and
+  documents cite by number.** "Invariant 2" or "Invariants 7, 10" appears in more than two
+  hundred places, but the only public list, in `SECURITY.md`, stopped at three, and the
+  protocol specification's compliance table pointed at documents that contained none, so a
+  reader could not check what a citation claimed. The new file states each invariant as the
+  code enforces it today, with the functions that enforce it and the tests that pin it, and
+  says where a test covers only part of one: the nonce ceiling cannot be reached from a
+  test, and the constant-time path check rests on review rather than measurement. Two
+  statements that are easy to get wrong are given as the code has them: a version mismatch
+  is answered with a typed reject that the client reports as `ProtocolRejected`, not with an
+  `UnsupportedVersion` error, and a build-variant mismatch ends the attempt with no reply
+  the client could report. `SECURITY.md`, `CONTRIBUTING.md`, `README.md`, the threat
+  model, the architecture overview, the 0-RTT guide, the protocol specification's
+  compliance table and the header of `core/tests/security_invariants.rs` point at it, so
+  the existing citations resolve without being rewritten; the compliance table's
+  "saturating epoch" now reads "the epoch never wraps", which is what the rekey path does.
+
+- **The compliance documents and the cancel-safety audit point at code by name rather than
+  by line number.** Many of their `file:line` references no longer landed on the code they
+  described — the handshake RNG sites, the resumption-binder compare, the cookie derivation
+  and the rekey range in `docs/compliance/`, and all twenty-two in the cancel-safety audit —
+  and a line number that drifts still resolves, so nothing announced it. Every reference is
+  now keyed on the file and the enclosing function, type or constant, as the panic-site
+  inventory already was. Re-deriving them re-checked the claims as well, and one changes
+  what a fips deployment can say: the RNG audit stated that every call site goes through
+  the `RngProvider` seam, and four do not. The cookie and proof-of-work master secret, both
+  handshake nonces and the initial PhantomUDP connection id call `getrandom` directly, so a
+  `--features fips` build draws them from the operating system rather than from the AWS-LC
+  DRBG. `docs/compliance/rng-audit.md` and the G-4 row of the Common Criteria mapping now
+  say so; the code is unchanged. The cancel-safety audit's `select!` sketches are redrawn
+  from the code, and stale counts (73 negative-security tests, 23 panic sites) and names
+  that no longer exist are corrected.
+
+- **The hand-curated C header describes the library it declares.** It still said the
+  surface followed UniFFI 0.31 as of 0.2.2, and it gave 18, 19 and 20 as the lowered
+  discriminants of `CoreError::ServerIdentityMismatch`, `ProtocolRejected` and
+  `Unsupported` — their numbers before three unused variants were removed (see
+  **Removed**). They are 15, 16 and 17, which is what the generated converters read and
+  write, so a C caller that followed the header recognised none of the three. Its object
+  summary now lists six objects, `ResumptionHint` included, its comment on `open_stream`
+  says to check the call status, and its description of the `PhantomConfig` record gives
+  the five fields in lowering order. The C README's symbol counts match the release cdylib
+  (189: 74 functions, 62 checksums, 53 runtime symbols). No declaration changed.
+
+- **What an operator sees when a client stops reading.** `docs/operations/deployment.md`
+  now says that the reference server's echo handler logs the resulting `Timeout` as a
+  warning only when it happens to be waiting in `recv()` as the session ends. A client that
+  stops reading while it keeps sending leaves the handler in `send()`, which then fails with
+  `NetworkError("Session closed")` and is logged at `DEBUG` as the peer closing. The
+  dependable signal is the `phantom.session.active` count, which falls when the session ends
+  however the handler heard of it. `phantom-server` binds without a `PhantomConfig` and so
+  runs with the thirty-second write deadline; an embedder binding its own listener chooses
+  the figure with `PhantomConfig::write_stall_timeout`.
 
 
 ## [0.2.2] - 2026-06-22
