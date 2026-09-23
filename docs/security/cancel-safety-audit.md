@@ -432,11 +432,14 @@ let _ = recv_done_tx.send(());
   place, so the state never trails what `recv()` reports while the send loop is
   still on its way to its teardown. Both are plain synchronous writes with no
   await between them, so a cancel cannot separate them. The teardown publishes the
-  same `Dead` on the same condition, and the liveness verdict — the only other
-  writer on the send loop — publishes `Connected` or `Migrating` through
-  `publish_unless_ended`, a single `fetch_update` that leaves `Dead`, `Closed`,
-  `Failed` and `Draining` alone, so no verdict computed before the give-up can
-  walk the state back afterwards.
+  same `Dead` on the same condition. On the send loop, the liveness verdict
+  publishes `Connected` or `Migrating` through `publish_unless_ended`, a single
+  `fetch_update` that leaves `Dead`, `Closed`, `Failed` and `Draining` alone, so no
+  verdict computed before the give-up can walk the state back afterwards; the tick
+  arm's other write, `Draining`, follows a peer close, and this path publishes `Dead`
+  only when there was none. From the application's thread, `disconnect()` publishes
+  `Closed` through the same kind of `fetch_update`, leaving `Dead` and `Failed` in
+  place.
 - `handle_packet` awaits in two kinds of place: tokio `Mutex` acquisitions on a
   stream's buffers (`Stream::on_sack`, `Stream::accept_in_order`,
   `Stream::received_sack`, `Stream::is_fin_acked`), and best-effort transport sends

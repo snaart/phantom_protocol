@@ -102,10 +102,10 @@ pub struct PhantomConfig {
     ///
     /// A longer deadline has a cost too. While a write waits, the session's pump waits
     /// with it: the session keeps its slot, and a `disconnect()` is carried out only
-    /// once the write returns or the deadline passes. It must not be zero — that would
-    /// give up on the first write the socket could not take at once, which on a busy
-    /// connection is almost every write — and the entry points that use it refuse zero
-    /// with `CoreError::ConfigError` before any I/O.
+    /// once the write returns or the deadline passes. It must be at least one second —
+    /// anything shorter gives up on nearly every write the socket could not take at
+    /// once, which on a busy connection is almost every write — and the entry points
+    /// that use it refuse a shorter one with `CoreError::ConfigError` before any I/O.
     ///
     /// Read by the TCP and TLS-mimicry listeners and by `connect_pinned_with_config`
     /// (and the mimicry connect that takes a config); ignored over PhantomUDP, whose
@@ -192,17 +192,24 @@ impl PhantomConfig {
     /// The write deadline for a stream transport built from this config, checked.
     ///
     /// Called by every entry point that builds a TCP or mimicry transport from a config,
-    /// before it does any I/O, so a zero deadline is refused where it was supplied
-    /// rather than discovered as a session that dies at the first full send buffer.
+    /// before it does any I/O, so a deadline too short to survive a busy send buffer is
+    /// refused where it was supplied rather than discovered as a session that dies at
+    /// the first full one.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn stream_write_stall_timeout(&self) -> Result<Duration, CoreError> {
-        if self.write_stall_timeout.is_zero() {
+        if self.write_stall_timeout < MIN_WRITE_STALL_TIMEOUT {
             return Err(CoreError::ConfigError(
-                "PhantomConfig::write_stall_timeout must be greater than zero".into(),
+                "PhantomConfig::write_stall_timeout must be at least one second".into(),
             ));
         }
         Ok(self.write_stall_timeout)
     }
 }
+
+/// The shortest write deadline a config may carry. A deadline shorter than this gives
+/// up on writes that a busy but healthy connection routinely makes wait.
+#[cfg(not(target_arch = "wasm32"))]
+const MIN_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[cfg(test)]
 mod tests {
@@ -245,9 +252,10 @@ mod tests {
         );
     }
 
-    /// Every preset's deadline passes the check the entry points make, and zero does
-    /// not.
+    /// Every preset's deadline passes the check the entry points make, and zero or
+    /// anything under a second does not.
     #[test]
+    #[cfg(not(target_arch = "wasm32"))]
     fn a_zero_write_deadline_is_refused_and_the_presets_are_not() {
         for cfg in [
             PhantomConfig::mobile(),
@@ -259,14 +267,31 @@ mod tests {
                 Some(cfg.write_stall_timeout)
             );
         }
+        for short in [
+            Duration::ZERO,
+            Duration::from_nanos(1),
+            Duration::from_millis(999),
+        ] {
+            let cfg = PhantomConfig {
+                write_stall_timeout: short,
+                ..PhantomConfig::default()
+            };
+            assert!(
+                matches!(
+                    cfg.stream_write_stall_timeout(),
+                    Err(CoreError::ConfigError(_))
+                ),
+                "{short:?} must be refused"
+            );
+        }
         let cfg = PhantomConfig {
-            write_stall_timeout: Duration::ZERO,
+            write_stall_timeout: MIN_WRITE_STALL_TIMEOUT,
             ..PhantomConfig::default()
         };
-        assert!(matches!(
-            cfg.stream_write_stall_timeout(),
-            Err(CoreError::ConfigError(_))
-        ));
+        assert_eq!(
+            cfg.stream_write_stall_timeout().ok(),
+            Some(MIN_WRITE_STALL_TIMEOUT)
+        );
     }
 
     #[test]

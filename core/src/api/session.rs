@@ -2588,10 +2588,12 @@ async fn run_data_pump<T: SessionTransport>(
         // finish, and until then `connection_state()` would go on reading `Connected`
         // while `recv()` already reports the session over — and `send()`, which reads
         // the state, would go on accepting writes the transport refuses. Nothing walks
-        // it back: the only later writers are the teardown, which publishes the same
-        // `Dead` on the same condition (the give-up is never cleared, and nothing but
-        // this task records a peer close), and the liveness verdict, which leaves an
-        // ended session alone (`publish_unless_ended`).
+        // it back: the teardown publishes the same `Dead` on the same condition (the
+        // give-up is never cleared, and nothing but this task records a peer close);
+        // the liveness verdict leaves an ended session alone (`publish_unless_ended`);
+        // the tick arm's `Draining` follows a peer close, which rules this path out;
+        // and `disconnect()`, called from the application's thread, leaves `Dead` and
+        // `Failed` in place.
         if transport_recv.has_given_up() && !crypto_recv.peer_closed() {
             record_terminal_cause(&terminal_error_recv, CoreError::Timeout);
             state_recv.store(ConnectionState::Dead as u8, Ordering::Relaxed);
@@ -6700,7 +6702,9 @@ impl PhantomSession {
     /// [`CoreError::Timeout`] from `last_error()` and `recv()` — **not announced**: the
     /// transport refuses every write after the one that stalled, the close frame
     /// included, and resets the connection. This call has returned long before; the
-    /// `Closed` it published gives way to `Dead` when that happens.
+    /// `Closed` it published gives way to `Dead` when that happens. Called on a session
+    /// that has already ended `Dead` or `Failed`, it leaves that state — and the cause
+    /// `last_error()` reports — as it is.
     ///
     /// The announcement is a best-effort `CONTROL` frame carrying
     /// [`ControlSubtype::CLOSE`]: it is not acknowledged and not retransmitted, so a
@@ -6716,7 +6720,17 @@ impl PhantomSession {
     /// generator unconditionally adds `AutoCloseable.close()` to every
     /// object, and a Rust-side `close` here would conflict with it.
     pub async fn disconnect(&self) -> Result<(), CoreError> {
-        self.set_state(ConnectionState::Closed);
+        // An end the session already reached says more than `Closed` would: `Dead`
+        // carries the cause `last_error()` reports, and `Failed` the handshake's. Both
+        // stay; anything else becomes `Closed`.
+        let _ = self
+            .state
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                match ConnectionState::from_u8(current) {
+                    ConnectionState::Dead | ConnectionState::Failed => None,
+                    _ => Some(ConnectionState::Closed as u8),
+                }
+            });
         // Raised rather than queued: a full command channel, or a pump that has stopped
         // reading it because the peer stopped reading, must not be able to hold this
         // call or the close it asks for.
@@ -8243,6 +8257,39 @@ mod tests {
     /// returns an error (not a silent queue), and `recv()` never yields. If a
     /// future change ever wires a real pump into this constructor, this test must
     /// be updated alongside the doc — the two must not drift apart.
+    /// `disconnect()` on a session that has already ended keeps the end it reached:
+    /// `Dead` is what a transport that gave up publishes beside the cause
+    /// `last_error()` reports, and `Failed` is a handshake's. Overwriting either with
+    /// `Closed` told a caller the session was closed on request when it had died.
+    #[tokio::test]
+    async fn disconnect_leaves_an_ended_session_in_the_state_it_ended_in() {
+        let failed = PhantomSession::connect("example.com:443".to_string());
+        assert_eq!(failed.connection_state(), ConnectionState::Failed);
+        failed.disconnect().await.unwrap();
+        assert_eq!(failed.connection_state(), ConnectionState::Failed);
+
+        let dead = PhantomSession::connect("example.com:443".to_string());
+        dead.set_state(ConnectionState::Dead);
+        dead.disconnect().await.unwrap();
+        assert_eq!(dead.connection_state(), ConnectionState::Dead);
+
+        for live in [
+            ConnectionState::Connecting,
+            ConnectionState::Connected,
+            ConnectionState::Migrating,
+            ConnectionState::Draining,
+        ] {
+            let session = PhantomSession::connect("example.com:443".to_string());
+            session.set_state(live);
+            session.disconnect().await.unwrap();
+            assert_eq!(
+                session.connection_state(),
+                ConnectionState::Closed,
+                "disconnect() from {live:?} must publish Closed"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn deprecated_connect_is_inert_and_reports_failed() {
         let session = PhantomSession::connect("example.com:443".to_string());
@@ -8338,7 +8385,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_phantom_session_close() {
+        // A live session: the inert constructor reports `Failed`, which a later
+        // `disconnect()` deliberately leaves in place.
         let session = PhantomSession::connect("example.com:443".to_string());
+        session.set_state(ConnectionState::Connected);
         session.disconnect().await.unwrap();
         assert_eq!(session.connection_state(), ConnectionState::Closed);
         assert!(!session.is_data_ready());
@@ -13690,7 +13740,7 @@ mod tests {
     async fn flood_a_peer_that_never_reads(
         session: &PhantomSession,
     ) -> Option<Result<Vec<u8>, CoreError>> {
-        let stream = session.open_stream();
+        let stream = session.open_stream().expect("open a stream");
         stream
             .send_unreliable(vec![0xE7; UNREAD_BACKLOG])
             .await
