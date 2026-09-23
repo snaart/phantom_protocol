@@ -1095,7 +1095,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_func_verifying_key_from_signing_key() != 62299) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned() != 2050) {
+    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned() != 13736) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp() != 56169) {
@@ -1107,10 +1107,10 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption() != 52312) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_config() != 23760) {
+    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_config() != 36966) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 25404) {
+    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 56380) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_has_early_data() != 35020) {
@@ -1155,7 +1155,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_connection_state() != 5175) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_disconnect() != 55165) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_disconnect() != 4445) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_early_data_accepted() != 46386) {
@@ -1179,7 +1179,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_migrate() != 13926) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_open_stream() != 57628) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_open_stream() != 61871) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_peer_addr() != 8519) {
@@ -1254,7 +1254,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind() != 2358) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_config_bytes() != 17389) {
+    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_config_bytes() != 17914) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_signing_key_bytes() != 31864) {
@@ -2582,8 +2582,11 @@ open class PhantomListener: Disposable, AutoCloseable, PhantomListenerInterface
         
     /**
      * Bind a TCP listener using a persisted 64-byte signing seed and a
-     * [`PhantomConfig`](crate::config::PhantomConfig) that controls liveness settings
-     * and session-cache sizing. The FFI analogue of the Rust-only
+     * [`PhantomConfig`](crate::config::PhantomConfig) that controls liveness settings,
+     * session-cache sizing, and the write deadline of every accepted connection
+     * ([`write_stall_timeout`](crate::config::PhantomConfig::write_stall_timeout) — a
+     * zero one is refused with [`CoreError::ConfigError`] before the port is bound).
+     * The FFI analogue of the Rust-only
      * [`bind_with_signing_key`](Self::bind_with_signing_key) + config combination.
      */
     @Throws(CoreException::class)
@@ -2897,6 +2900,21 @@ public interface PhantomSessionInterface {
      * itself unacknowledged. Have the peer say it received the data, at the
      * application level, and close after that answer arrives.
      *
+     * **On a stream socket its peer has stopped reading** — TCP or the TLS-mimicry
+     * leg — the pump can be parked inside a single transport write that the peer is
+     * not taking, and nothing, this request included, is read until that write
+     * returns. If the peer starts reading again, the close is carried out and
+     * announced as usual. If it does not, the write gives up once it has
+     * gone the transport's write deadline without progress (thirty seconds unless
+     * [`PhantomConfig::write_stall_timeout`](crate::config::PhantomConfig::write_stall_timeout)
+     * says otherwise), and the session ends [`ConnectionState::Dead`], with
+     * [`CoreError::Timeout`] from `last_error()` and `recv()` — **not announced**: the
+     * transport refuses every write after the one that stalled, the close frame
+     * included, and resets the connection. This call has returned long before; the
+     * `Closed` it published gives way to `Dead` when that happens. Called on a session
+     * that has already ended `Dead` or `Failed`, it leaves that state — and the cause
+     * `last_error()` reports — as it is.
+     *
      * The announcement is a best-effort `CONTROL` frame carrying
      * [`ControlSubtype::CLOSE`]: it is not acknowledged and not retransmitted, so a
      * peer that never receives it falls back to concluding the same thing from
@@ -3024,6 +3042,18 @@ public interface PhantomSessionInterface {
      * handle closes the stream's writing half behind everything written on it; see
      * [`PhantomStream`](crate::api::stream::PhantomStream) for when the stream then
      * leaves the session.
+     *
+     * # Errors
+     *
+     * [`CoreError::StreamError`] once this side has opened 32 767 streams in the
+     * session. A stream id travels in a 16-bit header field and each side allocates
+     * from its own half of that space, never reusing an id — even one whose stream
+     * has long since closed, because the peer may still be holding it or the record
+     * that it closed, and would fold a new stream's bytes into it. Nothing is opened
+     * and the session is otherwise unaffected: streams already open carry on, and
+     * `accept_stream()` still takes the peer's. The limit counts every stream opened,
+     * not the ones open at once, so a long-lived session that opens a stream per
+     * request reaches it; open a new session to continue.
      */
     fun `openStream`(): PhantomStream
     
@@ -3445,6 +3475,21 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
      * itself unacknowledged. Have the peer say it received the data, at the
      * application level, and close after that answer arrives.
      *
+     * **On a stream socket its peer has stopped reading** — TCP or the TLS-mimicry
+     * leg — the pump can be parked inside a single transport write that the peer is
+     * not taking, and nothing, this request included, is read until that write
+     * returns. If the peer starts reading again, the close is carried out and
+     * announced as usual. If it does not, the write gives up once it has
+     * gone the transport's write deadline without progress (thirty seconds unless
+     * [`PhantomConfig::write_stall_timeout`](crate::config::PhantomConfig::write_stall_timeout)
+     * says otherwise), and the session ends [`ConnectionState::Dead`], with
+     * [`CoreError::Timeout`] from `last_error()` and `recv()` — **not announced**: the
+     * transport refuses every write after the one that stalled, the close frame
+     * included, and resets the connection. This call has returned long before; the
+     * `Closed` it published gives way to `Dead` when that happens. Called on a session
+     * that has already ended `Dead` or `Failed`, it leaves that state — and the cause
+     * `last_error()` reports — as it is.
+     *
      * The announcement is a best-effort `CONTROL` frame carrying
      * [`ControlSubtype::CLOSE`]: it is not acknowledged and not retransmitted, so a
      * peer that never receives it falls back to concluding the same thing from
@@ -3701,10 +3746,23 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
      * handle closes the stream's writing half behind everything written on it; see
      * [`PhantomStream`](crate::api::stream::PhantomStream) for when the stream then
      * leaves the session.
-     */override fun `openStream`(): PhantomStream {
+     *
+     * # Errors
+     *
+     * [`CoreError::StreamError`] once this side has opened 32 767 streams in the
+     * session. A stream id travels in a 16-bit header field and each side allocates
+     * from its own half of that space, never reusing an id — even one whose stream
+     * has long since closed, because the peer may still be holding it or the record
+     * that it closed, and would fold a new stream's bytes into it. Nothing is opened
+     * and the session is otherwise unaffected: streams already open carry on, and
+     * `accept_stream()` still takes the peer's. The limit counts every stream opened,
+     * not the ones open at once, so a long-lived session that opens a stream per
+     * request reaches it; open a new session to continue.
+     */
+    @Throws(CoreException::class)override fun `openStream`(): PhantomStream {
             return FfiConverterTypePhantomStream.lift(
     callWithHandle {
-    uniffiRustCall() { _status ->
+    uniffiRustCallWithError(CoreException) { _status ->
     UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_open_stream(
         it,
         _status)
@@ -4176,10 +4234,12 @@ public object FfiConverterTypePhantomSession: FfiConverter<PhantomSession, Long>
  *
  * Once this side's close is acknowledged the session forgets the stream, whether or
  * not the peer has closed its own half — nobody is left here to read what that half
- * carries. Anything the peer sends on it afterwards is acknowledged and discarded, so
- * its writes still complete, up to the receive window this side last advertised; a
- * peer that keeps writing past that is held at it, as it would be by a reader that
- * stopped reading. To read the peer's side to its end, keep the handle until
+ * carries. Anything the peer sends on it afterwards is acknowledged and discarded, and
+ * the session keeps granting the peer flow-control room on it, so the peer's writes
+ * complete however much it goes on writing, and its other streams are not held up
+ * behind this one. Nothing tells the peer its bytes went unread; if that matters, say
+ * so at the application level before letting go. To read the peer's side to its end,
+ * keep the handle until
  * [`recv`](Self::recv) returns `Ok(None)`: a held handle keeps its stream for as long
  * as the peer's half is open.
  *
@@ -4314,10 +4374,12 @@ public interface PhantomStreamInterface {
  *
  * Once this side's close is acknowledged the session forgets the stream, whether or
  * not the peer has closed its own half — nobody is left here to read what that half
- * carries. Anything the peer sends on it afterwards is acknowledged and discarded, so
- * its writes still complete, up to the receive window this side last advertised; a
- * peer that keeps writing past that is held at it, as it would be by a reader that
- * stopped reading. To read the peer's side to its end, keep the handle until
+ * carries. Anything the peer sends on it afterwards is acknowledged and discarded, and
+ * the session keeps granting the peer flow-control room on it, so the peer's writes
+ * complete however much it goes on writing, and its other streams are not held up
+ * behind this one. Nothing tells the peer its bytes went unread; if that matters, say
+ * so at the application level before letting go. To read the peer's side to its end,
+ * keep the handle until
  * [`recv`](Self::recv) returns `Ok(None)`: a held handle keeps its stream for as long
  * as the peer's half is open.
  *
@@ -5913,17 +5975,20 @@ public object FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer<Metrics
  * Tunable parameters for a Phantom session / listener, exported across the
  * UniFFI boundary as a plain record.
  *
- * These four fields are actively consumed by the core:
+ * These five fields are actively consumed by the core:
  * - `keepalive_interval` → `LivenessConfig.keepalive_interval` (idle keep-alive PING interval)
  * - `session_timeout` → `LivenessConfig.idle_timeout` (Migrating→Dead reap window)
  * - `session_cache_capacity` → `SessionCache` max entries (server-only; client ignores)
  * - `session_ticket_lifetime` → `SessionCache` ticket lifetime (server-only; client ignores)
+ * - `write_stall_timeout` → the write deadline of a stream transport — TCP or the
+ * TLS-mimicry leg — that the entry point builds (PhantomUDP ignores it)
  *
  * **Note:** `session_cache_capacity` and `session_ticket_lifetime` are consumed only on the
  * server path — by **both** listeners, [`PhantomListener`] over TCP and
  * [`PhantomUdpListener`] over PhantomUDP, which is the production
- * transport. Client `connect_*` entry points read only `keepalive_interval` and
- * `session_timeout` from this struct and silently ignore the other two.
+ * transport. Client `connect_*` entry points read `keepalive_interval`,
+ * `session_timeout` and, over TCP, `write_stall_timeout` from this struct and
+ * silently ignore the other two.
  *
  * **Constructing one.** From Rust: `PhantomConfig::default()` — which is
  * `mobile()` — or one of the `server()` / `iot()` presets, then mutate the
@@ -6000,6 +6065,38 @@ data class PhantomConfig (
      * [`PhantomUdpListener`]: crate::api::udp_listener::PhantomUdpListener
      */
     var `sessionTicketLifetime`: java.time.Duration
+    , 
+    /**
+     * How long a write on a stream transport — TCP, or the TLS-mimicry leg — may go
+     * without the socket accepting a single byte before the session gives up on its
+     * peer. The write then fails with `CoreError::Timeout`, the connection is reset,
+     * and the session ends `Dead` with that cause.
+     *
+     * It bounds a peer that has **stopped** reading, not a slow one: every byte the
+     * socket accepts starts the clock again. But the socket reports progress coarsely.
+     * A write waiting on a full send buffer is woken only once a sizeable share of the
+     * buffer has drained — about a third of it on Linux — so on a slow path behind a
+     * large buffer the gaps between moments of progress are far longer than the byte
+     * rate suggests: a third of a 4 MiB buffer takes about 11 s to drain at 1 Mbit/s,
+     * and about 44 s at 256 kbit/s. Set this above the longest such gap the slowest
+     * expected path can produce, or a connection that is still moving is cut off.
+     *
+     * A longer deadline has a cost too. While a write waits, the session's pump waits
+     * with it: the session keeps its slot, and a `disconnect()` is carried out only
+     * once the write returns or the deadline passes. It must be at least one second —
+     * anything shorter gives up on nearly every write the socket could not take at
+     * once, which on a busy connection is almost every write — and the entry points
+     * that use it refuse a shorter one with `CoreError::ConfigError` before any I/O.
+     *
+     * Read by the TCP and TLS-mimicry listeners and by `connect_pinned_with_config`
+     * (and the mimicry connect that takes a config); ignored over PhantomUDP, whose
+     * sends never wait on the peer. An entry point that takes no `PhantomConfig` uses
+     * 30 s. A Rust caller that builds its own transport sets the deadline on that
+     * transport, and a config given to `SessionBuilder` does not change it.
+     *
+     * Defaults: 120 s (`mobile`, and so `default`), 30 s (`server`), 120 s (`iot`).
+     */
+    var `writeStallTimeout`: java.time.Duration
     
 ){
     
@@ -6020,6 +6117,7 @@ public object FfiConverterTypePhantomConfig: FfiConverterRustBuffer<PhantomConfi
             FfiConverterDuration.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterDuration.read(buf),
+            FfiConverterDuration.read(buf),
         )
     }
 
@@ -6027,7 +6125,8 @@ public object FfiConverterTypePhantomConfig: FfiConverterRustBuffer<PhantomConfi
             FfiConverterDuration.allocationSize(value.`keepaliveInterval`) +
             FfiConverterDuration.allocationSize(value.`sessionTimeout`) +
             FfiConverterUInt.allocationSize(value.`sessionCacheCapacity`) +
-            FfiConverterDuration.allocationSize(value.`sessionTicketLifetime`)
+            FfiConverterDuration.allocationSize(value.`sessionTicketLifetime`) +
+            FfiConverterDuration.allocationSize(value.`writeStallTimeout`)
     )
 
     override fun write(value: PhantomConfig, buf: ByteBuffer) {
@@ -6035,6 +6134,7 @@ public object FfiConverterTypePhantomConfig: FfiConverterRustBuffer<PhantomConfi
             FfiConverterDuration.write(value.`sessionTimeout`, buf)
             FfiConverterUInt.write(value.`sessionCacheCapacity`, buf)
             FfiConverterDuration.write(value.`sessionTicketLifetime`, buf)
+            FfiConverterDuration.write(value.`writeStallTimeout`, buf)
     }
 }
 
@@ -6154,8 +6254,18 @@ enum class ConnectionState(val value: kotlin.UByte) {
      */
     MIGRATING(7u),
     /**
-     * The session is dead: the path stayed down past the migration idle-timeout
-     * with no recovery. Terminal — `recv()` errors instead of hanging (P4.3).
+     * The session is dead: its peer stopped answering and the session gave up on
+     * it. Terminal — `recv()` errors instead of hanging.
+     *
+     * Two things reach it. The path stayed down past the migration idle-timeout with
+     * no recovery; or a stream transport gave up on a peer that stopped reading its
+     * socket: a write went the transport's write deadline without the socket taking a
+     * byte — on TCP and the TLS-mimicry leg thirty seconds, unless
+     * [`PhantomConfig::write_stall_timeout`](crate::config::PhantomConfig::write_stall_timeout)
+     * says otherwise — after which the transport writes nothing more. Either way
+     * `last_error()`, `recv()` and `send()` report [`CoreError::Timeout`]. A session
+     * closed with `disconnect()` while such a write was stuck ends here too, rather
+     * than in [`Closed`](Self::Closed), because the close never reached the peer.
      */
     DEAD(8u),
     /**
@@ -6937,6 +7047,12 @@ public object FfiConverterOptionalTypeCoreError: FfiConverterRustBuffer<CoreExce
          * from raw bytes (Security Invariant 1 — mandatory), and starts the
          * background handshake + data pump.
          *
+         * The transport gives up on a server that stops reading once a write has gone
+         * thirty seconds without progress, and the session then ends
+         * [`ConnectionState::Dead`] with [`CoreError::Timeout`]. Use
+         * [`connect_pinned_with_config`] to choose another deadline
+         * ([`PhantomConfig::write_stall_timeout`](crate::config::PhantomConfig::write_stall_timeout)).
+         *
          * Use [`connect_pinned_udp`] instead when you need seamless
          * connection migration (Wi-Fi ↔ LTE via [`PhantomSession::migrate`]).
          * TCP sessions return [`CoreError::Unsupported`] from `migrate()`.
@@ -7158,7 +7274,12 @@ public object FfiConverterOptionalTypeCoreError: FfiConverterRustBuffer<CoreExce
 
         /**
          * Like [`connect_pinned`] but also applies [`PhantomConfig`](crate::config::PhantomConfig)
-         * liveness settings to the session. FFI-exported.
+         * to the session: its liveness settings, and its
+         * [`write_stall_timeout`](crate::config::PhantomConfig::write_stall_timeout) as the TCP
+         * transport's write deadline. FFI-exported.
+         *
+         * A zero `write_stall_timeout` is refused with [`CoreError::ConfigError`] before any
+         * socket is opened.
          *
          * # ⚠ Returns before the handshake — `Ok` here does not mean the pin matched
          *
@@ -7241,6 +7362,10 @@ public object FfiConverterOptionalTypeCoreError: FfiConverterRustBuffer<CoreExce
          * (stale/unknown ticket or AEAD failure) the handshake completes 1-RTT — the
          * caller checks [`PhantomSession::early_data_accepted`] and re-sends over the
          * normal channel when it is not `Some(true)`.
+         *
+         * It takes no [`PhantomConfig`](crate::config::PhantomConfig), so the session keeps
+         * the default liveness settings and the thirty-second write deadline of
+         * [`connect_pinned`].
          *
          * Native-only, like [`connect_pinned`]: `TcpSessionTransport` lives
          * behind `cfg(not(target_arch = "wasm32"))`.
