@@ -6118,8 +6118,10 @@ fn released_stream_grant(stream_offset: u32, is_persist_probe: bool, fin: bool) 
 // `Connected` mid-handshake would make `is_data_ready()` lie and let `send()`
 // bypass the queue, or `Closed` without tearing down the pump.
 impl PhantomSession {
-    /// Transition to a new connection state. Crate-internal: driven by the
-    /// handshake task and teardown only.
+    /// Force the connection state. Test-only: in production the handshake task, the
+    /// pump and `disconnect()` publish the state through the shared atomic, each with
+    /// its own rule about which states it may overwrite.
+    #[cfg(test)]
     pub(crate) fn set_state(&self, new_state: ConnectionState) {
         self.state.store(new_state as u8, Ordering::Relaxed);
     }
