@@ -59,11 +59,19 @@ run_structure_gate() {
 # are relative to; `write_report` deliberately omits it, so the two helpers
 # together also pin the fallback (no baseline named → `[Unreleased]` only).
 write_report_with_baseline() {
+    # Written in two steps rather than through /dev/stdout inside a redirected
+    # block: on Linux, opening /dev/stdout reopens the target file and truncates
+    # it, which silently dropped the baseline lines and made every case that
+    # needs them fail on CI while passing on macOS.
+    local body
+    body="$(mktemp)"
+    write_report "${body}"
     {
         echo "    Building phantom-protocol v0.2.2 (baseline)"
         echo "       Built [  19.210s] (baseline)"
-        write_report /dev/stdout
+        cat "${body}"
     } > "$1"
+    rm -f "${body}"
 }
 
 write_report() {
