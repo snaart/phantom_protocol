@@ -136,11 +136,7 @@ impl FragmentAssembler {
             let state = self.assemblies.remove(&key).unwrap();
             let mut total_size = 0;
             for i in 0..state.total_chunks {
-                if let Some(chunk) = state.chunks.get(&i) {
-                    total_size += chunk.len();
-                } else {
-                    return None;
-                }
+                total_size += state.chunks.get(&i)?.len();
             }
 
             let mut packet = Vec::with_capacity(total_size);
