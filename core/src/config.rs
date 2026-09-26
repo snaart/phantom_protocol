@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::errors::CoreError;
 
 /// Tunable parameters for a Phantom session / listener, exported across the
