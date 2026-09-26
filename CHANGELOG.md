@@ -8,7 +8,7 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-09-07
+## [0.3.0] - 2026-09-26
 
 **Peers of this release and of 0.2.2 will not talk to each other, and the refusal is
 explicit.** The wire moved twice inside this window — `WIRE_VERSION` 6 → 7 (cumulative
