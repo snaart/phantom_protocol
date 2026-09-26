@@ -5,6 +5,9 @@
 //! - Phantom Protocol data transfer
 //! - gRPC (tonic) baseline
 //! - HTTP (hyper) baseline
+// Dev-only bench harness: the `.clippy.toml` disallowed-methods ban governs production
+// code, not benches — same rationale as the crate-root `cfg_attr(test, allow(..))`.
+#![allow(clippy::disallowed_methods)]
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use std::hint::black_box;

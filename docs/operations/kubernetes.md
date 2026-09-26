@@ -1,8 +1,11 @@
 # Kubernetes deployment
 
 Reference Kubernetes manifests and configuration patterns for running a Phantom Protocol server
-binary on a Kubernetes cluster. Phantom Protocol is a library; manifests assume a wrapper binary
-(`server-bin`) calling `PhantomListener::bind` and `accept`.
+on a Kubernetes cluster. The manifests below target the in-tree reference binary `phantom-server`
+(the `server/` crate, built by the repo-root `Dockerfile`), so its flags and `PHANTOM_*` / `OTEL_*`
+environment variables are what they configure. Embedders shipping their own binary around
+`PhantomListener::bind` / `accept` can reuse the same shapes with their own configuration surface.
+A packaged chart with these manifests ships at `docs/operations/helm/phantom-protocol/`.
 
 ## Deployment vs StatefulSet
 
@@ -34,7 +37,7 @@ spec:
       terminationGracePeriodSeconds: 30  # in-flight handshakes have 30 s to complete
       containers:
         - name: phantom-protocol
-          image: phantom-server:0.2.2
+          image: phantom-server:0.3.0
           imagePullPolicy: IfNotPresent
           ports:
             - {name: phantom, containerPort: 4242, protocol: TCP}
@@ -57,10 +60,18 @@ spec:
             capabilities: {drop: ["ALL"]}
           env:
             - {name: RUST_LOG, value: "info,phantom_protocol=info"}
+            # PHANTOM_BIND is a full SocketAddr; PHANTOM_SIGNING_KEY_FILE must point at the
+            # mounted Secret — the rootfs is read-only, so the binary's default
+            # /etc/phantom-server/signing.key cannot be created, and without it every pod
+            # would mint a fresh identity and break client pinning.
+            - {name: PHANTOM_BIND,             value: "0.0.0.0:4242"}
+            - {name: PHANTOM_SIGNING_KEY_FILE, value: "/etc/phantom/keys/signing_key.bin"}
             # phantom-server pushes OTLP/gRPC to an OpenTelemetry Collector; it opens no metrics port.
             - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://otel-collector.monitoring.svc:4317"}
             - {name: OTEL_SERVICE_NAME,           value: "phantom-protocol"}
-            - {name: OTEL_TRACES_SAMPLER_ARG,     value: "0.1"}   # head-sampling ratio
+            # Head-sampling ratio for root spans; effective on its own (no OTEL_TRACES_SAMPLER
+            # needed). Server default is 1.0 = export everything.
+            - {name: OTEL_TRACES_SAMPLER_ARG,     value: "0.1"}
           volumeMounts:
             - {name: signing-key, mountPath: /etc/phantom/keys, readOnly: true}
             - {name: tmp,         mountPath: /tmp}
@@ -98,11 +109,28 @@ probe.
 
 ## Resource requests and limits
 
-From `perf-tuning.md`: ~**64 KiB** working memory per session; **3–4 GB/s per core** ceiling
-(AES-256-GCM with AES-NI).
+From `perf-tuning.md`: **3–4 GB/s per core** ceiling (AES-256-GCM with AES-NI).
 
-**Memory.** `N × 64 KiB + ~64 MiB` (process + tokio runtime). The sample manifest targets
-~1 000 sessions: 128 MiB request, 512 MiB limit.
+**Memory.** Size it from `deployment.md`, "Session caps & resource limits", which separates
+the two figures this section used to conflate. A session carrying ordinary traffic sits
+around **512 KiB**; an authenticated but hostile peer can move one session's receive
+footprint into the hundreds of megabytes, and nothing divides any of it between concurrent
+sessions. The sample manifest targets ~1 000 sessions of ordinary traffic: 128 MiB request,
+512 MiB limit.
+
+One term is an exact constant and is the one to check a pod against — a session may draw
+8 MiB of receive-window growth across all its streams, so at `phantom-server`'s default cap
+
+```text
+  1024 × 8 MiB = 8 GiB of receive-window growth alone
+```
+
+is committed before a reorder entry or a delivery-queue slot is counted. That is sixteen
+times the limit above, so a pod on these numbers must lower `PHANTOM_MAX_SESSIONS` to match;
+the server prints the product at startup. Read it as **a floor on what the host must have,
+not a ceiling on what the process will use**: growth is one term of four and not the largest,
+and it is an advertisement rather than a residency — the bytes it admits come to rest in the
+reorder buffers and the delivery queues.
 
 **CPU.** One core saturates at ~3–4 GB/s. Handshake-heavy workloads need extra headroom for the
 PQC keygen path (~10–15 ms per handshake server-side). `2000m` suits moderate fan-out.

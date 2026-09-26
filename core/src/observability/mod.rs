@@ -33,7 +33,7 @@ pub use attrs::{
     ResumptionMode,
 };
 pub use config::{HistogramConfig, ObservabilityConfig, ObservabilityConfigBuilder};
-pub use snapshot::MetricsSnapshot;
+pub use snapshot::{MetricsSnapshot, MetricsSnapshotFfi};
 
 use crate::transport::types::LegType;
 use atomics::HotPathAtomics;
@@ -176,6 +176,16 @@ impl Observability {
     /// `Histogram` (`{ns}.handshake.duration`) are updated together; the
     /// histogram's `_count` series — sliced by the `outcome` attribute —
     /// is the canonical handshake count, so there is no separate counter.
+    ///
+    /// **`outcome = Success` is this side's own completion and says nothing about
+    /// whether the peer received the reply.** The server records it once it has
+    /// derived keys and sent its `ServerHello`, which is not acknowledged by
+    /// anything — so a reply lost on the way down leaves a session counted here as
+    /// a success that the peer never joined, and one live run held such a session
+    /// open for 135 s having neither sent nor received a byte. A server's success
+    /// total exceeding a client's is therefore an ordinary reading of a lossy path
+    /// rather than a contradiction, and it is the whole reason the two sides are
+    /// counted separately.
     pub fn record_handshake(
         &self,
         duration: std::time::Duration,
@@ -215,17 +225,103 @@ impl Observability {
 
     #[inline]
     pub fn record_replay_rejected(&self, reason: ReplayReason) {
+        self.atomics.record_replay_rejected();
         self.instruments.record_replay_rejected(reason);
     }
 
     #[inline]
     pub fn record_aead_failure(&self, leg: LegType, algorithm: AeadAlgorithm) {
+        self.atomics.record_aead_failure();
         self.instruments.record_aead_failure(leg, algorithm);
     }
 
     #[inline]
     pub fn record_unencrypted_dropped(&self, leg: LegType) {
+        self.atomics.record_unencrypted_dropped();
         self.instruments.record_unencrypted_dropped(leg);
+    }
+
+    /// **Unit: one datagram.** Record a handshake-type *datagram* arriving on a connection
+    /// the PhantomUDP listener has already committed a route to, as it lands and before
+    /// reassembly (PROTOCOL § 6.1).
+    ///
+    /// What it measures is the duplicate wire load a repeating client puts on the listener —
+    /// a cookie-bearing hello is three fragments, so one repeated question moves this by
+    /// three. **It is not the half to read against
+    /// [`record_handshake_flight_repeated`]**, which counts flights; that comparison is off
+    /// by the fragment count and reads as answers gone missing.
+    /// [`record_initial_flight_on_committed_route`] is the half that pairs with it.
+    ///
+    /// Deliberately unlabeled: the interesting attribute would be which peer is repeating,
+    /// and peer identity is exactly what the cardinality contract in
+    /// [`attrs`] module keeps out of instrument labels.
+    ///
+    /// [`record_handshake_flight_repeated`]: Self::record_handshake_flight_repeated
+    /// [`record_initial_flight_on_committed_route`]: Self::record_initial_flight_on_committed_route
+    /// [`attrs`]: crate::observability::attrs
+    #[inline]
+    pub fn record_initial_datagram_on_committed_route(&self) {
+        self.atomics.record_initial_datagram_on_committed_route();
+        self.instruments
+            .record_initial_datagram_on_committed_route();
+    }
+
+    /// **Unit: one flight.** Record a *reassembled* handshake message arriving on a
+    /// connection the PhantomUDP listener has already committed a route to — one per
+    /// question the client asked again, however many datagrams carried it (PROTOCOL § 6.1).
+    ///
+    /// **Meant to be read together with [`record_handshake_flight_repeated`], and in the
+    /// same unit as it**: this one says a client asked again, that one says an answer went
+    /// back. Unlabeled for the same reason as the datagram counter above.
+    ///
+    /// [`record_handshake_flight_repeated`]: Self::record_handshake_flight_repeated
+    #[inline]
+    pub fn record_initial_flight_on_committed_route(&self) {
+        self.atomics.record_initial_flight_on_committed_route();
+        self.instruments.record_initial_flight_on_committed_route();
+    }
+
+    /// **Unit: one flight.** Record a retained reply flight actually being repeated
+    /// (PROTOCOL § 6.1) — one per repeat sent, not per datagram of it.
+    ///
+    /// **Meant to be read together with [`record_initial_flight_on_committed_route`], which
+    /// is in the same unit**: that one says a client asked again, this one says the listener
+    /// had an answer and sent it. Kept apart because the two failures they separate need
+    /// opposite remedies: questions arriving with no answers going back is a listener whose
+    /// retention did not cover the session, while questions never arriving at all is a path
+    /// that went silent upstream. A single counter reads identically in both.
+    ///
+    /// [`record_initial_flight_on_committed_route`]: Self::record_initial_flight_on_committed_route
+    #[inline]
+    pub fn record_handshake_flight_repeated(&self) {
+        self.atomics.record_handshake_flight_repeated();
+        self.instruments.record_handshake_flight_repeated();
+    }
+
+    /// Record a retained reply flight dropped to make room for a newer one (PROTOCOL § 6.1).
+    ///
+    /// The repair holds a bounded amount of memory; past it the oldest answer goes so the
+    /// newest can be kept. An evicted session is back to the behaviour that made a single
+    /// lost reply datagram cost a whole connect, and nothing else on either side of that
+    /// connect would say so — which is why the eviction is counted rather than merely done.
+    #[inline]
+    pub fn record_handshake_flight_evicted(&self) {
+        self.atomics.record_handshake_flight_evicted();
+        self.instruments.record_handshake_flight_evicted();
+    }
+
+    /// Record a reply flight that was never retained, because repeating it would have
+    /// exceeded the RFC 9000 § 8.2 amplification limit (PROTOCOL § 6.1 rule 3).
+    ///
+    /// The third of the three ways the repair can fail to cover a session, and the only one
+    /// that is not about load: an eviction and an expiry both mean the mechanism ran, while
+    /// a refusal means it never armed. It cannot fire with today's messages, so a non-zero
+    /// value is a message size having moved past the bound — a change that alters no
+    /// serialized byte a peer would notice and that nothing else reports.
+    #[inline]
+    pub fn record_handshake_flight_refused(&self) {
+        self.atomics.record_handshake_flight_refused();
+        self.instruments.record_handshake_flight_refused();
     }
 
     pub fn record_path_migration(&self, from: u8, to: u8) {
@@ -271,6 +367,47 @@ mod tests {
         // Cloning the Arc preserves identity.
         let obs2 = obs.clone();
         assert_eq!(obs2.config().namespace.as_ref(), "myapp");
+    }
+
+    #[test]
+    fn security_counters_surface_through_snapshot() {
+        let obs = Observability::new(ObservabilityConfig::default());
+        let s = obs.snapshot();
+        assert_eq!(s.replay_rejected_total, 0);
+        assert_eq!(s.aead_failure_total, 0);
+        assert_eq!(s.unencrypted_dropped_total, 0);
+        assert_eq!(s.initial_datagrams_on_committed_route_total, 0);
+        assert_eq!(s.initial_flights_on_committed_route_total, 0);
+        assert_eq!(s.handshake_flight_repeated_total, 0);
+        assert_eq!(s.handshake_flight_evicted_total, 0);
+        assert_eq!(s.handshake_flight_refused_total, 0);
+
+        obs.record_replay_rejected(ReplayReason::Duplicate);
+        obs.record_replay_rejected(ReplayReason::Duplicate);
+        obs.record_aead_failure(LegType::Tcp, AeadAlgorithm::Aes256Gcm);
+        obs.record_unencrypted_dropped(LegType::Tcp);
+        // Three datagrams carrying the one flight that was then answered — the shape a
+        // fragmented repeat produces, and the reason the first two are not one counter.
+        obs.record_initial_datagram_on_committed_route();
+        obs.record_initial_datagram_on_committed_route();
+        obs.record_initial_datagram_on_committed_route();
+        obs.record_initial_flight_on_committed_route();
+        obs.record_handshake_flight_repeated();
+        obs.record_handshake_flight_evicted();
+        obs.record_handshake_flight_evicted();
+        obs.record_handshake_flight_refused();
+        obs.record_handshake_flight_refused();
+        obs.record_handshake_flight_refused();
+
+        let s = obs.snapshot();
+        assert_eq!(s.replay_rejected_total, 2);
+        assert_eq!(s.aead_failure_total, 1);
+        assert_eq!(s.unencrypted_dropped_total, 1);
+        assert_eq!(s.initial_datagrams_on_committed_route_total, 3);
+        assert_eq!(s.initial_flights_on_committed_route_total, 1);
+        assert_eq!(s.handshake_flight_repeated_total, 1);
+        assert_eq!(s.handshake_flight_evicted_total, 2);
+        assert_eq!(s.handshake_flight_refused_total, 3);
     }
 
     #[test]

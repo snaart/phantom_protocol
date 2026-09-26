@@ -1,18 +1,30 @@
-//! Phantom Protocol - Fallback State Machine
+//! Transport-mode degrade/heal state machine — **not connected to the data path.**
 //!
-//! A degrade/heal state machine over three abstract transport "modes"
-//! (`Turbo → Reliable → Stealth`): on repeated connection failures it walks one
-//! step toward the most-robust mode, and probes back up to the best mode when the
-//! path heals. The mode names predate the PhantomUDP rewrite — the concrete
-//! KCP / TCP / FakeTLS legs they referred to are gone (PhantomUDP is now the only
-//! production transport, with TCP/WebSocket/WASI/Embedded/MimicTls byte-pipes).
+//! A [`FallbackStateMachine`] is constructed into every `Session` and held there
+//! behind `#[allow(dead_code)]`, which is the whole of its participation: not one
+//! of the calls that would move it — [`record_sent`], [`record_success`],
+//! [`record_failure`], [`check_and_fallback`], [`upgrade`] — is made anywhere
+//! outside this file's own tests. The mode it reports is therefore `Turbo` for the
+//! lifetime of every connection that has ever run, and no transport behaviour has
+//! ever followed from reading it. Being reachable through a live `Session` makes
+//! this the easiest of the inert modules to misread as working.
 //!
-//! **Vestigial.** The machine is still constructed inside `Session` (held behind
-//! `#[allow(dead_code)]`) but no longer steers a live transport — the project does
-//! single-path connection migration, not transport-mode switching. The logic and
-//! tests are kept intact in case mode-switching is rewired against the current
-//! transports; treat the `Turbo`/`Reliable`/`Stealth` names as opaque tiers, not
-//! as the retired legs.
+//! What it would do, if driven: walk one step toward the most robust of three
+//! abstract tiers (`Turbo → Reliable → Stealth`) after repeated connection
+//! failures, then probe back up when the path heals. The tier names predate the
+//! PhantomUDP rewrite and no longer name anything — the KCP / TCP / FakeTLS legs
+//! they referred to are gone — so read them as an ordering and not as transports.
+//! Rewiring it is a feature: the project does single-path connection migration
+//! rather than transport-mode switching, so a mode change would need something
+//! concrete to switch between, and the machine's inputs would then be derived from
+//! a remote peer's observable behaviour, which is the point at which its escalation
+//! thresholds stop being a local decision.
+//!
+//! [`record_sent`]: FallbackMetrics::record_sent
+//! [`record_success`]: FallbackMetrics::record_success
+//! [`record_failure`]: FallbackMetrics::record_failure
+//! [`check_and_fallback`]: FallbackStateMachine::check_and_fallback
+//! [`upgrade`]: FallbackStateMachine::upgrade
 
 use crate::transport::scheduler::Scheduler;
 use parking_lot::RwLock;

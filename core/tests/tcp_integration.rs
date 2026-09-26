@@ -164,9 +164,9 @@ async fn tcp_integration_zero_rtt_resumption_round_trip() {
     })
     .await
     .expect("resumption hint did not arrive within 5s");
-    assert_eq!(hint.session_id.len(), 32, "session_id is 32 bytes");
+    assert_eq!(hint.session_id().len(), 32, "session_id is 32 bytes");
     assert_eq!(
-        hint.resumption_secret.len(),
+        hint.resumption_secret().len(),
         32,
         "resumption_secret is 32 bytes"
     );
@@ -374,6 +374,103 @@ async fn tcp_zero_rtt_rejection_retransmits_early_data_over_1rtt() {
     );
 
     server_handle.await.expect("server task");
+}
+
+/// Invariant 9 over real TCP: a resumed connect carrying the largest early-data payload
+/// the client accepts (`EARLY_DATA_MAX_LEN` bytes) completes its handshake. The client
+/// caps the plaintext and the listener's pre-decode walk bounds the sealed field, which
+/// is one AES-GCM tag longer; with the walk bounded at the plaintext cap, this hello was
+/// refused before it was decoded and the connect failed, where early-data may only ever
+/// be declined. The payload has to reach the server byte-exact by one of the two routes
+/// the contract allows, taken as 0-RTT or re-sent over 1-RTT, and the client's verdict
+/// has to name the route it took.
+#[tokio::test]
+#[ignore]
+async fn tcp_zero_rtt_full_size_early_data_completes_the_handshake() {
+    use phantom_protocol::api::session::{connect_pinned, connect_pinned_with_resumption};
+    use phantom_protocol::transport::handshake::EARLY_DATA_MAX_LEN;
+
+    let listener = PhantomListener::bind("127.0.0.1:0".to_string())
+        .await
+        .expect("bind listener");
+    let local = listener.local_addr();
+    let (host, port_str) = local.rsplit_once(':').expect("local_addr is host:port");
+    let host = host.to_string();
+    let port: u16 = port_str.parse().expect("port parses");
+    let pinned = listener.verifying_key_bytes();
+
+    let payload: Vec<u8> = (0..EARLY_DATA_MAX_LEN).map(|i| (i % 251) as u8).collect();
+    let expected = payload.clone();
+    let server_handle = tokio::spawn(async move {
+        // Connection 1 (plain): lets the client harvest a ticket.
+        {
+            let session = listener.accept().await.expect("accept 1").session();
+            assert_eq!(session.recv().await.expect("recv 1"), b"warmup");
+        }
+        // Connection 2 (resume with a full-size payload).
+        let outcome = listener.accept().await.expect("accept 2");
+        let taken = outcome.take_early_data();
+        let session = outcome.session();
+        let (got, as_zero_rtt) = match taken {
+            Some(early) => (early, true),
+            None => {
+                // Declined: the client re-sends it as ordinary data, which does not keep
+                // the payload's boundary, so read until the whole length is in.
+                let mut buf = Vec::with_capacity(EARLY_DATA_MAX_LEN);
+                while buf.len() < EARLY_DATA_MAX_LEN {
+                    buf.extend(session.recv().await.expect("re-sent early-data"));
+                }
+                (buf, false)
+            }
+        };
+        assert_eq!(got, expected, "the full-size payload arrives byte-exact");
+        let msg = session.recv().await.expect("recv after resume");
+        session.send(msg).await.expect("echo after resume");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        as_zero_rtt
+    });
+
+    let c1 = connect_pinned(host.clone(), port, pinned.clone())
+        .await
+        .expect("connect_pinned c1");
+    c1.send(b"warmup".to_vec()).await.expect("c1 send");
+    let hint = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(h) = c1.resumption_hint().await {
+                return h;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("resumption hint did not arrive");
+
+    let c2 = connect_pinned_with_resumption(host, port, pinned, hint, payload)
+        .await
+        .expect("a payload of exactly the cap passes the client-side check");
+    timeout(Duration::from_secs(10), c2.await_ready())
+        .await
+        .expect("handshake resolved in time")
+        .expect("a legal early-data payload must never fail the handshake");
+    let verdict = c2.early_data_accepted().await;
+    assert!(
+        verdict.is_some(),
+        "a resumed hello that carried early-data has a verdict"
+    );
+
+    c2.send(b"after-resume".to_vec()).await.expect("c2 send");
+    let echo = timeout(Duration::from_secs(5), c2.recv())
+        .await
+        .expect("echo timeout")
+        .expect("c2 recv");
+    assert_eq!(echo, b"after-resume");
+
+    let as_zero_rtt = server_handle.await.expect("server task");
+    assert_eq!(
+        verdict,
+        Some(as_zero_rtt),
+        "the client's verdict names the route the server saw the payload arrive by"
+    );
 }
 
 /// Bidirectional bulk transfer with both peers draining: exercises ENFORCED
@@ -658,4 +755,28 @@ async fn tcp_integration_stalled_peer_does_not_block_accept() {
     assert_eq!(got, b"ping-past-staller");
 
     drop(staller);
+}
+
+/// FFI persistent identity: binding with the SAME signing seed twice yields the
+/// SAME verifying key — the property a pinned client depends on across a server restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn tcp_bind_with_signing_key_bytes_is_stable_across_restart() {
+    use phantom_protocol::api::identity::generate_signing_key;
+    use phantom_protocol::api::listener::PhantomListener;
+
+    let seed = generate_signing_key().expect("generate");
+    let l1 = PhantomListener::bind_with_signing_key_bytes("127.0.0.1:0".to_string(), seed.clone())
+        .await
+        .expect("bind 1");
+    let vk1 = l1.verifying_key_bytes();
+    drop(l1);
+    let l2 = PhantomListener::bind_with_signing_key_bytes("127.0.0.1:0".to_string(), seed)
+        .await
+        .expect("bind 2");
+    assert_eq!(
+        vk1,
+        l2.verifying_key_bytes(),
+        "a persisted seed must yield a stable pinned identity"
+    );
 }

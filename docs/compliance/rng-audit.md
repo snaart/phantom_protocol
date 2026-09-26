@@ -7,8 +7,9 @@ each to its concrete OS / platform backend. The audit's purpose is twofold:
    cookie salt, session ID) originates from a CSPRNG.
 2. Document the FIPS 140-3 build's SP 800-90A-validated DRBG. The
    `--features fips` build's DRBG swap (`aws_lc_rs::rand::SystemRandom`)
-   and the `thread_rng()` fallback gating are **shipped** — see the
-   "FIPS-mode requirements" section below.
+   is **shipped**, and the old `thread_rng()` entropy fallbacks were
+   removed outright on every build — see the "FIPS-mode RNG" section
+   below.
 
 ## Backends per target
 
@@ -19,69 +20,96 @@ each to its concrete OS / platform backend. The audit's purpose is twofold:
 | `x86_64-apple-darwin` / `aarch64-apple-darwin` | `getentropy(2)` (BSD-style). | Returns `EIO` only on syscall misuse, never for entropy starvation. | macOS guarantees a seeded CSPRNG before user space starts. |
 | `aarch64-apple-ios` / `-ios-sim` | `SecRandomCopyBytes` via `getentropy(2)` shim. | Same. | |
 | `x86_64-pc-windows-msvc` / `aarch64-pc-windows-msvc` | `BCryptGenRandom(BCRYPT_USE_SYSTEM_PREFERRED_RNG)` via getrandom. | Cannot fail under normal operation. | CNG's system DRBG is SP 800-90A AES-CTR. |
-| `wasm32-unknown-unknown` (browser) | `window.crypto.getRandomValues` via `js-sys`. Enabled by the `getrandom = { features = ["js"] }` declaration in the wasm-only Cargo block. | Throws `QuotaExceededError` only for unreasonable lengths (`> 65536` per call). Phantom Protocol calls request `≤ 32` bytes per primitive — never hit. | Browser-provided CSPRNG (typically based on the platform PRNG). |
-| `wasm32-wasi` | WASI `random_get`. | Cannot fail in WASI snapshot 1. | Host-provided entropy. |
+| `wasm32-unknown-unknown` (browser) | `crypto.getRandomValues` via `getrandom` **0.4**'s `wasm_js` backend (declared in the wasm-only Cargo block). The separate `js`-featured `getrandom02` alias (0.2) serves `ring` / the rand_core-0.6 ecosystem, not `crypto::rng::OsRng`. | Throws `QuotaExceededError` only for unreasonable lengths (`> 65536` per call). Phantom Protocol calls request `≤ 32` bytes per primitive — never hit. | Browser-provided CSPRNG (typically based on the platform PRNG). |
+| `wasm32-wasip2` | WASI Preview 2 `wasi:random/random.get-random-bytes` (via the `wasi = 0.14` bindings). | Host-guaranteed; no in-guest failure path. | Host-provided entropy; the guest builds `std,wasi-leg` without `bindings`. |
 | `thumbv7em-none-eabihf` (Cortex-M, embedded) | **OE-supplied** — the shipped `RngProvider` trait (`crypto/rng.rs`, Phase 3.8) is the seam; a downstream HAL plugs in a hardware TRNG driver or an externally-seeded software DRBG. | OE responsibility. | See "Embedded path" below. |
 
 ## RNG call sites
 
+Sites are named by file (relative to `core/src/`) and the enclosing item, never
+by line number: a line number goes stale the moment anything is inserted above
+it, and it goes stale silently, still resolving to some line of unrelated code.
+To re-derive this inventory, run
+`grep -rnE 'getrandom::|OsRng|fill_bytes|next_u64|rand::' core/src` and read
+off the enclosing function of each production hit.
+
 Sites that pull cryptographic entropy:
 
-| Site (file:line) | Bytes | Purpose | Backend used |
+| Site (file :: item) | Bytes | Purpose | Backend used |
 | --- | --- | --- | --- |
-| `crypto/hybrid_kem.rs:47` | 32 (ephemeral X25519 sk) + ML-KEM-768 internal entropy | KEM keygen | `OsRng` (rand::rngs::OsRng) → wraps `getrandom` |
-| `crypto/hybrid_kem.rs:123` | encapsulation randomness | KEM encapsulate | `OsRng` |
-| `crypto/hybrid_sign.rs:52` | Ed25519 keypair | Long-lived signing key | `OsRng` |
-| `crypto/hybrid_sign.rs:58` (delegated) | ML-DSA-65 keypair | Long-lived signing key | `OsRng` (RustCrypto pulls via `rand_core::CryptoRng`) |
-| `transport/types.rs:27` | 32 bytes | Session ID | `getrandom::getrandom`, falls back to `rand::thread_rng()` |
-| `transport/handshake.rs:144` | 32 bytes | Server master secret (HMAC base for cookie + PoW bucket secrets) | `getrandom::getrandom`, propagates error |
-| `transport/handshake.rs:437` | 32 bytes | Client handshake nonce | `getrandom::getrandom`, propagates error |
-| `transport/path.rs:225` | 32 bytes | Multi-path validation challenge | `rand::random` (thread CSPRNG) — `getrandom`-failure fallback documented inline |
+| `crypto/hybrid_kem.rs` :: `HybridSecretKey::generate` | 32 (X25519 secret seed; default build) | KEM keygen; ML-KEM-768 keygen (`MlKem768::generate_keypair`) draws internally via ml-kem's `getrandom` feature | `crate::crypto::rng::OsRng` |
+| `crypto/hybrid_kem.rs` :: `HybridKeyPackage::encapsulate` | 32 (ephemeral X25519 seed; default build) | KEM encapsulate (classical half); the ML-KEM-768 encapsulation draws internally via ml-kem's `getrandom` feature | `crate::crypto::rng::OsRng` |
+| `crypto/hybrid_sign.rs` :: `HybridSigningKey::generate_with_provider` (first draw) | 32 (Ed25519 seed) | Hybrid signing key — a long-term server identity, or the client's ephemeral per-handshake key | injected `RngProvider` (`HybridSigningKey::generate` passes `OsRng`) |
+| `crypto/hybrid_sign.rs` :: `HybridSigningKey::generate_with_provider` (second draw) | 32 (ML-DSA-65 seed) | Same key, ML-DSA-65 half | injected `RngProvider` (`HybridSigningKey::generate` passes `OsRng`) |
+| `transport/types.rs` :: `SessionId::random` | 32 bytes | Session ID | `crate::crypto::rng::OsRng` (panics on CSPRNG failure) |
+| `transport/handshake.rs` :: `HandshakeServer::with_signing_key_and_cache` | 32 bytes | Server master secret (HMAC base for cookie + PoW bucket secrets); every `HandshakeServer` constructor funnels through this function | `getrandom::fill`, propagates error |
+| `transport/handshake.rs` :: `HandshakeServer::process_client_hello` | 32 bytes | Server handshake nonce (`server_nonce`) | `getrandom::fill`, propagates error |
+| `transport/handshake.rs` :: `HandshakeClient::new` | 32 bytes | Client handshake nonce | `getrandom::fill`, propagates error |
+| `transport/path.rs` :: `PathRegistry::issue_challenge` | 32 bytes | Path-validation challenge | `crate::crypto::rng::OsRng` |
+| `api/udp_transport.rs` :: `UdpClientTransport::connect` | 8 bytes | Initial PhantomUDP `ConnId` | `getrandom::fill`, propagates error |
 
-Sites that pull **non-cryptographic** entropy (test/jitter only):
+Under `--features fips` the two `crypto/hybrid_kem.rs` rows change shape: the
+classical half is ECDH-P-256, generated by `aws-lc-rs` itself
+(`PrivateKey::generate` in `HybridSecretKey::generate`,
+`EphemeralPrivateKey::generate` over a `SystemRandom` in
+`HybridKeyPackage::encapsulate`), so those bytes come from the AWS-LC CTR_DRBG
+and no seed is drawn from `OsRng`. The ML-KEM-768 draws are the same on both
+builds.
 
-| Site | Purpose | Note |
+`rand` is **not** a production dependency — it is dev-only
+(`core/Cargo.toml :: [dev-dependencies]`).
+
+Sites that pull **non-cryptographic** entropy (handle/jitter/test only):
+
+| Site (file :: item) | Purpose | Note |
 | --- | --- | --- |
-| `test_harness/mod.rs:131` | Simulated loss decision | Test-only |
+| `api/session.rs` :: `new_session_id` | 16-byte display handle for a session | Non-secret identifier; still drawn from the `OsRng` seam |
+| `transport/shaping.rs` :: `random_jitter` | Traffic-shaping timing jitter | Non-cryptographic; drawn from the `OsRng` seam |
+| `transport/legs/mimic_tls/` (`client_hello.rs`, `server_hello.rs`, `theater.rs`) | TLS `random`, legacy session id, key-share filler, GREASE values, extension-order shuffle, and the lengths and bytes of the opaque theater records (feature `mimicry`) | Public by design (`key-management.md` §5); drawn from an injected `&dyn RngProvider`, which `MimicTlsLeg::connect` / `MimicTlsLeg::accept` supply as `OsRng` |
+| `test_harness/mod.rs` :: `NetworkSimulator::effective_latency` | Latency jitter sample | Test-only (`rand`, under `#[cfg(test)]`) |
+| `test_harness/mod.rs` :: `NetworkSimulator::should_drop_packet` | Simulated loss decision | Test-only (`rand`, under `#[cfg(test)]`) |
 
 ## Fallback chain semantics
 
-Several sites use this pattern:
-
-```rust
-if getrandom::getrandom(&mut bytes).is_err() {
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
-}
-```
-
-`thread_rng()` returns a `ThreadRng` seeded from `OsRng` at thread startup
-and reseeded periodically. The fallback exists because `getrandom` can fail
-with `EAGAIN` in early boot before the kernel's CSPRNG is seeded. On any
-practical deployment (user-space processes after `init`), the primary call
-succeeds and the fallback is dead code.
-
-For a FIPS build this fallback **must be removed** — FIPS forbids
-fallback chains that drop entropy quality. Mitigation: gate it behind
-`#[cfg(not(feature = "fips"))]` when the `fips` feature is introduced.
+**There are no fallback chains.** Earlier revisions of this crate used a
+`getrandom` → `rand::thread_rng()` entropy-downgrade fallback; it was
+removed when the `RngProvider` seam landed. `rand` is no longer a
+production dependency at all (dev-only). Production sites either propagate
+the `getrandom` error as a `Result` or route through
+`crate::crypto::rng::OsRng`, whose documented failure model is **panic on a
+broken CSPRNG** — a loud fail is preferred over silently biased keys.
+This already satisfies the FIPS prohibition on entropy-quality fallbacks;
+no `#[cfg(not(feature = "fips"))]` gating is involved.
 
 ## Failure-mode policy
 
 Sites that **propagate** RNG errors as `Result`:
-- `handshake.rs:144` — server-side master-secret derivation, fatal at
-  listener bind.
-- `handshake.rs:437` — client-side nonce, fatal at handshake start.
+- `transport/handshake.rs` :: `HandshakeServer::with_signing_key_and_cache` —
+  server-side master secret, fatal at `HandshakeServer` construction
+  (`HandshakeError::RngError`).
+- `transport/handshake.rs` :: `HandshakeServer::process_client_hello` —
+  server handshake nonce, fatal for that handshake only; the failure goes
+  through `fail_and_reinsert`, so a consumed resumption ticket is put back.
+- `transport/handshake.rs` :: `HandshakeClient::new` — client-side nonce,
+  fatal at handshake start.
+- `api/udp_transport.rs` :: `UdpClientTransport::connect` — initial
+  PhantomUDP `ConnId`, fatal at client transport construction
+  (`CoreError::RngError`).
 
-Sites that **fall back to `thread_rng`** (all gated behind
-`#[cfg(not(feature = "fips"))]` — the fips build cannot use them):
-- `transport/types.rs` (session ID).
-- `transport/legs/mimic_tls/` (TLS-Hello random — the fallback moved here
-  when the old FakeTLS leg was replaced by the shipped `MimicTlsLeg`).
-- `transport/path.rs` (path challenge — see comment in source).
+Sites that route through the `RngProvider` seam
+(`crate::crypto::rng::OsRng`, panic-on-CSPRNG-failure — no entropy
+fallback on any build):
+- `transport/types.rs` :: `SessionId::random` (session ID).
+- `transport/legs/mimic_tls/` (TLS-Hello random — takes an injected
+  `&dyn RngProvider`).
+- `transport/path.rs` :: `PathRegistry::issue_challenge` (path challenge).
+- `crypto/hybrid_kem.rs` :: `HybridSecretKey::generate` /
+  `HybridKeyPackage::encapsulate` and `crypto/hybrid_sign.rs` ::
+  `HybridSigningKey::generate_with_provider` (key seeds).
 
-The fallback choice is intentional for non-key material where retrying the
-operation is more expensive than accepting a thread-RNG byte; the call sites
-are documented in source. Under `--features fips` the fallbacks are compiled
-out entirely.
+Because the seam has no fallback branch at all, the FIPS prohibition on
+entropy-downgrade chains is satisfied structurally rather than by `#[cfg]`
+gating.
 
 ## FIPS-mode RNG (shipped under `--features fips`)
 
@@ -94,13 +122,17 @@ The `--features fips` build's RNG posture is **shipped**:
    This is the recommended path in `docs/compliance/fips-readiness.md`.
 
 2. **Single seam for the swap.** The `RngProvider` trait
-   (`crypto/rng.rs`, Phase 3.8) is the abstraction seam — production call
-   sites route through `OsRng`, so the fips substitution is picked up
-   automatically without touching each construction site.
+   (`crypto/rng.rs`, Phase 3.8) is the abstraction seam — call sites that
+   route through `OsRng` pick up the fips substitution automatically,
+   without touching each construction site. That covers most sites but not
+   all of them: the four direct `getrandom::fill` calls and ml-kem's
+   internal draws are outside the seam (see "Status of near-term actions",
+   item 1).
 
-3. **`thread_rng()` fallbacks removed under fips.** All `thread_rng()`
-   fallbacks are gated behind `#[cfg(not(feature = "fips"))]`; the fips
-   build cannot use them.
+3. **No entropy fallbacks at all.** The `thread_rng()` fallbacks were
+   removed outright (not cfg-gated) when the `RngProvider` seam landed, and
+   `rand` is no longer a production dependency — so there is nothing for
+   the fips build to compile out.
 
 4. **Power-on self-test.** The DRBG is exercised transitively by the
    shipped POST (`crypto::self_tests::run_post` — hybrid KEM / sign keygen
@@ -128,15 +160,24 @@ trait (Phase 3.1) or a sibling `RngBackend` trait.
 
 ## Status of near-term actions
 
-1. ✅ Every RNG call site routes through the `crate::crypto::rng` module
-   (`RngProvider` / `OsRng`), so the FIPS swap is a single cfg-split in
-   that one file.
-2. ✅ `thread_rng` fallbacks are gated behind `#[cfg(not(feature =
-   "fips"))]` — non-FIPS builds keep the fallback for deployability; FIPS
-   builds compile it out.
+1. ⏳ Most RNG call sites route through the `crate::crypto::rng` module
+   (`RngProvider` / `OsRng`), so for them the FIPS swap is a single
+   cfg-split in that one file. **Four do not.** The `getrandom::fill`
+   calls in `HandshakeServer::with_signing_key_and_cache`,
+   `HandshakeServer::process_client_hello`, `HandshakeClient::new` and
+   `UdpClientTransport::connect` read the OS CSPRNG directly, so a
+   `--features fips` build still takes the cookie/PoW master secret, both
+   handshake nonces and the bootstrap connection id from `getrandom`
+   rather than from the AWS-LC CTR_DRBG. ML-KEM-768 key generation and
+   encapsulation likewise draw through ml-kem's `getrandom` feature on
+   every build. Closing the first half means routing those four sites
+   through `OsRng`; until that lands, the fips build's DRBG claim covers
+   the seam and not every byte of entropy the handshake consumes.
+2. ✅ `thread_rng` fallbacks are gone from production code on **every**
+   build — they were deleted with the `RngProvider` seam, and `rand` is now
+   a dev-dependency only.
 3. ⏳ A CI smoke test that grep-checks for `rand::thread_rng` /
-   `rand::random` outside of `test_harness/` and the documented fallback
-   sites is not yet wired.
+   `rand::random` outside of `test_harness/` is not yet wired.
 
 ## References
 

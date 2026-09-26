@@ -21,7 +21,7 @@ use crate::transport::{
     path::{PathRegistry, PathStateKind, PATH_CHALLENGE_LEN},
     scheduler::Scheduler,
     shaping::PaddingPolicy,
-    stream::Stream,
+    stream::{SharedRecvTuning, Stream},
     types::{
         PacketFlags, PacketHeader, PacketNumber, PhantomPacket, RawPacket, SchedulerMode,
         SessionId, StreamId,
@@ -180,6 +180,44 @@ impl CryptoState {
     }
 }
 
+/// Identity of the demux routes belonging to one accepted UDP session (WIRE v8).
+///
+/// Allocated by the listener's demux when it commits a slot to an `Initial`, and
+/// handed to the session that grows out of that handshake. The route table's other
+/// key — the 8-byte connection id — is chosen by whoever sent the first datagram, so
+/// it is the wrong thing to authorise a table mutation with; this is not on the wire
+/// and cannot be named by a peer. A `u64` does not wrap at any rate a socket can
+/// deliver: a million accepted sessions a second exhausts it in about 584,000 years.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct DemuxRouteOwner(pub u64);
+
+/// A live session's end of the UDP listener's datagram demux: the two things it tells
+/// the demux, and the identity the demux gave its routes. Installed once by the
+/// server's accept path ([`Session::set_demux_link`]) and absent on the client and on
+/// socket-routed transports, where both signals are no-ops.
+///
+/// It exists because the demux's route table is keyed on connection ids only the
+/// session can compute, so the demux cannot tell on its own when a session's window
+/// has moved or when the session is over. Two of its three other reclaim triggers —
+/// dropping a route when a datagram arrives for a dead one, and the sweep it runs
+/// every 256th new connection — are reactive to *traffic*, which is exactly what a
+/// peer that has left stops producing; the third, the demux's own timed sweep, is the
+/// backstop that runs when neither of those ever fires again.
+#[derive(Clone, Debug)]
+pub struct DemuxLink {
+    /// ε / WIRE v5: inbound CID-window slides, as the peer migrates. Unbounded,
+    /// as it has been since WIRE v5: one message per authenticated migration, so its rate
+    /// is bounded by the peer's packet rate, and a *dropped* slide would erode this
+    /// session's leading-edge headroom permanently (EPS-01) rather than costing a
+    /// reclaim that something else will get to.
+    pub slide_tx: tokio::sync::mpsc::UnboundedSender<CidSlide>,
+    /// WIRE v8: this session has ended and its routes can go. Bounded, and dropped
+    /// rather than queued when full — see [`Session::signal_route_retire`].
+    pub retire_tx: tokio::sync::mpsc::Sender<DemuxRouteOwner>,
+    /// Which routes in the demux table are this session's.
+    pub owner: DemuxRouteOwner,
+}
+
 /// A one-step slide of the inbound CID demux window (ε / WIRE v5), produced
 /// by [`Session::note_migration_path`] when the peer migrates. The demux applies
 /// it: `add` are the CIDs to register at the new leading edge, `remove` the CIDs
@@ -299,6 +337,10 @@ pub struct Session {
     streams: RwLock<HashMap<StreamId, Arc<Stream>>>,
     /// Next stream ID counter
     next_stream_id: AtomicU32,
+    /// Receive-window growth allowance shared by every stream this session opens. One
+    /// handle per session is the whole point: a per-stream allowance multiplies the
+    /// commitment by the stream count, which is a number the peer picks.
+    recv_tuning: Arc<SharedRecvTuning>,
     /// Path scheduler — **vestigial** (single-path connection migration, not
     /// multipath aggregation): constructed and reachable via `scheduler()`, but
     /// `select_paths` is never called on the live data path. See `SchedulerMode`.
@@ -345,13 +387,12 @@ pub struct Session {
     /// in the `Validated` state so legacy single-leg sessions keep
     /// working without any explicit setup.
     path_registry: Arc<PathRegistry>,
-    /// Outbound rate-limiter (Phase 2.6). Defaults to
-    /// [`Pacer::unlimited`] so the historical no-pacing behavior is
-    /// unchanged unless the caller explicitly sets a rate via
-    /// [`Session::pacer`]. The data pump consults this before every
-    /// outbound packet — the existing implementation just calls
-    /// `try_consume` and falls through if the pacer is disabled, so the
-    /// integration is zero-overhead in the default configuration.
+    /// Outbound rate-limiter. Starts as [`Pacer::unlimited`] — disabled, because
+    /// no acknowledgement has been processed and so no rate has been measured —
+    /// and [`Session::on_packet_acked`] switches it on with a real rate the
+    /// moment one has. The data pump's drain asks it before every segment and
+    /// stops the pass when it says wait, so this is what turns the congestion
+    /// window from a burst size into a rate.
     pacer: Arc<Pacer>,
     /// BBR-style bandwidth + RTT estimator (Phase 2.6 / Phase 4.4
     /// foundation). The data pump feeds it via [`Session::on_packet_sent`]
@@ -363,12 +404,24 @@ pub struct Session {
     /// instead of waiting for the next 10 ms `poll_interval` tick.
     /// The pump keeps the tick as a retransmit-timer fallback.
     send_notify: Arc<tokio::sync::Notify>,
-    /// Optional channel to the UDP demux for sliding this session's inbound CID
-    /// window (ε / WIRE v5). Set once post-handshake by the server's accept
-    /// path ([`Self::set_cid_slide_tx`]); `None` on the client and on socket-routed
-    /// transports (which have no CID demux). `handle_packet` signals a slide
-    /// through it when [`Self::note_migration_path`] reports the peer migrated.
-    cid_slide_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<CidSlide>>>,
+    /// Optional link to the UDP demux carrying this session's inbound CID-window
+    /// slides (ε / WIRE v5) and its end-of-session route retirement (WIRE v8),
+    /// together with the identity the demux gave its routes. Set once post-handshake
+    /// by the server's accept path ([`Self::set_demux_link`]); `None` on the client
+    /// and on socket-routed transports (which have no CID demux), where signalling is
+    /// a no-op.
+    demux_link: Mutex<Option<DemuxLink>>,
+    /// The peer announced it is closing this session (a `CONTROL` frame carrying
+    /// [`ControlSubtype::CLOSE`](crate::transport::types::ControlSubtype::CLOSE)).
+    ///
+    /// Set only from the post-AEAD receive path, so it records something an
+    /// authenticated peer said rather than something an off-path attacker asserted.
+    /// The receive loop reads it after each packet and starts a bounded draining
+    /// window, at the end of which it ends — which is what lets the pump tear down in
+    /// well under a second instead of waiting for the liveness timer to conclude from
+    /// silence what the peer already stated, while still delivering anything the close
+    /// overtook on the way in.
+    peer_closed: AtomicBool,
     /// An idle keep-alive PING is in flight, awaiting the peer's PONG (download-only
     /// liveness). Set when the pump emits a `KEEPALIVE` ping on an idle path;
     /// cleared when the peer's `KEEPALIVE | ACK` echo arrives (or any
@@ -418,6 +471,7 @@ impl Session {
             is_server: peer_side,
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
+            recv_tuning: Arc::new(SharedRecvTuning::default()),
             scheduler: Arc::new(Scheduler::new(SchedulerMode::LowLatency)),
             resumption_secret: RwLock::new(None),
             last_activity: RwLock::new(Instant::now()),
@@ -431,7 +485,8 @@ impl Session {
             pacer: Arc::new(Pacer::unlimited()),
             bandwidth_estimator: parking_lot::Mutex::new(BandwidthEstimator::new()),
             send_notify: Arc::new(tokio::sync::Notify::new()),
-            cid_slide_tx: Mutex::new(None),
+            demux_link: Mutex::new(None),
+            peer_closed: AtomicBool::new(false),
             keepalive_outstanding: AtomicBool::new(false),
         })
     }
@@ -473,6 +528,7 @@ impl Session {
             is_server,
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
+            recv_tuning: Arc::new(SharedRecvTuning::default()),
             scheduler: Arc::new(Scheduler::new(scheduler_mode)),
             resumption_secret: RwLock::new(None),
             last_activity: RwLock::new(Instant::now()),
@@ -486,7 +542,8 @@ impl Session {
             pacer: Arc::new(Pacer::unlimited()),
             bandwidth_estimator: parking_lot::Mutex::new(BandwidthEstimator::new()),
             send_notify: Arc::new(tokio::sync::Notify::new()),
-            cid_slide_tx: Mutex::new(None),
+            demux_link: Mutex::new(None),
+            peer_closed: AtomicBool::new(false),
             keepalive_outstanding: AtomicBool::new(false),
         }
     }
@@ -523,6 +580,7 @@ impl Session {
             is_server: peer_side,
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
+            recv_tuning: Arc::new(SharedRecvTuning::default()),
             scheduler: Arc::new(Scheduler::new(SchedulerMode::LowLatency)),
             resumption_secret: RwLock::new(Some(*resumption_secret)),
             last_activity: RwLock::new(Instant::now()),
@@ -536,7 +594,8 @@ impl Session {
             pacer: Arc::new(Pacer::unlimited()),
             bandwidth_estimator: parking_lot::Mutex::new(BandwidthEstimator::new()),
             send_notify: Arc::new(tokio::sync::Notify::new()),
-            cid_slide_tx: Mutex::new(None),
+            demux_link: Mutex::new(None),
+            peer_closed: AtomicBool::new(false),
             keepalive_outstanding: AtomicBool::new(false),
         })
     }
@@ -627,18 +686,64 @@ impl Session {
         })
     }
 
-    /// Install the demux slide channel (ε / WIRE v5) — called once by the
-    /// server's accept path so `handle_packet` can signal inbound-window slides.
-    pub fn set_cid_slide_tx(&self, tx: tokio::sync::mpsc::UnboundedSender<CidSlide>) {
-        *self.cid_slide_tx.lock() = Some(tx);
+    /// Install the [`DemuxLink`] (ε / WIRE v5; WIRE v8) — called once by the
+    /// server's accept path so the session can report window slides and its own end.
+    pub fn set_demux_link(&self, link: DemuxLink) {
+        *self.demux_link.lock() = Some(link);
     }
 
     /// Signal the demux to apply a [`CidSlide`] (ε / WIRE v5). A no-op when no
-    /// slide channel is installed (the client and socket-routed transports).
+    /// link is installed (the client and socket-routed transports).
     pub fn signal_cid_slide(&self, slide: CidSlide) {
-        if let Some(tx) = self.cid_slide_tx.lock().as_ref() {
-            let _ = tx.send(slide);
+        if let Some(link) = self.demux_link.lock().as_ref() {
+            let _ = link.slide_tx.send(slide);
         }
+    }
+
+    /// Signal the demux that this session is over and its routes can go (WIRE v8).
+    /// A no-op when no link is installed.
+    ///
+    /// The signal names the session by the identity the demux itself assigned, not by
+    /// anything from the wire, so it can only ever release this session's own routes.
+    ///
+    /// The queue it goes on is bounded, and a full queue means the signal is
+    /// **dropped** rather than waited for. That is the point of the bound: this is
+    /// called from a session's teardown, a peer decides when its session ends, and a
+    /// correlated departure — a deployment rollout, a carrier network transition, a
+    /// load balancer draining — would otherwise let a peer population decide how much
+    /// work sits in front of the demux's next datagram read.
+    ///
+    /// A dropped retire costs one deferred reclaim, and the thing that makes that
+    /// sentence true is the demux's **own** sweep timer rather than any of the reclaim
+    /// paths that predate this signal. Those all wait for a datagram — one arriving for
+    /// a dead route, or a new connection tripping the every-256th sweep — and a
+    /// correlated departure is precisely the population that has stopped sending
+    /// datagrams, so leaving the routes to them would leave them held for the life of
+    /// the listener. The timer is what turns the bound above from a stall into a
+    /// deferral rather than into a leak.
+    pub fn signal_route_retire(&self) {
+        let guard = self.demux_link.lock();
+        let Some(link) = guard.as_ref() else {
+            return;
+        };
+        if link.retire_tx.try_send(link.owner).is_err() {
+            log::debug!(
+                "Session: demux retire queue full; leaving these routes to the lazy reclaim"
+            );
+        }
+    }
+
+    /// Record that the peer announced it is closing this session. Call **post-AEAD
+    /// only** — see [`Session::peer_closed`]. Idempotent by construction: a second
+    /// announcement stores the same value, and the replay window has already refused
+    /// a byte-identical one before this could be reached.
+    pub fn note_peer_closed(&self) {
+        self.peer_closed.store(true, Ordering::Release);
+    }
+
+    /// Whether the peer announced it is closing this session.
+    pub fn peer_closed(&self) -> bool {
+        self.peer_closed.load(Ordering::Acquire)
     }
 
     /// The inbound CIDs the demux should route to this session (ε / WIRE v5): the
@@ -673,13 +778,37 @@ impl Session {
         *self.state.write() = new_state;
     }
 
-    /// Open a new stream
-    pub fn open_stream(&self) -> Arc<Stream> {
-        let stream_id = self.next_stream_id.fetch_add(1, Ordering::SeqCst) as StreamId;
-        let stream = Arc::new(Stream::new(stream_id));
+    /// Open a new stream, with the next id in sequence counting from 1.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::StreamError`] once every id a [`StreamId`] can hold has been handed
+    /// out. Ids are not reused: counting on would hand out 0, then 1 again, and the new
+    /// stream would silently replace the one this session still holds under that id.
+    pub fn open_stream(&self) -> Result<Arc<Stream>, CoreError> {
+        let exhausted = || {
+            CoreError::StreamError(
+                "stream id space exhausted: every 16-bit stream id has been opened".into(),
+            )
+        };
+        let id = self
+            .next_stream_id
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| {
+                StreamId::try_from(id).ok().map(|_| id + 1)
+            })
+            .map_err(|_| exhausted())?;
+        let stream_id = StreamId::try_from(id).map_err(|_| exhausted())?;
+        // Every stream of this session draws its receive-window growth from the session's
+        // one allowance, exactly as the streams the `PhantomSession` pump builds do. A
+        // `Session` driven on its own is still a session, and a budget handed out per stream
+        // would bound nothing: the multiplier on it is the peer's stream count.
+        let stream = Arc::new(Stream::with_recv_tuning(
+            stream_id,
+            self.recv_tuning.clone(),
+        ));
 
         self.streams.write().insert(stream_id, stream.clone());
-        stream
+        Ok(stream)
     }
 
     /// Get an existing stream
@@ -1138,25 +1267,234 @@ impl Session {
         self.bandwidth_estimator.lock().on_send(bytes);
     }
 
-    /// Record that an ACK arrived with delivery sample `sample`. The
-    /// returned `u64` is the updated bottleneck bandwidth estimate; we
-    /// reflect it into the pacer so the outbound rate tracks the
-    /// peer's actual receive throughput.
-    pub fn on_packet_acked(&self, sample: DeliverySample) -> u64 {
-        let bw = self.bandwidth_estimator.lock().on_ack(sample);
-        // Mirror the estimator's pacing decision onto the pacer so the
-        // two stay in lock-step.
-        let rate = self.bandwidth_estimator.lock().pacing_rate();
-        if rate > 0 {
-            self.pacer.set_rate(rate);
+    /// Record that an ACK arrived with delivery sample `sample`. The estimator's
+    /// pacing decision is mirrored onto the pacer here, so the outbound rate
+    /// tracks the peer's actual receive throughput.
+    ///
+    /// The returned `Duration` is the RTT sample the estimator accepted for this
+    /// acknowledgement — the locally timed round trip, less as much of the
+    /// peer's claimed ack delay as the min-RTT floor permits. It is returned
+    /// because the data pump publishes that same figure to its per-path RTT
+    /// gauge, and the two must be one number rather than two conclusions: the
+    /// floor the bound is taken against lives behind this lock, so a caller
+    /// asking for it separately paid a second acquisition of it for every
+    /// segment a cumulative acknowledgement retires.
+    ///
+    /// This is also where pacing is switched on, and the condition is the
+    /// bootstrap answer: not before the estimator has measured a bottleneck
+    /// bandwidth. Until it has, every rate derived from it is invented, and a
+    /// sender metered against an invented rate is at best throttled and at
+    /// worst stopped. Until then the congestion window alone governs, exactly
+    /// as it always did — an initial window is a small enough burst that
+    /// pacing it buys nothing anyway.
+    pub fn on_packet_acked(&self, sample: DeliverySample) -> std::time::Duration {
+        let mut est = self.bandwidth_estimator.lock();
+        let (rate, rtt_sample) = est.on_ack(sample);
+        let measured = est.bottleneck_bandwidth() > 0;
+        drop(est);
+        self.pacer.set_rate(rate);
+        // Guarded, not unconditional: enabling restarts the bucket's refill
+        // clock, so calling it on every acknowledgement would discard the
+        // credit accruing between them and meter the sender at a fraction of
+        // the rate it was just told to use.
+        if measured && !self.pacer.is_enabled() {
+            self.pacer.set_enabled(true);
         }
-        bw
+        rtt_sample
     }
 
-    /// Record that a packet of `bytes` length was lost (no ACK before
-    /// retransmit timer fired). Drives BBR's loss-based feedback.
+    /// Whether the pacer will admit another segment onto the wire right now.
+    ///
+    /// The send loop asks this *before* it pulls a segment out of a stream,
+    /// because that is the only order available: the stream chooses the
+    /// segment, so its size is not known until after the decision. The true
+    /// size is settled by [`Self::pacing_consume`], and the bucket carries any
+    /// overshoot as debt.
+    pub fn pacing_allows_send(&self) -> bool {
+        self.pacer.can_send()
+    }
+
+    /// Book `bytes` actually put on the wire against the pacer.
+    pub fn pacing_consume(&self, bytes: u64) {
+        self.pacer.consume(bytes);
+    }
+
+    /// How long until the pacer admits another segment. Zero when it already
+    /// does, or when pacing is off.
+    pub fn pacing_delay(&self) -> std::time::Duration {
+        self.pacer.time_until_credit()
+    }
+
+    /// Record that the send path put a copy of `bytes` bytes back on the wire in
+    /// place of an earlier transmission of the same segment.
+    ///
+    /// **This is the flight arithmetic, not the congestion signal.** The copy's
+    /// own `on_packet_sent` has already counted its bytes and the transmission
+    /// it replaces is no longer outstanding, so one of the two has to come back
+    /// off, at the instant the copy leaves — deferring it would leave the figure
+    /// one segment high for a round trip, and the drain's new-data budget is
+    /// `cwnd − inflight`, so the sender would withhold exactly while it was
+    /// recovering.
+    ///
+    /// Called for every copy. The congestion signal is [`Self::on_packet_lost`],
+    /// which the caller raises for the first copy of a segment only.
+    pub fn on_packet_retransmitted(&self, bytes: u64) {
+        self.bandwidth_estimator.lock().on_retransmit(bytes);
+    }
+
+    /// Report `bytes` of loss to congestion control — one hole, raised at the
+    /// moment the send path puts the segment's **first** copy on the wire.
+    ///
+    /// The instant is chosen for what it is not: it is not conditioned on
+    /// anything the peer does. A rule that waited for an acknowledgement — for
+    /// its arrival, its timing, or the round trip it implied — would be a rule a
+    /// peer can switch off by going quiet or bend by holding its
+    /// acknowledgements, and the quantity it decides is the sender's own window.
+    /// The copy leaves on this endpoint's own timer (`Stream::poll_send`'s RTO
+    /// pass fires against a wholly silent peer), so there is no silence that
+    /// makes a lossy path read as a clean one.
+    ///
+    /// The cost of choosing that instant is stated rather than hidden: at the
+    /// moment the copy leaves it is not yet known whether the original was
+    /// dropped or merely overtaken, and on this wire it never becomes known —
+    /// an acknowledgement names the segment's gap-free stream offset, which
+    /// every copy shared. A path that reorders is therefore charged as a path
+    /// that drops.
+    ///
     pub fn on_packet_lost(&self, bytes: u64) {
         self.bandwidth_estimator.lock().on_loss(bytes);
+    }
+
+    /// Count a drain pass that came up empty, and whether any of its streams was
+    /// empty *because its send buffer was full* rather than because the
+    /// application had nothing to give.
+    ///
+    /// Recorded, not acted on. The phase still opens for both, exactly as before;
+    /// what this adds is that a run can say which of the two it saw. The two are
+    /// reported identically by `poll_send` — its final `Idle` is reached whenever
+    /// no segment is unsent, which a buffer holding nothing and a buffer holding
+    /// only unacknowledged segments both satisfy — and the application-limited
+    /// phase they open disables the loss response, the Startup exit judgement and
+    /// the bandwidth filter's right to a new maximum. Which of the two is
+    /// producing that on a given path has been an argument; this makes it a
+    /// column.
+    pub fn note_dry_pass(&self, against_a_full_buffer: bool, peer_window_exhausted: bool) {
+        self.bandwidth_estimator
+            .lock()
+            .note_dry_pass(against_a_full_buffer, peer_window_exhausted);
+    }
+
+    /// Record the room left in the peer's advertised window, as the drain saw it.
+    /// Recorded, read by nothing.
+    pub fn note_peer_window_remaining(&self, bytes: u64) {
+        self.bandwidth_estimator
+            .lock()
+            .note_peer_window_remaining(bytes);
+    }
+
+    /// Count a dry pass that happened while the pump held application bytes of its
+    /// own — deferred, or unread in its command channel. Recorded, not acted on.
+    ///
+    /// The drain and the pump's ingestion of application data are competing
+    /// branches of one `select!`, so a turn spent draining is a turn not spent
+    /// reading. A pass can therefore find every stream empty while the
+    /// application's next chunk is already inside this process, and the phase that
+    /// opens then blames the application for this endpoint's own scheduling.
+    pub fn note_dry_pass_with_pump_work(&self) {
+        self.bandwidth_estimator
+            .lock()
+            .note_dry_pass_with_pump_work();
+    }
+
+    /// Count a drain pass that ended for `outcome`.
+    ///
+    /// Recorded and read by nothing: the pump schedules from the pass's own
+    /// `DrainStop`, which carries the pacing delay this does not. What the tally
+    /// adds is a census of what actually stopped the sender, where an analysis
+    /// could previously only infer one from the window and the bytes outstanding
+    /// — and that inference cannot tell a pass the pacer metered from a pass that
+    /// ran dry with the window open, because the two leave the same window
+    /// behind.
+    pub fn note_drain_stop(&self, outcome: crate::transport::bandwidth_estimator::DrainOutcome) {
+        self.bandwidth_estimator.lock().note_drain_outcome(outcome);
+    }
+
+    /// Record which rule ordered a repair. Called for **every** copy, unlike
+    /// [`Self::on_packet_lost`], which is called once per hole.
+    ///
+    /// The two counts share no denominator on purpose. A hole is booked once
+    /// however many copies it takes, so its count pairs with the bytes charged
+    /// to congestion control; a rule's rate of firing is a property of the
+    /// copies, and one of the three rules can only fire on a segment with no
+    /// copy on the wire. Counting arms per hole would have made that rule's
+    /// share a construction rather than a measurement.
+    ///
+    /// **Recorded, and read by nothing.** It moves no threshold, enters no rate
+    /// and reaches no decision — which matters more here than the wording
+    /// suggests, because *which arm fires is a choice the peer can make*. A
+    /// receiver picks the packet-threshold arm by acknowledging a segment's
+    /// successors while withholding it, and the RACK arm by acknowledging just
+    /// short of the threshold and then going quiet past `srtt·9/8`; both gates
+    /// read values written by the peer, and the round-trip estimate the second
+    /// is expressed in is sampled from the peer's own acknowledgement timing. So
+    /// this split is a record of what the peer's acknowledgements made this
+    /// endpoint conclude, not a property of the path — and that is exactly why
+    /// it must stay out of every decision.
+    pub fn note_repair_ordered_by(&self, cause: crate::transport::stream::LossCause) {
+        self.bandwidth_estimator
+            .lock()
+            .note_repair_ordered_by(cause);
+    }
+
+    /// A send pass ended for want of data to send. Opens an application-limited
+    /// phase if the congestion window still had room.
+    ///
+    /// The send loop is the only place that knows this. From the acknowledgement
+    /// stream alone a round in which the application had nothing to give looks
+    /// exactly like one in which the path refused to carry more, and the two ask
+    /// for opposite responses: the first must not set the bandwidth filter's
+    /// maximum and must not have its loss rate judged, because both of those
+    /// figures are measurements of the application.
+    ///
+    /// The phase this opens closes by itself, in the estimator, once everything
+    /// that was outstanding when it opened has been acknowledged. While it is
+    /// open, `poll_send` stamps it onto each segment it puts on the wire, and it
+    /// is that stamp — not this phase as read later — that the acknowledgement
+    /// path feeds back.
+    pub fn note_app_limited_drain(&self) {
+        self.bandwidth_estimator.lock().note_app_limited_drain();
+    }
+
+    /// Bytes of hole this session has reported to congestion control — one
+    /// booking per segment whose first copy went on the wire. Observability /
+    /// test hook, and the observable that the send path reports loss at all.
+    pub fn bbr_bytes_lost(&self) -> u64 {
+        self.bandwidth_estimator.lock().bytes_lost()
+    }
+
+    /// Which rule ordered each repair this session emitted, as
+    /// `(packet threshold, RACK time threshold, RTO)` over copies.
+    ///
+    /// Observability / test hook, and the only reach the attribution has outside
+    /// the estimator: nothing in the transport reads it, and nothing may — which
+    /// arm fires is a choice a hostile peer can make through what it
+    /// acknowledges and when.
+    pub fn bbr_repairs_by_cause(&self) -> (u64, u64, u64) {
+        let est = self.bandwidth_estimator.lock();
+        (
+            est.declared_by_packet_threshold(),
+            est.declared_by_time_threshold(),
+            est.declared_by_rto(),
+        )
+    }
+
+    /// Bytes this session has retransmitted, counting every copy. Observability
+    /// / test hook.
+    ///
+    /// The companion to [`Self::bbr_bytes_lost`]: their difference is what the
+    /// sender spent re-repairing segments whose first copy did not get through.
+    pub fn bbr_bytes_retransmitted(&self) -> u64 {
+        self.bandwidth_estimator.lock().bytes_retransmitted()
     }
 
     /// Reset the congestion controller + pacer to startup (Phase 4 / QUIC §9.4):
@@ -1170,11 +1508,17 @@ impl Session {
         let rate = est.pacing_rate();
         drop(est);
         // Drop the dead path's stale pacing rate; BBR re-paces on the first ACK.
+        // Pacing goes back off with it: the fresh estimator has measured nothing,
+        // and metering the new path against the old one's rate is precisely the
+        // carry-over this reset exists to prevent.
+        self.pacer.set_enabled(false);
         self.pacer.set_rate(rate);
     }
 
-    /// Current BBR congestion-control state. Observability / test hook — lets
-    /// callers confirm a loss drove the estimator into `FastRecovery`.
+    /// Current BBR congestion-control phase. Observability / test hook.
+    ///
+    /// Loss does not appear here: it is answered by a bound on inflight, not by
+    /// a phase change. Use [`Self::bbr_bytes_lost`] for that.
     pub fn bbr_state(&self) -> crate::transport::bandwidth_estimator::BbrState {
         self.bandwidth_estimator.lock().state()
     }
@@ -1185,10 +1529,31 @@ impl Session {
         let est = self.bandwidth_estimator.lock();
         BandwidthSnapshot {
             bottleneck_bw_bps: est.bottleneck_bandwidth(),
+            last_delivery_rate_bps: est.last_delivery_rate(),
             min_rtt: est.min_rtt(),
+            drain_outcomes: est.drain_outcomes(),
+            dry_passes_against_a_full_buffer: est.dry_passes_against_a_full_buffer(),
+            peer_window_remaining: est.peer_window_remaining(),
+            dry_passes_with_no_peer_window: est.dry_passes_with_no_peer_window(),
+            dry_passes_with_pump_work: est.dry_passes_with_pump_work(),
+            app_limited_acked_bytes: est.app_limited_acked_bytes(),
+            smoothed_rtt: est.smoothed_rtt(),
+            rtt_variation: est.rtt_variation(),
             pacing_rate_bps: est.pacing_rate(),
             cwnd_bytes: est.cwnd(),
             inflight_bytes: est.inflight_bytes(),
+            delivered_bytes: est.delivered_bytes(),
+            delivered_time: est.delivered_time(),
+            state: est.state(),
+            app_limited: est.is_app_limited(),
+            bytes_retransmitted: est.bytes_retransmitted(),
+            bytes_lost: est.bytes_lost(),
+            loss_declarations: est.loss_declarations(),
+            repairs_attributed: est.repairs_attributed(),
+            declared_by_packet_threshold: est.declared_by_packet_threshold(),
+            declared_by_time_threshold: est.declared_by_time_threshold(),
+            declared_by_rto: est.declared_by_rto(),
+            inflight_hi_bytes: est.inflight_hi().unwrap_or(0),
         }
     }
 
@@ -1521,10 +1886,184 @@ impl Session {
 #[derive(Debug, Clone, Copy)]
 pub struct BandwidthSnapshot {
     pub bottleneck_bw_bps: u64,
+    /// The most recent delivery-rate sample, before the estimator's maximum
+    /// filter decided whether to keep it.
+    ///
+    /// It travels beside `bottleneck_bw_bps` rather than replacing it because
+    /// the pair is what makes a recorded run readable. That field is a maximum
+    /// over [`BW_FILTER_WINDOW`](crate::transport::bandwidth_estimator::BW_FILTER_WINDOW);
+    /// the throughput a run gets compared against is
+    /// a mean over a much shorter interval, and a maximum over the longer window
+    /// exceeds a mean over the shorter one for reasons that have nothing to do
+    /// with the estimator being wrong. Which of those two a high-looking ratio
+    /// is cannot be settled from the filtered figure alone: a raw sample that
+    /// tracks the delivered rate while the estimate sits far above it is the
+    /// filter retaining a peak, and a raw sample that itself reads high is the
+    /// sample arithmetic.
+    ///
+    /// **It is a point sample, and reading a spread off it would repeat in
+    /// miniature the mismatch it exists to expose.** Whoever takes this snapshot
+    /// gets whichever single acknowledgement happened to arrive last before the
+    /// instant they asked; the value's variation across a sweep is a fact about
+    /// when the sampler ticked, not about the connection. A central value over
+    /// many intervals is meaningful and a tail of them is not — `analyze.py`
+    /// prints a median for this column and percentiles only for the filtered
+    /// one, and labels each with the statistic behind it for that reason.
+    pub last_delivery_rate_bps: u64,
     pub min_rtt: Duration,
+    /// Of the drain passes that came up empty, how many did so with at least one
+    /// stream's send buffer full — i.e. with the application parked against this
+    /// endpoint's own ceiling rather than out of data.
+    ///
+    /// Read against `drain_outcomes[0]`, which counts all of them. The two are
+    /// the same population split in two, and the split is the difference between
+    /// "the application was the limit" and "the application was waiting for us".
+    pub dry_passes_against_a_full_buffer: u64,
+    /// Room left in the peer's advertised window as of the last drain pass — the
+    /// minimum over the streams that pass looked at.
+    ///
+    /// The sender settles at 0.81-0.88 MB against a 1.05 MB ceiling, and whether
+    /// the missing fifth is the peer's grant arriving late or something on this
+    /// side cannot be told from `inflight` alone. The grant is cumulative and
+    /// rides in a frame nothing retransmits, so under load it lags by about a
+    /// round trip; that would read here as a remainder well under the nominal
+    /// window while nothing else constrains the sender.
+    pub peer_window_remaining: u64,
+    /// Of the dry passes, those that found a stream with no room left in the peer's
+    /// advertised window — the pass `poll_send` would have called `FlowControl`
+    /// had it held an unsent segment to be refused.
+    ///
+    /// Which of the two a pass reports is therefore decided by whether the peer's
+    /// SACK or its `WINDOW_UPDATE` arrived first, and only one of the two opens an
+    /// application-limited phase. A peer-chosen ordering reaching a local
+    /// decision; this says how often it did.
+    pub dry_passes_with_no_peer_window: u64,
+    /// Of the dry passes, those that happened while the pump held application
+    /// bytes of its own — deferred, or unread in its command channel.
+    pub dry_passes_with_pump_work: u64,
+    /// Acknowledged bytes whose segment left inside an application-limited phase,
+    /// and acknowledged bytes in total.
+    ///
+    /// The share between them is what the loss response, the Startup exit and the
+    /// bandwidth filter actually read — each gates on the stamp a segment left
+    /// with. The `app_limited` flag recorded beside it is a different quantity:
+    /// the phase as read at sampling time, a duty cycle over wall clock. A phase
+    /// opened while a full flight is outstanding holds that flag up for a round
+    /// trip while stamping nothing.
+    pub app_limited_acked_bytes: (u64, u64),
+    /// Drain passes by the reason each ended, in `DrainOutcome` declaration
+    /// order: drained, congestion-limited, flow-controlled, transport-refused,
+    /// segment-budget, paced.
+    ///
+    /// The census an analysis previously had to infer from the window and the
+    /// bytes outstanding. That inference cannot separate a pass the pacer metered
+    /// from one that ran dry with the window open — they leave the same window
+    /// behind — and those two are the pair the application-limited flag turns on,
+    /// so the difference between them decides whether a run's rate describes the
+    /// path or the application.
+    pub drain_outcomes: [u64; 6],
+    /// Smoothed round trip and its variation, beside the minimum because the
+    /// minimum alone cannot price a delay.
+    ///
+    /// A recorded run could say a quarter of its repairs were ordered by the
+    /// retransmission timer rather than by the packet threshold, and could not
+    /// say what that cost: the threshold fires about a round trip after the
+    /// send, the timer at `srtt + 4·rttvar`, and the difference between them is
+    /// the variation — tens of milliseconds or hundreds, two different findings.
+    /// `None` until the first acknowledgement survives Karn's gate.
+    ///
+    /// Diagnostics. The timer the wire waits on is per stream and keeps its own
+    /// pair; these are the session's, and nothing reads them back.
+    pub smoothed_rtt: Option<Duration>,
+    /// See [`Self::smoothed_rtt`].
+    pub rtt_variation: Duration,
     pub pacing_rate_bps: u64,
     pub cwnd_bytes: u64,
     pub inflight_bytes: u64,
+    /// Total bytes the connection has had acknowledged. Stamped onto each
+    /// outgoing segment so its acknowledgement yields a delivery-rate sample
+    /// over the interval the segment spanned.
+    pub delivered_bytes: u64,
+    /// When `delivered_bytes` last advanced. Stamped alongside it, and it is the
+    /// pair that makes the sample an interval: the acknowledgement supplies the
+    /// far end, this supplies the near one. Without it the near end defaults to
+    /// the segment's own send time, which is later — and a numerator measured
+    /// over a longer span than its denominator reads high.
+    pub delivered_time: std::time::Instant,
+    /// Which BBR phase the sender is in. Without it a window that stops growing
+    /// is indistinguishable from one that left Startup early on purpose.
+    pub state: crate::transport::bandwidth_estimator::BbrState,
+    /// Whether the sender is currently application-limited — i.e. the window
+    /// has room and there is simply nothing to send. Distinguishes "the
+    /// transport is the bottleneck" from "the application is".
+    pub app_limited: bool,
+    /// Bytes retransmitted so far — every copy the loss detector ordered,
+    /// counting the second and third copies of a segment as well as the first.
+    ///
+    /// Recorded beside [`Self::bytes_lost`] because neither is interpretable
+    /// alone: one is the bandwidth the sender spent on repair, the other is the
+    /// number of holes the repair was for, and their difference is what went
+    /// into re-repairing segments whose first copy also failed to arrive. Until
+    /// both existed, a recorded run said the sender backed off and could not say
+    /// what it spent doing so.
+    ///
+    /// Neither figure separates a path that drops from a path that reorders;
+    /// nothing this sender can observe does. A row
+    /// showing loss on a route known to reorder is an upper bound on the drops.
+    ///
+    /// Cumulative over the estimator's life, not the session's:
+    /// [`Session::reset_congestion`] replaces the estimator on a migration, so
+    /// these restart from zero on the new path, exactly as the bandwidth
+    /// estimate and the round-trip minimum do. A series that spans a migration
+    /// therefore is not monotone, and a reader taking a maximum over one gets
+    /// the larger of the two paths rather than the sum.
+    pub bytes_retransmitted: u64,
+    /// Bytes of hole fed to the loss response — the numerator of the round loss
+    /// rate `adapt_inflight_bound` judges, summed over the connection.
+    pub bytes_lost: u64,
+    /// Holes declared, one per segment the detector first ordered a copy of —
+    /// the count [`Self::bytes_lost`] is the byte weight of.
+    ///
+    /// A recorded run had the weight and not the count, and the two are
+    /// different findings: two megabytes of holes at 1156 bytes each is a
+    /// different path from two megabytes at two hundred.
+    pub loss_declarations: u64,
+    /// Copies whose ordering rule was recorded — the denominator of the three arm
+    /// counters below.
+    ///
+    /// **Not** the same population as [`Self::loss_declarations`]: a hole is
+    /// counted once however many copies repairing it took, while every copy is
+    /// attributed. One of the three rules can only fire on a segment with no copy
+    /// on the wire, so attributing per hole would have made its share a
+    /// construction rather than a measurement.
+    pub repairs_attributed: u64,
+    /// Of those copies, the ones the packet threshold ordered — successors of a
+    /// segment were acknowledged and it was not.
+    ///
+    /// This is the arm an overtaken datagram satisfies without anything having
+    /// been dropped, so a run whose declarations sit here while its raw controls
+    /// show no reordering is saying its holes were drops. Sums with
+    /// [`Self::declared_by_time_threshold`] to more than
+    /// [`Self::loss_declarations`] by the number of declarations both arms made.
+    pub declared_by_packet_threshold: u64,
+    /// Of those, the ones RACK's time threshold ordered — the segment aged past
+    /// `srtt·9/8` since its latest transmission.
+    pub declared_by_time_threshold: u64,
+    /// Of those, the ones the retransmission timer ordered against a peer that
+    /// had acknowledged nothing. The backstop, and the only arm no
+    /// acknowledgement takes part in.
+    pub declared_by_rto: u64,
+    /// The loss-imposed upper bound on inflight, in bytes, or `0` when the path
+    /// has given no reason for one.
+    ///
+    /// Recorded rather than inferred. The bound is applied inside `cwnd()`, so
+    /// from the outside its engagement can only be guessed at by comparing
+    /// `cwnd_bytes` against `bottleneck_bw_bps × min_rtt` — and that guess is
+    /// wrong in exactly the states worth reading: ProbeRTT pins the window to
+    /// four packets for reasons of its own, and a bound set when the estimate
+    /// was smaller stays a fixed byte count while the product it is compared
+    /// against keeps growing. Zero here is unambiguous.
+    pub inflight_hi_bytes: u64,
 }
 
 impl std::fmt::Debug for Session {
@@ -1546,5 +2085,42 @@ impl Drop for Session {
         if let Some(mut secret) = self.resumption_secret.write().take() {
             secret.zeroize();
         }
+    }
+}
+
+#[cfg(test)]
+mod stream_id_tests {
+    use super::*;
+
+    /// A session hands out every id a `StreamId` can hold and then refuses, rather than
+    /// wrapping to 0 and replacing a stream it still holds.
+    #[test]
+    fn open_stream_refuses_once_every_stream_id_is_used() {
+        let session = Session::new(SessionId([0x5A; 32]), &[0x11; 32], false).expect("session");
+        let first = session.open_stream().expect("the first id");
+        assert_eq!(first.id(), 1);
+
+        // Skip to the top of the id space rather than open sixty-five thousand streams.
+        session
+            .next_stream_id
+            .store(u32::from(StreamId::MAX), Ordering::SeqCst);
+        let top = session.open_stream().expect("the last id");
+        assert_eq!(top.id(), StreamId::MAX);
+
+        for attempt in 0..3 {
+            match session.open_stream() {
+                Err(CoreError::StreamError(_)) => {}
+                Ok(stream) => panic!(
+                    "attempt {attempt}: handed out id {} past the top of the id space",
+                    stream.id()
+                ),
+                Err(other) => panic!("attempt {attempt}: refused with {other:?}"),
+            }
+        }
+        assert_eq!(session.stream_count(), 2, "a refused open adds nothing");
+        assert!(
+            Arc::ptr_eq(&session.get_stream(1).expect("stream 1"), &first),
+            "the first stream must still be the one under its id"
+        );
     }
 }

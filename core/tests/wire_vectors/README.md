@@ -42,7 +42,7 @@ widths, endianness). Two non-obvious points, both reproduced by the Python
 decoder:
 
 - **packets** use a hand-rolled **big-endian** codec: `version` first, integers
-  network byte order, byte arrays as-is. WIRE v6 is a diet image —
+  network byte order, byte arrays as-is. The image is a diet one since WIRE v6 —
   `header(15) || payload`, with **no** length prefixes (the v5 cleartext
   `payload_len` / `ext_len` `u32` prefixes were dropped as a structural
   fingerprint, and `extensions` is no longer carried on the wire). On the wire

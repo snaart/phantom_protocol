@@ -7,11 +7,22 @@
 //! - Multi-streaming (independent streams, no head-of-line blocking)
 //! - 0-RTT connection establishment (resumption + early-data)
 //! - Seamless single-path connection migration (session survives IP changes)
-//! - Adaptive fallback tiers (`Turbo → Reliable → Stealth`, see `fallback`)
 //!
 //! NOTE: multipath bandwidth aggregation / multi-homing was deliberately rejected
-//! — migration moves one active path at a time, it does not bond paths. The
-//! `scheduler` module is consequently vestigial.
+//! — migration moves one active path at a time, it does not bond paths.
+//!
+//! # Modules that are published but not on the data path
+//!
+//! [`compression`], [`fallback`], [`scheduler`] and the encoding half of
+//! [`packet_coalescer`] are compiled, tested and exported, and no send or receive
+//! path calls any of them. They are named here rather than left to be discovered
+//! because the cost of mistaking one for a working mechanism falls on the reader
+//! and never on the compiler: someone who finds `AdaptiveCompressor` in the public
+//! API concludes that packets are compressed, and not one is. Each of those
+//! modules now opens its own documentation with the same statement, so the
+//! disclaimer survives arriving at a module directly rather than through this
+//! index. Connecting any of them to the pump is a feature with a wire-level design
+//! behind it, not a cleanup.
 
 // ── no_std-clean subset (Phase 3.6) ────────────────────────────────────
 // `session_transport` and `legs::embedded` compile on bare-metal and are the
@@ -33,8 +44,6 @@ pub mod buffer_pool;
 #[cfg(feature = "std")]
 pub mod compression;
 #[cfg(feature = "std")]
-pub mod device_profile;
-#[cfg(feature = "std")]
 pub mod fallback;
 #[cfg(feature = "std")]
 pub mod fragmentation;
@@ -42,6 +51,8 @@ pub mod fragmentation;
 pub mod handshake;
 #[cfg(feature = "std")]
 pub mod liveness;
+#[cfg(feature = "std")]
+pub mod mtu;
 #[cfg(feature = "std")]
 pub mod multiplexer;
 #[cfg(feature = "std")]
@@ -72,7 +83,7 @@ pub mod stream;
 pub mod types;
 
 // ── Native-only sub-modules (Phase 3.5) ────────────────────────────────
-// These pull in `tokio::net::*` / raw sockets / libc and have no wasm
+// These pull in `tokio::net::*` / raw sockets and have no wasm
 // equivalent. On wasm32 the corresponding functionality is provided
 // either by `legs::WebSocketLeg` (transport) or by simply not being
 // available (listening for incoming TCP — browsers cannot listen).
@@ -81,8 +92,13 @@ pub mod types;
 pub mod framing;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub mod phantom_udp;
-#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-pub mod udp_transport;
+
+// Every std target, WASI and the browser included: the write-stall deadline is
+// one constant shared by the tokio stream transports, the WASI leg and the
+// `PhantomConfig` presets, and only the tokio write helper inside it is
+// native-only.
+#[cfg(feature = "std")]
+pub(crate) mod write_stall;
 
 // Re-exports for convenience
 #[cfg(feature = "std")]

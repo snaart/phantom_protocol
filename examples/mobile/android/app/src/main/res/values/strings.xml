@@ -12,7 +12,7 @@
     <string name="connect">Connect</string>
     <string name="disconnect">Disconnect</string>
     <string name="reconnect_zero_rtt">Reconnect (0-RTT)</string>
-    <string name="call_migrate_api">Call migrate() API (no-op over TCP)</string>
+    <string name="call_migrate_api">Call migrate() API (TCP returns Unsupported)</string>
     <string name="message_hint">Type a message</string>
     <string name="send">Send</string>
 </resources>

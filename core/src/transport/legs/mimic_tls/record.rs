@@ -333,7 +333,7 @@ mod tests {
         let mut fragment = Vec::new();
         fragment.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
         fragment.extend_from_slice(chunk);
-        fragment.extend(std::iter::repeat(0u8).take(pad));
+        fragment.extend(std::iter::repeat_n(0u8, pad));
         let mut out = Vec::new();
         encode_record(CT_APPLICATION_DATA, VER_TLS12, &fragment, &mut out).expect("encode");
         out

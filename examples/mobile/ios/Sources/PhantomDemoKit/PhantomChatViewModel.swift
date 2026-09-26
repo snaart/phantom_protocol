@@ -17,23 +17,22 @@
 //                            fresh resumption hint, tear the old session down,
 //                            then connect() again (which prefers 0-RTT).
 //   * callMigrateAPI(to:)  — calls PhantomSession.migrate(localAddr:) for
-//                            API-completeness only; see the honesty note below.
+//                            API-completeness only; see MIGRATION MODEL below.
 //   * disconnect()         — graceful close; persists a final hint.
 //
-// HONEST MIGRATION MODEL (important):
-// The UniFFI surface exposes only connectPinned / connectPinnedWithResumption,
-// and BOTH ride the TCP transport (TcpSessionTransport). On that transport
-// `migrate(localAddr:)` is a DEFAULT NO-OP on the SessionTransport trait — it
-// returns Ok(()) without rebinding any socket. Real seamless path migration
-// exists only on the native (Rust) UDP client transport, which is NOT yet on
-// the FFI surface. TCP is connection-oriented and cannot rebind its local
-// address without reconnecting. So the genuinely-working mobile recovery
-// pattern over this FFI surface is RECONNECT WITH 0-RTT RESUMPTION: harvest a
-// ResumptionHint while alive, and on a network change open a fresh session via
-// connectPinnedWithResumption, folding the first request into the new
-// ClientHello. That is what reconnect() and the NetworkPathMonitor handler do.
-// callMigrateAPI(to:) is kept purely to demonstrate the API call and is
-// labelled as a no-op everywhere it surfaces.
+// MIGRATION MODEL (important):
+// The UniFFI surface exposes BOTH TCP and UDP entry points. This app uses
+// connectPinned / connectPinnedWithResumption (TCP transport). On a TCP session
+// `migrate(localAddr:)` returns Err(Unsupported) — TCP is connection-oriented
+// and cannot rebind its local address without reconnecting. For real seamless
+// path migration use connectPinnedUdp / connectPinnedUdpWithResumption (UDP);
+// on a UDP session migrate() performs a real path rebind. So the working
+// mobile recovery pattern FOR THIS APP (TCP path) is RECONNECT WITH 0-RTT
+// RESUMPTION: harvest a ResumptionHint while alive, and on a network change
+// open a fresh session via connectPinnedWithResumption, folding the first
+// request into the new ClientHello. That is what reconnect() and the
+// NetworkPathMonitor handler do. callMigrateAPI(to:) demonstrates the API
+// and surfaces the Unsupported error it receives on TCP.
 //
 // Actor discipline: the class is @MainActor so every @Published mutation is on
 // the main actor. The SDK's async methods are `Sendable` and run their futures
@@ -94,10 +93,10 @@ public final class PhantomChatViewModel: ObservableObject {
         self.pathMonitor = pathMonitor
 
         // React to Wi-Fi <-> cellular changes by reconnecting with 0-RTT
-        // resumption. (We cannot migrate the live socket: the FFI surface rides
-        // TCP, where migrate() is a no-op — see the file header.) The callback
-        // fires on the monitor's private queue; hop to the main actor before
-        // touching this actor.
+        // resumption. (This app uses TCP, where migrate() returns Unsupported —
+        // see the file header. For real migration use connectPinnedUdp.) The
+        // callback fires on the monitor's private queue; hop to the main actor
+        // before touching this actor.
         self.pathMonitor.onChange = { [weak self] iface in
             Task { @MainActor [weak self] in
                 self?.handleInterfaceChange(iface)
@@ -342,13 +341,13 @@ public final class PhantomChatViewModel: ObservableObject {
         await connect()
     }
 
-    // MARK: - migrate() API demonstration (HONEST no-op over TCP)
+    // MARK: - migrate() API demonstration (returns Unsupported over TCP)
 
-    /// Calls `PhantomSession.migrate(localAddr:)` purely for API-completeness.
-    /// Over the TCP transport exposed by `connectPinned`, this is a SILENT
-    /// NO-OP — it returns success without rebinding any socket. We surface that
-    /// fact plainly rather than pretending a migration occurred. `localAddr` is
-    /// the would-be LOCAL bind in "0.0.0.0:0" form.
+    /// Calls `PhantomSession.migrate(localAddr:)` to demonstrate the API.
+    /// Over the TCP transport (`connectPinned`) this returns `Err(Unsupported)` —
+    /// TCP cannot rebind a socket without reconnecting. We surface the error
+    /// plainly. For real seamless migration use `connectPinnedUdp` instead.
+    /// `localAddr` is the would-be LOCAL bind in "0.0.0.0:0" form.
     public func callMigrateAPI(to localAddr: String) async {
         guard let session else {
             appendSystem("Not connected — cannot call migrate().")
@@ -361,18 +360,18 @@ public final class PhantomChatViewModel: ObservableObject {
         appendSystem("Calling migrate(localAddr: \(localAddr))…")
         do {
             try await session.migrate(localAddr: localAddr)
-            // The call returns Ok(()), but nothing actually migrated. Be honest
-            // about what just happened.
+            // Unexpected success on a TCP session — log it honestly.
             appendSystem(
-                "migrate() is a no-op over the TCP transport exposed by " +
-                "connectPinned; real path migration requires the native UDP " +
-                "transport, which is not yet on the FFI surface. On a real " +
-                "network change this app reconnects with 0-RTT instead."
+                "migrate() returned success (unexpected on TCP). " +
+                "For real path migration use connectPinnedUdp."
             )
-            // The session state is unchanged; reflect whatever it actually is.
             await refreshState(from: session)
         } catch {
-            appendSystem("migrate() call returned an error: \(describe(error))")
+            // Expected: TCP migrate() returns Unsupported.
+            appendSystem(
+                "migrate() returned an error (expected on TCP): \(describe(error)). " +
+                "Use connectPinnedUdp for real seamless path migration."
+            )
             await refreshState(from: session)
         }
     }
@@ -441,7 +440,7 @@ public final class PhantomChatViewModel: ObservableObject {
 
     /// Harvests and persists a resumption hint exactly once per session, the
     /// first time the session is observed in an established, data-ready state
-    /// (`.connected` / `.pqcReady` / `.classicalReady`). This is where 0-RTT
+    /// (`.connected`). This is where 0-RTT
     /// for the next launch is actually made to work: `connectPinned*` returns
     /// before the background handshake finishes, so `resumptionHint()` only
     /// yields a real ticket once the session is up. Guarded by
@@ -451,7 +450,7 @@ public final class PhantomChatViewModel: ObservableObject {
                                      from session: PhantomSession) async {
         guard !hasHarvestedHint, !isHarvestingHint else { return }
         switch live {
-        case .connected, .pqcReady, .classicalReady:
+        case .connected:
             // In-flight guard so a concurrent poll cannot also enter the harvest
             // across the await (the main actor serialises these, but the await
             // is a suspension point). The success flag is only set if a hint was
@@ -554,13 +553,11 @@ public final class PhantomChatViewModel: ObservableObject {
     private func statusLine(for state: ConnectionState) -> String {
         switch state {
         case .connecting: return "Connecting…"
-        case .classicalReady: return "Classical channel ready"
-        case .pqcUpgrading: return "Upgrading to PQC…"
-        case .pqcReady: return "PQC ready (hybrid)"
         case .connected: return "Connected (hybrid PQC)"
         case .failed: return "Connection failed"
         case .closed: return "Disconnected"
         case .migrating: return "Migrating — path silent"
+        case .draining: return "Peer closed — draining"
         case .dead: return "Session dead"
         }
     }

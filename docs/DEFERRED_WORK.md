@@ -109,24 +109,47 @@ RTO-timeout retransmits. That was the actionable, in-tree half of the original #
 
 **Why ECN itself is deferred.** A working ECN congestion-feedback loop is a
 multi-part feature, not a socket flag: (1) mark the ECT(0)/ECT(1) codepoint on
-egress datagrams; (2) **read the received ECN codepoint on ingress** — which needs
-`IP_RECVTOS` / `IPV6_RECVTCLASS` and `recvmsg` control-message parsing that the
-high-level `tokio::net::UdpSocket` API does not surface, so it would be a
-**net-new** `unsafe` libc `recvmsg`/cmsg path in `udp_transport.rs` (the module's
-only current `unsafe` is a `setsockopt(SO_MAX_PACING_RATE)` call for egress pacing —
-there is no ingress cmsg path today), and is platform-specific; (3) a **wire field
-to echo ECN counts** back to the peer (AccECN-style), i.e. a `WIRE_VERSION` bump;
-and (4) a BBR reaction to CE marks. Each of the ingress readback and the wire
-change is non-trivial; ECN is a measurable but not load-bearing congestion
-refinement, so it is deferred rather than half-built.
+egress datagrams; (2) **read the received ECN codepoint on ingress** — enabling
+the option is portable enough (`socket2` exposes `set_recv_tos_v4` /
+`set_recv_tclass_v6` without `unsafe`), but reading the value the kernel then
+attaches needs `recvmsg` control-message parsing, which the high-level
+`tokio::net::UdpSocket` API does not surface at all, so it would be a **net-new**
+`unsafe` libc `recvmsg`/cmsg path in `core/src/api/udp_transport.rs`, and is
+platform-specific; (3) a **wire field to echo ECN counts** back to the peer
+(AccECN-style), i.e. a `WIRE_VERSION` bump; and (4) a BBR reaction to CE marks.
+Each of the ingress readback and the wire change is non-trivial; ECN is a
+measurable but not load-bearing congestion refinement, so it is deferred rather
+than half-built.
 
-**What landing it would require.** Egress codepoint marking (feasible via
-`socket2::Socket::set_tos`); a **net-new** ingress cmsg readback path (a new
-`unsafe` `recvmsg` block under the same `// SAFETY:` discipline — there is no
-existing ingress path to extend); an AccECN-style ECN-count echo field and the
-matching `WIRE_VERSION` bump + wire vectors; and a congestion-controller response
-to CE marks with a loss-equivalent backoff. It composes cleanly with the
-loss-feedback work already shipped in #142.
+**The `unsafe` cost, stated exactly, because it is the largest of the four.**
+There is no native `unsafe` in this crate to extend. The two surviving
+`#![allow(unsafe_code)]` opt-ins — `transport/legs/websocket.rs` (wasm32-only
+wasm-bindgen JS-boundary glue) and `transport/legs/wasi.rs` (WASI-only
+`Send`/`Sync` assertions over WIT-bindgen socket handles) — are
+cross-language-boundary code, so **no native build compiles any `unsafe` at
+all**, and `core/Cargo.toml` names no `libc` dependency on any target (it is
+present transitively, under `socket2` and the RNG stack, but nothing in
+`core/src` calls it). An earlier version of this note assumed otherwise,
+describing a
+`setsockopt(SO_MAX_PACING_RATE)` egress-pacing call as the module's existing
+`unsafe`; that call and the module holding it (`transport/udp_transport.rs`, a
+`pub mod` with no caller anywhere) were both deleted, and the pacing it never
+performed is done in userspace by `transport::pacer::Pacer` off the BBR
+estimator. So the ingress path would be the crate's *first* native `unsafe`
+block, re-opening `#![deny(unsafe_code)]` on the platform every production
+deployment runs on, and it would put `libc` back in `core/Cargo.toml` as a
+direct, called dependency. That raises the bar for landing ECN; it does not
+lower it.
+
+**What landing it would require.** Egress codepoint marking, which needs no
+`unsafe` (`socket2::Socket::set_tos_v4` / `set_tclass_v6` — the locked socket2
+0.6 spells these per address family; the older single `set_tos` is gone); the
+net-new ingress cmsg readback path above, whose `// SAFETY:` discipline has to be
+established for it rather than inherited from a native precedent that does not
+exist; an AccECN-style ECN-count echo field and the matching `WIRE_VERSION` bump
++ wire vectors; and a congestion-controller response to CE marks with a
+loss-equivalent backoff. It composes cleanly with the loss-feedback work already
+shipped in #142.
 
 ---
 

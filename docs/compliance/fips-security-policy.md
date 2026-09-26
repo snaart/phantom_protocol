@@ -91,7 +91,12 @@ authentication is required at the module boundary.
 
 - ChaCha20-Poly1305 cipher suite — feature-gated to off in `--features
   fips`.
-- BLAKE3 hashing — replaced by SHA-256 in `--features fips`.
+- BLAKE3 **as a KDF** — every `derive_key_32` call site swaps to
+  HKDF-SHA-256 in `--features fips`. BLAKE3 remains linked and is still
+  used for the non-KDF DoS gate in `crypto/pow.rs` (keyed-BLAKE3 stateless
+  challenge MAC + the unkeyed PoW work function). That path performs no
+  approved security function and handles no CSP, so it is outside the
+  approved-service set; it must be declared as such in the ST.
 - Pre-FIPS 203 Kyber768 / Pre-FIPS 204 Dilithium3 — already migrated to
   ML-KEM-768 / ML-DSA-65 in Phase 5.1.
 
@@ -102,11 +107,15 @@ authentication is required at the module boundary.
 | AES-256-GCM | SP 800-38D | AEAD (record encryption) |
 | SHA-256 | FIPS 180-4 | Hashing |
 | HKDF-SHA-256 | RFC 5869 / SP 800-56C Rev. 2 | Key derivation |
-| HMAC-SHA-256 | FIPS 198-1 / SP 800-198 | Cookie + PoW MAC |
+| HMAC-SHA-256 | FIPS 198-1 / SP 800-198 | Stateless-cookie MAC (`transport/handshake.rs`) |
 | Ed25519 | FIPS 186-5 | Classical signature half |
 | ML-KEM-768 | FIPS 203 | Post-quantum KEM |
 | ML-DSA-65 | FIPS 204 | Post-quantum signature |
 | CTR_DRBG (via `aws-lc-rs`) | SP 800-90A Rev. 1 | RNG |
+
+The PoW challenge-integrity MAC uses keyed BLAKE3 and is **not** an
+approved security function; it is a DoS gate over public inputs and
+handles no CSP — declare it as a non-approved-but-allowed service.
 
 ## 6. Modes of operation
 
@@ -125,7 +134,8 @@ returns `true` iff the build is FIPS-feature'd AND POST has succeeded.
 
 ## 7. Key zeroization
 
-See `docs/compliance/key-management.md` §"Zeroize-on-Drop coverage". All
+See `docs/compliance/key-management.md` §"Storage classes and zeroize-on-drop
+coverage". All
 key material is zeroized when its containing struct is dropped. The
 `Drop` impls come from the `zeroize` crate's `ZeroizeOnDrop` derive.
 
@@ -137,14 +147,16 @@ interior is the responsibility of ring (FIPS-validated build).
 See `docs/compliance/self-tests.md`. Summary:
 
 - POST runs (via the cached `ensure_post_passed()`) on first call to
-  `PhantomListener::bind*` / `PhantomSession::connect*` / `connect_pinned*`
-  per process under `--features fips`.
+  `PhantomListener::bind*`, `PhantomUdpListener::bind_udp*`,
+  `SessionBuilder::connect` or any of the seven `connect_pinned*` free
+  functions, per process under `--features fips`.
 - On failure: the bootstrap short-circuits and the call returns
   `CoreError::FipsSelfTestFailure(String)` instead of standing up a
   listener / session over broken primitives.
-- Per-keygen PCTs wired into every keygen function are not yet shipped
-  (POST already covers KEM / signature pairwise consistency once at
-  startup).
+- The signing-key PCT is shipped
+  (`HybridSigningKey::pairwise_consistency_check`, run at every long-term
+  identity generation site). A per-keygen PCT on the KEM keypair is not yet
+  wired; the POST already covers KEM pairwise consistency once at startup.
 
 ## 9. Physical security
 
@@ -162,11 +174,11 @@ underlying CSPRNG (Linux kernel ≥ 5.18 in FIPS mode, or platform DRBG).
 | --- | --- |
 | Timing on cookie / PoW / path-challenge verification | `subtle::ConstantTimeEq` (see `constant-time-audit.md`). |
 | Timing on AEAD tag verification | Delegated to `aws-lc-rs` (audited upstream). |
-| Replay | Per-stream sliding-window replay protection (`security/replay_protection.rs`) after AEAD verify. |
-| Cross-protocol confusion | Domain-separated HKDF labels per direction and per epoch (`phantom-traffic-v1`, `phantom-rekey-v1`, `phantom-faketls-c2s-v1`, etc.). |
-| Downgrade | Wire version is transcript-bound (Phase 1.8); FakeTLS outer AEAD is anti-DPI only and not the security boundary. |
+| Replay | Single per-direction sliding-window bitmap keyed on the u64 packet number (`security/replay_window.rs`, `WINDOW_BITS = 1024`, RFC 4303 §3.4.3), consulted **after** AEAD verify. |
+| Cross-protocol confusion | Domain-separated KDF labels per direction / role / purpose (`phantom-transport-key`, `phantom-rekey-v1`, `phantom-aes-send-v1` / `phantom-aes-recv-v1`, `phantom-hp-send-v1` / `phantom-hp-recv-v1`, `phantom-cid-c2s-v1` / `phantom-cid-s2c-v1`, `phantom-early-data-key-v3`, `phantom-resume-binder-v1`, `phantom-pow-cookie-v1`), all routed through `crypto::kdf::derive_key_32` or an explicit HKDF `info`. |
+| Downgrade | `ClientHello.version` (`PROTOCOL_VERSION`) and the build-side `PROTOCOL_VARIANT` are both transcript-bound and signed; the header `version` byte is AEAD-AAD-bound. The optional `mimicry` leg is keyless framing-only theater — it carries no AEAD and is explicitly not a security boundary. |
 | Nonce exhaustion | `AEAD_MAX_INVOCATIONS = 2^48` per epoch; rekey before exhaustion (Phase 1.7). |
-| Replay of resumption / 0-RTT | 0-RTT resumption is shipped; `SessionCache::try_resume` is **one-shot** (the ticket is consumed on first lookup), so a replayed `ClientHello` finds no ticket and falls back to the normal 1-RTT cookie/PoW gate (Security Invariant 9). |
+| Replay of resumption / 0-RTT | The server `peek()`s the ticket, verifies the `ClientHello.resumption_binder` in constant time (proof-of-possession), then **eagerly `remove()`s** it (race-free one-shot; re-inserted unchanged on a later handshake failure). A replayed `ClientHello` therefore finds no ticket and falls back to the normal 1-RTT cookie/PoW gate; over UDP a resume never bypasses the stateless cookie (`udp_admit`). Optionally globally one-shot via the pluggable distributed anti-replay store (Security Invariant 9). |
 
 ## 12. References
 

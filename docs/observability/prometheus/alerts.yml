@@ -72,6 +72,13 @@ groups:
             past 5 minutes. Check adaptive-PoW tier and recent deploys.
 
       - alert: PhantomPoWRejectionStorm
+        # `phantom.security.pow` is recorded by `cookie_pow_gate`
+        # (transport/handshake.rs), so this series exists and the rule fires.
+        # Only a *presented* solution produces a sample (solved/rejected); a
+        # hello with no solution just gets a challenge issued and is not
+        # counted, which keeps normal first-contact traffic out of the
+        # rejection rate. Requires a `telemetry-otel` build — the PoW counter
+        # is OTel-only and has no snapshot mirror.
         # Sudden volume of PoW rejections may indicate DoS attempt.
         expr: rate(phantom_security_pow_total{outcome="rejected"}[5m]) > 10
         for: 5m

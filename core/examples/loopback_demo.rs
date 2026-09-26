@@ -10,13 +10,13 @@
 //! ```
 //!
 //! What it demonstrates end-to-end:
-//! - Server creates a hybrid (Ed25519 + Dilithium3) signing keypair on bind.
+//! - Server creates a hybrid (Ed25519 + ML-DSA-65) signing keypair on bind.
 //! - Server's `HybridVerifyingKey` is exported via `verifying_key_bytes()`
 //!   and pinned by the client. This is the **Vuln-1 fix** from the May 2026
 //!   security review — without pinning, any MITM with their own keypair
 //!   could complete a handshake against a naive client.
-//! - The handshake is hybrid PQ-secure (X25519 + Kyber768 KEM, Ed25519 +
-//!   Dilithium3 signatures over the transcript).
+//! - The handshake is hybrid PQ-secure (X25519 + ML-KEM-768 KEM, Ed25519 +
+//!   ML-DSA-65 signatures over the transcript).
 //! - Application bytes after the handshake are AES-256-GCM-encrypted with
 //!   per-direction keys derived from the shared secret; the wire bytes do
 //!   not contain the plaintext.
@@ -48,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Accept exactly one connection, echo one message, then close.
         // `accept()` yields an `AcceptOutcome`; `.session()` is the
         // established session (`.take_early_data()` would be the 0-RTT
-        // payload, if any — none in this plain V2 demo).
+        // payload, if any — none in this plain 1-RTT demo).
         let session = listener.accept().await.expect("accept failed").session();
         println!("▶ server: accepted connection from {}", session.peer_addr());
 

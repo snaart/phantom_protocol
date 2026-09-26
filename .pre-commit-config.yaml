@@ -1,4 +1,4 @@
-# Pre-commit hooks for phantom_protocol (Phase 0.5).
+# Pre-commit hooks for phantom_protocol.
 #
 # Optional local gate that mirrors the cheapest CI checks. Install once with:
 #
@@ -23,9 +23,9 @@ repos:
         # Don't touch the auto-generated bindings — they get regenerated
         # by `generate_*.sh` and a whitespace tweak here would just drift
         # back next CI run.
-        exclude: ^tests/bindings/(phantom_protocol\.py|swift/phantom_protocol\.swift|swift/phantom_protocolFFI\.h|kotlin/uniffi/phantom_protocol/phantom_protocol\.kt)$
+        exclude: ^tests/bindings/(phantom_protocol\.py|swift/phantom_protocol\.swift|swift/phantom_protocolFFI\.h|swift/phantom_protocolFFI\.modulemap|kotlin/uniffi/phantom_protocol/phantom_protocol\.kt)$
       - id: end-of-file-fixer
-        exclude: ^tests/bindings/(phantom_protocol\.py|swift/phantom_protocol\.swift|swift/phantom_protocolFFI\.h|kotlin/uniffi/phantom_protocol/phantom_protocol\.kt)$
+        exclude: ^tests/bindings/(phantom_protocol\.py|swift/phantom_protocol\.swift|swift/phantom_protocolFFI\.h|swift/phantom_protocolFFI\.modulemap|kotlin/uniffi/phantom_protocol/phantom_protocol\.kt)$
       - id: check-yaml
         # GitHub Actions workflows use multi-document anchors and YAML that
         # tripped strict parsers; allow them.
@@ -56,11 +56,58 @@ repos:
         # can break a lint two files over, so we don't pass filenames.
         pass_filenames: false
 
-      # ── Binding manifest version sync (Phase 8.1) ─────────────────────
+      # ── Panic-site inventory ──────────────────────────────────────────
+      - id: check-panic-sites
+        name: panic-site inventory matches core/src
+        entry: scripts/check_panic_sites.py
+        language: system
+        # Fires on any Rust change (a new panic site can appear anywhere)
+        # and on the document itself. Pure text scan, a few tens of ms.
+        files: ^(core/src/.*\.rs|docs/security/panic-sites\.md)$
+        pass_filenames: false
+
+      # ── Published memory arithmetic ───────────────────────────────────
+      - id: check-memory-arithmetic
+        name: published memory arithmetic matches its constants
+        # The session cap is a clap default in server/, the per-session growth
+        # allowance is a constant in core/, and six documents plus one test
+        # state their product. Neither crate can see the other's number, so
+        # nothing but this script notices when one of them moves.
+        entry: scripts/check_memory_arithmetic.py
+        language: system
+        files: ^(server/src/config\.rs|core/src/transport/stream\.rs|core/src/api/session\.rs|core/tests/security_invariants\.rs|CHANGELOG\.md|docs/security/threat-model\.md|docs/operations/deployment\.md|docs/operations/kubernetes\.md|docs/operations/helm/phantom-protocol/values\.yaml|\.env\.example|server/README\.md)$
+        pass_filenames: false
+
+      - id: check-changelog-structure
+        name: CHANGELOG [Unreleased] has one heading per change type
+        # Two branches each add a `### Documented` that did not exist in the
+        # other; the merge has both, and no diff calls that a conflict.
+        # The second block is then invisible to anyone who found the first.
+        # Report-free half of the release-path gate, so it costs nothing here.
+        entry: python3 scripts/check_changelog_breaking.py --structure-only
+        language: system
+        files: ^CHANGELOG\.md$
+        pass_filenames: false
+
+      # ── Landing page and license text that ship inside the crate ──────
+      - id: sync-readme
+        name: core/README.md and core/LICENSE mirror the root copies
+        # Copies rather than complains: the file is derived, the author who
+        # edited the root README has no reason to know a second copy exists,
+        # and a hook that repairs and then stops for re-staging costs them one
+        # `git add`. CI runs the same script with --check, which asserts and
+        # never writes — a job that repaired the tree would report success for
+        # a state nobody committed.
+        entry: scripts/sync_readme.sh
+        language: system
+        files: ^(README\.md|core/README\.md|LICENSE|core/LICENSE)$
+        pass_filenames: false
+
+      # ── Binding manifest version sync ─────────────────────────────────
       - id: check-binding-versions
         name: bindings — manifest version sync
         entry: tests/bindings/check_versions.sh
         language: system
         # Only fire when something touches a manifest the script reads.
-        files: ^(core/Cargo\.toml|server/Cargo\.toml|cli/Cargo\.toml|tests/bindings/pyproject\.toml|tests/bindings/c/phantom_protocol\.pc\.in)$
+        files: ^(core/Cargo\.toml|server/Cargo\.toml|cli/Cargo\.toml|testbed/Cargo\.toml|python/pyproject\.toml|tests/bindings/pyproject\.toml|tests/bindings/c/phantom_protocol\.pc\.in|docker-compose\.yml)$
         pass_filenames: false

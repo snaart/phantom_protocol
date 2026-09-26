@@ -1,6 +1,6 @@
 //! Host-side integration tests for the WASI-leg surface.
 //!
-//! Two `#[ignore]`-gated tests, both using the same
+//! Three `#[ignore]`-gated tests, all using the same
 //! `phantom-wasi-guest` fixture:
 //!  1. `wasi_guest_round_trips_payload_through_wasmtime` —
 //!     default mode (`futures::executor::block_on` inside the guest)
@@ -10,8 +10,12 @@
 //!     `WasiRuntime::spawn` + `drive` + `poll_until_progress`
 //!     composition with `WasiLeg`, so the two pieces are also
 //!     tested together.
+//!  3. `wasi_guest_write_to_a_host_that_never_reads_times_out` —
+//!     `PHANTOM_MODE=stall` against a host that accepts and never
+//!     reads: the leg's write has to give up with `Timeout` rather
+//!     than block the instance forever.
 //!
-//! Both:
+//! The first two:
 //!  - build the `phantom-wasi-guest` fixture via `cargo build
 //!    --target wasm32-wasip2` (with the same toolchain that
 //!    compiled this test binary — see `env!("CARGO")` use);
@@ -27,11 +31,19 @@
 //! `wasm32-wasip2` rustup target installed. CONTRIBUTING.md
 //! documents the install step.
 
+// Tests `.unwrap()` freely so failures surface as readable diagnostics; the
+// disallowed-methods list in `.clippy.toml` is for production code, not the test
+// harness. (Integration-test crates are their own crate and therefore do not
+// inherit `core/src/lib.rs`'s `#![cfg_attr(test, allow(...))]`.)
+#![allow(clippy::disallowed_methods)]
+
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 /// Project-relative path to the wasi-guest fixture's Cargo.toml.
 fn fixture_manifest() -> PathBuf {
@@ -114,21 +126,30 @@ fn wasi_runtime_available() -> bool {
     true
 }
 
-/// Shared test body: build the guest, spin up an echo server on a
-/// loopback OS-chosen port, run the guest under `wasmtime` with
-/// `PHANTOM_PORT` set (and `PHANTOM_MODE` when non-empty), assert
-/// the guest exits 0 and prints `expected_marker` to stderr.
-fn run_guest_round_trip(mode: &str, expected_marker: &str) {
+/// How long a guest run may take before the test kills it and fails. Every
+/// mode finishes in well under a second; the bound exists so a guest that
+/// blocks forever — the defect the stall mode pins — fails the test instead of
+/// hanging it.
+const GUEST_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Shared test body: build the guest, accept its connection on a loopback
+/// OS-chosen port and hand it to `serve` on a thread of its own, run the
+/// guest under `wasmtime` with `PHANTOM_PORT` set (and `PHANTOM_MODE` when
+/// non-empty), assert the guest exits 0 and prints `expected_marker` to
+/// stderr. `serve` also receives a signal that fires once the guest has
+/// exited, for a server that has to hold the connection open until then.
+fn run_guest(mode: &str, expected_marker: &str, serve: fn(TcpStream, mpsc::Receiver<()>)) {
     if !wasi_runtime_available() {
         return;
     }
     build_guest();
 
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind echo server");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
     let port = listener.local_addr().expect("local_addr").port();
+    let (guest_done_tx, guest_done_rx) = mpsc::channel();
     let server_thread = thread::spawn(move || {
         let (stream, _) = listener.accept().expect("accept");
-        echo_once(stream);
+        serve(stream, guest_done_rx);
     });
 
     let mut args: Vec<String> = vec![
@@ -143,12 +164,29 @@ fn run_guest_round_trip(mode: &str, expected_marker: &str) {
         args.push(format!("PHANTOM_MODE={mode}"));
     }
 
-    let out = Command::new("wasmtime")
+    let mut child = Command::new("wasmtime")
         .args(&args)
         .arg(guest_wasm())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("spawn wasmtime");
+    let started = Instant::now();
+    while child.try_wait().expect("poll wasmtime").is_none() {
+        if started.elapsed() > GUEST_DEADLINE {
+            let _ = child.kill();
+            let out = child.wait_with_output().expect("collect killed guest");
+            panic!(
+                "wasi guest (mode={mode:?}) was still running after {GUEST_DEADLINE:?}\n\
+                 stderr:\n{}",
+                String::from_utf8_lossy(&out.stderr),
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let out = child.wait_with_output().expect("collect guest output");
 
+    let _ = guest_done_tx.send(());
     let _ = server_thread.join();
     assert!(
         out.status.success(),
@@ -164,12 +202,24 @@ fn run_guest_round_trip(mode: &str, expected_marker: &str) {
     );
 }
 
+/// The round-trip modes' server: echo one frame and close.
+fn serve_echo(stream: TcpStream, _guest_done: mpsc::Receiver<()>) {
+    echo_once(stream);
+}
+
+/// The stall mode's server: hold the connection open, and never read it,
+/// until the guest has exited.
+fn serve_without_reading(stream: TcpStream, guest_done: mpsc::Receiver<()>) {
+    let _ = guest_done.recv();
+    drop(stream);
+}
+
 /// Proves `WasiLeg::connect / send / recv` work via
 /// `futures::executor::block_on` (the simplest possible driver).
 #[test]
 #[ignore]
 fn wasi_guest_round_trips_payload_through_wasmtime() {
-    run_guest_round_trip("", "OK: round-tripped");
+    run_guest("", "OK: round-tripped", serve_echo);
 }
 
 /// Proves the `WasiRuntime` + `WasiLeg` composition works
@@ -177,5 +227,18 @@ fn wasi_guest_round_trips_payload_through_wasmtime() {
 #[test]
 #[ignore]
 fn wasi_guest_round_trips_payload_via_runtime_through_wasmtime() {
-    run_guest_round_trip("runtime", "OK: runtime-driven round-trip");
+    run_guest("runtime", "OK: runtime-driven round-trip", serve_echo);
+}
+
+/// Proves a write to a host that never reads gives up with `Timeout`
+/// instead of blocking the instance forever, and that nothing is written
+/// after it.
+#[test]
+#[ignore]
+fn wasi_guest_write_to_a_host_that_never_reads_times_out() {
+    run_guest(
+        "stall",
+        "OK: a write the host never read failed with Timeout",
+        serve_without_reading,
+    );
 }

@@ -85,6 +85,23 @@ pub(crate) struct HotPathAtomics {
     handshake_latency_ns_sum: CachePadded<AtomicU64>,
     handshake_latency_count: CachePadded<AtomicU64>,
 
+    /// Security counters. These are always-on lock-free totals surfaced
+    /// through the cold-path snapshot regardless of whether the
+    /// `telemetry-otel` feature is enabled. The labeled OTel instruments
+    /// (in `instruments.rs`) record the same events with attribution; both
+    /// paths are driven together by the facade in `mod.rs`.
+    replay_rejected_total: CachePadded<AtomicU64>,
+    aead_failure_total: CachePadded<AtomicU64>,
+    unencrypted_dropped_total: CachePadded<AtomicU64>,
+    /// Two counts of the same event in two units — see the recorders. The `_flights_` one
+    /// is the half of the pair `handshake_flight_repeated_total` is read against; the
+    /// `_datagrams_` one measures a different quantity and is not comparable with it.
+    initial_datagrams_on_committed_route_total: CachePadded<AtomicU64>,
+    initial_flights_on_committed_route_total: CachePadded<AtomicU64>,
+    handshake_flight_repeated_total: CachePadded<AtomicU64>,
+    handshake_flight_evicted_total: CachePadded<AtomicU64>,
+    handshake_flight_refused_total: CachePadded<AtomicU64>,
+
     /// Process-start timestamp for uptime calculation. Set once at
     /// construction; the snapshot reader computes `elapsed()` on read.
     started_at: Instant,
@@ -110,6 +127,14 @@ impl HotPathAtomics {
             handshake_failure_count: CachePadded::new(AtomicU64::new(0)),
             handshake_latency_ns_sum: CachePadded::new(AtomicU64::new(0)),
             handshake_latency_count: CachePadded::new(AtomicU64::new(0)),
+            replay_rejected_total: CachePadded::new(AtomicU64::new(0)),
+            aead_failure_total: CachePadded::new(AtomicU64::new(0)),
+            unencrypted_dropped_total: CachePadded::new(AtomicU64::new(0)),
+            initial_datagrams_on_committed_route_total: CachePadded::new(AtomicU64::new(0)),
+            initial_flights_on_committed_route_total: CachePadded::new(AtomicU64::new(0)),
+            handshake_flight_repeated_total: CachePadded::new(AtomicU64::new(0)),
+            handshake_flight_evicted_total: CachePadded::new(AtomicU64::new(0)),
+            handshake_flight_refused_total: CachePadded::new(AtomicU64::new(0)),
             started_at: Instant::now(),
         }
     }
@@ -178,6 +203,18 @@ impl HotPathAtomics {
     /// surfaced through the live snapshot. The labeled OTel `Histogram`
     /// (`{ns}.handshake.duration`) is a separate path in the instrument
     /// holder; the facade's `record_handshake` drives both together.
+    ///
+    /// **Success here means "this side finished", not "the peer heard the
+    /// reply".** Each side counts its own completion, and the server's is
+    /// recorded the moment it has derived keys and sent its reply — after which
+    /// nothing under the handshake is reliable, so a reply lost on the way down
+    /// leaves a session that this counter has already called successful and that
+    /// the peer never joined. A live run recorded exactly that: a session with
+    /// `dur=135.0 s, rx=0, tx=0`, counted as a success against a client seeing
+    /// timeouts. Read against a client's own failures the asymmetry is the
+    /// finding, not a contradiction; `initial_flights_on_committed_route_total`
+    /// and `handshake_flight_repeated_total` are what say whether the reply was
+    /// asked for again and re-sent.
     pub(crate) fn record_handshake_success(&self, duration_ns: u64) {
         self.handshake_success_count.fetch_add(1, Ordering::Relaxed);
         self.handshake_latency_ns_sum
@@ -191,6 +228,134 @@ impl HotPathAtomics {
     #[cold]
     pub(crate) fn record_handshake_failure(&self) {
         self.handshake_failure_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the always-on replay-rejected total. The facade's
+    /// `record_replay_rejected` calls this before forwarding to the OTel
+    /// instruments, so the counter is populated even when `telemetry-otel`
+    /// is off.
+    #[inline]
+    pub(crate) fn record_replay_rejected(&self) {
+        self.replay_rejected_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the always-on AEAD-failure total. The facade's
+    /// `record_aead_failure` calls this before forwarding to the OTel
+    /// instruments, so the counter is populated even when `telemetry-otel`
+    /// is off.
+    #[inline]
+    pub(crate) fn record_aead_failure(&self) {
+        self.aead_failure_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the always-on unencrypted-drop total — the receive path's
+    /// stripped-flag downgrade defence firing (Invariant 2). Kept alongside the
+    /// other two security totals rather than in the OTel instruments alone: the
+    /// event it counts is an attack indicator, and an operator who has not opted
+    /// into `telemetry-otel` still needs to see that it happened. It is also the
+    /// only externally visible evidence that the gate ran at all — a dropped
+    /// packet is otherwise indistinguishable from one that never arrived.
+    #[inline]
+    pub(crate) fn record_unencrypted_dropped(&self) {
+        self.unencrypted_dropped_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// **Unit: one datagram.** Increment the always-on count of handshake-type
+    /// *datagrams* arriving on a connection the listener has already committed a
+    /// route to, counted as each one lands and before reassembly (PROTOCOL § 6.1).
+    ///
+    /// This is the wire cost of clients repeating themselves, not the number of
+    /// times they asked: a cookie-bearing `ClientHello` is three fragments, so one
+    /// repeated question moves this by three. It is the only measure of that cost
+    /// the listener has — the demux records no per-packet counters of its own —
+    /// which is why it is kept, and why it is kept under a name that says
+    /// `datagrams`.
+    ///
+    /// **Do not read it against [`record_handshake_flight_repeated`]**, which
+    /// counts flights: the comparison is off by the fragment count and reads as
+    /// answers gone missing. [`record_initial_flight_on_committed_route`] is the
+    /// half that pairs with it.
+    ///
+    /// [`record_handshake_flight_repeated`]: Self::record_handshake_flight_repeated
+    /// [`record_initial_flight_on_committed_route`]: Self::record_initial_flight_on_committed_route
+    #[inline]
+    pub(crate) fn record_initial_datagram_on_committed_route(&self) {
+        self.initial_datagrams_on_committed_route_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// **Unit: one flight.** Increment the always-on count of *reassembled*
+    /// handshake messages arriving on a connection the listener has already
+    /// committed a route to — one per question the client asked again, however
+    /// many datagrams carried it (PROTOCOL § 6.1).
+    ///
+    /// It exists because of a question that could not be answered from any
+    /// artifact on either side of a failed connect: whether the client's repeated
+    /// hellos reached the server at all. A non-zero count says one flight went
+    /// missing on the way down; zero, against a client that timed out, says the
+    /// path fell silent in both directions. Those need different remedies and were
+    /// indistinguishable without this.
+    ///
+    /// **Meant to be read together with [`record_handshake_flight_repeated`], and
+    /// in the same unit as it**: this one is bumped before anything has decided
+    /// whether an answer is owed, so alone it cannot say whether the listener
+    /// repaired the connect or had nothing to send.
+    ///
+    /// [`record_handshake_flight_repeated`]: Self::record_handshake_flight_repeated
+    #[inline]
+    pub(crate) fn record_initial_flight_on_committed_route(&self) {
+        self.initial_flights_on_committed_route_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// **Unit: one flight.** Increment the always-on count of retained reply
+    /// flights actually repeated (PROTOCOL § 6.1) — one per repeat sent, not per
+    /// datagram of it.
+    ///
+    /// **Meant to be read together with
+    /// [`record_initial_flight_on_committed_route`], which is in the same unit**:
+    /// asks arriving with no repeats sent is a listener that had nothing to answer
+    /// with, which is a different fault from a path that lost the answer on the way
+    /// down and a different fault again from one that never carried the question.
+    ///
+    /// [`record_initial_flight_on_committed_route`]: Self::record_initial_flight_on_committed_route
+    #[inline]
+    pub(crate) fn record_handshake_flight_repeated(&self) {
+        self.handshake_flight_repeated_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the always-on count of retained reply flights dropped to make room
+    /// for a newer one (PROTOCOL § 6.1).
+    ///
+    /// This is the repair running out of the memory it is allowed, and it is the
+    /// only externally visible sign of it: an evicted session's connect still
+    /// succeeds unless its reply is lost, so the failures it causes are rare,
+    /// load-dependent and indistinguishable from the ones the repair was built for.
+    /// A non-zero rate says the listener is completing handshakes faster than its
+    /// retention budget covers, and that some clients are back to the pre-repair
+    /// behaviour.
+    #[inline]
+    pub(crate) fn record_handshake_flight_evicted(&self) {
+        self.handshake_flight_evicted_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A reply flight was never retained at all, because repeating it would have
+    /// exceeded the RFC 9000 § 8.2 amplification limit against the hello that drew it.
+    ///
+    /// The sibling of the eviction counter and the same kind of blind spot: an entry
+    /// that was refused and one that was never offered look identical from outside,
+    /// yet the first means every connect of that shape has no repair while the second
+    /// means the listener is idle. It cannot happen with today's messages — the reply
+    /// is 1.99x the smallest hello that can draw it, against a limit of 3 — so a
+    /// non-zero value says a message size moved and the repair has silently stopped
+    /// arming, which is exactly the kind of change nothing else reports.
+    #[inline]
+    pub(crate) fn record_handshake_flight_refused(&self) {
+        self.handshake_flight_refused_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     // --- Read accessors (cold path) ---
@@ -262,6 +427,40 @@ impl HotPathAtomics {
 
     pub(crate) fn handshake_latency_count(&self) -> u64 {
         self.handshake_latency_count.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn replay_rejected_total(&self) -> u64 {
+        self.replay_rejected_total.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn aead_failure_total(&self) -> u64 {
+        self.aead_failure_total.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn unencrypted_dropped_total(&self) -> u64 {
+        self.unencrypted_dropped_total.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn initial_datagrams_on_committed_route_total(&self) -> u64 {
+        self.initial_datagrams_on_committed_route_total
+            .load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn initial_flights_on_committed_route_total(&self) -> u64 {
+        self.initial_flights_on_committed_route_total
+            .load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn handshake_flight_repeated_total(&self) -> u64 {
+        self.handshake_flight_repeated_total.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn handshake_flight_evicted_total(&self) -> u64 {
+        self.handshake_flight_evicted_total.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn handshake_flight_refused_total(&self) -> u64 {
+        self.handshake_flight_refused_total.load(Ordering::Relaxed)
     }
 
     pub(crate) fn uptime_secs(&self) -> u64 {
@@ -357,6 +556,51 @@ mod tests {
         h.stream_opened();
         h.stream_closed();
         assert_eq!(h.active_streams(), 1);
+    }
+
+    #[test]
+    fn security_counters_increment_independently() {
+        let h = HotPathAtomics::new();
+        assert_eq!(h.replay_rejected_total(), 0);
+        assert_eq!(h.aead_failure_total(), 0);
+        assert_eq!(h.unencrypted_dropped_total(), 0);
+        assert_eq!(h.initial_datagrams_on_committed_route_total(), 0);
+        assert_eq!(h.initial_flights_on_committed_route_total(), 0);
+        assert_eq!(h.handshake_flight_repeated_total(), 0);
+        assert_eq!(h.handshake_flight_evicted_total(), 0);
+        assert_eq!(h.handshake_flight_refused_total(), 0);
+
+        h.record_replay_rejected();
+        h.record_replay_rejected();
+        h.record_aead_failure();
+        h.record_unencrypted_dropped();
+        h.record_unencrypted_dropped();
+        h.record_unencrypted_dropped();
+        h.record_initial_datagram_on_committed_route();
+        h.record_initial_datagram_on_committed_route();
+        h.record_initial_datagram_on_committed_route();
+        h.record_initial_datagram_on_committed_route();
+        h.record_initial_flight_on_committed_route();
+        h.record_initial_flight_on_committed_route();
+        h.record_handshake_flight_repeated();
+        h.record_handshake_flight_repeated();
+        h.record_handshake_flight_evicted();
+        h.record_handshake_flight_refused();
+        h.record_handshake_flight_refused();
+        h.record_handshake_flight_refused();
+        h.record_handshake_flight_refused();
+        h.record_handshake_flight_refused();
+
+        assert_eq!(h.replay_rejected_total(), 2);
+        assert_eq!(h.aead_failure_total(), 1);
+        assert_eq!(h.unencrypted_dropped_total(), 3);
+        // Four datagrams carrying two flights: the two totals count the same event in
+        // different units, and each has to move on its own recorder only.
+        assert_eq!(h.initial_datagrams_on_committed_route_total(), 4);
+        assert_eq!(h.initial_flights_on_committed_route_total(), 2);
+        assert_eq!(h.handshake_flight_repeated_total(), 2);
+        assert_eq!(h.handshake_flight_evicted_total(), 1);
+        assert_eq!(h.handshake_flight_refused_total(), 5);
     }
 
     #[test]

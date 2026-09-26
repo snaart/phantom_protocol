@@ -14,12 +14,15 @@ wasm-pack build --target web --release -- --manifest-path phantom-wasm-client/Ca
 wasm-pack build --target bundler --release -- --manifest-path phantom-wasm-client/Cargo.toml
 ```
 
-**Feature flags.** Do NOT enable native-only features (`rt-multi-thread`, `net`,
-`kcp`). Minimal `Cargo.toml` for the wasm-pack crate:
+**Feature flags.** The browser row is `--no-default-features` plus `std`,
+`compression-zstd`, `classical-crypto`. Do NOT enable the native-only tokio
+features (`rt-multi-thread`, `net`), and leave the default-on `bindings`
+feature off — UniFFI 0.32's rust-future glue requires `Send`, which browser
+futures are not. Minimal `Cargo.toml` for the wasm-pack crate:
 
 ```toml
 [dependencies]
-phantom_protocol    = { path = "../core", default-features = false }
+phantom-protocol = { path = "../core", default-features = false, features = ["std", "compression-zstd", "classical-crypto"] }
 wasm-bindgen    = "0.2"
 wasm-bindgen-futures = "0.4"
 ```
@@ -64,14 +67,17 @@ pub async fn start_phantom_session() -> Result<(), JsError> {
     let pinned = HybridVerifyingKey::from_bytes(SERVER_VERIFYING_KEY)
         .map_err(|e| JsError::new(&e.to_string()))?;
 
+    // Synchronous, infallible constructor — the handshake runs in a background
+    // task; await readiness (or inspect last_error()) before sending.
     let session = PhantomSession::connect_with_transport_with_runtime(
         "wss://phantom.example.com",
         leg,
         pinned,
         Arc::new(WasmRuntime),   // setTimeout-based sleep, spawn_local task spawning
-    ).await.map_err(|e| JsError::new(&e.to_string()))?;
+    );
+    session.await_ready().await.map_err(|e| JsError::new(&e.to_string()))?;
 
-    session.send(b"hello from browser").await
+    session.send(b"hello from browser".to_vec()).await
         .map_err(|e| JsError::new(&e.to_string()))?;
     Ok(())
 }
@@ -97,9 +103,11 @@ server signing key requires a wasm rebuild and redeploy.
 ## Session resumption via IndexedDB
 
 After a session establishes, `PhantomSession::resumption_hint()` returns
-`Option<ResumptionHint>` — a record with 32-byte `session_id` and
-`resumption_secret` fields. Persist it in IndexedDB for 0-RTT resumption
-on subsequent page loads.
+`Option<Arc<ResumptionHint>>` — an object whose `session_id()` and
+`resumption_secret()` accessors each return 32 bytes. It is an object rather
+than a record because UniFFI generates a field-printing stringifier for every
+record, which put the resumption secret one `print` away from a log. Persist the
+two values in IndexedDB for 0-RTT resumption on subsequent page loads.
 
 **Recommended JSON shape** (keyed by server hostname):
 
@@ -111,31 +119,40 @@ on subsequent page loads.
 `SessionCache` default: 1 hour).
 
 **Resuming.** The native `connect_pinned_with_resumption` shim is
-`cfg(not(wasm32))`; browser builds resume through the Rust-level
-`connect_with_resumption`, which takes the raw `(session_id,
-resumption_secret)` tuple and an early-data `Vec<u8>` (≤ 16 KiB):
+`cfg(not(wasm32))`; browser builds resume through the type-state builder,
+which takes an `Arc<ResumptionHint>` (a 32-byte `session_id` plus a 32-byte
+`resumption_secret`) and an early-data `Vec<u8>` (≤ 16 KiB):
 
 ```rust
-let session = PhantomSession::connect_with_resumption(
-    "wss://phantom.example.com",
-    leg,
-    pinned,
-    (sid, secret),        // [u8; 32] each, hex-decoded from IndexedDB
-    Vec::new(),           // early_data: Vec<u8>, max 16 KiB
-)?;
+let session = PhantomSession::builder("wss://phantom.example.com")
+    .pinned_key(pinned)
+    .transport(leg)
+    .resumption(
+        // The fields are private, so `new` is the only way to build one; it
+        // hands back the `Arc<ResumptionHint>` the builder takes.
+        ResumptionHint::new(sid.to_vec(), secret.to_vec()),  // 32 bytes each, hex-decoded from IndexedDB
+        Vec::new(),           // early_data: Vec<u8>, max 16 KiB
+    )
+    .runtime(Arc::new(WasmRuntime))
+    .connect()
+    .await?;
 
-// None = no V3 attempt; Some(true) = server accepted early data.
+// None = no 0-RTT attempt; Some(true) = server accepted early data.
 if session.early_data_accepted().await == Some(true) { /* ... */ }
 ```
 
-**Anti-replay.** `SessionCache::try_resume` is one-shot — a replayed or expired
-hint falls back to 1-RTT. Clear stored hints on logout. The SDK ships no
+**Anti-replay.** Resumption tickets are one-shot: the server verifies the
+resumption binder against a non-consuming `peek()`, then consumes the ticket
+with `remove()` before doing any KEM work, so a replayed or expired hint falls
+back to 1-RTT. Clear stored hints on logout. The SDK ships no
 IndexedDB helper; use `web_sys::IdbDatabase` / `IdbObjectStore` directly.
 
 ## Bundle size
 
-Phantom Protocol's wasm32 build pulls in ml-kem (FIPS 203), ml-dsa (FIPS 204), ring
-AES-256-GCM, and ChaCha20-Poly1305 unconditionally.
+Phantom Protocol's wasm32 build pulls in ml-kem (FIPS 203) and ml-dsa (FIPS 204)
+via the `std` feature, plus ring's AES-256-GCM / ChaCha20-Poly1305 and
+x25519-dalek via `classical-crypto` — the browser feature row names both, so all
+four land in the bundle.
 
 **Measuring** (TBD — the wasm32 build was unblocked in Phase 3.5):
 

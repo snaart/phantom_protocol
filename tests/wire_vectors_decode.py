@@ -23,15 +23,42 @@ What it covers:
     and `extensions` are off the wire; the 15-byte header has session_id off-wire).
     Fully decoded **and** re-encoded, same as the borsh structs.
 
-Run: ``python3 tests/wire_vectors_decode.py`` (stdlib only; exits non-zero on
+  * **the 47-byte AEAD AAD image** — encode only, and necessarily so: the image is
+    authenticated but never transmitted, so there is nothing to decode it *from*.
+    PROTOCOL.md § 4.2 states it as a second table beside the wire layout and leaves
+    the relationship between the two for the reader to work out by diffing them;
+    what is written here is that relationship as one checkable claim, with the
+    fixture supplying fourteen of the fifteen fields independently of the encoder.
+
+  * **the signed handshake transcript** — encode only, for the sharper reason: its
+    committed artefact is a SHA-256 digest, and a hash cannot be decoded. Every
+    other vector here would still pass if this file and the Rust shared a
+    compensating pair of mistakes in encode and decode; this one cannot, because
+    there is no decode side to compensate. It composes the transcript out of the
+    committed message fixtures and hashes it, and the negative cases below fix the
+    field order and the borsh encoding of the leading field, neither of which the
+    fixture can state on its own.
+
+  * **the `WINDOW_UPDATE` plaintext** — an 8-byte big-endian cumulative limit, together
+    with the rule a receiver of one must apply. It has no frozen fixture (it is an AEAD
+    plaintext, not an outer container), so what is stated here is the codec and the rule,
+    in a second language: the encoding against written-out byte strings, and the rule as
+    an explicit function fed from the decoder, graded against a written-out transcript.
+    The rule has two halves and both are stated — the monotone maximum against the limit
+    already held, *and* the local clamp to one `MAX_SEND_WINDOW` past what has been sent,
+    which is the half that exists because the number is written by the peer.
+
+Run:``python3 tests/wire_vectors_decode.py`` (stdlib only; exits non-zero on
 any mismatch). Regenerate the fixtures from Rust with
 ``PHANTOM_REGEN_WIRE_VECTORS=1 cargo test --manifest-path core/Cargo.toml``.
 """
 
 from __future__ import annotations
 
+import hashlib
 import struct
 import sys
+from itertools import permutations
 from pathlib import Path
 
 VECTORS_DIR = Path(__file__).resolve().parent.parent / "core" / "tests" / "wire_vectors"
@@ -44,8 +71,49 @@ ML_DSA_PK_LEN = 1952
 ML_DSA_SIG_LEN = 3309
 CLASSICAL_PK_LEN = 32
 PROTOCOL_VARIANT = b"phantom-default-1"
-PROTOCOL_VERSION = 3  # bumped 2->3 (T4.3): ServerHello server_key_package -> 32-byte server_nonce
-WIRE_VERSION = 6  # bumped 5->6 (v6 anti-fingerprint): masked version byte + dropped length prefixes
+PROTOCOL_VERSION = 5  # bumped 4->5: CONTROL frames lead with a subtype byte (see below)
+# Bumped 7->8 with it. What the pair refuses is a peer built for the *previous* wire: the
+# header version is checked before any flag, so a v7 receiver drops every v8 frame rather
+# than misreading the new plaintext, and PROTOCOL_VERSION turns that silent drop into a
+# typed rejection at the handshake. It does not refuse a v8 peer that simply omits the
+# CONTROL branch -- nothing on the wire can, which is why that obligation is written out
+# below and enforced only by conformance.
+WIRE_VERSION = 8
+
+# CONTROL AEAD plaintext: a one-byte subtype, then whatever that subtype defines (nothing,
+# for the only assignment so far). Like WINDOW_UPDATE it has no frozen fixture — it is an
+# AEAD plaintext, not an outer container — so the registry is written out here for a second
+# implementation reading only this file. 0x00 is deliberately unassigned, so a zeroed body
+# is not a valid control frame; every unassigned byte is unknown and the frame is dropped.
+# A receiver that instead let an unknown subtype fall through to its data path would hand
+# the subtype byte to its application as one byte of the caller's stream.
+CONTROL_SUBTYPE_LEN = 1
+CONTROL_SUBTYPE_CLOSE = 0x01
+
+# WINDOW_UPDATE AEAD plaintext: 8 big-endian bytes, the cumulative total the receiver is
+# willing to have sent on that stream, counted from the stream's first byte. It replaced a
+# 4-byte relative credit at WIRE_VERSION 7. There is no frozen fixture for it — it is an
+# AEAD plaintext rather than an outer container — but a second implementation reading only
+# this file has to get the length and the meaning right, so both are stated here and the
+# length is asserted against the spec below.
+WINDOW_UPDATE_PAYLOAD_LEN = 8
+
+# The three numbers PROTOCOL.md § 4.5 puts on the flow-control ledger. They are not
+# encodings, so no fixture can carry them, and a second implementation that guesses them
+# wrong stalls or overruns without ever mis-parsing a byte — which is why they are written
+# out here under the names the spec uses rather than left as literals in a table.
+#
+# The limit both ends assume before any WINDOW_UPDATE has been seen. Starting from zero
+# instead deadlocks: the first frame is only emitted once the peer's application has
+# consumed bytes that, at a zero opening limit, would never have been sent to it.
+INITIAL_STREAM_WINDOW = 64 * 1024
+# The ceiling on what a receiver may advertise beyond what its application has consumed.
+MAX_RECV_WINDOW = 1024 * 1024
+# The ceiling on what a sender will honour beyond what it has already sent, whatever
+# number arrives. Written out independently of MAX_RECV_WINDOW rather than defined from
+# it, so that the two being equal is something this file checks rather than something it
+# arranges — see `window_update_limit_rule`.
+MAX_SEND_WINDOW = 1024 * 1024
 
 
 def pat(seed: int, n: int) -> bytes:
@@ -462,11 +530,14 @@ def packet_header():
     check(enc_packet_header(h) == raw, "header re-encode != fixture")
 
 
-def _packet_roundtrip(name: str, payload: bytes, ext: bytes):
+def _packet_roundtrip(name: str, payload: bytes):
+    # No `extensions` comparison here: the decoder returns a constant empty slice,
+    # so comparing it to an empty literal would assert nothing about the fixture.
+    # What actually pins "extensions are off the wire" is that the payload the
+    # caller writes out is the whole remainder after the 15-byte header.
     raw = load(name)
     p = dec_phantom_packet(raw)
     check(p["payload"] == payload, f"{name}: payload")
-    check(p["extensions"] == ext, f"{name}: extensions")
     check(p["header"]["version"] == WIRE_VERSION, f"{name}: header version")
     check(enc_phantom_packet(p) == raw, f"{name}: re-encode != fixture")
     return p
@@ -474,14 +545,14 @@ def _packet_roundtrip(name: str, payload: bytes, ext: bytes):
 
 @vector
 def phantom_packet_data():
-    p = _packet_roundtrip("phantom_packet_data.bin", pat(0x11, 64), b"")
+    p = _packet_roundtrip("phantom_packet_data.bin", pat(0x11, 64))
     fl = p["header"]["flags"]
     check(fl & 0x0020 != 0 and fl & 0x0001 != 0, "data packet ENCRYPTED|RELIABLE")
 
 
 @vector
 def phantom_packet_ack():
-    p = _packet_roundtrip("phantom_packet_ack.bin", b"", b"")
+    p = _packet_roundtrip("phantom_packet_ack.bin", b"")
     check(p["header"]["flags"] == 0x0002, "ack packet flags == ACK only")
 
 
@@ -490,9 +561,472 @@ def phantom_packet_extensions():
     # WIRE v6: the struct that produced this fixture had extensions set, but
     # they are DROPPED from the wire — the fixture is just header(15) ‖ payload(16),
     # and decoding yields EMPTY extensions. This pins "extensions off the wire".
-    _packet_roundtrip("phantom_packet_extensions.bin", pat(0x11, 16), b"")
+    _packet_roundtrip("phantom_packet_extensions.bin", pat(0x11, 16))
     check(len(load("phantom_packet_extensions.bin")) == HEADER_SIZE + 16,
           "v6 ext fixture is header || payload only (no extension bytes)")
+
+
+def enc_window_update(limit: int) -> bytes:
+    """WINDOW_UPDATE AEAD plaintext: the cumulative limit, big-endian u64."""
+    return struct.pack(">Q", limit)
+
+
+def dec_window_update(raw: bytes) -> int:
+    check(len(raw) == WINDOW_UPDATE_PAYLOAD_LEN,
+          f"WINDOW_UPDATE plaintext must be exactly {WINDOW_UPDATE_PAYLOAD_LEN} bytes")
+    return struct.unpack(">Q", raw)[0]
+
+
+def apply_window_limit(held: int, sent: int, advertised: int) -> tuple[int, str]:
+    """Fold one WINDOW_UPDATE into the state a sender is already holding.
+
+    The state is two numbers, not one. ``held`` is the highest limit honoured so
+    far; ``sent`` is the total this side has already put on the wire, counted the
+    way § 4.5 counts it — each reliable application byte once, retransmissions not
+    counted again, **and a first transmission the transport refused subtracted
+    back**, since those bytes never left. Both are needed, because half the rule is
+    a bound the peer's number is measured against rather than a comparison between
+    two peer numbers, and a model carrying only ``held`` cannot express that half
+    at all.
+
+    That ``sent`` can fall is what makes the two halves independent rather than one
+    rule wearing two names: the ceiling it fixes can drop below a limit already
+    honoured, and the transcript exercises that state deliberately.
+
+    Deliberately not written as ``max``. This file earns its keep by stating the
+    rule a second implementation has to follow, and ``max(a, b)`` states nothing a
+    reader could disagree with — it asserts that a builtin behaves like itself.
+    Worse, it states the wrong rule: it honours whatever number arrives, and the
+    number arrives from a peer that is authenticated but not trusted.
+
+    Returns the settled total *and* which of the four cases the frame fell into.
+    The case is returned because two of them settle on the same total — a
+    duplicate and a stale frame both leave ``held`` where it was — so a rule that
+    only reports the total makes "a duplicate grants nothing extra" and "a stale
+    frame is discarded" one claim wearing two names, and the second of them is
+    unverifiable prose. § 4.5 lists them as separate properties; naming which one
+    a frame exercised is what keeps them separate here.
+    """
+    # What this side is willing to honour, whoever is writing the number. A peer
+    # advertising u64::MAX buys exactly one window of permission beyond what has
+    # already gone out and must send another frame for more — so the field is a
+    # rate of permission per frame rather than a lever the peer can hold down.
+    # Saturating in the normative implementation, where both are u64
+    # (`core/src/transport/stream.rs`, `apply_peer_window_limit`). Python's integers
+    # do not overflow, so the plain sum here is right by accident rather than by
+    # construction — a port to a fixed-width language has to saturate, or a peer
+    # writing a total near the type's maximum wraps the ceiling to a small number and
+    # stops the stream.
+    ceiling = sent + MAX_SEND_WINDOW
+    if advertised > ceiling:
+        # The local bound, not the peer's number, decided the outcome. It still
+        # settles by maximum against `held`: a clamp is not a revocation, so an
+        # oversized frame arriving after the ceiling has already been spent
+        # leaves the total exactly where it was.
+        return max(held, ceiling), "clamped"
+    if advertised > held:
+        # A genuine grant: the receiver has drained, and the total it is now
+        # willing to have sent is the number on the wire — not that number added
+        # to anything. The field counts from the stream's first byte, so adding
+        # would credit the same bytes a second time and let the sender overrun a
+        # receiver that never opened that much room.
+        return advertised, "grant"
+    if advertised == held:
+        # A duplicate — the same frame retransmitted, or a peer restating an
+        # unchanged total. It must move nothing. That idempotence is precisely
+        # why the frame carries no sequence number and needs no acknowledgement.
+        return held, "duplicate"
+    # A smaller total is an older frame that lost the race with a newer one.
+    # Discarding it is what keeps the window monotone: a receiver never revokes
+    # room it has already granted, so a sender that acted on the larger total
+    # cannot be retroactively put in the wrong by the network's ordering.
+    return held, "stale"
+
+
+@vector
+def window_update_codec():
+    """The flow-control plaintext's bytes, stated independently of the Rust.
+
+    There is no frozen fixture — this is an AEAD plaintext, not an outer container —
+    so the encoding is pinned against written-out byte strings rather than against
+    itself. One of them needs all 64 bits on purpose: a reader that quietly truncated
+    the cumulative total to 32 bits agrees with every small limit and diverges only on
+    a long-lived stream, which is the hardest place to notice it.
+    """
+    for limit, encoded in [
+        (165_536, "00000000000286a0"),
+        (281_474_976_710_657, "0001000000000001"),
+        (18_446_744_073_709_551_615, "ffffffffffffffff"),
+    ]:
+        raw = enc_window_update(limit)
+        check(raw.hex() == encoded,
+              f"WINDOW_UPDATE encoding of {limit}: got {raw.hex()}, expected {encoded}")
+        check(dec_window_update(bytes.fromhex(encoded)) == limit,
+              f"WINDOW_UPDATE decode of {encoded}: got "
+              f"{dec_window_update(bytes.fromhex(encoded))}, expected {limit}")
+
+    for bad in (b"", b"\x00\x00\x00\x01", b"\x00" * 9):
+        try:
+            dec_window_update(bad)
+        except Failure:
+            continue
+        raise Failure(f"a {len(bad)}-byte WINDOW_UPDATE plaintext was accepted")
+
+
+@vector
+def window_update_limit_rule():
+    """The rule a receiver of a WINDOW_UPDATE has to apply, on decoded frames.
+
+    Every advertised total below reaches the rule the way a real one does — through
+    the decoder — so a codec that misreads the field and a rule that misapplies it
+    both land on this check instead of only one of them. The expected columns are
+    written out rather than computed, because a table filled in by the very
+    expression under test grades its own homework and would accept any rule at all.
+    """
+    # The two ends of the ledger are the same figure, and the spec says so in both
+    # directions. Checked rather than arranged: were the sender's ceiling the smaller
+    # of the two, a receiver advertising the whole window it is entitled to would have
+    # the top of its grant silently discarded, and the stall that follows looks like a
+    # slow path rather than a disagreement about a constant.
+    check(MAX_SEND_WINDOW == MAX_RECV_WINDOW,
+          f"the sender honours at most {MAX_SEND_WINDOW} but the receiver may advertise "
+          f"up to {MAX_RECV_WINDOW}; § 4.5 makes them the same figure")
+
+    # The rule's shape is part of what is being stated, and it is checked before anything
+    # is asked of its arithmetic. A rule that reports only a total cannot tell a duplicate
+    # from a stale frame — they settle on the same number — so collapsing this back to
+    # `max(held, advertised)` is not a simplification but the loss of a claim, and it is
+    # the exact restatement this vector exists to refuse. Checked here rather than inside
+    # a loop so the collapse is reported as a broken contract and not as an unpacking
+    # accident three assertions later.
+    shape = apply_window_limit(INITIAL_STREAM_WINDOW, INITIAL_STREAM_WINDOW, 165_536)
+    check(isinstance(shape, tuple) and len(shape) == 2 and isinstance(shape[1], str),
+          f"the rule must report the settled total and which case it took, got {shape!r}")
+
+    # Stated first among the arithmetic, and by name, because a sum also grows: "the
+    # total went up" is not evidence against one, so a summing rule caught below would
+    # be reported as an arithmetic mismatch rather than as the wrong rule. Summing is
+    # what a port of the older relative-credit frame arrives at by inertia, and it is
+    # the single wrong rule this second implementation exists to refuse.
+    for held, sent, advertised in [(65_536, 65_536, 165_536), (165_536, 65_536, 165_536)]:
+        settled, _ = apply_window_limit(held, sent, advertised)
+        check(settled != held + advertised,
+              f"applying {advertised} to {held} summed to {held + advertised}")
+
+    # (frame bytes, held, already sent, held afterwards, which case the frame was)
+    transcript = [
+        # An opening grant against the limit every stream starts at.
+        ("00000000000286a0", INITIAL_STREAM_WINDOW, 65_536, 165_536, "grant"),
+        ("00000000000286a0", 165_536, 65_536, 165_536, "duplicate"),
+        ("0000000000010000", 165_536, 65_536, 165_536, "stale"),
+        ("00000000000286a1", 165_536, 65_536, 165_537, "grant"),
+        # 0x0001_0000_0000_0001 is 281_474_976_710_657 — a peer buying itself room it
+        # never granted. What it actually buys is one MAX_SEND_WINDOW past the 165_537
+        # bytes already sent, and it has to send another frame for more.
+        ("0001000000000001", 165_537, 165_537, 1_214_113, "clamped"),
+        # Absurd again with nothing sent since: the ceiling is where it was, so this
+        # frame moves nothing at all. The permission is per frame, not cumulative.
+        ("ffffffffffffffff", 1_214_113, 165_537, 1_214_113, "clamped"),
+        # ...and once those bytes have gone out, the same absurd number buys exactly
+        # one more window. The clamp tracks what was sent; it is not a one-off ceiling.
+        ("ffffffffffffffff", 1_214_113, 1_214_113, 2_262_689, "clamped"),
+        # The ceiling below a limit already honoured — the one state that tells a clamp
+        # apart from a revocation, and the reason the rule settles by maximum rather
+        # than returning the ceiling outright. It is reachable, not hypothetical: § 4.5
+        # subtracts a first transmission the transport refused back out of the sent
+        # total, so the ceiling falls while the honoured limit stays where it was. A
+        # rule that answered with the ceiling here would take back room this side has
+        # already told itself it may use, and the sender would stop with permission it
+        # had been granted.
+        ("ffffffffffffffff", 1_214_113, 100_000, 1_214_113, "clamped"),
+        # Exactly on the ceiling. § 4.5 bounds what a sender honours *at most* at one
+        # window past the bytes already sent, so the boundary belongs to the grant: a
+        # rule that clamps here settles on the same total by a different route and
+        # reports a peer within its rights as one exceeding them.
+        ("0000000000110000", 165_536, 65_536, 1_114_112, "grant"),
+        # A total below the limit every stream starts at, offered before anything has
+        # moved. It is stale, and only because that opening limit is 64 KiB: a second
+        # implementation that started lower would read this frame as a duplicate and
+        # conclude the peer had restated an unchanged total.
+        ("0000000000008000", INITIAL_STREAM_WINDOW, 0, INITIAL_STREAM_WINDOW, "stale"),
+        # A grant genuinely past 2^32 and genuinely under the ceiling, so nothing but
+        # the decoder's width decides it. A reader that took only the low four bytes
+        # sees 0 here and calls a real grant stale — the one failure that stays hidden
+        # until a stream has run past four gigabytes, where it reads as a stall.
+        ("0000000100000000", 4_294_000_000, 4_294_000_000, 4_294_967_296, "grant"),
+        ("00000000ffffffff", 4_294_967_296, 4_294_000_000, 4_294_967_296, "stale"),
+    ]
+    for encoded, held, sent, expected, expected_case in transcript:
+        advertised = dec_window_update(bytes.fromhex(encoded))
+        after, case = apply_window_limit(held, sent, advertised)
+        check(after == expected,
+              f"applying {advertised} to a held total of {held} with {sent} sent gave "
+              f"{after}, expected {expected}")
+        check(case == expected_case,
+              f"applying {advertised} to a held total of {held} with {sent} sent was "
+              f"read as {case!r}, expected {expected_case!r}")
+
+    # Order-independence is the property the frame is built around: the same grants
+    # delivered in any order have to leave the sender holding one settled total. The
+    # clamp does not disturb it — the ceiling is fixed by what this side has sent, not
+    # by what arrived when — so a peer's oversized frame is free to sit anywhere in the
+    # order. Only which frame gets *called* clamped moves with the order, which is why
+    # this checks the settled total alone.
+    sent = 65_536
+    grants = [0x0000_0000_0002_86A0, 0x0000_0000_0002_8000, 0x0001_0000_0000_0001]
+    for order in permutations(grants):
+        held = INITIAL_STREAM_WINDOW
+        for grant in order:
+            held, _ = apply_window_limit(
+                held, sent, dec_window_update(enc_window_update(grant)))
+        check(held == 1_114_112,
+              f"grants delivered as {[hex(g) for g in order]} settled at {held}, "
+              "expected 1114112")
+
+
+def dec_control_subtype(raw: bytes) -> int:
+    """Read the subtype byte leading a CONTROL frame's AEAD plaintext."""
+    check(len(raw) >= CONTROL_SUBTYPE_LEN,
+          "a CONTROL plaintext must be at least one byte: it names its subtype")
+    return raw[0]
+
+
+def dispatch_control(raw: bytes) -> str:
+    """What a conforming receiver does with a CONTROL frame, as a word.
+
+    Written as a total function over the byte rather than as a lookup that may
+    return nothing, because "nothing" is exactly the outcome that is wrong here: a
+    receiver which falls out of its control dispatch lands in the data path, and the
+    subtype byte is then delivered to its application. Every byte has to name an
+    action, and for all but the assigned ones that action is to drop the frame.
+    """
+    subtype = dec_control_subtype(raw)
+    if subtype == CONTROL_SUBTYPE_CLOSE:
+        return "close"
+    return "drop"
+
+
+@vector
+def control_subtype_registry():
+    """The CONTROL frame's plaintext rule, stated independently of the Rust.
+
+    No fixture can carry it — it is an AEAD plaintext — so the three things a second
+    implementation has to get right are written out: the close subtype's value, that
+    an unassigned byte (including 0x00) is dropped rather than guessed at, and that a
+    body naming no subtype is refused instead of read as its default.
+    """
+    check(dispatch_control(bytes([CONTROL_SUBTYPE_CLOSE])) == "close",
+          "0x01 is the session-close subtype")
+
+    for unassigned in (0x00, 0x02, 0x7F, 0xFE, 0xFF):
+        got = dispatch_control(bytes([unassigned]))
+        check(got == "drop",
+              f"subtype 0x{unassigned:02x} is unassigned and must be dropped, got {got!r}")
+
+    # A close body carries nothing after the subtype, but the rule is stated for a
+    # body that does: trailing bytes belong to the subtype's own branch and never to
+    # the dispatch, so their presence cannot change which branch is taken.
+    check(dispatch_control(bytes([CONTROL_SUBTYPE_CLOSE]) + b"\xde\xad") == "close",
+          "dispatch reads the first byte only; a subtype's body is that branch's business")
+
+    try:
+        dispatch_control(b"")
+    except Failure:
+        pass
+    else:
+        raise Failure("an empty CONTROL plaintext names no subtype and must be refused")
+
+
+# ─── the 47-byte AEAD AAD image (encode only) ──────────────────────────────
+#
+# PROTOCOL.md § 4.2 prints two tables — the 15-byte wire layout and the 47-byte
+# image the AEAD authenticates — and states neither in terms of the other. The
+# relationship between them is the thing a second implementation actually needs,
+# because the image is what its AEAD has to reproduce byte for byte and no
+# fixture can carry it: `session_id` is authenticated and never transmitted, so
+# an image is not something a peer ever receives and decodes.
+
+AAD_SIZE = 47
+
+
+def enc_aad_image(h, session_id: bytes) -> bytes:
+    """The 47-byte image an AEAD open must reproduce, from header fields.
+
+    Written as an encoder over the decoded fields rather than as a splice of the
+    wire bytes, so that the check below compares two independently-built things:
+    this, which goes field by field through the widths and byte order § 4.2
+    gives, against the fixture's own bytes with the session_id put in. A splice
+    on both sides would agree however wrong the field widths were.
+    """
+    check(len(session_id) == 32, "the AAD image carries a 32-byte session_id")
+    return (
+        bytes([h["version"]])
+        + session_id
+        + struct.pack(">Q", h["packet_number"])
+        + struct.pack(">H", h["flags"])
+        + struct.pack(">H", h["stream_id"])
+        + bytes([h["epoch"], h["path_id"]])
+    )
+
+
+@vector
+def aad_image():
+    """The AAD image is the wire header with the session_id spliced in at offset 1.
+
+    That sentence is the whole of what a second implementation has to know, and it
+    is the one form § 4.2 does not put it in. Everything else about the image
+    follows: the field order after the session_id is the wire order, the widths are
+    the wire widths, and the version byte leads both.
+    """
+    raw = load("packet_header.bin")
+    h = dec_packet_header(raw)
+    # Off-wire, so no fixture fixes it and any value serves. This one is the
+    # session_id the handshake fixtures carry, so the two sets describe one
+    # session rather than two.
+    session_id = arr32(0xE0)
+
+    aad = enc_aad_image(h, session_id)
+    check(len(aad) == AAD_SIZE, f"the AAD image is {AAD_SIZE} bytes, got {len(aad)}")
+    check(aad == raw[:1] + session_id + raw[1:],
+          "the AAD image must be the 15-byte wire header with the 32-byte session_id "
+          "inserted after the version byte")
+
+    # The reason the image exists rather than the wire bytes being used directly.
+    # A packet delivered to the wrong session reconstructs *that* session's id, so
+    # the image it rebuilds differs from the one the sender authenticated and the
+    # open fails — which only works if the id is genuinely part of the image.
+    check(enc_aad_image(h, arr32(0x00)) != aad,
+          "a different session_id must produce a different AAD image, or a "
+          "mis-delivered packet would open cleanly against the wrong session")
+
+
+# ─── the signed handshake transcript (encode only) ─────────────────────────
+
+
+def enc_handshake_transcript(v) -> bytes:
+    """Borsh-encode the seven-field transcript of PROTOCOL.md § 6.5.
+
+    Two things here are load-bearing and neither is visible in the struct listing
+    the spec prints. The leading `protocol_variant` is a byte *slice*, so borsh
+    gives it the same `u32`-little-endian length prefix a `Vec<u8>` gets — while
+    `server_nonce` and `session_id` are fixed 32-byte arrays and get none. And a
+    nested struct contributes exactly its own encoding with no wrapper, which is
+    why the whole `ClientHello` fixture can be dropped in unchanged.
+    """
+    w = BorshWriter()
+    w.vec_u8(v["protocol_variant"])
+    enc_client_hello(w, v["client_hello"])
+    w.fixed(v["server_nonce"])
+    enc_ciphertext(w, v["ciphertext"])
+    enc_verify_key(w, v["server_verify_key"])
+    w.fixed(v["session_id"])
+    w.boolean(v["early_data_accepted"])
+    return bytes(w.buf)
+
+
+def transcript_digest(v) -> bytes:
+    """`SHA256(borsh(transcript))` — the message both signature halves are over."""
+    return hashlib.sha256(enc_handshake_transcript(v)).digest()
+
+
+@vector
+def transcript_hash():
+    """The signed transcript, composed from the committed message fixtures.
+
+    This is the only vector here that cannot be written as a round trip, and that
+    is what makes it worth having. Every other check in this file passes an
+    encoder's output back through its own decoder somewhere; a pair of matching
+    errors — a field read and written at the same wrong width, say — survives that
+    intact. A digest admits no such pair: the bytes are either the bytes the Rust
+    hashed or they are not, and `transcript_hash.bin` says which.
+
+    It also localises a failure. The transcript is assembled out of fixtures each
+    of which is separately round-tripped above, so if those pass and this one does
+    not, what moved is the composition — the field order, the borsh encoding of the
+    leading slice, or the trailing bool — and not any message's own grammar.
+    """
+    transcript = {
+        "protocol_variant": PROTOCOL_VARIANT,
+        "client_hello": borsh_roundtrip(
+            "client_hello_full.bin", dec_client_hello, enc_client_hello),
+        "server_nonce": arr32(0x70),
+        "ciphertext": borsh_roundtrip(
+            "hybrid_ciphertext.bin", dec_ciphertext, enc_ciphertext),
+        "server_verify_key": borsh_roundtrip(
+            "hybrid_verifying_key.bin", dec_verify_key, enc_verify_key),
+        "session_id": arr32(0xE0),
+        "early_data_accepted": True,
+    }
+    expected = load("transcript_hash.bin")
+    check(len(expected) == 32, f"transcript_hash.bin must be 32 bytes, got {len(expected)}")
+    got = transcript_digest(transcript)
+    check(got == expected,
+          f"transcript digest {got.hex()} != fixture {expected.hex()}; the signing "
+          "input differs from the reference peer's, so its signatures will not verify")
+
+    # Each mutation below is a reading of § 6.5 that the prose permits and the
+    # bytes do not, so the fixture alone cannot rule any of them out. They are
+    # listed by the misreading rather than by the field, because that is what an
+    # implementer arrives at them from.
+    def mutated(**over):
+        return transcript_digest({**transcript, **over})
+
+    # `protocol_variant` is a slice, not a fixed array: its 17 bytes carry a u32
+    # length prefix. Written raw the digest is over a buffer four bytes shorter,
+    # and — since both peers would still agree on the *tag* — the failure surfaces
+    # only as a signature that will not verify.
+    raw_variant = BorshWriter()
+    raw_variant.fixed(PROTOCOL_VARIANT)
+    enc_client_hello(raw_variant, transcript["client_hello"])
+    raw_variant.fixed(transcript["server_nonce"])
+    enc_ciphertext(raw_variant, transcript["ciphertext"])
+    enc_verify_key(raw_variant, transcript["server_verify_key"])
+    raw_variant.fixed(transcript["session_id"])
+    raw_variant.boolean(True)
+    check(hashlib.sha256(bytes(raw_variant.buf)).digest() != expected,
+          "an unprefixed protocol_variant reproduced the fixture digest")
+
+    # The verdict is signed (Invariant 9) — an on-path flip of
+    # ServerHello.early_data_accepted has to break the signature.
+    check(mutated(early_data_accepted=False) != expected,
+          "flipping the 0-RTT verdict left the transcript digest unchanged")
+
+    # The verdict is the *last* field and the variant the *first* (Invariant 10).
+    # A six-field reading that drops the trailing bool, and a seven-field one that
+    # orders the two the other way round, must both diverge.
+    six_field = BorshWriter()
+    six_field.vec_u8(PROTOCOL_VARIANT)
+    enc_client_hello(six_field, transcript["client_hello"])
+    six_field.fixed(transcript["server_nonce"])
+    enc_ciphertext(six_field, transcript["ciphertext"])
+    enc_verify_key(six_field, transcript["server_verify_key"])
+    six_field.fixed(transcript["session_id"])
+    check(hashlib.sha256(bytes(six_field.buf)).digest() != expected,
+          "a transcript without the trailing early_data_accepted reproduced the fixture")
+
+    verdict_first = BorshWriter()
+    verdict_first.boolean(True)
+    verdict_first.vec_u8(PROTOCOL_VARIANT)
+    enc_client_hello(verdict_first, transcript["client_hello"])
+    verdict_first.fixed(transcript["server_nonce"])
+    enc_ciphertext(verdict_first, transcript["ciphertext"])
+    enc_verify_key(verdict_first, transcript["server_verify_key"])
+    verdict_first.fixed(transcript["session_id"])
+    check(hashlib.sha256(bytes(verdict_first.buf)).digest() != expected,
+          "moving the verdict ahead of protocol_variant reproduced the fixture")
+
+    # The transcript covers the *whole* ClientHello, the sealed early-data blob
+    # included (Invariant 7). A peer that signed the hello minus its 0-RTT payload
+    # would let an on-path attacker strip it undetected.
+    without_early_data = dict(transcript["client_hello"], early_data=None)
+    check(mutated(client_hello=without_early_data) != expected,
+          "stripping early_data from the covered hello reproduced the fixture digest")
+
+    # And the version is under the signature, which is the whole of this
+    # protocol's downgrade resistance — there is no version negotiation to attack.
+    downgraded = dict(transcript["client_hello"], version=PROTOCOL_VERSION - 1)
+    check(mutated(client_hello=downgraded) != expected,
+          "downgrading client_hello.version reproduced the fixture digest")
 
 
 def main() -> int:

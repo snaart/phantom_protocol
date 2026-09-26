@@ -17,8 +17,8 @@ And one pinned constant that is **not** an evolving axis (see §3):
 
 | Constant | Identifier | Lives in | Value |
 | --- | --- | --- | --- |
-| Wire-format version | `WIRE_VERSION` (packet-header byte) | `core/src/transport/types.rs` | `6` |
-| Protocol version | `PROTOCOL_VERSION` (`ClientHello.version`) | `core/src/transport/handshake.rs` | `3` |
+| Wire-format version | `WIRE_VERSION` (packet-header byte) | `core/src/transport/types.rs` | `8` |
+| Protocol version | `PROTOCOL_VERSION` (`ClientHello.version`) | `core/src/transport/handshake.rs` | `5` |
 
 A single commit can move zero, one, or both of the live axes. Each axis has its
 own changelog entry (see `CHANGELOG.md`).
@@ -35,9 +35,28 @@ Pre-1.0: minor versions may break.
 - `0.x → 1.0`: marks API stability. After 1.0, strict SemVer applies.
 
 The `cargo-semver-checks` CI job (`.github/workflows/release.yml`) is the
-automated guardrail. Manual review remains authoritative because SemVer is a
-contract about *intent*, not just signatures (e.g. behavioural changes that
-match the same signature are still breaking).
+automated guardrail, and pre-1.0 it guards the *record* rather than the surface.
+Breaking the Rust API is permitted here, so the tool finding a break is not a
+failure; the job fails on the two things that are. A run that produced no verdict
+compared nothing and is a broken check, not a clean one — `scripts/semver_report.sh`
+tells those apart by reading the report rather than the exit code. And a break the
+CHANGELOG's `[Unreleased]` section does not name is one a consumer meets as a
+compiler error instead of a list — `scripts/check_changelog_breaking.py` requires
+each reported symbol, and its owner, to appear there. The report itself is attached
+to every pull-request run as the `semver-checks-report` artifact and printed to the
+job summary.
+
+The comparison covers default features plus `telemetry-otel`, `mimicry` and
+`embedded` — the largest set of this crate's features that builds together on one
+host, and the same set docs.rs uses. `fips`, `wasi-leg` and `no-std` are compared
+by nothing, so a break confined to one of those three reaches a release
+unannounced; that is the standing gap in this axis, not an oversight of a
+particular release.
+
+Manual review remains authoritative because SemVer is a contract about *intent*,
+not just signatures (e.g. behavioural changes that match the same signature are
+still breaking), and because the tool compares shapes and not values: a `pub const`
+whose number changed passes it silently.
 
 ### What counts as a public API break
 
@@ -61,19 +80,24 @@ match the same signature are still breaking).
 
 The wire format is **one protocol with one pinned version byte**. There is no
 `VersionedPacket` enum, no per-session `wire_version` negotiation, and no
-in-protocol fallback. Pre-1.0 there are no deployed peers to stay compatible
-with, so there is nothing to negotiate against.
+in-protocol fallback. That is a decision, not an absence of peers: 0.2.x is
+published on crates.io and speaks `WIRE_VERSION` 6 / `PROTOCOL_VERSION` 3, and
+0.3.0 (8 / 5) cannot talk to it. Pre-1.0 a wire change ships as a hard cut
+rather than as something to negotiate — a peer on the other side of the cut is
+refused at the handshake, and the two ends of a connection upgrade together.
 
 Two constants pin the format:
 
-- `WIRE_VERSION = 6` — the packet-header version byte (`transport/types.rs`). It
-  is bound into the AEAD AAD; as of v6 it is itself header-protection–masked on the
+- `WIRE_VERSION = 8` — the packet-header version byte (`transport/types.rs`). It
+  is bound into the AEAD AAD; since v6 it is itself header-protection–masked on the
   wire (no constant cleartext byte). See `docs/protocol/PROTOCOL.md` § 1 / § 4.2.
-- `PROTOCOL_VERSION = 3` — `ClientHello.version` (`transport/handshake.rs`),
+- `PROTOCOL_VERSION = 5` — `ClientHello.version` (`transport/handshake.rs`),
   bound into the signed handshake transcript.
 
-Both bumped several times pre-1.0, as a hard cut each time (no negotiation, no
-deployed peers to keep compatible). The history, for the record:
+Both bumped several times pre-1.0, as a hard cut each time (no negotiation). A
+cut strands every peer still running the release before it: 0.2.0 could not
+talk to the published 0.1.x (`WIRE_VERSION` 2 / `PROTOCOL_VERSION` 2), and
+0.3.0 cannot talk to the published 0.2.x (6 / 3). The history, for the record:
 
 - **`WIRE_VERSION 1 → 2`** — the packet codec moved off `alkahest` to the
   hand-rolled big-endian layout.
@@ -89,13 +113,40 @@ deployed peers to keep compatible). The history, for the record:
   `version` byte included) and the two cleartext `u32` length prefixes
   (`payload_len` / `ext_len`) were dropped, with `extensions` moved off the
   data-plane wire.
+- **`6 → 7`** — cumulative flow control: the `WINDOW_UPDATE` AEAD plaintext went
+  from a 4-byte relative credit to an 8-byte cumulative limit. The header did not
+  move; what moved is a plaintext codec, which is normally not a version concern
+  (§ "Adding bytes without a version bump"). It is one here because a peer reading
+  the old encoding would compute a wrong window rather than fail to parse, and
+  because a relative credit in an unacknowledged frame is destroyed by loss —
+  see `PROTOCOL.md` § 4.5.
+- **`7 → 8`** — in-session control frames: the AEAD plaintext of an
+  `ENCRYPTED | CONTROL` packet now leads with a one-byte subtype, and the first
+  assignment is the session-close announcement (`PROTOCOL.md` § 4.11). Again no
+  header byte moved, and again the data-plane version check is what enforces it: a v7
+  peer drops a v8 frame at step 1 of its dispatch, on the version byte, before any
+  flag is examined. So the failure it prevents is not misread data — it is a peer that
+  completes a handshake, agrees keys, and then **silently discards every packet**,
+  which is the exact shape of "failing quietly" this policy exists to rule out.
+  Bumping `PROTOCOL_VERSION` with it is what turns that into a typed refusal before a
+  session exists.
 
 `PROTOCOL_VERSION` bumped `1 → 2` (the signed transcript began covering the 0-RTT
 verdict `early_data_accepted` and `ClientHello` gained the `resumption_binder`
-proof-of-possession field) and `2 → 3` (`ServerHello`'s `server_key_package` was
-replaced by a 32-byte `server_nonce`, changing the signed-transcript content).
-Handshakes across any of these versions cannot interoperate. See PROTOCOL.md § 1
-for the authoritative narrative.
+proof-of-possession field), `2 → 3` (`ServerHello`'s `server_key_package` was
+replaced by a 32-byte `server_nonce`, changing the signed-transcript content),
+`3 → 4` alongside `WIRE_VERSION 6 → 7`, and `4 → 5` alongside `WIRE_VERSION 7 → 8`
+— no handshake field changed in either of the last two; the bump exists so an older
+peer is refused with a typed `ServerReject` instead of completing a handshake and
+then having its packets dropped silently by the data-plane version check. **That
+pairing is the rule, not a one-off**: a data-plane change without a handshake bump
+converts a diagnosable refusal into a silent stall, and at `7 → 8` into a total one —
+the version byte is on every packet, so the older peer moves no data at all rather
+than only losing the frames the change touched. A version increment moves a *value*,
+never a field:
+`protocol_variant` stays the leading transcript field and `early_data_accepted`
+stays the last, both times. Handshakes across any of these versions cannot
+interoperate. See PROTOCOL.md § 1 for the authoritative narrative.
 
 Both are **tamper-check anchors**, not negotiated sets:
 
@@ -149,14 +200,21 @@ A change to any of the following requires bumping `WIRE_VERSION` /
 - A change to the borsh field order of `ClientHello` / `ServerHello` /
   `HelloRetryRequest`.
 - A change to the cookie or PoW inputs.
+- A change to the meaning or width of an AEAD-plaintext control codec that both
+  peers must agree on to make progress — the `WINDOW_UPDATE` limit, the `Sack`
+  encoding, the reliable-frame offset prefix. These are not frozen by any `.bin`,
+  so nothing else catches a divergence: the frames decrypt, and the peers then
+  disagree about how much may be sent or what was acknowledged.
 
 Because there is no negotiation, such a bump is a **coordinated, breaking
-change**: every peer must move to the new constant at once. Pre-1.0 there are no
-peers to keep on the old value, so the bump ships as a single hard cut (a crate
-**major** version bump, plus a migration note in `CHANGELOG.md`). The
-constant exists precisely so a future deliberate bump has a single, signed,
-tamper-checked anchor to move — not so that multiple versions coexist on the
-wire.
+change**: every peer must move to the new constant at once. Published releases
+do leave peers on the old value — 0.3.0 left every 0.2.x deployment behind — and
+pre-1.0 the bump still ships as a single hard cut rather than a negotiated
+transition: a crate **major** version bump (the minor position while pre-1.0, as
+0.2 → 0.3 was), plus a migration note in `CHANGELOG.md` that tells operators to
+upgrade both ends together. The constant exists precisely so a future deliberate
+bump has a single, signed, tamper-checked anchor to move — not so that multiple
+versions coexist on the wire.
 
 ---
 
@@ -184,8 +242,9 @@ Practice:
 
 ## 5. Cargo features vs. version bumps
 
-Feature flags (`compression-zstd`, `std`, `bindings`, `embedded`, `no-std`,
-`telemetry-otel`, `fips`, `wasi-leg`) are not versioned independently. A feature
+Feature flags (`compression-zstd`, `std`, `bindings`, `classical-crypto`,
+`header-protection`, `embedded`, `no-std`, `mimicry`, `telemetry-otel`,
+`fips`, `wasi-leg`, `uniffi-cli`) are not versioned independently. A feature
 toggle:
 
 - Adding a feature: SemVer-minor (additive).
@@ -196,8 +255,8 @@ toggle:
   change is purely additive at the feature's exported API.
 
 Default features are part of the API contract: changing the default set
-(`["compression-zstd", "std", "bindings"]`) is breaking, since consumers may
-have implicitly relied on the included dependency.
+(`["compression-zstd", "std", "bindings", "classical-crypto"]`) is breaking,
+since consumers may have implicitly relied on the included dependency.
 
 ---
 
@@ -227,7 +286,9 @@ recent stable, not under the MSRV gate — the MSRV promise covers the
 ## 7. PQC and cryptographic dependency updates
 
 `ml-kem` and `ml-dsa` (the FIPS-203 / FIPS-204 RustCrypto crates) are
-optional dependencies, enabled by default via the `std` feature (`ml-kem = "0.2"`, `ml-dsa = "0.1.1"`). A bump of a
+optional dependencies, enabled by default via the `std` feature
+(`ml-kem = "0.3"` with features `hazmat`/`getrandom`/`zeroize`,
+`ml-dsa = "0.1.1"`). A bump of a
 cryptographic dependency is treated as a potential **wire-format change**:
 if the upgrade alters the serialised key-package / ciphertext / signature bytes
 or the KAT vectors, it is a coordinated `WIRE_VERSION` / `PROTOCOL_VERSION` bump
@@ -275,8 +336,12 @@ migration.
 
 ## 10. Tooling
 
-- `cargo-semver-checks`: `.github/workflows/release.yml` runs it PR-triggered to
-  detect SemVer-breaking changes from the latest published version.
+- `cargo-semver-checks`: `.github/workflows/release.yml` runs it PR-triggered
+  against the latest published version, through `scripts/semver_report.sh`. The
+  report is uploaded as the `semver-checks-report` artifact;
+  `scripts/check_changelog_breaking.py` then requires every symbol in it to be
+  named in `CHANGELOG.md`. See §2 for what does and does not fail that job, and
+  `scripts/check_changelog_breaking_test.sh` for the gate's own cases.
 - `git tag` policy: `vX.Y.Z` on the commit that produced the corresponding
   `Cargo.toml` version; the tag-triggered release pipeline builds cross-target
   artifacts with SLSA-3 build-provenance attestation.

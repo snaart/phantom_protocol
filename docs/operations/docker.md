@@ -5,6 +5,16 @@ binary. Phantom Protocol itself is a library — the example below assumes a
 small wrapper binary (`server-bin` in your workspace) that calls
 `PhantomListener::bind` and `accept`.
 
+> **The repo already ships one.** `Dockerfile` at the repo root builds the
+> in-tree `server/` crate (`phantom-server`) on `rust:1-slim-bookworm`, runs as
+> a non-root user, exposes 4242, and presets `PHANTOM_BIND`,
+> `PHANTOM_SIGNING_KEY_FILE`, `PHANTOM_LOG_JSON`,
+> `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME` and `RUST_LOG`;
+> `docker-compose.yml` wires it up with a persistent signing-key volume, and
+> `.env.example` documents every environment variable. Use those unless you are
+> embedding the SDK in your own binary — the Dockerfile below is a from-scratch
+> template for that case.
+
 ## Minimal Dockerfile
 
 ```dockerfile
@@ -40,10 +50,10 @@ ENTRYPOINT ["/usr/local/bin/phantom-server"]
 ## Build and run
 
 ```sh
-docker build -t phantom-server:0.2.2 .
+docker build -t phantom-server:0.3.0 .
 docker run --rm -p 4242:4242 \
     -e RUST_LOG=info,phantom_protocol=debug \
-    --name phantom phantom-server:0.2.2
+    --name phantom phantom-server:0.3.0
 ```
 
 For aarch64 hosts, prefix `--platform linux/arm64` and use `rust:1.93-slim`
@@ -59,10 +69,11 @@ on the corresponding architecture.
 - **Networking.** Use host network mode (`--network host`) for highest
   throughput; otherwise the userspace NAT in Docker's bridge adds
   per-packet overhead.
-- **File descriptors.** Phantom Protocol sessions hold a single fd each
-  — one TCP socket, or one UDP socket for the native reliable-UDP
-  (PhantomUDP) path. The default Docker ulimit (1024) is sufficient for
-  ~1k concurrent sessions; raise it for higher fan-out:
+- **File descriptors.** A TCP session holds one fd each. On the PhantomUDP
+  server every session shares the listener's single UDP socket (CID demux),
+  so fd pressure there comes from the listener, not the session count. The
+  default Docker ulimit (1024) is sufficient for ~1k concurrent TCP
+  sessions; raise it for higher fan-out:
   ```
   docker run --ulimit nofile=65535:65535 …
   ```
@@ -106,7 +117,7 @@ Then point Docker at the JSON driver in `docker-compose.yml`:
 ```yaml
 services:
   phantom:
-    image: phantom-server:0.2.2
+    image: phantom-server:0.3.0
     logging:
       driver: json-file
       options:
@@ -140,7 +151,7 @@ container env):
 |------|-----|---------|
 | `--otlp-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector address, e.g. `http://otel-collector:4317` |
 | `--otel-service-name` | `OTEL_SERVICE_NAME` | `service.name` resource attribute |
-| | `OTEL_TRACES_SAMPLER_ARG` | Head-sampling ratio |
+| `--otel-trace-sample-ratio` | `OTEL_TRACES_SAMPLER_ARG` | Head-sampling ratio for root spans (default `1.0` = export everything); either form works on its own |
 | | `OTEL_EXPORTER_OTLP_HEADERS` | Auth headers for SaaS backends |
 
 In `docker-compose.yml`, point the server at a Collector sidecar:
@@ -148,7 +159,7 @@ In `docker-compose.yml`, point the server at a Collector sidecar:
 ```yaml
 services:
   phantom:
-    image: phantom-server:0.2.2
+    image: phantom-server:0.3.0
     environment:
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
       OTEL_SERVICE_NAME: "phantom-server"

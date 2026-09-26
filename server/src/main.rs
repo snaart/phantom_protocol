@@ -155,10 +155,9 @@ async fn main() -> Result<()> {
     // `HandshakeServer` around our key — the listener's
     // `verifying_key_bytes()` is the SAME bytes we just logged from
     // disk, so we only need to surface one value to operators.
-    let listener =
-        PhantomListener::bind_with_signing_key(cfg.bind.to_string(), signing_key)
-            .await
-            .context("PhantomListener::bind_with_signing_key")?;
+    let listener = PhantomListener::bind_with_signing_key(cfg.bind.to_string(), signing_key)
+        .await
+        .context("PhantomListener::bind_with_signing_key")?;
     debug_assert_eq!(
         hex::encode(listener.verifying_key_bytes()),
         vk_hex,
@@ -177,15 +176,36 @@ async fn main() -> Result<()> {
     // Admission control: a global session cap (backpressure — stop accepting
     // when full rather than exhausting fds/memory) plus a per-IP cap so one
     // source can't monopolise the pool. `max_sessions == 0` → unbounded.
+    //
+    // The cap is also this process's memory setting: receive buffers are bounded
+    // per session and nothing divides them between sessions, so what the process
+    // holds is this number times what one session holds. The library publishes no
+    // single figure for the second factor — the receive path's buffers each carry
+    // their own bound, and adding them up produces something that reads as a total
+    // while omitting whatever it has not enumerated — so sizing here comes from
+    // measurement under the traffic the deployment actually carries. The one term
+    // that *is* an enforced constant is receive-window growth, and the product of
+    // it and this cap is logged below so the operator who chose the cap sees what
+    // it commits — a floor on what the host must have, never a statement of the
+    // total. It is a log line rather than a flag on purpose; see
+    // `Config::recv_window_growth_commitment_mib`.
     let session_slots = Arc::new(Semaphore::new(if cfg.max_sessions == 0 {
         Semaphore::MAX_PERMITS
     } else {
         cfg.max_sessions
     }));
     let per_ip = PerIpLimiter::new(cfg.max_sessions_per_ip);
+    // Rendered rather than logged as a number, because an unbounded cap has no product
+    // and a zero in this field would read as "commits nothing" — the opposite of what an
+    // unbounded cap means.
+    let growth_commitment = match cfg.recv_window_growth_commitment_mib() {
+        Some(mib) => format!("{mib} MiB (one term of the receive footprint, not a total)"),
+        None => "unbounded".to_string(),
+    };
     tracing::info!(
         max_sessions = cfg.max_sessions,
         max_sessions_per_ip = cfg.max_sessions_per_ip,
+        recv_window_growth_commitment = %growth_commitment,
         "session admission control active"
     );
 

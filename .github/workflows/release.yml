@@ -1,8 +1,9 @@
 name: Release
 
 # Two trigger surfaces:
-# 1. `cargo-semver-checks` on every PR — guards against accidental
-#    breaking changes in the public Rust API.
+# 1. `cargo-semver-checks` on every PR — produces the list of public Rust API
+#    breaks against the published release, and requires each one to be written
+#    down in CHANGELOG.md before the PR lands.
 # 2. A tag push (`v*.*.*`) triggers the release pipeline:
 #    publish dry-run + build release artifacts + GitHub Release draft.
 on:
@@ -11,6 +12,9 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  # Manual trigger for the Python wheel smoke-test job. Does not trigger on
+  # every push; run from the GitHub Actions "Run workflow" button.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -28,34 +32,98 @@ concurrency:
 
 jobs:
   # ── SemVer hygiene ────────────────────────────────────────────────
-  # `cargo-semver-checks` compares the current branch's public surface
-  # against the latest published version of `phantom_protocol` on crates.io.
-  # Failures here mean the PR introduces a breaking change that would
-  # require a major-version bump. Run on PRs only; tag pushes are
-  # post-bump and so are expected to legitimately change the API.
+  # `cargo-semver-checks` compares this branch's public surface against the
+  # latest `phantom-protocol` published on crates.io, and the comparison is
+  # kept: written to the job summary and uploaded as an artifact, so the list
+  # of what broke exists while the change is being reviewed rather than being
+  # reconstructed on release day.
+  #
+  # What fails this job, and what does not. A 0.x crate is allowed to break its
+  # Rust API between minors, so the tool *finding* breakage is not a failure —
+  # it is a fact to record. Two things are failures: a run that could not
+  # compare anything, and a break that nobody wrote down. The first is caught by
+  # `scripts/semver_report.sh` (which insists on a verdict line rather than
+  # trusting the exit code), the second by `scripts/check_changelog_breaking.py`.
+  #
+  # This replaces a `continue-on-error: true` step that had never compared
+  # anything: with no feature flags the tool enables every feature it does not
+  # recognise as exotic, which for this crate means `fips` and `no-std`
+  # together, which `core/src/lib.rs` rejects with a `compile_error!`. The run
+  # died building rustdoc for the current crate and exited non-zero — the same
+  # non-zero a genuine finding produces, and swallowed the same way. See
+  # `scripts/semver_report.sh` for the feature set that does build and for what
+  # it still cannot see.
   semver-checks:
     name: cargo-semver-checks
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          # Need full history so cargo-semver-checks can locate the
-          # previous tagged release.
-          fetch-depth: 0
+      # No `fetch-depth: 0`: the baseline is the crate published on crates.io,
+      # resolved through the registry, and no step here passes `--baseline-rev`.
+      # Git history supplied nothing to this job.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: "."
-      - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2
-        # The crate is not yet published to crates.io, so there is no baseline
-        # to diff the public API against — the action errors with "not found in
-        # registry". Keep the check visible but non-blocking during pre-1.0
-        # iteration; it becomes a hard gate once the first version ships.
-        continue-on-error: true
+      # A prebuilt binary rather than `obi1kenobi/cargo-semver-checks-action`:
+      # that action runs the tool itself and leaves the output only in the job
+      # log, and the report is the deliverable here. `taiki-e/install-action` is
+      # already the installer this repository uses for cargo-fuzz.
+      #
+      # The version is pinned. Unpinned, the installer takes whatever was
+      # released last, so the set of lints that decides this job changes under
+      # a PR that did not touch it: a new release that adds a lint can fail an
+      # unchanged tree, and the failure reads as a defect in whichever PR
+      # happened to run next. When 0.50.0 was pinned it was run against this
+      # tree on rustc 1.93.0 (the MSRV) and 1.98.1 (the `stable` of the day):
+      # both runs reached a verdict, they agreed, and every break they
+      # reported is named in CHANGELOG.md. The installer's manifest at the
+      # pinned action SHA carries this version's checksums.
+      #
+      # The cost of a pin is that `stable` keeps moving and the tool does not:
+      # a later rustc can emit a rustdoc JSON format this release cannot read.
+      # That fails loudly — semver_report.sh finds no verdict line and exits
+      # non-zero — and the fix is to move the pin, as its own change, after
+      # running scripts/semver_report.sh with the new version and
+      # scripts/check_changelog_breaking.py on its report.
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2
         with:
-          manifest-path: core/Cargo.toml
-          release-type: minor
+          tool: cargo-semver-checks@0.50.0
+      - name: Compare the public API against the published release
+        run: scripts/semver_report.sh "${GITHUB_WORKSPACE}/semver-report.txt"
+      # `always()` on both of the next two steps: a report is most worth having
+      # when the step that produced it failed.
+      - name: Publish the report to the job summary
+        if: always()
+        run: |
+          {
+            echo '## cargo-semver-checks'
+            echo ''
+            echo '```'
+            cat "${GITHUB_WORKSPACE}/semver-report.txt" 2>/dev/null || echo '(no report was written)'
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: semver-checks-report
+          path: semver-report.txt
+          if-no-files-found: warn
+      - name: Every breaking change is named in CHANGELOG.md
+        run: |
+          python3 scripts/check_changelog_breaking.py \
+            --report "${GITHUB_WORKSPACE}/semver-report.txt"
+      # Both scripts above decide whether this job is green, and both decide it
+      # by reading text. These cases are what says they read it correctly — the
+      # verdict-versus-exit-code distinction in particular, which is the thing
+      # the old arrangement got wrong. They stub cargo and cost a second.
+      - name: The two scripts' own cases
+        run: |
+          scripts/semver_report_test.sh
+          scripts/check_changelog_breaking_test.sh
 
   # ── Pre-release sanity ────────────────────────────────────────────
   # Verify the publish dry-run succeeds. Catches version bumps that
@@ -66,7 +134,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -74,8 +142,8 @@ jobs:
       - run: cargo publish --manifest-path core/Cargo.toml --dry-run --allow-dirty
 
   # ── Build release artifacts ───────────────────────────────────────
-  # Produces a tarball with the static library + license, plus a
-  # sigstore-backed in-toto v1 SLSA build-provenance statement
+  # Produces a tarball with the library artifacts (.rlib + cdylib) + license,
+  # plus a sigstore-backed in-toto v1 SLSA build-provenance statement
   # (.intoto.jsonl) per artifact — verifiable with:
   #   gh attestation verify --owner <org> <artifact>
   #   cosign verify-blob-attestation <artifact>
@@ -100,7 +168,7 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           targets: ${{ matrix.target }}
@@ -122,16 +190,35 @@ jobs:
           mkdir -p dist
           NAME="phantom_protocol-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir -p "dist/${NAME}"
-          # The crate is a library — ship the .rlib + headers + license.
-          # For dynamic library variants this would also copy .so/.dylib;
-          # phantom_protocol is statically linked, so .rlib is sufficient.
-          cp core/target/${{ matrix.target }}/release/*.rlib "dist/${NAME}/" 2>/dev/null || true
-          cp LICENSE "dist/${NAME}/" 2>/dev/null || true
-          cp README.md "dist/${NAME}/" 2>/dev/null || true
-          tar -czf "dist/${NAME}.tar.gz" -C dist "${NAME}"
+          # crate-type = ["lib", "cdylib"] — ship the .rlib (Rust consumers) AND
+          # the cdylib (.so on Linux, .dylib on macOS), which is what every
+          # UniFFI / C consumer links against. `core` is the root workspace's
+          # only member, so cargo's target dir is the repo-root `target/`, not
+          # `core/target/`. No `|| true` on the library copies: a missing library
+          # must fail the release loudly rather than ship an empty tarball.
+          LIBDIR="target/${{ matrix.target }}/release"
+          cp "${LIBDIR}/libphantom_protocol.rlib" "dist/${NAME}/"
+          if [ -f "${LIBDIR}/libphantom_protocol.so" ]; then
+            cp "${LIBDIR}/libphantom_protocol.so" "dist/${NAME}/"
+          else
+            cp "${LIBDIR}/libphantom_protocol.dylib" "dist/${NAME}/"
+          fi
+          # The license text is not optional either: Apache-2.0 §4(a) requires
+          # every redistribution, binaries included, to carry a copy, so a
+          # tarball without it must not be produced at all. The README goes with
+          # it on the same terms — both are tracked files at the checkout root.
+          cp LICENSE "dist/${NAME}/"
+          cp README.md "dist/${NAME}/"
+          # Archive the files and nothing about the host they sat on. macOS tar
+          # otherwise stores extended attributes (com.apple.provenance, for one)
+          # as pax headers and AppleDouble `._*` members: a Linux consumer then
+          # extracts a `._` twin of every file, and GNU tar warns about each
+          # unknown header. COPYFILE_DISABLE stops the `._` members on macOS;
+          # --no-xattrs is understood by both bsdtar and GNU tar.
+          COPYFILE_DISABLE=1 tar --no-xattrs -czf "dist/${NAME}.tar.gz" -C dist "${NAME}"
           shasum -a 256 "dist/${NAME}.tar.gz" > "dist/${NAME}.tar.gz.sha256"
       - name: Generate SLSA build provenance attestation
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/phantom_protocol-*.tar.gz
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -154,7 +241,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
@@ -163,7 +250,7 @@ jobs:
         run: |
           cd dist
           ls -la
-      - uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+      - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           draft: true
           generate_release_notes: true
@@ -171,3 +258,59 @@ jobs:
             dist/*.tar.gz
             dist/*.tar.gz.sha256
             dist/*.intoto.jsonl
+
+  # ── Python wheel build + smoke test ───────────────────────────────
+  # Manually triggered only (workflow_dispatch). Builds a maturin wheel that
+  # bundles the cdylib + UniFFI-generated Python glue, installs it in a
+  # fresh venv, and verifies `import phantom_protocol` succeeds.
+  #
+  # A full multi-platform cibuildwheel matrix is a documented follow-up;
+  # this job proves the config is correct on a single platform.
+  #
+  # To publish to PyPI after this job succeeds:
+  #   maturin publish --manifest-path core/Cargo.toml
+  # (requires MATURIN_PYPI_TOKEN in repository secrets — not wired here).
+  build-python-wheel:
+    name: Build Python wheel (manual smoke test)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: "."
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - name: Install maturin
+        run: pip install "maturin>=1.6,<2.0"
+      - name: Build wheel
+        # Run from python/ so maturin picks up python/pyproject.toml, which
+        # sets manifest-path, bindings = "uniffi", and python-source. maturin
+        # will:
+        #   1. Compile the cdylib (phantom_protocol) with --features bindings.
+        #   2. Compile the uniffi-bindgen binary (auto-enables uniffi-cli).
+        #   3. Run uniffi-bindgen to generate phantom_protocol.py.
+        #   4. Bundle cdylib + generated .py into a platform wheel.
+        # The --manifest-path in pyproject.toml is relative to the pyproject dir,
+        # so we need to override here with the absolute-from-cwd form; the --out
+        # flag lands the wheel in the repo-root target/wheels directory.
+        run: |
+          maturin build --release \
+            --manifest-path ../core/Cargo.toml \
+            --features bindings \
+            --out ../target/wheels
+        working-directory: python
+      - name: Smoke-test wheel
+        run: |
+          python -m venv /tmp/phantom-smoke-venv
+          /tmp/phantom-smoke-venv/bin/pip install --no-index --find-links target/wheels phantom-protocol
+          /tmp/phantom-smoke-venv/bin/python -c "import phantom_protocol; print(getattr(phantom_protocol, '__doc__', None) or 'import OK')"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-wheel-linux-x86_64
+          path: target/wheels/*.whl
+          if-no-files-found: error

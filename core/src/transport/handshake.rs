@@ -25,12 +25,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use zeroize::ZeroizeOnDrop;
 
-use crate::crypto::adaptive_crypto::{CipherSuite, CryptoSession};
+use crate::crypto::adaptive_crypto::{CipherSuite, CryptoSession, AEAD_OVERHEAD};
 use crate::crypto::hybrid_kem::{HybridCiphertext, HybridKeyPackage, HybridSecretKey};
 use crate::crypto::hybrid_sign::{HybridSignature, HybridSigningKey, HybridVerifyingKey};
 use crate::crypto::kdf::derive_early_data_keying;
 use crate::crypto::pow::{PoWChallenge, PoWSolution};
 use crate::errors::CoreError;
+use crate::observability::attrs::{CookieOutcome, EarlyDataOutcome, PowOutcome, ResumptionMode};
+use crate::observability::Observability;
 use crate::transport::reputation::ReputationTracker;
 use crate::transport::session::{CryptoState, Session};
 use crate::transport::session_cache::SessionCache;
@@ -38,11 +40,23 @@ use crate::transport::types::{SchedulerMode, SessionId};
 use std::sync::Arc;
 
 /// Maximum 0-RTT early-data plaintext, in bytes.
-/// The client constructor rejects a larger payload; the server drops
-/// an oversized blob and continues as a normal 1-RTT handshake. Caps
-/// the work an unauthenticated peer can force before the handshake
+/// The client constructor rejects a larger payload; the server bounds
+/// the sealed field instead, at [`EARLY_DATA_SEALED_MAX_LEN`]. Caps the
+/// work an unauthenticated peer can force before the handshake
 /// completes.
 pub const EARLY_DATA_MAX_LEN: usize = 16 * 1024;
+
+/// Maximum sealed 0-RTT blob in `ClientHello.early_data`, in bytes: an
+/// [`EARLY_DATA_MAX_LEN`] plaintext plus the AES-256-GCM tag.
+///
+/// The client caps the plaintext, but the server only ever sees the sealed
+/// field, so every server-side bound on it is this one — the pre-decode length
+/// walk both listeners run and the size gate in front of the AEAD open alike.
+/// A hello over it is refused before it is decoded, which no conforming client
+/// can cause. Bounding the field at the plaintext cap instead refused the last
+/// tag's worth of legal payloads there, and a refusal at that point fails the
+/// handshake rather than declining the early-data (Invariant 9).
+pub const EARLY_DATA_SEALED_MAX_LEN: usize = EARLY_DATA_MAX_LEN + AEAD_OVERHEAD;
 
 /// Compile-time protocol-variant tag, baked into every `ClientHello`
 /// (cleartext field) **and** the signed handshake transcript. Peers
@@ -62,9 +76,27 @@ pub const PROTOCOL_VARIANT: &[u8] = b"phantom-fips-1";
 
 /// The sole protocol version carried in `ClientHello.version` and bound into the
 /// handshake transcript. Pinned to one value — the protocol is not negotiated
-/// (pre-1.0, no users). It is a tamper-check anchor and a hook for a future,
-/// deliberate version increment.
-pub const PROTOCOL_VERSION: u8 = 3;
+/// (pre-1.0, no users). It is a tamper-check anchor and the field that makes a
+/// deliberate version increment *diagnosable*.
+///
+/// It moved `4 → 5` together with
+/// [`WIRE_VERSION`](crate::transport::types::WIRE_VERSION) `7 → 8`, which gave the
+/// `CONTROL` flag a one-byte subtype in its AEAD plaintext
+/// ([`ControlSubtype`](crate::transport::types::ControlSubtype)). Earlier it moved `3 → 4`
+/// with `WIRE_VERSION` `6 → 7`, which changed the `WINDOW_UPDATE` plaintext from a
+/// relative credit to a cumulative limit.
+///
+/// Both times, bumping the wire version alone would have been the worse of the two
+/// failures: the data-plane check on `PacketHeader.version` **drops** a mismatched frame
+/// silently, so an old peer would have completed a handshake and then sat in a stall with
+/// no error to show for it — the exact shape of failure these changes exist to remove.
+/// A mismatch here is answered with a typed [`ServerReject`] before any session exists.
+///
+/// Note what moves and what does not: this is a *value* carried by a field whose presence
+/// and position in the transcript are fixed. `protocol_variant` remains the leading
+/// transcript field (Invariant 10) and `early_data_accepted` remains the last (Invariant
+/// 7); a version increment must never be an excuse to reorder them.
+pub const PROTOCOL_VERSION: u8 = 5;
 
 /// Marker leading a [`ServerReject`] body. Reply *kind* dispatch is by the
 /// explicit [`ServerReply`] discriminant byte (`from_wire`), not by this marker
@@ -182,7 +214,7 @@ pub struct ClientHello {
 /// Real maximum byte lengths of the variable-length `ClientHello` fields (M-7). The ML-KEM-768
 /// encapsulation key is 1184 B and the ML-DSA-65 verifying key 1952 B — both fixed by FIPS
 /// 203 / 204, independent of the classical/fips build — and the `PROTOCOL_VARIANT` tag is well
-/// under 32 B; 0-RTT early-data is capped at [`EARLY_DATA_MAX_LEN`].
+/// under 32 B; the sealed 0-RTT early-data field is capped at [`EARLY_DATA_SEALED_MAX_LEN`].
 const ML_KEM_PK_MAX: usize = 1184;
 const ML_DSA_PK_MAX: usize = 1952;
 const PROTOCOL_VARIANT_MAX: usize = 64;
@@ -285,7 +317,7 @@ pub(crate) fn client_hello_lengths_within_bounds(bytes: &[u8]) -> bool {
     // early_data Option<Vec<u8>>
     match read_opt(bytes, &mut pos) {
         Some(true) => {
-            if !vec_le(bytes, &mut pos, EARLY_DATA_MAX_LEN) {
+            if !vec_le(bytes, &mut pos, EARLY_DATA_SEALED_MAX_LEN) {
                 return false;
             }
         }
@@ -581,6 +613,17 @@ pub struct HandshakeServer {
     /// `Arc<HandshakeServer>` — read once per resume (a brief, uncontended lock off the hot path).
     #[zeroize(skip)]
     anti_replay: parking_lot::Mutex<Option<Arc<dyn ZeroRttAntiReplay>>>,
+    /// Optional listener-owned observability sink. `None` (the default for every
+    /// constructor) makes every recording site below a compile-time-visible no-op —
+    /// the raw handshake state machine used by `transport::api`, benches, and tests
+    /// stays allocation- and dependency-free. `PhantomListener` / `PhantomUdpListener`
+    /// install their shared `Arc<Observability>` via [`Self::with_observability`]
+    /// before the server is wrapped in its `Arc`, so no interior mutability is needed.
+    ///
+    /// Metrics only: nothing read from here can influence a handshake decision.
+    /// Not secret, hence `#[zeroize(skip)]`.
+    #[zeroize(skip)]
+    observability: Option<Arc<Observability>>,
 }
 
 impl HandshakeServer {
@@ -614,6 +657,37 @@ impl HandshakeServer {
     /// `HandshakeServer`'s [`ZeroizeOnDrop`] — the same memory-hygiene
     /// invariant as the auto-generated path.
     pub fn with_signing_key(signing_key: HybridSigningKey) -> Result<Self, HandshakeError> {
+        Self::with_signing_key_and_cache(signing_key, SessionCache::new())
+    }
+
+    /// Like [`new`](Self::new) — mints a fresh per-process server identity and runs the
+    /// FIPS pairwise-consistency check on it — but installs a caller-sized resumption
+    /// [`SessionCache`] (from [`PhantomConfig`](crate::PhantomConfig)). Used by the
+    /// `bind_*_with_config` path when no persisted signing key is supplied but a custom
+    /// cache capacity / lifetime is. Without this, the config-with-fresh-key arm would
+    /// skip the startup pairwise-consistency check that `new()` performs.
+    pub fn new_with_cache(cache: SessionCache) -> Result<Self, HandshakeError> {
+        let (signing_key, verifying_key) = HybridSigningKey::generate();
+        signing_key
+            .pairwise_consistency_check(&verifying_key)
+            .map_err(|e| {
+                HandshakeError::RngError(format!(
+                    "server signing identity failed its pairwise-consistency test: {e:?}"
+                ))
+            })?;
+        Self::with_signing_key_and_cache(signing_key, cache)
+    }
+
+    /// Build a `HandshakeServer` from a caller-supplied [`HybridSigningKey`] and a
+    /// pre-sized [`SessionCache`] (e.g., from `PhantomConfig::session_cache()`).
+    ///
+    /// The `signing_key` is moved in under `ZeroizeOnDrop`; the `cache` is
+    /// immediately wrapped in its `Arc<Mutex>`. All other state initialises the same
+    /// way as [`with_signing_key`](Self::with_signing_key).
+    pub fn with_signing_key_and_cache(
+        signing_key: HybridSigningKey,
+        cache: SessionCache,
+    ) -> Result<Self, HandshakeError> {
         let verifying_key = signing_key.verifying_key();
 
         let mut master_secret = [0u8; 32];
@@ -630,11 +704,40 @@ impl HandshakeServer {
             master_secret,
             handshakes_this_minute: AtomicU64::new(0),
             minute_start_unix_sec: AtomicU64::new(now_sec),
-            session_cache: Arc::new(parking_lot::Mutex::new(SessionCache::new())),
+            session_cache: Arc::new(parking_lot::Mutex::new(cache)),
             reputation: Arc::new(ReputationTracker::new()),
             early_data_enabled: AtomicBool::new(true),
             anti_replay: parking_lot::Mutex::new(None),
+            observability: None,
         })
+    }
+
+    /// Install the embedder-owned observability sink so the DoS gate, the
+    /// resumption path, and the 0-RTT early-data path emit their OTel events
+    /// (`phantom.security.cookie` / `.pow`, `phantom.handshake.resumptions`,
+    /// `phantom.handshake.early_data`).
+    ///
+    /// Consuming builder rather than an `&self` setter: both listeners construct
+    /// the `HandshakeServer` and *then* wrap it in an `Arc`, so the sink can be
+    /// installed by value — no `Mutex`/`ArcSwap` read on the recording path.
+    ///
+    /// Purely additive: the returned server behaves identically, and a server
+    /// without a sink records nothing.
+    pub fn with_observability(mut self, observability: Arc<Observability>) -> Self {
+        self.observability = Some(observability);
+        self
+    }
+
+    /// Run `f` against the installed observability sink, if any.
+    ///
+    /// Every call site is metrics-only — `f` must not be able to change a
+    /// handshake decision, and none of the `Observability::record_*` methods
+    /// can fail, panic, or block.
+    #[inline]
+    fn observe(&self, f: impl FnOnce(&Observability)) {
+        if let Some(obs) = &self.observability {
+            f(obs);
+        }
     }
 
     /// Enable or disable 0-RTT early-data acceptance (A2b). Default enabled. When disabled, the
@@ -742,17 +845,38 @@ impl HandshakeServer {
     /// 0-RTT-over-UDP completes a cookie round first.
     pub(crate) fn udp_admit(&self, client_hello: &ClientHello, client_ip: IpAddr) -> UdpAdmit {
         let cookie_valid = match client_hello.cookie {
-            Some(c) => validate_cookie(&self.master_secret, client_ip, &c).unwrap_or(false),
+            // Metrics: a presented cookie is a validation *event* — record which way it
+            // went. A `validate_cookie` `Err` is an infra fault (clock), not a
+            // client-attributable outcome, so it records nothing and keeps the historical
+            // `unwrap_or(false)` decision unchanged.
+            Some(c) => match validate_cookie(&self.master_secret, client_ip, &c) {
+                Ok(v) => {
+                    self.observe(|o| {
+                        o.record_cookie(if v {
+                            CookieOutcome::ValidatedOk
+                        } else {
+                            CookieOutcome::ValidatedMismatch
+                        })
+                    });
+                    v
+                }
+                Err(_) => false,
+            },
+            // No cookie presented: not a validation event. The `Issued` record below
+            // covers the first-contact case.
             None => false,
         };
         if cookie_valid {
             return UdpAdmit::Admit;
         }
         match generate_cookie(&self.master_secret, client_ip) {
-            Ok(cookie) => UdpAdmit::Retry(HelloRetryRequest {
-                challenge: None,
-                cookie: Some(cookie),
-            }),
+            Ok(cookie) => {
+                self.observe(|o| o.record_cookie(CookieOutcome::Issued));
+                UdpAdmit::Retry(HelloRetryRequest {
+                    challenge: None,
+                    cookie: Some(cookie),
+                })
+            }
             Err(_) => UdpAdmit::Drop,
         }
     }
@@ -862,17 +986,37 @@ impl HandshakeServer {
         // `ClientHello` cannot burn a victim's ticket. The KEM round-trip still
         // runs, so forward secrecy is preserved by the fresh hybrid-KEM secret
         // (X25519+ML-KEM-768; ECDH-P-256+ML-KEM-768 under `--features fips`).
+        //
+        // `resume_reject` is metrics-only bookkeeping: it records *why* an offered
+        // ticket was not honored so the single 0-RTT recording site below can attribute
+        // the rejection. It is written but never read by any handshake decision.
+        let mut resume_reject: Option<EarlyDataOutcome> = None;
         let resumed: Option<ConsumedTicket> = client_hello.resume_session_id.and_then(|rid| {
-            let (secret, suite, created_at, expires_at) = self.session_cache.lock().peek(&rid)?;
+            let Some((secret, suite, created_at, expires_at)) =
+                self.session_cache.lock().peek(&rid)
+            else {
+                // Unknown or expired ticket id.
+                resume_reject = Some(EarlyDataOutcome::RejectedUnknownTicket);
+                return None;
+            };
             // Proof-of-possession: only a holder of `resumption_secret` can
             // produce a binder that matches. `None` binder ⇒ no resume.
             let expected = derive_resumption_binder(&secret, &rid, &client_hello.nonce);
-            let presented = client_hello.resumption_binder?;
+            let Some(presented) = client_hello.resumption_binder else {
+                // A missing or wrong binder means the presenter does not hold the
+                // ticket secret, so the id does not name a ticket *it* may use — the
+                // same observable class as an unknown ticket (the attribute enum has
+                // no separate binder-failure variant).
+                resume_reject = Some(EarlyDataOutcome::RejectedUnknownTicket);
+                return None;
+            };
             if !bool::from(presented.ct_eq(&expected)) {
+                resume_reject = Some(EarlyDataOutcome::RejectedUnknownTicket);
                 return None;
             }
             // Binder verified — consume now (race-free via `remove`'s bool).
             if !self.session_cache.lock().remove(&rid) {
+                resume_reject = Some(EarlyDataOutcome::RejectedReplay);
                 return None; // a concurrent resume already consumed it on THIS node
             }
             // A2b — when a distributed anti-replay store is installed, the consume must ALSO be
@@ -885,6 +1029,7 @@ impl HandshakeServer {
             let store = self.anti_replay.lock().clone();
             if let Some(store) = store {
                 if !store.check_and_set(&rid) {
+                    resume_reject = Some(EarlyDataOutcome::RejectedReplay);
                     return None; // already consumed on another node (replay) → no resume
                 }
             }
@@ -916,18 +1061,64 @@ impl HandshakeServer {
         // A2b — when 0-RTT early-data is disabled by config, reject it unconditionally:
         // `early_data_accepted = false`, the resuming client resends the payload 1-RTT. The
         // resume itself (cookie/PoW bypass) still stands; only the early-data is dropped.
-        let early_data_plaintext: Option<Vec<u8>> =
-            if self.early_data_enabled.load(Ordering::Relaxed) {
-                match (&resumed, &client_hello.early_data) {
-                    (Some(t), Some(blob)) => {
-                        decrypt_early_data(&t.secret, &client_hello.nonce, &t.rid, blob)
-                    }
-                    _ => None,
+        let early_data_enabled = self.early_data_enabled.load(Ordering::Relaxed);
+        let early_data_plaintext: Option<Vec<u8>> = if early_data_enabled {
+            match (&resumed, &client_hello.early_data) {
+                (Some(t), Some(blob)) => {
+                    decrypt_early_data(&t.secret, &client_hello.nonce, &t.rid, blob)
                 }
-            } else {
-                None
-            };
+                _ => None,
+            }
+        } else {
+            None
+        };
         let early_data_accepted = early_data_plaintext.is_some();
+
+        // ── Observability (metrics only — nothing below changes a decision) ──
+        //
+        // One resumption event per hello that offered a ticket. `mode` is what the
+        // client asked for (a sealed early-data blob ⇒ 0-RTT); `accepted` is whether
+        // the server honored exactly that.
+        if client_hello.resume_session_id.is_some() {
+            let (mode, accepted) = if client_hello.early_data.is_some() {
+                (ResumptionMode::ZeroRtt, early_data_accepted)
+            } else {
+                (ResumptionMode::OneRtt, resumed.is_some())
+            };
+            self.observe(|o| o.record_resumption(mode, accepted));
+        }
+        // One early-data event per hello that carried a sealed blob, attributed to the
+        // reason it was not used. The gate is `client_hello.early_data.is_some()` and
+        // nothing else: a hello that offered no blob is not a 0-RTT decision at all and
+        // must never inflate the series.
+        //
+        // `early_data_enabled == false` (A2b, the server-wide 0-RTT kill switch) is an
+        // operator policy decision rather than a client-attributable failure, but it IS
+        // recorded — as its own `rejected_disabled` attribution. Without it a flat
+        // early-data line on a dashboard is ambiguous between "no client is offering
+        // 0-RTT" and "the kill switch is on here", which is exactly the question an
+        // operator debugging a 0-RTT-less deployment is asking.
+        if let Some(blob) = &client_hello.early_data {
+            let outcome = if !early_data_enabled {
+                // Checked first: with the switch off the blob was never looked up or
+                // opened, so no other attribution has been computed for it.
+                EarlyDataOutcome::RejectedDisabled
+            } else if early_data_accepted {
+                EarlyDataOutcome::Accepted
+            } else if resumed.is_none() {
+                // No usable ticket. `resume_reject` carries the attribution from the
+                // resume path above; the fallback covers "early-data offered with no
+                // `resume_session_id` at all", which is likewise no usable ticket.
+                resume_reject.unwrap_or(EarlyDataOutcome::RejectedUnknownTicket)
+            } else if blob.len() > EARLY_DATA_SEALED_MAX_LEN {
+                // Mirrors `decrypt_early_data`'s pre-crypto size gate. Read-only —
+                // the decision was already made above.
+                EarlyDataOutcome::RejectedOversized
+            } else {
+                EarlyDataOutcome::RejectedAead
+            };
+            self.observe(|o| o.record_early_data(outcome));
+        }
 
         // Hybrid Key Exchange (PFS preserved — a fresh KEM secret even on the
         // 0-RTT path).
@@ -1015,7 +1206,19 @@ impl HandshakeServer {
         // 5-10 min effective validity). Comparisons are constant-time.
         let cookie_valid = match client_hello.cookie {
             Some(c) => match validate_cookie(&self.master_secret, client_ip, &c) {
-                Ok(v) => v,
+                Ok(v) => {
+                    // Metrics: a presented cookie is a validation event. A missing
+                    // cookie is not — the `Issued` record on the retry path below
+                    // covers first contact.
+                    self.observe(|o| {
+                        o.record_cookie(if v {
+                            CookieOutcome::ValidatedOk
+                        } else {
+                            CookieOutcome::ValidatedMismatch
+                        })
+                    });
+                    v
+                }
                 Err(e) => return Err(HandshakeResponse::Fail(e)),
             },
             None => false,
@@ -1062,6 +1265,20 @@ impl HandshakeServer {
                     }
                 }
                 pow_valid = any_valid;
+                // Metrics: only a *presented* solution produces a solved/rejected
+                // event. A hello with no solution is first contact (a challenge is
+                // issued below), not a rejection — recording it as one would drown
+                // the `PhantomPoWRejectionStorm` DoS signal in normal traffic.
+                self.observe(|o| {
+                    o.record_pow(
+                        if any_valid {
+                            PowOutcome::Solved
+                        } else {
+                            PowOutcome::Rejected
+                        },
+                        difficulty,
+                    )
+                });
             } else {
                 pow_valid = false;
                 let derived = match derive_session_secret_for_hour(&self.master_secret, cur_hour) {
@@ -1077,13 +1294,16 @@ impl HandshakeServer {
         }
 
         if !bypass && (!cookie_valid || !pow_valid) {
+            let cookie = if !cookie_valid {
+                // Metrics: the retry hands the client a fresh cookie.
+                self.observe(|o| o.record_cookie(CookieOutcome::Issued));
+                Some(expected_cookie)
+            } else {
+                None
+            };
             return Err(HandshakeResponse::Retry(HelloRetryRequest {
                 challenge,
-                cookie: if !cookie_valid {
-                    Some(expected_cookie)
-                } else {
-                    None
-                },
+                cookie,
             }));
         }
         Ok(())
@@ -1415,7 +1635,7 @@ fn derive_session_id(shared_secret: &[u8; 32], nonce: &[u8; 32]) -> [u8; 32] {
 ///
 /// Returns `None` — early-data rejected, the handshake simply
 /// continues as 1-RTT — when:
-/// - the sealed blob exceeds the [`EARLY_DATA_MAX_LEN`] cap (checked
+/// - the sealed blob exceeds [`EARLY_DATA_SEALED_MAX_LEN`] (checked
 ///   before any crypto work — anti-DoS), or
 /// - the AEAD tag fails to verify (tampered / wrong key).
 fn decrypt_early_data(
@@ -1426,7 +1646,7 @@ fn decrypt_early_data(
 ) -> Option<Vec<u8>> {
     // A sealed blob is `plaintext || 16-byte GCM tag`. Reject anything
     // whose plaintext would exceed the cap before doing crypto work.
-    if sealed.len() > EARLY_DATA_MAX_LEN + 16 {
+    if sealed.len() > EARLY_DATA_SEALED_MAX_LEN {
         return None;
     }
     let (key, nonce) = derive_early_data_keying(resumption_secret, client_nonce);
@@ -1596,7 +1816,22 @@ pub enum HandshakeError {
 
 impl From<HandshakeError> for CoreError {
     fn from(err: HandshakeError) -> Self {
-        CoreError::InternalError(err.to_string())
+        match err {
+            // Server identity mismatch maps to the typed variant so callers can
+            // branch on it without string-matching (Security Invariant 1).
+            HandshakeError::ServerIdentityMismatch => CoreError::ServerIdentityMismatch,
+            // Protocol variant mismatch maps to ProtocolRejected so callers can
+            // distinguish "update your client" from generic handshake failures.
+            HandshakeError::ProtocolVariantMismatch { expected, received } => {
+                CoreError::ProtocolRejected(format!(
+                    "protocol variant mismatch (expected {:?}, received {:?})",
+                    String::from_utf8_lossy(&expected),
+                    String::from_utf8_lossy(&received)
+                ))
+            }
+            // All other handshake errors surface as the opaque HandshakeError string.
+            other => CoreError::HandshakeError(other.to_string()),
+        }
     }
 }
 
@@ -2198,6 +2433,56 @@ mod tests {
         assert!(!client_hello_lengths_within_bounds(&[]));
     }
 
+    /// Invariant 9: the admission walk bounds the *sealed* early-data field, and a client
+    /// bounds the *plaintext*. The two differ by the AES-256-GCM tag, so the walk has to
+    /// admit a hello carrying the largest payload a client is allowed to send — otherwise
+    /// a legal 0-RTT attempt is refused before it is decoded and the connect fails, where
+    /// the contract is that early-data can only ever be declined. Driven from a real
+    /// `create_client_hello_with_resume`, so the sealed length is the one a client
+    /// actually produces rather than an arithmetic claim about it.
+    #[tokio::test]
+    async fn client_hello_length_walk_admits_the_largest_legal_early_data() {
+        let server = HandshakeServer::new().unwrap();
+        let client_ip = "127.0.0.1".parse().unwrap();
+        let (resume_id, resume_secret) = first_handshake_for_hint(&server, client_ip);
+
+        let payload = vec![0x5Au8; EARLY_DATA_MAX_LEN];
+        let client = HandshakeClient::new().unwrap();
+        let hello =
+            client.create_client_hello_with_resume(resume_id, &resume_secret, Some(&payload));
+        assert_eq!(
+            hello.early_data.as_ref().map(Vec::len),
+            Some(EARLY_DATA_SEALED_MAX_LEN),
+            "a full-size payload seals to exactly the server-side bound"
+        );
+
+        let bytes = borsh::to_vec(&hello).expect("serialize");
+        assert!(
+            client_hello_lengths_within_bounds(&bytes),
+            "the walk must admit a hello whose early-data plaintext is exactly the cap"
+        );
+
+        // And the admitted hello is then accepted as 0-RTT, not merely decoded: the walk and
+        // `decrypt_early_data` agree on the same bound.
+        let decoded = borsh::from_slice::<ClientHello>(&bytes).expect("decode");
+        match server.process_client_hello(&decoded, 0, client_ip) {
+            HandshakeResponse::Success(sh, _session, early_data) => {
+                assert!(sh.early_data_accepted, "a full-size blob is accepted");
+                assert_eq!(early_data.as_deref(), Some(&payload[..]));
+            }
+            _ => panic!("a fresh ticket with a full-size blob must complete as 0-RTT"),
+        }
+
+        // One byte past what any conforming client can seal is still refused before decode.
+        let mut over = hello.clone();
+        over.early_data = Some(vec![0u8; EARLY_DATA_SEALED_MAX_LEN + 1]);
+        let over_bytes = borsh::to_vec(&over).expect("serialize");
+        assert!(
+            !client_hello_lengths_within_bounds(&over_bytes),
+            "a sealed blob one byte past plaintext cap + tag must be refused before decode"
+        );
+    }
+
     /// M-5 (audit 2026-06-11): the per-IP PoW-difficulty reduction for "ticket holders" must
     /// key on a VALID resume — a cached ticket whose binder verifies — not on mere presence of
     /// a `resume_session_id`. Otherwise a flagged abuser attaches 32 random bytes and pays zero
@@ -2257,6 +2542,247 @@ mod tests {
         assert!(
             server.has_valid_resume(&resume),
             "a real cached ticket with a valid binder must count as a valid resume"
+        );
+    }
+
+    // ── Observability wiring (metrics-only; must not perturb any decision) ──
+
+    /// Build a `HandshakeServer` with a live observability sink installed, so every
+    /// `record_cookie` / `record_pow` / `record_resumption` / `record_early_data` site
+    /// below is actually executed instead of short-circuited by the `None` sink.
+    fn server_with_observability() -> HandshakeServer {
+        let obs = crate::observability::Observability::new(
+            crate::observability::ObservabilityConfig::default(),
+        );
+        HandshakeServer::new()
+            .expect("HandshakeServer::new")
+            .with_observability(obs)
+    }
+
+    /// The DoS gate must behave identically with a metrics sink installed: a bare hello
+    /// still gets a cookie Retry, a bad PoW solution is still rejected, and a solved one
+    /// still completes. Exercises the `Issued` / `ValidatedOk` / `ValidatedMismatch`
+    /// cookie records and the `Solved` / `Rejected` PoW records on the real paths.
+    #[tokio::test]
+    async fn observability_sink_does_not_perturb_the_cookie_pow_gate() {
+        let server = server_with_observability();
+        let client = HandshakeClient::new().expect("client");
+        let ip: IpAddr = "198.51.100.9".parse().unwrap();
+
+        // 1. No cookie → Retry carrying a freshly issued cookie (records `Issued`).
+        let hello = client.create_client_hello();
+        let retry = match server.process_client_hello(&hello, 8, ip) {
+            HandshakeResponse::Retry(r) => r,
+            o => panic!("expected Retry, got {o:?}"),
+        };
+        let cookie = retry.cookie.expect("retry demands a cookie");
+        let challenge = retry
+            .challenge
+            .expect("difficulty 8 demands a PoW challenge");
+
+        // 2. Valid cookie (records `ValidatedOk`) but a bogus PoW solution
+        //    (records `Rejected`) → still Retry.
+        let mut bad = hello.clone();
+        bad.cookie = Some(cookie);
+        // An all-zero nonce fails the challenge's keyed-MAC integrity check
+        // deterministically (no 1-in-2^difficulty chance of accidentally passing
+        // the leading-zeros test, which a real nonce with a junk counter would have).
+        bad.pow_solution = Some(PoWSolution {
+            nonce: [0u8; 32],
+            solution: 0,
+        });
+        assert!(
+            matches!(
+                server.process_client_hello(&bad, 8, ip),
+                HandshakeResponse::Retry(_)
+            ),
+            "a bogus PoW solution must still be rejected with the sink installed"
+        );
+
+        // 3. Wrong cookie (records `ValidatedMismatch`) → still Retry.
+        let mut wrong_cookie = hello.clone();
+        wrong_cookie.cookie = Some([0x5Au8; 32]);
+        assert!(
+            matches!(
+                server.process_client_hello(&wrong_cookie, 0, ip),
+                HandshakeResponse::Retry(_)
+            ),
+            "a mismatched cookie must still be rejected with the sink installed"
+        );
+
+        // 4. Valid cookie + solved PoW (records `Solved`) → Success, and the client
+        //    still verifies the transcript signature (no signing-input drift).
+        let mut good = hello.clone();
+        good.cookie = Some(cookie);
+        good.pow_solution = Some(challenge.solve().expect("solve difficulty-8 PoW"));
+        let sh = match server.process_client_hello(&good, 8, ip) {
+            HandshakeResponse::Success(sh, _, _) => sh,
+            o => panic!("expected Success, got {o:?}"),
+        };
+        client
+            .process_server_hello(&good, &sh, Some(server.verifying_key()))
+            .expect("client verifies the ServerHello");
+    }
+
+    /// The resumption and 0-RTT paths must behave identically with a metrics sink
+    /// installed. Covers each `EarlyDataOutcome` the server can attribute:
+    /// `Accepted`, `RejectedUnknownTicket`, `RejectedAead`, `RejectedOversized`,
+    /// plus the one-shot `RejectedReplay` on a second use of the same ticket.
+    /// (`RejectedDisabled` has its own test below — it needs the kill switch off.)
+    #[tokio::test]
+    async fn observability_sink_does_not_perturb_resumption_or_early_data() {
+        let server = server_with_observability();
+        let ip: IpAddr = "198.51.100.10".parse().unwrap();
+
+        // Accepted 0-RTT (records ZeroRtt/accepted + `Accepted`).
+        let (rid, secret) = first_handshake_for_hint(&server, ip);
+        let client = HandshakeClient::new().unwrap();
+        let hello = client.create_client_hello_with_resume(rid, &secret, Some(b"0rtt"));
+        match server.process_client_hello(&hello, 0, ip) {
+            HandshakeResponse::Success(sh, _, early) => {
+                assert!(sh.early_data_accepted, "0-RTT still accepted with the sink");
+                assert_eq!(early.as_deref(), Some(&b"0rtt"[..]));
+            }
+            o => panic!("expected Success, got {o:?}"),
+        }
+
+        // Replaying the SAME ticket: it was consumed one-shot, so no bypass — the
+        // server falls through to the cookie gate (records `RejectedUnknownTicket`
+        // once the gate is cleared; here the Retry short-circuits first).
+        let replay = client.create_client_hello_with_resume(rid, &secret, Some(b"0rtt"));
+        assert!(
+            matches!(
+                server.process_client_hello(&replay, 0, ip),
+                HandshakeResponse::Retry(_)
+            ),
+            "a consumed ticket must not be resumable a second time"
+        );
+
+        // Oversized blob on a fresh, valid ticket (records `RejectedOversized`) —
+        // handshake still completes 1-RTT.
+        let (rid2, secret2) = first_handshake_for_hint(&server, ip);
+        let c2 = HandshakeClient::new().unwrap();
+        let huge = vec![0u8; EARLY_DATA_MAX_LEN + 1];
+        let h2 = c2.create_client_hello_with_resume(rid2, &secret2, Some(&huge));
+        match server.process_client_hello(&h2, 0, ip) {
+            HandshakeResponse::Success(sh, _, early) => {
+                assert!(!sh.early_data_accepted, "oversized blob still rejected");
+                assert!(early.is_none());
+            }
+            o => panic!("expected Success, got {o:?}"),
+        }
+
+        // In-range garbage blob on a fresh, valid ticket (records `RejectedAead`).
+        let (rid3, secret3) = first_handshake_for_hint(&server, ip);
+        let c3 = HandshakeClient::new().unwrap();
+        let mut h3 = c3.create_client_hello_with_resume(rid3, &secret3, None);
+        h3.early_data = Some(vec![0xFFu8; 128]);
+        match server.process_client_hello(&h3, 0, ip) {
+            HandshakeResponse::Success(sh, _, early) => {
+                assert!(!sh.early_data_accepted, "AEAD failure still rejected");
+                assert!(early.is_none());
+            }
+            o => panic!("expected Success, got {o:?}"),
+        }
+    }
+
+    /// A2b kill switch: with `set_early_data_enabled(false)` an offered blob is
+    /// refused by policy. The resume itself still stands (the ticket's binder is
+    /// valid, so the cookie/PoW bypass applies) and the handshake completes 1-RTT
+    /// with `early_data_accepted = false` — the record-site restructuring that
+    /// introduced `EarlyDataOutcome::RejectedDisabled` must not have moved any
+    /// decision. The metric itself is OTel-only, so its emission is pinned by
+    /// `core/tests/observability_instrument_wiring.rs`; what this test guards is
+    /// that the now-unconditional record site is reached on a path that still
+    /// behaves exactly as before.
+    #[tokio::test]
+    async fn disabled_early_data_still_completes_a_1rtt_resume() {
+        let server = server_with_observability();
+        let ip: IpAddr = "198.51.100.12".parse().unwrap();
+
+        let (rid, secret) = first_handshake_for_hint(&server, ip);
+        server.set_early_data_enabled(false);
+        assert!(!server.early_data_enabled());
+
+        let client = HandshakeClient::new().unwrap();
+        let hello = client.create_client_hello_with_resume(rid, &secret, Some(b"denied"));
+        assert!(
+            hello.early_data.is_some(),
+            "the client must actually have offered a sealed blob"
+        );
+        let sh = match server.process_client_hello(&hello, 0, ip) {
+            HandshakeResponse::Success(sh, _, early) => {
+                assert!(
+                    !sh.early_data_accepted,
+                    "the kill switch must refuse the blob"
+                );
+                assert!(early.is_none(), "no early-data plaintext may surface");
+                sh
+            }
+            o => panic!("the resume itself must still complete, got {o:?}"),
+        };
+        // Invariant 7/H2 unchanged: the client still verifies the transcript, which
+        // ends with the (false) `early_data_accepted` verdict.
+        client
+            .process_server_hello(&hello, &sh, Some(server.verifying_key()))
+            .expect("client verifies the ServerHello");
+    }
+
+    /// A hello that offers **no** early-data must not produce an early-data sample at
+    /// all, kill switch or not — a client that never asked for 0-RTT is not a
+    /// rejection, and counting it would swamp the series with every plain handshake.
+    /// Asserted structurally: the record site's sole gate is
+    /// `client_hello.early_data.is_some()`.
+    #[tokio::test]
+    async fn a_hello_without_early_data_is_not_an_early_data_event() {
+        let server = server_with_observability();
+        let ip: IpAddr = "198.51.100.13".parse().unwrap();
+        server.set_early_data_enabled(false);
+
+        let client = HandshakeClient::new().unwrap();
+        let mut hello = client.create_client_hello();
+        assert!(hello.early_data.is_none());
+        let retry = match server.process_client_hello(&hello, 0, ip) {
+            HandshakeResponse::Retry(r) => r,
+            o => panic!("expected a cookie Retry on first contact, got {o:?}"),
+        };
+        hello.cookie = Some(retry.cookie.expect("retry demands a cookie"));
+        match server.process_client_hello(&hello, 0, ip) {
+            HandshakeResponse::Success(sh, _, early) => {
+                assert!(!sh.early_data_accepted);
+                assert!(early.is_none());
+            }
+            o => panic!("expected Success with a valid cookie, got {o:?}"),
+        }
+    }
+
+    /// H-2: the UDP stateless-cookie pre-gate keeps its exact verdicts with a metrics
+    /// sink installed (`Retry` on a missing/bad cookie, `Admit` on a valid one).
+    #[test]
+    fn observability_sink_does_not_perturb_udp_admit() {
+        let server = server_with_observability();
+        let client = HandshakeClient::new().expect("client");
+        let ip: IpAddr = "198.51.100.11".parse().unwrap();
+
+        let hello = client.create_client_hello();
+        let cookie = match server.udp_admit(&hello, ip) {
+            UdpAdmit::Retry(hrr) => hrr.cookie.expect("HRR carries a cookie"),
+            UdpAdmit::Admit => panic!("a cookieless hello must not be admitted"),
+            UdpAdmit::Drop => panic!("a cookieless hello must be re-challenged, not dropped"),
+        };
+
+        let mut bad = hello.clone();
+        bad.cookie = Some([0x33u8; 32]);
+        assert!(
+            matches!(server.udp_admit(&bad, ip), UdpAdmit::Retry(_)),
+            "a mismatched cookie must still be re-challenged"
+        );
+
+        let mut good = hello.clone();
+        good.cookie = Some(cookie);
+        assert!(
+            matches!(server.udp_admit(&good, ip), UdpAdmit::Admit),
+            "a valid cookie must still admit"
         );
     }
 }

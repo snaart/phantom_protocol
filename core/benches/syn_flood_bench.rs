@@ -1,3 +1,7 @@
+// Dev-only bench harness: the `.clippy.toml` disallowed-methods ban governs production
+// code, not benches — same rationale as the crate-root `cfg_attr(test, allow(..))`.
+#![allow(clippy::disallowed_methods)]
+
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use phantom_protocol::transport::handshake::{ClientHello, HandshakeClient, HandshakeServer};
 use phantom_protocol::transport::reputation::ReputationTracker;

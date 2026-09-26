@@ -1,5 +1,8 @@
 //! Focused encryption-only benchmark.
 //! Measures raw ring AES-256-GCM speed with zero allocation overhead.
+// Dev-only benchmark example: the `.clippy.toml` disallowed-methods ban governs production
+// code, not example harnesses — same rationale as the crate-root `cfg_attr(test, allow(..))`.
+#![allow(clippy::disallowed_methods)]
 
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, CHACHA20_POLY1305};
 use std::time::Instant;
@@ -42,8 +45,7 @@ fn bench_aead(algo: &'static ring::aead::Algorithm, key_bytes: &[u8; 32]) {
         };
 
         let start = Instant::now();
-        let mut counter: u64 = 0;
-        for _ in 0..iters {
+        for counter in 0..iters as u64 {
             // Reset buffer to "plaintext" state (keep allocation!)
             // Only write tag area as 0, rest stays as-is — doesn't affect encryption speed
             buf.truncate(size);
@@ -53,7 +55,6 @@ fn bench_aead(algo: &'static ring::aead::Algorithm, key_bytes: &[u8; 32]) {
             // Build nonce
             let mut n = [0u8; 12];
             n[4..].copy_from_slice(&counter.to_be_bytes());
-            counter += 1;
             let nonce = Nonce::assume_unique_for_key(n);
 
             // IN-PLACE encrypt (zero allocation)

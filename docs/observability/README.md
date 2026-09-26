@@ -10,12 +10,26 @@ self-hosted Prometheus via the OTel Collector's `prometheusexporter`).
 
 Two pillars, OTel-native:
 
-- **Metrics** — `phantom.*` namespace (configurable via
-  `PHANTOM_TELEMETRY_NAMESPACE`). Hot-path packet / byte counters via
-  lock-free atomics with `ObservableCounter` callbacks; security signals,
-  cookie/PoW gate, rekey, fallback, early-data outcomes as labeled
-  `Counter`s; handshake / path-validation latency as explicit-boundary
-  `Histogram`s with exemplar correlation to traces.
+- **Metrics** — `phantom.*` namespace (hard-wired; see metrics-catalog.md).
+  Hot-path packet / byte counters, AEAD encrypt/decrypt timing and per-path
+  RTT via lock-free atomics with `ObservableCounter` / `ObservableGauge`
+  callbacks; the security signals (replay rejections, AEAD failures,
+  unencrypted-drop downgrades, the cookie and PoW DoS gates) plus the
+  active-session and active-stream gauges, rekey, 0-RTT early-data,
+  resumption and path-migration as labeled instruments; handshake and
+  path-validation latency as explicit-boundary `Histogram`s. **20 of the 21
+  registered instruments have a live recording call site**; only
+  `phantom.transport.fallback` is unfed, because the fallback state machine
+  it would report on is never driven. The two former partial gaps are
+  closed: a server with 0-RTT disabled by policy records
+  `early_data{outcome="rejected_disabled"}` for a blob it refuses, and a
+  path-validation challenge the peer never answers is expired by the pump's
+  heartbeat as `path.validation.duration{outcome="timeout"}` (budget = the
+  session's own path-down threshold; the sweep is metrics-only and leaves
+  the path registry alone). Per-instrument detail is in the **Status** column of
+  [`metrics-catalog.md`](metrics-catalog.md). Exemplar correlation requires
+  an exemplar reservoir the embedder must configure; the reference server
+  does not.
 
 - **Traces** — `phantom.*` spans on listener bind/accept, handshake
   (client and server sides), session rekey, path validation. Span
@@ -37,8 +51,14 @@ default build is unchanged. The reference server (`phantom-server`) turns
 it on:
 
 ```toml
-# in server/Cargo.toml
-phantom_protocol = { path = "../core", features = ["telemetry-otel"] }
+# in server/Cargo.toml — the reference server opts out of the default
+# `bindings` feature and names the rest explicitly
+phantom-protocol = { path = "../core", default-features = false, features = [
+    "std",
+    "compression-zstd",
+    "classical-crypto",
+    "telemetry-otel",
+] }
 ```
 
 For a custom embedder, enable the feature the same way and install
@@ -78,8 +98,9 @@ threads.
 
 - [`refactor-plan.md`](refactor-plan.md) — the working plan + atomic-commit
   rollout (Phase 8 — this refactor).
-- [`metrics-catalog.md`](metrics-catalog.md) — every emitted instrument:
-  name, type, unit, attributes, suggested alert thresholds.
+- [`metrics-catalog.md`](metrics-catalog.md) — every registered instrument:
+  name, type, unit, attributes, whether it is actually recorded today,
+  suggested alert thresholds.
 - [`otlp-setup.md`](otlp-setup.md) — production setup recipes for the
   major backends (self-hosted, Datadog, Honeycomb, Grafana Cloud, mTLS).
 - [`tracing-guide.md`](tracing-guide.md) — span inventory, sampling,
@@ -95,13 +116,16 @@ Phantom Protocol honors the OpenTelemetry SDK env-var spec where applicable:
 | `OTEL_EXPORTER_OTLP_HEADERS` | — | Auth headers (Datadog/Honeycomb API keys) |
 | `OTEL_EXPORTER_OTLP_COMPRESSION` | — | `gzip` / `zstd` |
 | `OTEL_METRIC_EXPORT_INTERVAL` | `10000` (ms) | Push period |
-| `OTEL_TRACES_SAMPLER` | `parentbased_traceidratio` | Sampler implementation |
-| `OTEL_TRACES_SAMPLER_ARG` | `0.01` | Trace sampling ratio |
+| `OTEL_TRACES_SAMPLER` | — (not consulted) | Sampler implementation. `phantom-server` installs its sampler explicitly, so this variable is ignored — use `OTEL_TRACES_SAMPLER_ARG` / `--otel-trace-sample-ratio` instead |
+| `OTEL_TRACES_SAMPLER_ARG` | `1.0` (`phantom-server` default — export every trace) | Trace sampling ratio, the env fallback for `--otel-trace-sample-ratio`. `server/src/telemetry.rs` installs it as `ParentBased(TraceIdRatioBased(ratio))`, so it takes effect on its own without `OTEL_TRACES_SAMPLER`; the ratio gates root spans only and out-of-range values are clamped |
 | `OTEL_RESOURCE_ATTRIBUTES` | — | `service.namespace=prod,deployment.environment=staging` |
-| `PHANTOM_TELEMETRY_NAMESPACE` | `phantom` | Instrument-name prefix (Phantom-specific) |
+| `PHANTOM_TELEMETRY_NAMESPACE` | `phantom` | Instrument-name prefix — read only by `ObservabilityConfig::from_env`, which currently has **no caller**; the variable is inert today |
 
-`ObservabilityConfig::from_env` reads only `PHANTOM_TELEMETRY_NAMESPACE`;
-there is no runtime telemetry kill-switch. To disable telemetry, build
+`ObservabilityConfig::from_env` reads only `PHANTOM_TELEMETRY_NAMESPACE`, but
+nothing calls it: the library always constructs
+`Observability::new(ObservabilityConfig::default())` and exposes no seam to
+inject a config, so the namespace is effectively fixed at `phantom`. There is
+no runtime telemetry kill-switch. To disable telemetry, build
 without the `telemetry-otel` Cargo feature, or simply do not point
 `OTEL_EXPORTER_OTLP_ENDPOINT` at a reachable collector — the SDK's
 bounded export queue then drops telemetry at near-zero cost.

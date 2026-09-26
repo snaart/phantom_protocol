@@ -8,7 +8,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-cargo build --release --manifest-path "${REPO_ROOT}/core/Cargo.toml" --features uniffi-cli
+# uniffi-bindgen 0.32 reads the exported metadata from an ELF library's symbol
+# table, which the release profile's `strip = "symbols"` removes; the library it
+# reads is built unstripped. Stripping never changes what is generated.
+CARGO_PROFILE_RELEASE_STRIP=none cargo build --release --manifest-path "${REPO_ROOT}/core/Cargo.toml" --features uniffi-cli
 
 # Detect dylib path (macOS: .dylib, Linux: .so)
 DYLIB="${REPO_ROOT}/target/release/libphantom_protocol.dylib"

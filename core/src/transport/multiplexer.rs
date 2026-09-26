@@ -7,11 +7,17 @@
 //! copying. Stream id 0 is reserved for the session-level control channel;
 //! unknown stream ids are dropped with a log warning.
 
-use crate::transport::types::SequenceNumber;
+use crate::errors::CoreError;
+use crate::transport::types::{SequenceNumber, StreamId};
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::mpsc;
+
+/// The highest stream id a packet header can carry: its `stream_id` field is 16 bits
+/// ([`StreamId`]). Neither side allocates past it — see
+/// [`StreamDemultiplexer::open_stream`].
+pub const LAST_STREAM_ID: u32 = StreamId::MAX as u32;
 
 /// Messages routed to a stream by the demultiplexer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,13 +43,39 @@ pub enum StreamMessage {
 ///
 /// Each stream is identified by a `u32` stream ID extracted from the packet header.
 /// Unrecognized stream IDs are dropped (with a log warning).
+///
+/// # Stream-ID allocation
+///
+/// Stream IDs 0 and 1 are reserved (`0` = session control channel, `1` = raw-app
+/// stream used by `PhantomSession::send`/`recv`). To avoid collisions when both
+/// peers open streams independently (QUIC-style), allocation is role-stratified:
+///
+/// - **Client** allocates **odd** ids: 3, 5, 7, …, 65535
+/// - **Server** allocates **even** ids: 2, 4, 6, …, 65534
+///
+/// Neither side will ever produce an id the other produces, so concurrent
+/// `open_stream()` calls on both ends never clash.
+///
+/// Ids are counted in 32 bits here but travel in the packet header's 16-bit
+/// field, so allocation stops at [`LAST_STREAM_ID`]: 32 767 ids per side for the
+/// life of the session, after which [`open_stream`](Self::open_stream) refuses.
+/// Counting on would put the next id on the wire as its low 16 bits — an id this
+/// side already used, whose stream the peer still holds or has dropped — and the
+/// peer would merge the new stream's bytes into the old one or acknowledge and
+/// discard them, with no error at either end.
 pub struct StreamDemultiplexer {
     /// Active stream senders: stream_id → sender channel
     streams: DashMap<u32, mpsc::Sender<StreamMessage>>,
     /// Control channel for session-level messages (stream_id = 0)
     control_tx: mpsc::Sender<Bytes>,
-    /// Next stream ID to allocate
+    /// First id this side allocates: 3 for a client, 2 for a server. Fixes the parity of
+    /// every id [`open_stream`](Self::open_stream) will ever return.
+    first_stream_id: u32,
+    /// Next stream ID to allocate (always steps by 2, starting at 3 for clients
+    /// and 2 for servers; 0 and 1 are permanently reserved).
     next_stream_id: AtomicU32,
+    /// Step between consecutive allocations (always 2 — stored for clarity).
+    id_step: u32,
 }
 
 /// Handle returned when a stream is registered with the demultiplexer.
@@ -59,12 +91,32 @@ impl StreamDemultiplexer {
     ///
     /// The control channel (stream_id = 0) receives session-level packets
     /// such as keepalives, migration signals, and stream management.
+    ///
+    /// Stream-id allocation defaults to the *server* role (even ids starting
+    /// at 2). Use [`StreamDemultiplexer::new_with_role`] when the calling side
+    /// is known at construction time.
     pub fn new(control_buffer: usize) -> (Self, mpsc::Receiver<Bytes>) {
+        Self::new_with_role(control_buffer, false)
+    }
+
+    /// Create a new demultiplexer with an explicit peer role.
+    ///
+    /// - `is_client = true`  → allocates **odd** ids (3, 5, 7, …)
+    /// - `is_client = false` → allocates **even** ids (2, 4, 6, …)
+    ///
+    /// Stream IDs 0 (control) and 1 (raw-app) are permanently reserved and
+    /// will never be returned by [`open_stream`](Self::open_stream).
+    pub fn new_with_role(control_buffer: usize, is_client: bool) -> (Self, mpsc::Receiver<Bytes>) {
         let (control_tx, control_rx) = mpsc::channel(control_buffer);
+        // client → first user-visible id = 3 (odd), server → 2 (even).
+        // Step is always 2 so parity is maintained for every subsequent call.
+        let first_id = if is_client { 3 } else { 2 };
         let mux = Self {
             streams: DashMap::new(),
             control_tx,
-            next_stream_id: AtomicU32::new(2), // 0 = control, 1 = raw-app session channel
+            first_stream_id: first_id,
+            next_stream_id: AtomicU32::new(first_id),
+            id_step: 2,
         };
         (mux, control_rx)
     }
@@ -72,22 +124,77 @@ impl StreamDemultiplexer {
     /// Register a new stream and get back a handle with the assigned ID.
     ///
     /// `buffer_size` controls the depth of the per-stream receive buffer.
-    pub fn open_stream(&self, buffer_size: usize) -> StreamHandle {
-        let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
+    ///
+    /// The allocated id respects the role set at construction time:
+    /// clients get odd ids (≥ 3), servers get even ids (≥ 2). Id 1 (the
+    /// raw-app stream) is never returned here.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::StreamError`] once this side's half of the 16-bit id space is
+    /// used up — every id of its parity up to [`LAST_STREAM_ID`] has been handed
+    /// out. Ids are never reused within a session, so this is permanent for the
+    /// session; nothing is registered and the allocator does not move.
+    pub fn open_stream(&self, buffer_size: usize) -> Result<StreamHandle, CoreError> {
+        let stream_id = self
+            .next_stream_id
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+                // `next + id_step` cannot overflow: `next` never moves past
+                // `LAST_STREAM_ID + id_step`, far below `u32::MAX`.
+                (next <= LAST_STREAM_ID).then_some(next + self.id_step)
+            })
+            .map_err(|_| {
+                CoreError::StreamError(
+                    "stream id space exhausted: this side has opened every stream id the \
+                     16-bit header can carry; open a new session"
+                        .into(),
+                )
+            })?;
+        let (tx, rx) = mpsc::channel(buffer_size);
+        self.streams.insert(stream_id, tx);
+        Ok(StreamHandle { stream_id, rx })
+    }
+
+    /// Move the allocator so the next id [`open_stream`](Self::open_stream) hands out is
+    /// `next`, as though every id of this side's parity below it had been opened — the way
+    /// a test reaches the top of the id space without opening thirty thousand streams.
+    #[cfg(test)]
+    pub(crate) fn skip_to_stream_id_for_test(&self, next: u32) {
+        assert!(
+            self.is_local_stream_id(next),
+            "{next} is not an id of this side's parity"
+        );
+        self.next_stream_id.store(next, Ordering::Release);
+    }
+
+    /// Register a stream with a specific ID (e.g., for accepting remote-initiated streams).
+    ///
+    /// Does **not** advance `next_stream_id`: the registered id belongs to the
+    /// remote peer (opposite parity) and has no bearing on our own allocation
+    /// sequence, which already cannot collide with it.
+    pub fn register_stream(&self, stream_id: u32, buffer_size: usize) -> StreamHandle {
         let (tx, rx) = mpsc::channel(buffer_size);
         self.streams.insert(stream_id, tx);
         StreamHandle { stream_id, rx }
     }
 
-    /// Register a stream with a specific ID (e.g., for accepting remote-initiated streams).
-    pub fn register_stream(&self, stream_id: u32, buffer_size: usize) -> StreamHandle {
-        let (tx, rx) = mpsc::channel(buffer_size);
-        self.streams.insert(stream_id, tx);
-        // Update next_stream_id if necessary to avoid collisions
-        let _ = self
-            .next_stream_id
-            .fetch_max(stream_id + 1, Ordering::Relaxed);
-        StreamHandle { stream_id, rx }
+    /// Whether `stream_id` is in the half of the id space this side allocates from — odd
+    /// for a client, even for a server. The reserved ids 0 and 1 belong to neither side.
+    ///
+    /// The peer can therefore never open such a stream: the only way one exists is that
+    /// this side opened it.
+    pub fn is_local_stream_id(&self, stream_id: u32) -> bool {
+        stream_id > 1 && stream_id % 2 == self.first_stream_id % 2
+    }
+
+    /// Whether [`open_stream`](Self::open_stream) has already handed out `stream_id`.
+    ///
+    /// Allocation only moves forward, so an id of this side's parity below the next one to
+    /// be handed out has been used, whether or not its stream is still open.
+    pub fn has_opened(&self, stream_id: u32) -> bool {
+        self.is_local_stream_id(stream_id)
+            && stream_id >= self.first_stream_id
+            && stream_id < self.next_stream_id.load(Ordering::Acquire)
     }
 
     /// Remove a stream from the routing table.
@@ -122,21 +229,31 @@ impl StreamDemultiplexer {
             return self.control_tx.send(payload).await.is_ok();
         }
 
-        if let Some(sender) = self.streams.get(&stream_id) {
-            sender.send(StreamMessage::Data(payload)).await.is_ok()
-        } else {
-            log::warn!(
-                "StreamDemultiplexer: dropping data for unknown stream_id={}",
-                stream_id
-            );
-            false
+        // Clone the per-stream `Sender` out and DROP the DashMap read guard BEFORE the
+        // (potentially blocking) `.await`. Holding a per-shard guard across the await
+        // would block any same-shard map write — `open_stream()` (a sync public API on
+        // the app thread) or the pump's `close_stream()` — for as long as this send is
+        // backpressured, which an unread peer-flooded stream can hold open indefinitely.
+        let sender = self.streams.get(&stream_id).map(|r| r.value().clone());
+        match sender {
+            Some(sender) => sender.send(StreamMessage::Data(payload)).await.is_ok(),
+            None => {
+                log::warn!(
+                    "StreamDemultiplexer: dropping data for unknown stream_id={}",
+                    stream_id
+                );
+                false
+            }
         }
     }
 
     /// Route an ACK signal to a stream **without blocking**. Returns
-    /// `false` if the stream is unknown or its buffer is full — the recv pump
-    /// uses this on its never-block path, where a vestigial/absent stream
-    /// consumer must not stall inbound ACK/control processing.
+    /// `false` if the stream is unknown or its buffer is full.
+    ///
+    /// The session's receive path does not call this. A stream's channel is bounded and
+    /// only its reader empties it, so acknowledgements queued there by a stream that is
+    /// only ever written to would fill it — and the session's delivery task, which serves
+    /// every stream in turn, would then wait on that stream's next data or EOF for good.
     pub fn route_ack(&self, stream_id: u32, seq: SequenceNumber) -> bool {
         if stream_id == 0 {
             return false;
@@ -166,14 +283,17 @@ impl StreamDemultiplexer {
             return false;
         }
 
-        if let Some(sender) = self.streams.get(&stream_id) {
-            sender.send(StreamMessage::Ack(seq)).await.is_ok()
-        } else {
-            log::warn!(
-                "StreamDemultiplexer: dropping ACK for unknown stream_id={}",
-                stream_id
-            );
-            false
+        // Drop the DashMap guard before the await (see route_data_async).
+        let sender = self.streams.get(&stream_id).map(|r| r.value().clone());
+        match sender {
+            Some(sender) => sender.send(StreamMessage::Ack(seq)).await.is_ok(),
+            None => {
+                log::warn!(
+                    "StreamDemultiplexer: dropping ACK for unknown stream_id={}",
+                    stream_id
+                );
+                false
+            }
         }
     }
 
@@ -183,14 +303,17 @@ impl StreamDemultiplexer {
             return false;
         }
 
-        if let Some(sender) = self.streams.get(&stream_id) {
-            sender.send(StreamMessage::Close).await.is_ok()
-        } else {
-            log::warn!(
-                "StreamDemultiplexer: dropping CLOSE for unknown stream_id={}",
-                stream_id
-            );
-            false
+        // Drop the DashMap guard before the await (see route_data_async).
+        let sender = self.streams.get(&stream_id).map(|r| r.value().clone());
+        match sender {
+            Some(sender) => sender.send(StreamMessage::Close).await.is_ok(),
+            None => {
+                log::warn!(
+                    "StreamDemultiplexer: dropping CLOSE for unknown stream_id={}",
+                    stream_id
+                );
+                false
+            }
         }
     }
 
@@ -213,7 +336,7 @@ mod tests {
     async fn test_demux_open_and_route() {
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
 
-        let handle = demux.open_stream(16);
+        let handle = demux.open_stream(16).expect("an id is free");
         let sid = handle.stream_id;
         let mut rx = handle.rx;
 
@@ -253,7 +376,7 @@ mod tests {
     async fn test_demux_close_stream() {
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
 
-        let handle = demux.open_stream(16);
+        let handle = demux.open_stream(16).expect("an id is free");
         let sid = handle.stream_id;
         assert!(demux.has_stream(sid));
 
@@ -262,16 +385,102 @@ mod tests {
         assert_eq!(demux.active_stream_count(), 0);
     }
 
+    /// Regression: a backpressured `route_data_async` (parked on a full per-stream
+    /// channel) must NOT hold the DashMap shard guard across its `.await`, or a
+    /// same-key map write (`close_stream` / `open_stream`) would deadlock — which
+    /// would let an unread, peer-flooded stream wedge `open_stream()` (a sync public
+    /// API) and the pump's `close_stream`. With the guard-held-across-await bug this
+    /// test times out; with the clone-then-drop fix `close_stream` returns promptly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backpressured_route_data_async_does_not_block_same_key_map_write() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
+        let demux = Arc::new(demux);
+
+        // Stream id=2 with a single-slot channel whose consumer never reads.
+        let handle = demux.register_stream(2, 1);
+        let _rx_never_read = handle.rx; // keep the channel open but undrained
+        assert!(demux.route_data_async(2, Bytes::from_static(b"fill")).await); // fills the slot
+
+        // A second async send blocks forever on the full channel (consumer idle).
+        let d_parked = demux.clone();
+        let parked =
+            tokio::spawn(
+                async move { d_parked.route_data_async(2, Bytes::from_static(b"x")).await },
+            );
+        tokio::time::sleep(Duration::from_millis(50)).await; // let it reach the .await
+
+        // Same-key DashMap write must not be blocked by the parked send.
+        let d_close = demux.clone();
+        let closed = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || d_close.close_stream(2)),
+        )
+        .await;
+        assert!(
+            closed.is_ok(),
+            "close_stream(2) deadlocked behind a backpressured route_data_async on the same stream"
+        );
+        parked.abort();
+    }
+
     #[tokio::test]
     async fn test_demux_multiple_streams() {
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
 
-        let h1 = demux.open_stream(16);
-        let h2 = demux.open_stream(16);
-        let h3 = demux.open_stream(16);
+        let h1 = demux.open_stream(16).expect("an id is free");
+        let h2 = demux.open_stream(16).expect("an id is free");
+        let h3 = demux.open_stream(16).expect("an id is free");
 
         assert_ne!(h1.stream_id, h2.stream_id);
         assert_ne!(h2.stream_id, h3.stream_id);
         assert_eq!(demux.active_stream_count(), 3);
+    }
+
+    /// Each side hands out its own parity up to the last id the 16-bit header can carry,
+    /// and then refuses — for good — rather than counting on.
+    ///
+    /// The allocator counted in 32 bits and never stopped, while the id travels as 16: the
+    /// client's id after 65535 was 65537, which goes on the wire as 1, the reserved raw
+    /// application stream, and every id after that lands on one this side has already
+    /// used. The peer then merges the new stream into the old one, or acknowledges and
+    /// discards it, and nothing reports either.
+    #[tokio::test]
+    async fn allocation_stops_at_the_top_of_the_16_bit_id_space() {
+        for (is_client, last) in [(true, LAST_STREAM_ID), (false, LAST_STREAM_ID - 1)] {
+            let (demux, _ctrl) = StreamDemultiplexer::new_with_role(16, is_client);
+            // 32 767 ids for either side, 0 and 1 being reserved.
+            assert_eq!((last - demux.first_stream_id) / 2 + 1, 32_767);
+
+            demux.skip_to_stream_id_for_test(last - 2);
+            let below = demux.open_stream(1).expect("an id below the top");
+            let top = demux.open_stream(1).expect("the top id itself");
+            assert_eq!((below.stream_id, top.stream_id), (last - 2, last));
+            assert_eq!(u32::from(top.stream_id as StreamId), top.stream_id);
+
+            for attempt in 0..3 {
+                match demux.open_stream(1) {
+                    Err(CoreError::StreamError(_)) => {}
+                    Ok(past) => panic!(
+                        "attempt {attempt}: allocated {} past the top of the id space; it \
+                         goes on the wire as {}",
+                        past.stream_id, past.stream_id as StreamId
+                    ),
+                    Err(other) => panic!("attempt {attempt}: refused with {other:?}"),
+                }
+            }
+            assert_eq!(
+                demux.active_stream_count(),
+                2,
+                "a refused open registers nothing"
+            );
+            assert!(demux.has_opened(last), "the top id was handed out");
+            assert!(
+                !demux.has_opened(last + 2),
+                "a refused open does not count as an id handed out"
+            );
+        }
     }
 }

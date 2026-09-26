@@ -6,9 +6,10 @@
 // connection-state surfacing, and reconnect-with-0-RTT on a network change.
 //
 // Note: the "Call migrate() API" button exercises PhantomSession.migrate(...)
-// for API-completeness only — it is a no-op over the TCP transport exposed by
-// connectPinned. The working recovery pattern is the "Reconnect (0-RTT)" button
-// (and the automatic NetworkPathMonitor handler).
+// for API-completeness only — over the TCP transport it returns Unsupported.
+// The working recovery pattern on TCP is the "Reconnect (0-RTT)" button
+// (and the automatic NetworkPathMonitor handler). For real seamless migration
+// use connectPinnedUdp and call migrate() from the network-change callback.
 //
 // All networking lives in PhantomDemoKit's PhantomChatViewModel; this file is
 // just the view layer.
@@ -77,7 +78,7 @@ struct ContentView: View {
                     Button {
                         Task { await viewModel.callMigrateAPI(to: "0.0.0.0:0") }
                     } label: {
-                        Label("Call migrate() API (no-op over TCP)",
+                        Label("Call migrate() API (TCP → Unsupported)",
                               systemImage: "arrow.triangle.2.circlepath")
                     }
                     .disabled(!viewModel.isConnected || viewModel.isBusy)
@@ -109,12 +110,17 @@ struct ContentView: View {
 
     private var bannerColor: Color {
         switch viewModel.state {
-        case .connected, .pqcReady:
+        case .connected:
             return .green
-        case .classicalReady, .pqcUpgrading, .connecting:
+        case .connecting:
             return .yellow
         case .migrating:
             return .orange
+        // The peer has announced its close and the pump is draining what is
+        // already in flight. Reads still land; writes are refused. Amber says
+        // "ending", which is what it is.
+        case .draining:
+            return .yellow
         case .failed, .dead:
             return .red
         case .closed:

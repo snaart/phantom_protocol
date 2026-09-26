@@ -617,7 +617,7 @@ Each row is one atomic commit. Each commit compiled and passed `cargo test
 
 | # | Step | Commit subject | Status | SHA |
 |---|------|---------------|--------|-----|
-| 1 | Doc plan committed | `docs(observability): OTel refactor working plan` | [x] | `5db2fbc` |
+| 1 | Doc plan committed | `docs(observability): OTel refactor working plan` | [x] | `e7290a7` |
 | 2 | Module scaffold + feature gate | `observability: scaffold module + ObservabilityConfig (no OTel deps yet)` | [x] | `e59a1f1` |
 | 3 | HotPathAtomics + per-leg arrays + CachePadded | `observability: lock-free HotPathAtomics with per-leg padding` | [x] | `02af467` |
 | 4 | Migrate recording sites from old TransportMetrics | `observability: migrate handshake/listener recording sites` | [x] | `f266415` |

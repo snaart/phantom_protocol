@@ -1,9 +1,9 @@
 [package]
 name = "phantom-protocol"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.93"
-description = "Post-quantum-secure L4/L6 universal transport framework — hybrid X25519+ML-KEM-768 / Ed25519+ML-DSA-65, multi-path, UniFFI bindings"
+description = "Post-quantum-secure L4/L6 universal transport framework — hybrid X25519+ML-KEM-768 / Ed25519+ML-DSA-65, reliable UDP with connection migration, UniFFI bindings"
 license = "Apache-2.0"
 repository = "https://github.com/snaart/phantom_protocol"
 documentation = "https://docs.rs/phantom-protocol"
@@ -46,11 +46,18 @@ default = ["compression-zstd", "std", "bindings", "classical-crypto"]
 bindings = ["std", "dep:uniffi"]
 
 # `uniffi-cli` (SUPPLY-01): the codegen-only surface. Adds uniffi's `cli`
-# feature (which drags in `clap` / `cargo_metadata` / `tempfile`) and is the
-# `required-features` for the `uniffi-bindgen` binary. Kept OUT of `bindings`
-# so a normal lib / server / mobile build links the FFI scaffolding WITHOUT the
-# build-time CLI dependency tree. The `tests/bindings/generate_*.sh` scripts
-# enable it when they regenerate the language bindings.
+# feature and is the `required-features` for the `uniffi-bindgen` binary, kept
+# OUT of `bindings` so a normal lib / server / mobile build does not link the
+# codegen CLI. The `tests/bindings/generate_*.sh` scripts enable it when they
+# regenerate the language bindings.
+#
+# What that actually buys, checked with `cargo tree -i <crate> -e normal` rather
+# than assumed: **`clap` only.** An earlier version of this comment named
+# `clap` / `cargo_metadata` / `tempfile` together as the tree this feature keeps
+# out; two of the three are in a default build regardless, because `uniffi`
+# itself depends on `cargo_metadata` and its `uniffi_pipeline` on `tempfile`
+# outside the `cli` feature. Narrowing supply-chain surface here means moving
+# them upstream or dropping `uniffi`, not toggling this flag.
 uniffi-cli = ["bindings", "uniffi/cli"]
 
 # `std` (Phase 3.6): the standard "everything on" build. Pulls every std-bound
@@ -220,11 +227,21 @@ serde = { version = "1", default-features = false, features = ["derive", "alloc"
 # frozen by `core/tests/wire_vectors.rs` (and the transcript hash by
 # `transport::handshake::tests::transcript_hash_wire_vector`). A patch/minor bump
 # to `borsh` can silently shift the handshake bytes and break interop with no
-# `WIRE_VERSION` change, so it is pinned to an exact version — bump it only as a
-# deliberate wire change, paired with a vector regeneration.
-borsh = { version = "=1.7.0", default-features = false, optional = true, features = ["derive"] }
+# `WIRE_VERSION` change, so it is pinned to an exact version — bump it only after
+# the vectors have been run against the new version, and treat a shifted byte as
+# a wire change rather than a bump.
+#
+# 1.7.0 -> 1.8.1 was taken that way and shifted nothing: `wire_vectors` (16),
+# its independent Python decoder (21 assertions), `transcript_hash_wire_vector`,
+# `nist_kat` (6) and `cavp` (5) all passed against the committed fixtures with
+# no regeneration. That is the evidence the pin exists to demand, and it is
+# what distinguishes this bump from a wire change — not the size of the version
+# jump. The fixtures were **not** regenerated, deliberately: a regenerated
+# vector proves the encoder agrees with itself, where an unchanged one proves
+# the bytes are the same as the ones the published release emits.
+borsh = { version = "=1.8.1", default-features = false, optional = true, features = ["derive"] }
 hex = { version = "0.4", default-features = false, optional = true, features = ["alloc"] }
-base64 = { version = "0.22", default-features = false, optional = true, features = ["alloc"] }
+base64 = { version = "0.23", default-features = false, optional = true, features = ["alloc"] }
 anyhow = { version = "1", optional = true }
 thiserror = { version = "2", optional = true }
 log = { version = "0.4", optional = true }
@@ -242,8 +259,8 @@ subtle = { version = "2.5", default-features = false, optional = true }  # Const
 tracing = { version = "0.1", optional = true }  # Structured spans / events for observability (Phase 4.5)
 
 # --- Crypto (std-only) ---
-x25519-dalek = { version = "2", optional = true, features = ["static_secrets", "zeroize"] }
-ed25519-dalek = { version = "2", optional = true, features = ["zeroize", "rand_core"] }
+x25519-dalek = { version = "3", optional = true, features = ["static_secrets", "zeroize"] }
+ed25519-dalek = { version = "3", optional = true, features = ["zeroize", "rand_core"] }
 ring = { version = "0.17", optional = true }  # HW-accelerated AES-GCM (ARM64 AES intrinsics / x86 AES-NI) + ChaCha20-Poly1305
 # --- Header protection (QUIC RFC 9001 §5.4) primitives, T4.6 ---
 # Raw AES-256-ECB single-block (`aes::Aes256`) + ChaCha20 keystream
@@ -287,11 +304,11 @@ getrandom = { version = "0.4", optional = true }
 bitflags = { version = "2.13", optional = true }
 parking_lot = { version = "0.12", optional = true }  # Fast mutex for buffer pool
 arc-swap = { version = "1", optional = true }        # Lock-free atomic swap for the CryptoState rekey path (Phase 1.5)
-lz4_flex = { version = "0.13.1", optional = true }   # Fastest pure-Rust LZ4 (safe, no C bindings); >=0.13.1 floor avoids yanked 0.11.5 (RUSTSEC-2026-0041)
+lz4_flex = { version = "0.14", optional = true }   # Fastest pure-Rust LZ4 (safe, no C bindings); >=0.13.1 floor avoids yanked 0.11.5 (RUSTSEC-2026-0041)
 # zstd pinned to a release version. Optional (gated by `compression-zstd`
 # feature) so WASM / embedded builds can opt out of the C bindings in
 # zstd-sys, falling back to lz4_flex.
-zstd = { version = "0.13", optional = true }
+zstd = { version = "0.14", optional = true }
 
 # --- Networking ---
 # TCP/UDP-using crates are non-wasm-only (Phase 3.5). Moved to the
@@ -299,9 +316,9 @@ zstd = { version = "0.13", optional = true }
 time = { version = "0.3", optional = true }
 
 # --- FFI ---
-uniffi = { version = "0.31", optional = true, features = ["tokio"] }
+uniffi = { version = "0.32", optional = true, features = ["tokio"] }
 zeroize = { version = "1.8.2", optional = true, features = ["derive"] }
-argon2 = { version = "0.5.3", optional = true }
+argon2 = { version = "0.6", optional = true }
 crossbeam-queue = { version = "0.3.12", optional = true }
 crossbeam-utils = { version = "0.8", optional = true }  # CachePadded for observability hot-path atomics
 
@@ -323,12 +340,13 @@ dashmap = { version = "6.1.0", optional = true }
 # link-time `critical-section` impl). The crate MSRV is now 1.93, so the prior
 # `async-lock < 3.4` cap (held only for the old 1.75 MSRV — 3.4 needs 1.85) is
 # dropped. `embedded-io-async` is at 0.7 (was 0.6): the 0.7 bump made
-# `Write::flush` a required method, which only touched the test mock writers.
+# `Write::flush` a required method — every in-tree `impl Write` (unit-test mocks
+# *and* `core/examples/embedded_demo.rs`) must define it.
 embedded-io-async = { version = "0.7", optional = true }
 async-lock = { version = ">=3, <4", optional = true, default-features = false }
 
 [build-dependencies]
-uniffi = { version = "0.31", features = ["build"] }
+uniffi = { version = "0.32", features = ["build"] }
 
 # ─── Native (non-wasm32) dependencies (Phase 3.5) ────────────────────────
 # TCP/UDP transport legs and raw sockets live here. wasm32 builds
@@ -354,15 +372,6 @@ socket2 = { version = "0.6", optional = true }
 # (AWS-LC-FIPS 3.0.x) as the sole backend. Listing both `aws-lc-sys`
 # and `fips` would attempt to enable both backends and bloat the link.
 aws-lc-rs = { version = "1.17", optional = true, default-features = false, features = ["fips"] }
-
-# ─── Linux-only dependencies ──────────────────────────────────────────────
-# `libc` backs the Linux UDP fast paths in `transport/udp_transport` — the
-# `SO_MAX_PACING_RATE` pacing offload (`setsockopt`) and the `sendmmsg` batch
-# send — all gated on `cfg(target_os = "linux")`. Declared in a Linux-only
-# target block so the direct dependency edge matches the only place the code
-# names `libc::`; macOS / Windows / wasm / WASI builds never pull it here.
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
 
 # ─── Browser-WASM-only dependencies (Phase 3.3) ───────────────────────────
 # Pulled in only for `wasm32-unknown-unknown` builds (the browser target).
@@ -420,9 +429,9 @@ wasi = { version = "0.14", optional = true }
 
 [dev-dependencies]
 blake3 = "1.5"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-rand = "0.8"
-uniffi = { version = "0.31", features = ["bindgen-tests"] }
+ed25519-dalek = { version = "3", features = ["rand_core"] }
+rand = { version = "0.10", features = ["sys_rng"] }
+uniffi = { version = "0.32", features = ["bindgen-tests"] }
 criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
 tokio-test = "0.4"
 proptest = "1"  # property-based testing harness
@@ -484,4 +493,25 @@ required-features = ["classical-crypto"]
 
 [lib]
 name = "phantom_protocol"
+# `lib`       — the rlib every Rust consumer (cli/, server/, benches) links.
+# `cdylib`    — the UniFFI delivery vehicle: libphantom_protocol.{so,dylib,dll},
+#               loaded by the Python / Kotlin / C bindings.
+#
+# `staticlib` is deliberately NOT listed. The iOS XCFramework flow does need a
+# `libphantom_protocol.a`, but a `staticlib` is a *final* artifact, so adding it
+# here makes cargo demand a `#[panic_handler]` and a `#[global_allocator]` on
+# bare-metal targets — which this library does not (and must not) provide, since
+# the embedder supplies them. It breaks the `thumbv7em-none-eabihf` row of
+# cross.yml outright:
+#
+#     error: no global memory allocator found but one is required
+#     error: `#[panic_handler]` function required, but not found
+#
+# The archive is therefore produced on demand, per target, without perturbing
+# the manifest or any other build:
+#
+#     cargo rustc --manifest-path core/Cargo.toml --release \
+#         --target aarch64-apple-ios --crate-type staticlib
+#
+# That is what `tests/bindings/swift/build-xcframework.sh` runs.
 crate-type = ["lib", "cdylib"]

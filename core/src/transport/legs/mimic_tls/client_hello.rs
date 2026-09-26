@@ -380,11 +380,15 @@ mod tests {
     use super::*;
     use crate::crypto::rng::OsRng;
 
-    /// Minimal independent re-parser: walk the ClientHello and return
+    /// What [`reparse`] recovers from a ClientHello:
     /// `(cipher_suites, supported_groups, key_share_groups, legacy_session_id,
-    /// extension_types)`. Returns `None` on any structural inconsistency — so a
-    /// passing parse proves every length field is internally consistent.
-    fn reparse(msg: &[u8]) -> Option<(Vec<u16>, Vec<u16>, Vec<u16>, Vec<u8>, Vec<u16>)> {
+    /// extension_types)`.
+    type Reparsed = (Vec<u16>, Vec<u16>, Vec<u16>, Vec<u8>, Vec<u16>);
+
+    /// Minimal independent re-parser: walk the ClientHello and return the
+    /// [`Reparsed`] view of it. Returns `None` on any structural inconsistency —
+    /// so a passing parse proves every length field is internally consistent.
+    fn reparse(msg: &[u8]) -> Option<Reparsed> {
         let mut p = Parser::new(msg);
         if p.u8()? != HS_TYPE_CLIENT_HELLO {
             return None;
@@ -475,7 +479,7 @@ mod tests {
         }
     }
     fn u16s(b: &[u8]) -> Option<Vec<u16>> {
-        if b.len() % 2 != 0 {
+        if !b.len().is_multiple_of(2) {
             return None;
         }
         Some(

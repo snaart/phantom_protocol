@@ -12,12 +12,19 @@
 //!    `drive` / `poll_until_progress` loop. Proves the runtime + leg
 //!    composition is sound end-to-end (the gap the original PR
 //!    review called out).
+//!  - `stall` — the host accepts the connection and never reads it. The
+//!    guest writes until a write fails, and that failure has to be the
+//!    leg's `Timeout` rather than a wait that never ends; the write after
+//!    it has to be refused the same way.
 //!
 //! Exit codes:
 //!  - `0` — success (stderr emits an `OK:` marker the host asserts on)
 //!  - `2` — payload mismatch
 //!  - `3` — I/O error in the runtime-mode future
 //!  - `4` — runtime drained but task handle not finished (executor bug)
+//!  - `5` — stall mode: every write succeeded, so nothing was ever stalled
+//!  - `6` — stall mode: a write failed, but not with `Timeout`
+//!  - `7` — stall mode: a write after the stall was not refused with `Timeout`
 //!
 //! The PhantomSession layer is not exercised — that requires a full
 //! handshake which lives behind tokio. The point of this fixture is
@@ -43,14 +50,61 @@ fn main() {
     let mode = std::env::var("PHANTOM_MODE").unwrap_or_default();
     match mode.as_str() {
         "runtime" => run_with_runtime(addr),
+        "stall" => run_against_a_peer_that_never_reads(addr),
         _ => run_with_block_on(addr),
     }
 }
 
+/// Stall path: the host never reads, so the socket buffers fill and a write
+/// has to wait on it. The leg must give up on that write with `Timeout` once
+/// it has made no progress for its deadline, instead of blocking the instance
+/// forever, and must then refuse the next write rather than append it to the
+/// frame the stalled one cut off.
+fn run_against_a_peer_that_never_reads(addr: SocketAddr) {
+    use phantom_protocol::CoreError;
+    use std::time::Duration;
+
+    /// 64 MiB in all: far more than loopback socket buffers hold, so the
+    /// writes cannot all complete without the host reading. The frames stay
+    /// at 4 KiB so the run also means something against a leg that writes
+    /// through the blocking stream call, which takes at most 4096 bytes.
+    const MAX_FRAMES: usize = 16 * 1024;
+
+    let leg = WasiLeg::connect(addr)
+        .expect("WasiLeg::connect (stall mode)")
+        .with_write_stall_timeout(Duration::from_millis(500));
+    let frame = vec![0xA5_u8; 4 * 1024];
+    let mut sent = 0usize;
+    let failure = loop {
+        match futures::executor::block_on(leg.send_bytes(&frame)) {
+            Ok(()) if sent < MAX_FRAMES => sent += 1,
+            Ok(()) => {
+                eprintln!("NEVER STALLED: {sent} frames of 4 KiB all went out");
+                std::process::exit(5);
+            }
+            Err(e) => break e,
+        }
+    };
+    if !matches!(failure, CoreError::Timeout) {
+        eprintln!("WRONG ERROR: the stalled write failed with {failure:?}");
+        std::process::exit(6);
+    }
+    match futures::executor::block_on(leg.send_bytes(b"after the stall")) {
+        Err(CoreError::Timeout) => {}
+        other => {
+            eprintln!("NOT REFUSED: the write after the stall gave {other:?}");
+            std::process::exit(7);
+        }
+    }
+    eprintln!("OK: a write the host never read failed with Timeout after {sent} frames");
+}
+
 /// Default path: drive `WasiLeg` via `futures::executor::block_on`.
-/// `WasiLeg`'s `SessionTransport` futures resolve synchronously
-/// because the WASI Preview 2 `blocking_*` stream calls park the
-/// instance host-side, so no real executor work is needed.
+/// `WasiLeg`'s `SessionTransport` futures resolve on their first poll,
+/// because the leg parks the instance host-side for every wait it makes —
+/// `blocking_read` for a read, and for a write a `wasi:io/poll` on the
+/// output stream's readiness together with the write-stall timer — so no
+/// real executor work is needed.
 fn run_with_block_on(addr: SocketAddr) {
     let leg = WasiLeg::connect(addr).expect("WasiLeg::connect (block_on mode)");
 
@@ -107,11 +161,12 @@ fn run_with_runtime(addr: SocketAddr) {
         }
     }));
 
-    // Drive until the spawned task drains out of the queue. WASI
-    // `blocking_*` calls inside the future cause `drive()` to do the
-    // real work synchronously; `poll_until_progress` is the watchdog
-    // that keeps the loop from spin-busy-waiting on a future that
-    // returns `Pending` without registering a Pollable.
+    // Drive until the spawned task drains out of the queue. The leg's
+    // waits — `blocking_read` on a read, a `wasi:io/poll` on the output
+    // stream and the stall timer on a write — happen inside the future, so
+    // `drive()` does the real work synchronously; `poll_until_progress` is
+    // the watchdog that keeps the loop from spin-busy-waiting on a future
+    // that returns `Pending` without registering a Pollable.
     while rt.tasks_pending() > 0 {
         rt.drive();
         rt.poll_until_progress(Duration::from_millis(100));

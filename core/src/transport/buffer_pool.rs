@@ -5,10 +5,12 @@
 //! hot acquire/return path usually stays thread-local and contention-free, spilling
 //! to the global queue only in batches.
 //!
-//! Used by the low-level `transport::udp_transport` socket helper and the
-//! `buffer_pool_bench`. NOTE: the production `SessionTransport`-level recv path
-//! (`TcpSessionTransport`) uses a persistent `BytesMut` accumulator instead, so
-//! this pool is the alternate / lower-level path rather than the main data plane.
+//! Not wired to the data path: the only caller left is `buffer_pool_bench`. The
+//! production `SessionTransport`-level recv paths own their receive storage
+//! directly — `TcpSessionTransport` keeps a persistent `BytesMut` accumulator and
+//! the PhantomUDP transports a per-task datagram buffer — so nothing in the crate
+//! acquires from this pool. Its former user was a low-level socket helper that has
+//! since been removed.
 
 use crossbeam_queue::ArrayQueue;
 use std::cell::RefCell;
@@ -279,6 +281,6 @@ mod tests {
         .unwrap();
 
         // global pool should have received the flushed buffers
-        assert!(pool.buffers.len() > 0);
+        assert!(!pool.buffers.is_empty());
     }
 }

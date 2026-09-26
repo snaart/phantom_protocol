@@ -13,7 +13,7 @@
 //! module is the per-frame, fault-injecting `SessionTransport` wrapper that the
 //! loss-recovery tests actually drive.
 
-use rand::Rng;
+use rand::RngExt;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -139,7 +139,7 @@ impl NetworkSimulator {
         if jitter_ms == 0 {
             return base;
         }
-        let extra = rand::rngs::OsRng.gen_range(0..=jitter_ms);
+        let extra = rand::rng().random_range(0..=jitter_ms);
         base + Duration::from_millis(extra as u64)
     }
 
@@ -176,7 +176,7 @@ impl NetworkSimulator {
         if loss >= 100 {
             return true;
         }
-        rand::rngs::OsRng.gen::<u32>() % 100 < loss
+        rand::rng().random::<u32>() % 100 < loss
     }
 
     // === Bandwidth Limit ===

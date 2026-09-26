@@ -15,7 +15,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-phantom_protocol = { version = "0.2", default-features = false, features = ["std", "wasi-leg"] }
+phantom-protocol = { version = "0.3", default-features = false, features = ["std", "wasi-leg", "classical-crypto"] }
 futures = { version = "0.3", default-features = false, features = ["executor"] }
 
 [[bin]]
@@ -37,9 +37,10 @@ fn main() {
     let addr: SocketAddr = "127.0.0.1:4242".parse().unwrap();
     let leg = WasiLeg::connect(addr).expect("WasiLeg::connect");
 
-    // SessionTransport's async fns block via WASI Preview 2's
-    // `wasi:io/streams::blocking_*` under the hood, so the futures
-    // resolve as soon as they are polled.
+    // WasiLeg's SessionTransport futures block the instance inside the
+    // call — a read through `wasi:io/streams::blocking-read`, a write
+    // through `wasi:io/poll` on the stream's readiness and a stall timer —
+    // so they resolve as soon as they are polled.
     futures::executor::block_on(leg.send_bytes(b"hello")).unwrap();
     let echo = futures::executor::block_on(leg.recv_bytes()).unwrap();
     assert_eq!(&echo[..], b"hello");
@@ -67,7 +68,7 @@ The Cargo feature itself implies `std`; it is mutually exclusive with
 the `WebSocketLeg` + `WasmRuntime` surface that the browser path
 already provides.
 
-## Why `--no-default-features --features std,wasi-leg`?
+## Why `--no-default-features --features std,wasi-leg,classical-crypto`?
 
 The `bindings` Cargo feature (default-on) pulls in UniFFI's
 `setup_scaffolding!` and the `#[uniffi::export]` derives that the
@@ -75,10 +76,12 @@ native Swift / Kotlin / Python / C bindings consume. UniFFI's
 exported-symbol metadata is incompatible with `wasm-component-ld`
 (the wasm32-wasip2 linker — it expects a Wasm component, not a
 bag of named exports). WASI guests therefore drop `bindings` and
-re-add only the features they need:
+re-add only the features they need. `classical-crypto` must be named
+explicitly — it is deliberately not implied by `std` so a FIPS build can
+drop `ring` / `x25519-dalek`:
 
 ```toml
-phantom_protocol = { ..., default-features = false, features = ["std", "wasi-leg"] }
+phantom-protocol = { ..., default-features = false, features = ["std", "wasi-leg", "classical-crypto"] }
 ```
 
 The `bindings` feature is irrelevant inside a WASI guest anyway —
@@ -129,7 +132,7 @@ These are deliberate omissions, not bugs:
   `start_listen` / `finish_listen` / `accept` exist; wiring them to
   `PhantomListener` requires a `WasiListener` mirror that doesn't
   exist yet; running `phantom-server` as a WASI guest is deliberately
-  deferred.
+  deferred (see `docs/DEFERRED_WORK.md` §3).
 - **Full `PhantomSession` over `WasiLeg`.** The host integration
   test exercises `WasiLeg::connect / send / recv`, not a complete
   handshake. The session machinery needs

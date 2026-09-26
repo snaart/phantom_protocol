@@ -25,26 +25,29 @@ adversary doesn't already have.
 
 ### Cookie validation (Class A)
 
-`core/src/transport/handshake.rs` — `verify_cookie`. The cookie is
-an HMAC-SHA-256 tag bound to client IP + port + a rotating time-bucket secret.
-Validation accepts either the current bucket or the previous bucket
-(sliding-window freshness).
+`core/src/transport/handshake.rs` — `validate_cookie` (reached from
+`cookie_pow_gate`). The cookie is an HMAC-SHA-256 tag over the client IP
+string and the 5-minute bucket index, keyed by an hour-rotating secret
+derived from the listener's master secret. Validation accepts any of the
+2×2 combinations of (current/previous hour) × (current/previous bucket).
 
 Discipline:
-- Each `cookie == expected_for_bucket` performed via
+- Each `cookie == expected_for_(hour, bucket)` performed via
   `cookie.ct_eq(&expected)` returning a `subtle::Choice`.
-- Accept signal is **accumulated** as `accept |= cookie.ct_eq(...)` over both
-  buckets. The function never branches on a per-bucket result, never
-  short-circuits, and always evaluates HMACs for **both** buckets.
-- Final conversion: `accept.into()` (`Choice` → `bool`) happens once at the
-  return.
+- Accept signal is **accumulated** as `accept |= cookie.ct_eq(...)` over all
+  four candidates. The function never branches on a per-candidate result,
+  never short-circuits, and always evaluates all four HMACs.
+- Final conversion: `bool::from(accept)` (`Choice` → `bool`) happens once at
+  the return.
 
 Compliance: ✅ class A satisfied.
 
 ### Path-validation challenge response (Class A)
 
-`core/src/transport/path.rs` — `Session::complete_path_validation`.
-The 32-byte challenge is server-issued and unique per `(path_id, session)`.
+`core/src/transport/path.rs` — `PathRegistry::verify_response`, reached
+from `Session::complete_path_validation` (`core/src/transport/session.rs`),
+which delegates to it. The 32-byte challenge is server-issued and unique per
+`(path_id, session)`.
 The response from the peer is attacker-controllable.
 
 Discipline:
@@ -56,20 +59,22 @@ Compliance: ✅ class A satisfied.
 
 ### PoW solution verification (Class A)
 
-`core/src/crypto/pow.rs` — `Challenge::verify`. Solution is attacker-
+`core/src/crypto/pow.rs` — `PoWChallenge::verify`. Solution is attacker-
 controllable (the client submits it).
 
 Discipline:
-- The PoW invariant is "leading zero bits of HMAC-SHA-256(secret || client_id
-  || solution) ≥ difficulty". The hash is computed in full regardless of the
-  result; the zero-bit count is evaluated by reading bytes left-to-right and
-  comparing each byte to `0u8`. The early termination happens on a non-zero
-  byte, but the loop bound is `difficulty / 8 + 1` — which is determined by
-  the **server's** policy, not the attacker. No secret bytes (key material)
-  flow into the loop counter.
+- The PoW invariant is "leading zero bits of `BLAKE3(nonce ‖ solution_le)`
+  ≥ difficulty" — an **unkeyed** hash over public inputs. The hash is
+  computed in full regardless of the result; the zero-bit count
+  (`check_leading_zeros`, same file) reads bytes left-to-right and stops at
+  the first non-zero byte, so its running time depends on the hash value.
+  That value is a public function of the challenge nonce and the
+  attacker's own solution — the attacker can compute it offline — so the
+  early exit reveals nothing the attacker does not already hold. No secret
+  bytes flow into the loop.
 
-Compliance: ✅ class A satisfied. (The early-exit is on `difficulty`, a
-public server policy parameter; not on a secret.)
+Compliance: ✅ class A satisfied. (The early exit depends on the unkeyed
+hash of public inputs, not on a secret.)
 
 ### PoW challenge-integrity MAC (Class A) — CRYPTO-2/HS-04
 
@@ -84,6 +89,23 @@ Discipline:
   many leading MAC bytes a guess matched).
 
 Compliance: ✅ class A satisfied (since CRYPTO-2/HS-04).
+
+### 0-RTT resumption binder (Class A)
+
+`core/src/transport/handshake.rs` — `HandshakeServer::has_valid_resume`
+and the 0-RTT resume fast path at the top of
+`HandshakeServer::process_client_hello` (the closure that builds `resumed`)
+compare the client-supplied `ClientHello.resumption_binder` against
+`derive_resumption_binder(secret, rid, nonce)` (a free function in the same
+file), which is keyed by the cached 32-byte resumption secret. The presented
+binder is fully attacker-controllable.
+
+Discipline:
+- `bool::from(presented.ct_eq(&expected))` via `subtle::ConstantTimeEq`.
+- No short-circuit before the compare; a mismatch simply yields "no
+  resume" and the ticket is left untouched (Security Invariant 9).
+
+Compliance: ✅ class A satisfied.
 
 ### Server-identity pinning (Class C)
 
@@ -105,13 +127,15 @@ Compliance: ✅ class C — plain `derive(PartialEq)` is correct.
 ### AEAD tag verification
 
 `core/src/crypto/adaptive_crypto.rs` — `CryptoSession::decrypt*` delegates
-to `ring::aead::LessSafeKey::open_in_place`. ring guarantees constant-time
-tag comparison for AES-256-GCM and ChaCha20-Poly1305 on supported platforms
-(AES-NI / ARMv8 crypto extensions / portable bitsliced ChaCha).
+to `ring::aead::LessSafeKey::open_in_place` on the default build and to
+`aws_lc_rs::aead` under `--features fips` (the fips build is ring-free).
+Both guarantee constant-time tag comparison for AES-256-GCM — and, on the
+default build, ChaCha20-Poly1305 — on supported platforms (AES-NI / ARMv8
+crypto extensions / portable bitsliced ChaCha).
 
-`core/src/crypto/aes_session.rs` — same ring backing.
+`core/src/crypto/aes_session.rs` — same backing.
 
-Compliance: ✅ delegated to ring (audited upstream).
+Compliance: ✅ delegated to ring / aws-lc-rs (both audited upstream).
 
 ### Hybrid signature verification
 
@@ -124,18 +148,21 @@ Compliance: ✅ delegated to ed25519-dalek + ml-dsa (audited upstream).
 
 ### Replay-window bitmap lookups
 
-`core/src/security/replay_window.rs` — bitmap operations on per-stream
-sequence numbers. Sequence numbers are **not secret** (they're sent in the
-header AAD). No CT requirement.
+`core/src/security/replay_window.rs` — bitmap operations on the single
+per-direction u64 **packet number** (`WINDOW_BITS = 1024`, RFC 4303
+§3.4.3). Packet numbers are **not secret** — they are covered by the AEAD
+AAD and recoverable from the header once header protection is stripped.
+No CT requirement.
 
-Compliance: N/A — sequence numbers are public.
+Compliance: N/A — packet numbers are public.
 
 ### Session ID compares
 
 `core/src/api/session.rs` / `core/src/transport/handshake.rs` — `SessionId`
-is `[u8; 32]` (32 bytes). After establishment, the session ID is exchanged
-in cleartext per packet (in the `PacketHeader`). It is **not** a
-confidentiality secret — it's a routing identifier.
+(defined in `core/src/transport/types.rs`) is `[u8; 32]`. Since WIRE v5 it
+is **never transmitted**: it is bound into the 47-byte AEAD AAD image only,
+and the receiver fills it from session context before the AEAD open. It is a routing/context identifier, not a
+confidentiality secret, and both peers already hold it.
 
 Compliance: ✅ class C — plain `==` is correct.
 
@@ -153,8 +180,9 @@ None at the time of writing — all known secret comparisons go through
 
 1. A new wire field is introduced that involves a secret (e.g., 0-RTT
    replay-window keys in Phase 4.1, ML-DSA-NN per-context signing keys).
-2. A new primitive backend is added (e.g., `aws-lc-rs` for FIPS) — verify
-   the new backend's CT guarantees.
+2. A new primitive backend is added. The `aws-lc-rs` FIPS backend has
+   already landed and is covered above; any further backend must be
+   re-classified here.
 3. Any `==` is added in `core/src/crypto/` or `core/src/security/` — the
    reviewer must classify it per the table above.
 

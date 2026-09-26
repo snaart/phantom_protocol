@@ -1,10 +1,17 @@
 //! End-to-end UDP integration for `PhantomUdpListener` <-> `PhantomSession` over `UdpClientTransport`.
 //! `#[ignore]`-gated (run with `-- --ignored`).
 
+// Tests `.unwrap()` freely so failures surface as readable diagnostics; the
+// disallowed-methods list in `.clippy.toml` is for production code, not the test
+// harness. (Integration-test crates are their own crate and therefore do not
+// inherit `core/src/lib.rs`'s `#![cfg_attr(test, allow(...))]`.)
+#![allow(clippy::disallowed_methods)]
+
 use phantom_protocol::api::session::PhantomSession;
 use phantom_protocol::api::udp_listener::PhantomUdpListener;
 use phantom_protocol::api::udp_transport::UdpClientTransport;
 use phantom_protocol::crypto::hybrid_sign::HybridVerifyingKey;
+use phantom_protocol::CoreError;
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -109,7 +116,7 @@ async fn udp_integration_two_sessions_one_client_socket_is_not_required_but_two_
 
     let server = tokio::spawn(async move {
         for _ in 0..2 {
-            let s = listener.accept().await.expect("accept").session();
+            let s = listener.clone().accept().await.expect("accept").session();
             let m = s.recv().await.expect("recv");
             s.send(m).await.expect("echo"); // echo back
         }
@@ -119,7 +126,6 @@ async fn udp_integration_two_sessions_one_client_socket_is_not_required_but_two_
     let mut handles = Vec::new();
     for i in 0u8..2 {
         let key = key.clone();
-        let addr = addr;
         handles.push(tokio::spawn(async move {
             let t = UdpClientTransport::connect(addr).await.unwrap();
             let c = PhantomSession::connect_with_transport(&addr.to_string(), t, key);
@@ -508,17 +514,21 @@ async fn udp_integration_server_migration_rotates_both_cids_and_survives() {
     // (post-migration) — two distinct sources, impossible without a real send-socket
     // rebind — and rotated its CID across the move. A no-op `migrate_server` would leave
     // both at 1 source / would not change the source set.
-    let s2c_srcs_seen = s2c_srcs.lock().unwrap();
+    // Snapshot the collected facts inside a block so the `std::sync::MutexGuard`
+    // is released here and never stays live across the `server.await` below
+    // (clippy::await_holding_lock — a real hazard shape, so it gets a real fix).
+    let (saw_listen_addr_src, s2c_src_count) = {
+        let s2c_srcs_seen = s2c_srcs.lock().unwrap();
+        (s2c_srcs_seen.contains(&server_addr), s2c_srcs_seen.len())
+    };
     assert!(
-        s2c_srcs_seen.contains(&server_addr),
+        saw_listen_addr_src,
         "the server's pre-migration s2c must come from the listen address"
     );
     assert!(
-        s2c_srcs_seen.len() >= 2,
-        "the s2c source address must change across server migration (saw {} distinct sources)",
-        s2c_srcs_seen.len()
+        s2c_src_count >= 2,
+        "the s2c source address must change across server migration (saw {s2c_src_count} distinct sources)"
     );
-    drop(s2c_srcs_seen);
     let s2c_cids_seen = s2c_cids.lock().unwrap().len();
     assert!(
         s2c_cids_seen >= 2,
@@ -731,6 +741,27 @@ async fn udp_liveness_dead_path_surfaces_migrating_then_dead() {
         "recv() must error on a dead session (got {r:?})"
     );
 
+    // And the cause has to be recorded, because that is what `last_error()`
+    // promises: "the terminal error from a failed handshake **or a dead
+    // session**". A death decided by the liveness timer has no failing call site
+    // to carry a cause, so before this the slot stayed empty and the accessor
+    // answered `None` to a caller its own documentation had told to read it.
+    // `Timeout` is the variant: a deadline elapsed on a session that stopped
+    // answering.
+    let cause = client.last_error().await;
+    assert!(
+        matches!(cause, Some(CoreError::Timeout)),
+        "a session reaped by the liveness timer must record why it died; \
+         last_error() gave {cause:?}"
+    );
+    // `await_ready()` reads the same slot, so it has to tell the same story
+    // rather than a second, vaguer one about the same event.
+    let ready = client.await_ready().await;
+    assert!(
+        matches!(ready, Err(CoreError::Timeout)),
+        "await_ready() on a dead session must surface the recorded cause; got {ready:?}"
+    );
+
     server.abort();
 }
 
@@ -846,6 +877,27 @@ async fn udp_keepalive_download_only_path_detects_dead_downstream() {
     assert!(
         matches!(r, Ok(Err(_))),
         "recv() must error on a dead session (got {r:?})"
+    );
+
+    // And the cause has to be recorded, because that is what `last_error()`
+    // promises: "the terminal error from a failed handshake **or a dead
+    // session**". A death decided by the liveness timer has no failing call site
+    // to carry a cause, so before this the slot stayed empty and the accessor
+    // answered `None` to a caller its own documentation had told to read it.
+    // `Timeout` is the variant: a deadline elapsed on a session that stopped
+    // answering.
+    let cause = client.last_error().await;
+    assert!(
+        matches!(cause, Some(CoreError::Timeout)),
+        "a session reaped by the liveness timer must record why it died; \
+         last_error() gave {cause:?}"
+    );
+    // `await_ready()` reads the same slot, so it has to tell the same story
+    // rather than a second, vaguer one about the same event.
+    let ready = client.await_ready().await;
+    assert!(
+        matches!(ready, Err(CoreError::Timeout)),
+        "await_ready() on a dead session must surface the recorded cause; got {ready:?}"
     );
 
     server.abort();
@@ -1453,6 +1505,48 @@ async fn udp_integration_cover_traffic_fills_idle_and_is_dropped() {
     server.await.unwrap();
 }
 
+/// FFI shim smoke test — `connect_pinned_udp` is the UniFFI-exported free function
+/// that opens a UDP client session with key pinning, mirroring `connect_pinned` for TCP.
+/// Verifies the full handshake + encrypted data exchange over the production
+/// `UdpClientTransport` path, reachable by mobile / FFI callers with only
+/// `(host, port, pinned_key)`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_ffi_connect_pinned_udp_roundtrip() {
+    use phantom_protocol::api::session::connect_pinned_udp;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let local: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key_bytes = listener.verifying_key_bytes();
+
+    let server = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept").session();
+        let msg = session.recv().await.expect("server recv");
+        assert_eq!(msg, b"ffi-udp-hello");
+        session
+            .send(b"ffi-udp-reply".to_vec())
+            .await
+            .expect("server send");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+
+    let client = connect_pinned_udp("127.0.0.1".to_string(), local.port(), key_bytes)
+        .await
+        .expect("connect_pinned_udp");
+    client
+        .send(b"ffi-udp-hello".to_vec())
+        .await
+        .expect("client send");
+    let reply = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .expect("no timeout")
+        .expect("client recv");
+    assert_eq!(reply, b"ffi-udp-reply");
+    server.await.unwrap();
+}
+
 /// Traffic-shaping config can be set BEFORE the (async) client handshake
 /// completes, and is applied when the session installs — so the very first data
 /// packets are already shaped (no "warm up then configure" gap). `set_traffic_shaping`
@@ -1508,4 +1602,1010 @@ async fn udp_integration_shaping_set_before_establishment_applies() {
     );
 
     server.await.unwrap();
+}
+
+/// Smoke-tests `connect_pinned_udp_with_resumption` over a live UDP loopback: an
+/// unknown (synthetic) hint forces the server to reject 0-RTT and fall back to a
+/// normal 1-RTT handshake (security invariant 9), and the byte-exact round-trip
+/// still succeeds. Empty early_data avoids the rejected-early-data re-queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_ffi_connect_pinned_udp_resumption_1rtt_fallback() {
+    use phantom_protocol::api::session::connect_pinned_udp_with_resumption;
+    use phantom_protocol::api::session::ResumptionHint;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let local: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key_bytes = listener.verifying_key_bytes();
+
+    let server = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept").session();
+        let msg = session.recv().await.expect("server recv");
+        assert_eq!(msg, b"ffi-udp-resume-hello");
+        session
+            .send(b"ffi-udp-resume-reply".to_vec())
+            .await
+            .expect("server send");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+
+    // A synthetic (unknown) hint: the server has no matching ticket, so the
+    // handshake falls back to 1-RTT (security invariant 9). We pass empty
+    // early_data so nothing is re-queued on rejection (C3 retransmit contract).
+    // The test exercises the connect path over UDP, not 0-RTT acceptance.
+    let hint = ResumptionHint::new(vec![7u8; 32], vec![9u8; 32]);
+    let client = connect_pinned_udp_with_resumption(
+        "127.0.0.1".to_string(),
+        local.port(),
+        key_bytes,
+        hint,
+        vec![],
+    )
+    .await
+    .expect("connect_pinned_udp_with_resumption");
+    client
+        .send(b"ffi-udp-resume-hello".to_vec())
+        .await
+        .expect("client send");
+    let reply = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .expect("no timeout")
+        .expect("client recv");
+    assert_eq!(reply, b"ffi-udp-resume-reply");
+    server.await.unwrap();
+}
+
+/// Invariant 9 over PhantomUDP: a resumed connect carrying the largest early-data payload
+/// the client accepts (`EARLY_DATA_MAX_LEN` bytes) completes its handshake. Two walks sit
+/// on this path, the demux's before it commits a route and the handshake task's before it
+/// decodes, and both bound the sealed field, which is one AES-GCM tag longer than the
+/// plaintext the client caps. With the walks bounded at the plaintext cap the demux
+/// dropped every copy of this hello without a reply, and the connect ran out its deadline
+/// where early-data may only ever be declined. The payload has to reach the server
+/// byte-exact by one of the two routes the contract allows, and the client's verdict has
+/// to name the route it took.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_zero_rtt_full_size_early_data_completes_the_handshake() {
+    use phantom_protocol::api::session::{connect_pinned_udp, connect_pinned_udp_with_resumption};
+    use phantom_protocol::transport::handshake::EARLY_DATA_MAX_LEN;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let local: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key_bytes = listener.verifying_key_bytes();
+
+    let payload: Vec<u8> = (0..EARLY_DATA_MAX_LEN).map(|i| (i % 251) as u8).collect();
+    let expected = payload.clone();
+    let server = tokio::spawn(async move {
+        // Connection 1 (plain): lets the client harvest a ticket.
+        let first = listener.clone().accept().await.expect("accept 1").session();
+        assert_eq!(first.recv().await.expect("recv 1"), b"warmup");
+        // Connection 2 (resume with a full-size payload).
+        let outcome = listener.accept().await.expect("accept 2");
+        let taken = outcome.take_early_data();
+        let session = outcome.session();
+        let (got, as_zero_rtt) = match taken {
+            Some(early) => (early, true),
+            None => {
+                // Declined: the client re-sends it as ordinary data, which does not keep
+                // the payload's boundary, so read until the whole length is in.
+                let mut buf = Vec::with_capacity(EARLY_DATA_MAX_LEN);
+                while buf.len() < EARLY_DATA_MAX_LEN {
+                    buf.extend(session.recv().await.expect("re-sent early-data"));
+                }
+                (buf, false)
+            }
+        };
+        assert_eq!(got, expected, "the full-size payload arrives byte-exact");
+        let msg = session.recv().await.expect("recv after resume");
+        session.send(msg).await.expect("echo after resume");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(first);
+        as_zero_rtt
+    });
+
+    let c1 = connect_pinned_udp("127.0.0.1".to_string(), local.port(), key_bytes.clone())
+        .await
+        .expect("connect_pinned_udp c1");
+    c1.send(b"warmup".to_vec()).await.expect("c1 send");
+    let hint = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(h) = c1.resumption_hint().await {
+                return h;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("resumption hint did not arrive");
+
+    let c2 = connect_pinned_udp_with_resumption(
+        "127.0.0.1".to_string(),
+        local.port(),
+        key_bytes,
+        hint,
+        payload,
+    )
+    .await
+    .expect("a payload of exactly the cap passes the client-side check");
+    timeout(Duration::from_secs(15), c2.await_ready())
+        .await
+        .expect("handshake resolved in time")
+        .expect("a legal early-data payload must never fail the handshake");
+    let verdict = c2.early_data_accepted().await;
+    assert!(
+        verdict.is_some(),
+        "a resumed hello that carried early-data has a verdict"
+    );
+
+    c2.send(b"after-resume".to_vec()).await.expect("c2 send");
+    let echo = timeout(Duration::from_secs(10), c2.recv())
+        .await
+        .expect("echo timeout")
+        .expect("c2 recv");
+    assert_eq!(echo, b"after-resume");
+
+    let as_zero_rtt = server.await.expect("server task");
+    assert_eq!(
+        verdict,
+        Some(as_zero_rtt),
+        "the client's verdict names the route the server saw the payload arrive by"
+    );
+}
+
+/// `is_shutting_down` reflects `shutdown()`, and `accept()` after shutdown returns
+/// `ConnectionClosed` — exercises the newly UniFFI-exported listener surface.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_listener_shutdown_flag_is_observable() {
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    assert!(!listener.is_shutting_down());
+    listener.shutdown();
+    assert!(listener.is_shutting_down());
+    let result = listener.accept().await;
+    assert!(matches!(
+        result,
+        Err(phantom_protocol::CoreError::ConnectionClosed)
+    ));
+}
+
+/// The PhantomUDP listener publishes its own counter set, and it is the same
+/// aggregate an accepted session reports — an operator running the production
+/// transport from a foreign language must be able to read handshake counters,
+/// `replay_rejected_total` and `aead_failure_total` while no session is in hand.
+///
+/// Two-sided by construction: the pre-accept assertion rejects an accessor that
+/// answers with a constant, and the session-versus-listener equality rejects one
+/// that hands back a freshly built `Observability` instead of the shared handle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_listener_metrics_snapshot_is_the_shared_aggregate() {
+    const SESSIONS: u64 = 3;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+
+    let before = listener.metrics_snapshot();
+    assert_eq!(
+        before.handshakes_success, 0,
+        "a listener that has accepted nothing must report no handshakes"
+    );
+    assert_eq!(before.handshakes_failure, 0);
+
+    // Keep every client and every accepted session alive for the whole test: a
+    // dropped session tears its pump down, and the point here is the aggregate.
+    let mut clients = Vec::new();
+    let mut accepted = Vec::new();
+    for i in 0..SESSIONS {
+        let transport = UdpClientTransport::connect(addr)
+            .await
+            .expect("udp connect");
+        let client =
+            PhantomSession::connect_with_transport(&addr.to_string(), transport, key.clone());
+        let outcome = timeout(Duration::from_secs(10), listener.clone().accept())
+            .await
+            .expect("no accept timeout")
+            .expect("accept");
+        let session = outcome.session();
+        // Exchange a datagram so the session is genuinely established, not merely
+        // handed over by the acceptor.
+        client
+            .send(format!("ping-{i}").into_bytes())
+            .await
+            .expect("client send");
+        let got = timeout(Duration::from_secs(10), session.recv())
+            .await
+            .expect("no recv timeout")
+            .expect("server recv");
+        assert_eq!(got, format!("ping-{i}").into_bytes());
+        clients.push(client);
+        accepted.push(session);
+    }
+
+    let after = listener.metrics_snapshot();
+    assert_eq!(
+        after.handshakes_success, SESSIONS,
+        "listener handshake successes must count every accepted session"
+    );
+    assert_eq!(after.handshake_latency_count, SESSIONS);
+
+    // The accessor is only worth anything if it reads the very counters the
+    // sessions write through: each accepted session shares the listener's handle,
+    // so its snapshot carries the same aggregate.
+    for session in &accepted {
+        let from_session = session.metrics_snapshot();
+        assert_eq!(
+            from_session.handshakes_success, after.handshakes_success,
+            "accepted session and listener must read one shared counter set"
+        );
+        assert_eq!(from_session.uptime_secs, after.uptime_secs);
+    }
+}
+
+/// Headline regression: a session built through the FFI shim `connect_pinned_udp`
+/// performs a REAL single-path connection migration mid-exchange. Over the TCP
+/// `connect_pinned` shim `migrate()` is a no-op; this proves the UDP FFI path wires
+/// `migrate()` through to a genuine socket rebind, with the reliable byte stream
+/// surviving byte-exact and no re-handshake. Faithful FFI-path analogue of
+/// `udp_integration_migration_survives_mid_exchange`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_ffi_migrate_survives_mid_exchange() {
+    use phantom_protocol::api::session::connect_pinned_udp;
+    const ROUNDS: usize = 8;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let local: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key_bytes = listener.verifying_key_bytes();
+
+    let server = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept").session();
+        for _ in 0..ROUNDS {
+            let m = session.recv().await.expect("server recv");
+            session.send(m).await.expect("server echo");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+
+    let client = connect_pinned_udp("127.0.0.1".to_string(), local.port(), key_bytes)
+        .await
+        .expect("connect_pinned_udp");
+
+    let m0 = b"round-0-pre-migration".to_vec();
+    client.send(m0.clone()).await.expect("send 0");
+    let e0 = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .expect("no timeout")
+        .expect("recv 0");
+    assert_eq!(e0, m0, "pre-migration echo must be byte-exact");
+
+    // The FFI-exported migrate() must perform a real rebind (not the TCP no-op).
+    client
+        .migrate("127.0.0.1:0".to_string())
+        .await
+        .expect("migrate");
+
+    for i in 1..ROUNDS {
+        let m = format!("round-{i}-post-migration-{}", "x".repeat(i * 7)).into_bytes();
+        client.send(m.clone()).await.expect("send post-migration");
+        let e = timeout(Duration::from_secs(10), client.recv())
+            .await
+            .expect("no timeout (the FFI session must survive the migration)")
+            .expect("recv post-migration");
+        assert_eq!(e, m, "post-migration echo must be byte-exact (round {i})");
+    }
+
+    server.await.unwrap();
+}
+
+/// Stronger headline regression: proves the FFI `connect_pinned_udp` `migrate()`
+/// performs a REAL local-socket rebind, not the silent no-op it would be over TCP
+/// (or if the migration control surface were swallowed before reaching
+/// `UdpClientTransport::migrate`). A relay between client and server records every
+/// distinct client source address; a real rebind makes the relay observe a NEW
+/// source after `migrate()` (a no-op would keep exactly one). The reliable byte
+/// stream also survives the migration byte-exact through the relay. The server-side
+/// migration-follow is covered separately by
+/// `udp_integration_migration_survives_mid_exchange`; here the relay masks the move
+/// from the server so the assertion isolates the CLIENT rebind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_ffi_migrate_actually_rebinds_through_relay() {
+    use phantom_protocol::api::session::connect_pinned_udp;
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+    use tokio::net::UdpSocket;
+    const ROUNDS: usize = 6;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let server_addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key_bytes = listener.verifying_key_bytes();
+
+    let server = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept").session();
+        for _ in 0..ROUNDS {
+            let m = session.recv().await.expect("server recv");
+            session.send(m).await.expect("server echo");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    });
+
+    // Relay (client <-> relay <-> server) recording every DISTINCT client source
+    // address. A real migrate() rebinds the client's local socket -> a new source
+    // port -> a second distinct address here; a no-op migrate would keep one.
+    //
+    // Design: two UNCONNECTED sockets on the relay side. The inbound (facing client)
+    // socket `relay` records client source addresses and forwards c2s to server_addr.
+    // The outbound (facing server) socket `upstream` sends c2s using send_to and
+    // receives s2c using recv_from; all s2c arrives from server_addr and is routed
+    // back to the last-known client_addr. Unconnected sockets are used on both sides
+    // to ensure recv_from sees the actual source (no connected-socket filtering).
+    let client_srcs: Arc<Mutex<HashSet<std::net::SocketAddr>>> =
+        Arc::new(Mutex::new(HashSet::new()));
+    let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+    let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let srcs = client_srcs.clone();
+    tokio::spawn(async move {
+        let mut c2s = vec![0u8; 2048];
+        let mut s2c = vec![0u8; 2048];
+        let mut client_addr: Option<std::net::SocketAddr> = None;
+        loop {
+            tokio::select! {
+                r = relay.recv_from(&mut c2s) => {
+                    let (n, from) = match r { Ok(x) => x, Err(_) => continue };
+                    client_addr = Some(from);
+                    srcs.lock().unwrap().insert(from);
+                    let _ = upstream.send_to(&c2s[..n], server_addr).await;
+                }
+                r = upstream.recv_from(&mut s2c) => {
+                    let (n, _src) = match r { Ok(x) => x, Err(_) => continue };
+                    if let Some(ca) = client_addr {
+                        let _ = relay.send_to(&s2c[..n], ca).await;
+                    }
+                }
+            }
+        }
+    });
+
+    // Build the client THROUGH the FFI shim, pointed at the relay.
+    let client = connect_pinned_udp("127.0.0.1".to_string(), relay_addr.port(), key_bytes)
+        .await
+        .expect("connect_pinned_udp");
+
+    let m0 = b"round-0-pre-migration".to_vec();
+    client.send(m0.clone()).await.expect("send 0");
+    let e0 = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .expect("no timeout")
+        .expect("recv 0");
+    assert_eq!(e0, m0, "pre-migration echo must be byte-exact");
+    let before = client_srcs.lock().unwrap().len();
+    assert!(
+        before >= 1,
+        "the client's original source must be seen pre-migration"
+    );
+
+    // The FFI-exported migrate() must perform a real local-socket rebind.
+    client
+        .migrate("127.0.0.1:0".to_string())
+        .await
+        .expect("migrate");
+
+    // Give the new socket a moment to bind and the path validation to complete
+    // before the post-migration sends, so the relay sees the new source address.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    for i in 1..ROUNDS {
+        let m = format!("round-{i}-post-migration-{}", "x".repeat(i * 7)).into_bytes();
+        client.send(m.clone()).await.expect("send post-migration");
+        let e = timeout(Duration::from_secs(10), client.recv())
+            .await
+            .expect("no timeout (the FFI session must survive the migration)")
+            .expect("recv post-migration");
+        assert_eq!(e, m, "post-migration echo must be byte-exact (round {i})");
+    }
+
+    // The relay observed a NEW client source address after migrate(): proof the FFI
+    // migrate() actually rebound the local socket (a no-op would keep exactly one).
+    let after = client_srcs.lock().unwrap().len();
+    assert!(
+        after >= 2 && after > before,
+        "FFI migrate() must rebind the client socket to a new source address \
+         (distinct client sources before {before}, after {after}); a no-op migrate \
+         would keep exactly one"
+    );
+
+    server.await.unwrap();
+}
+
+/// FFI persistent identity over UDP: two binds with the same seed → same verifying key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_bind_with_signing_key_bytes_is_stable_across_restart() {
+    use phantom_protocol::api::identity::generate_signing_key;
+
+    let seed = generate_signing_key().expect("generate");
+    let l1 = PhantomUdpListener::bind_udp_with_signing_key_bytes(
+        "127.0.0.1:0".to_string(),
+        seed.clone(),
+    )
+    .await
+    .expect("bind 1");
+    let vk1 = l1.verifying_key_bytes();
+    drop(l1);
+    let l2 = PhantomUdpListener::bind_udp_with_signing_key_bytes("127.0.0.1:0".to_string(), seed)
+        .await
+        .expect("bind 2");
+    assert_eq!(
+        vk1,
+        l2.verifying_key_bytes(),
+        "persisted UDP identity must be stable"
+    );
+}
+
+/// Headline regression: the full FFI server-identity loop. A server generated from a
+/// persisted seed serves a pinned client; after a "restart" (rebind from the same seed)
+/// the SAME pin still authenticates — exactly what a pure-FFI VPN server needs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_ffi_persistent_identity_loop_pin_survives_restart() {
+    use phantom_protocol::api::identity::{generate_signing_key, verifying_key_from_signing_key};
+    use phantom_protocol::api::session::connect_pinned_udp;
+
+    let seed = generate_signing_key().expect("generate");
+    // The pin a client would store, derived from the seed WITHOUT binding.
+    let pinned = verifying_key_from_signing_key(seed.clone()).expect("derive pin");
+
+    // First server instance from the seed.
+    let l1 = PhantomUdpListener::bind_udp_with_signing_key_bytes(
+        "127.0.0.1:0".to_string(),
+        seed.clone(),
+    )
+    .await
+    .expect("bind 1");
+    assert_eq!(
+        l1.verifying_key_bytes(),
+        pinned,
+        "bound identity matches the derived pin"
+    );
+    let port1 = {
+        let a: std::net::SocketAddr = l1.local_addr().parse().unwrap();
+        a.port()
+    };
+    let srv1 = tokio::spawn(async move {
+        let s = l1.accept().await.expect("accept").session();
+        let m = s.recv().await.expect("recv");
+        s.send(m).await.expect("echo");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    });
+    let c1 = connect_pinned_udp("127.0.0.1".to_string(), port1, pinned.clone())
+        .await
+        .expect("client 1 connects against the pinned identity");
+    c1.send(b"v1".to_vec()).await.expect("send");
+    let e1 = timeout(Duration::from_secs(10), c1.recv())
+        .await
+        .expect("no timeout")
+        .expect("recv");
+    assert_eq!(e1, b"v1");
+    srv1.await.unwrap();
+
+    // "Restart": a fresh server instance from the SAME seed. The client's ORIGINAL pin
+    // must still authenticate it — the whole point of a persisted identity.
+    let l2 = PhantomUdpListener::bind_udp_with_signing_key_bytes("127.0.0.1:0".to_string(), seed)
+        .await
+        .expect("bind 2");
+    let port2 = {
+        let a: std::net::SocketAddr = l2.local_addr().parse().unwrap();
+        a.port()
+    };
+    let srv2 = tokio::spawn(async move {
+        let s = l2.accept().await.expect("accept").session();
+        let m = s.recv().await.expect("recv");
+        s.send(m).await.expect("echo");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    });
+    let c2 = connect_pinned_udp("127.0.0.1".to_string(), port2, pinned)
+        .await
+        .expect("client reconnects with the SAME pin after restart");
+    c2.send(b"v2".to_vec()).await.expect("send");
+    let e2 = timeout(Duration::from_secs(10), c2.recv())
+        .await
+        .expect("no timeout")
+        .expect("recv");
+    assert_eq!(e2, b"v2");
+    srv2.await.unwrap();
+}
+
+/// End-to-end: the `_with_config` FFI entry points (server `bind_udp_with_config_bytes`
+/// + client `connect_pinned_udp_with_config`) establish a working pinned session. Guards
+/// that threading a `PhantomConfig` through both sides does not break the connect path
+/// (the config's liveness is installed before the pump; the server cache is sized from it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_ffi_with_config_roundtrip() {
+    use phantom_protocol::api::identity::generate_signing_key;
+    use phantom_protocol::api::session::connect_pinned_udp_with_config;
+    use phantom_protocol::PhantomConfig;
+
+    let seed = generate_signing_key().expect("generate");
+    let cfg = PhantomConfig::mobile();
+
+    let listener = PhantomUdpListener::bind_udp_with_config_bytes(
+        "127.0.0.1:0".to_string(),
+        seed,
+        cfg.clone(),
+    )
+    .await
+    .expect("bind_udp_with_config_bytes");
+    let local: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key_bytes = listener.verifying_key_bytes();
+
+    let server = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept").session();
+        let msg = session.recv().await.expect("server recv");
+        assert_eq!(msg, b"cfg-hello");
+        session
+            .send(b"cfg-reply".to_vec())
+            .await
+            .expect("server send");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+
+    let client =
+        connect_pinned_udp_with_config("127.0.0.1".to_string(), local.port(), key_bytes, cfg)
+            .await
+            .expect("connect_pinned_udp_with_config");
+    client
+        .send(b"cfg-hello".to_vec())
+        .await
+        .expect("client send");
+    let reply = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .expect("no timeout")
+        .expect("client recv");
+    assert_eq!(reply, b"cfg-reply");
+    server.await.unwrap();
+}
+
+/// A pass-through UDP relay that classifies every datagram it forwards by the
+/// PhantomUDP outer flags byte (`[type:2][frag:1][reserved:5]`), counting the
+/// short-header (1-RTT) datagrams and how many of those carry the fragment bit.
+///
+/// Handshake `Initial` datagrams are deliberately excluded from the count: a
+/// `ClientHello` / `ServerHello` carries a 1184-byte ML-KEM key and a 3309-byte
+/// ML-DSA signature, so it legitimately exceeds the path MTU and must fragment.
+/// Application data must not — it is the sender that chooses the chunk size.
+async fn spawn_counting_relay(
+    server_addr: std::net::SocketAddr,
+) -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicU64>,
+    std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use tokio::net::UdpSocket;
+
+    /// Outer flags: bits 7..6 are the packet type; `0b01` is `OneRtt`.
+    const TYPE_ONE_RTT: u8 = 0b01;
+    /// Outer flags: bit 5 marks a fragment of a larger logical frame.
+    const FRAG_BIT: u8 = 0b0010_0000;
+
+    let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+    let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    upstream.connect(server_addr).await.unwrap();
+    let one_rtt = Arc::new(AtomicU64::new(0));
+    let fragmented = Arc::new(AtomicU64::new(0));
+    let (o, f) = (one_rtt.clone(), fragmented.clone());
+    tokio::spawn(async move {
+        let mut c2s = vec![0u8; 4096];
+        let mut s2c = vec![0u8; 4096];
+        let mut client_addr: Option<std::net::SocketAddr> = None;
+        let classify = |d: &[u8]| {
+            if let Some(&flags) = d.first() {
+                if flags >> 6 == TYPE_ONE_RTT {
+                    o.fetch_add(1, Ordering::Relaxed);
+                    if flags & FRAG_BIT != 0 {
+                        f.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        };
+        loop {
+            tokio::select! {
+                r = relay.recv_from(&mut c2s) => {
+                    let (n, from) = match r { Ok(x) => x, Err(_) => continue };
+                    client_addr = Some(from);
+                    classify(&c2s[..n]);
+                    let _ = upstream.send(&c2s[..n]).await;
+                }
+                r = upstream.recv(&mut s2c) => {
+                    let n = match r { Ok(x) => x, Err(_) => continue };
+                    classify(&s2c[..n]);
+                    if let Some(ca) = client_addr {
+                        let _ = relay.send_to(&s2c[..n], ca).await;
+                    }
+                }
+            }
+        }
+    });
+    (relay_addr, one_rtt, fragmented)
+}
+
+/// A bulk transfer must arrive byte-exact AND must never put a fragmented 1-RTT
+/// datagram on the wire.
+///
+/// The sender chooses how much application data goes into one packet; the
+/// PhantomUDP transport then fragments whatever does not fit `PATH_MTU`. If the
+/// chunk is sized without accounting for the packet header, the in-plaintext
+/// reliable stream offset and the AEAD tag, every full-size segment is split into
+/// a full datagram plus a small tail — double the datagram rate for the same
+/// goodput, and a segment that now needs both datagrams to survive, so an
+/// independent per-datagram loss rate `p` becomes ~`2p` per segment. This test
+/// pins the property that the pump's chunk fits one datagram.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn udp_integration_bulk_transfer_never_fragments_application_datagrams() {
+    use std::sync::atomic::Ordering;
+
+    const BULK: usize = 64 * 1024;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let server_addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+
+    let server = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept").session();
+        // `send()` does not preserve message boundaries above the chunk size, so
+        // drain until the full byte count has arrived, then echo it back in one
+        // write (which the pump re-chunks the same way).
+        let mut got = Vec::with_capacity(BULK);
+        while got.len() < BULK {
+            let part = session.recv().await.expect("server recv");
+            got.extend_from_slice(&part);
+        }
+        session.send(got).await.expect("server echo");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    });
+
+    let (relay_addr, one_rtt, fragmented) = spawn_counting_relay(server_addr).await;
+    let transport = UdpClientTransport::connect(relay_addr)
+        .await
+        .expect("udp connect");
+    let client = PhantomSession::connect_with_transport(&relay_addr.to_string(), transport, key);
+
+    let payload: Vec<u8> = (0..BULK).map(|i| (i % 251) as u8).collect();
+    client.send(payload.clone()).await.expect("client send");
+
+    let mut echoed = Vec::with_capacity(BULK);
+    while echoed.len() < BULK {
+        let part = timeout(Duration::from_secs(30), client.recv())
+            .await
+            .expect("no timeout")
+            .expect("client recv");
+        echoed.extend_from_slice(&part);
+    }
+    assert_eq!(echoed, payload, "bulk transfer must be byte-exact");
+
+    let seen = one_rtt.load(Ordering::Relaxed);
+    let frag = fragmented.load(Ordering::Relaxed);
+    assert!(seen > 0, "the relay must have observed 1-RTT datagrams");
+    assert_eq!(
+        frag, 0,
+        "{frag} of {seen} application datagrams were fragmented; one application \
+         chunk must fit one PhantomUDP datagram"
+    );
+
+    server.await.unwrap();
+}
+
+/// A departing client must free its server-side slot at once, not on a timer.
+///
+/// PhantomUDP has no socket-level end-of-stream. On the byte-pipe legs the peer's
+/// `read_exact` returns `UnexpectedEof` the moment the socket is dropped, so a
+/// departing client's server session ends within a second; on a datagram socket the
+/// same departure is indistinguishable from a quiet moment, and the only thing that
+/// ever noticed was the liveness timer — keep-alive to `Migrating`, then
+/// `session_timeout` to `Dead`, more than two minutes later. For all that time the
+/// session slot stayed occupied, the server kept firing keep-alives into a closed
+/// client port, and those keep-alives kept a NAT binding warm for a conversation
+/// that had ended.
+///
+/// The observable the operator has for that slot is the demux route table: an
+/// established session owns its bootstrap route plus the 19-CID rotating window, and
+/// they are reclaimed only by triggers a departed client no longer fires. So this
+/// asserts on `active_route_count()` falling to zero, within a window far shorter
+/// than any liveness deadline — which is exactly the difference the close frame
+/// makes, and nothing else in the session's teardown can produce.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_client_close_reclaims_the_server_routes_promptly() {
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+
+    let listener_for_server = listener.clone();
+    let server = tokio::spawn(async move {
+        let session = listener_for_server
+            .accept()
+            .await
+            .expect("accept")
+            .session();
+        let msg = session.recv().await.expect("server recv");
+        assert_eq!(msg, b"ping");
+        session.send(b"pong".to_vec()).await.expect("server send");
+        // Hold the accepted handle across the client's departure: the routes must be
+        // reclaimed because the peer said it was leaving, not because this side let
+        // go of its session object.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+    });
+
+    let transport = UdpClientTransport::connect(addr)
+        .await
+        .expect("udp connect");
+    let client = PhantomSession::connect_with_transport(&addr.to_string(), transport, key);
+    client.send(b"ping".to_vec()).await.expect("client send");
+    let reply = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .expect("no timeout")
+        .expect("client recv");
+    assert_eq!(reply, b"pong");
+
+    let established = listener.active_route_count();
+    assert!(
+        established > 1,
+        "an established session must hold its bootstrap route plus the CID window; got {established}"
+    );
+
+    // The client leaves.
+    client.disconnect().await.expect("disconnect");
+    drop(client);
+
+    // Five seconds is generous for a frame that crosses loopback plus the draining
+    // window the server holds it for afterwards, and still an order of magnitude below
+    // the shortest liveness deadline that could reclaim the slot on its own — so a
+    // pass here cannot be the timer in disguise.
+    let left_at = std::time::Instant::now();
+    let deadline = left_at + Duration::from_secs(5);
+    while listener.active_route_count() > 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let reclaimed_after = left_at.elapsed();
+    println!(
+        "routes while established: {established}; after close: {} (reclaimed within {:?})",
+        listener.active_route_count(),
+        reclaimed_after
+    );
+    assert_eq!(
+        listener.active_route_count(),
+        0,
+        "the server must reclaim every route of a session whose peer announced its close \
+         (was {established} while established)"
+    );
+
+    server.await.unwrap();
+}
+
+/// Relay client→server datagrams to `server_addr`, holding back exactly one of them.
+///
+/// Once `armed` is set, the first client→server datagram larger than `hold_min_len`
+/// is released `hold` later instead of immediately; everything before it, after it,
+/// and everything in the reverse direction is forwarded untouched. That is a
+/// one-position reorder — the smallest displacement a datagram path can produce, and
+/// the one an ECMP/LAG rehash, a wireless link-layer retry, or the two-live-paths
+/// window right after a migration all produce as a matter of course.
+///
+/// The size gate is what makes the choice deterministic rather than positional: the
+/// caller sizes the payload it wants reordered well above every other frame the
+/// session emits at that moment (a close copy is 45 B on the wire, an ACK and a
+/// keep-alive are smaller still), so "the first big one after arming" names exactly
+/// one datagram no matter how the handshake before it was paced.
+async fn spawn_reordering_relay(
+    server_addr: std::net::SocketAddr,
+    hold_min_len: usize,
+    hold: Duration,
+) -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use tokio::net::UdpSocket;
+
+    let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let relay_addr = relay.local_addr().unwrap();
+    let upstream = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    upstream.connect(server_addr).await.unwrap();
+    let armed = Arc::new(AtomicBool::new(false));
+    let armed_task = armed.clone();
+    tokio::spawn(async move {
+        let mut c2s = vec![0u8; 2048];
+        let mut s2c = vec![0u8; 2048];
+        let mut client_addr: Option<std::net::SocketAddr> = None;
+        let mut already_held = false;
+        loop {
+            tokio::select! {
+                r = relay.recv_from(&mut c2s) => {
+                    let (n, from) = match r { Ok(x) => x, Err(_) => continue };
+                    client_addr = Some(from);
+                    if !already_held && armed_task.load(Ordering::Relaxed) && n > hold_min_len {
+                        already_held = true;
+                        let held = c2s[..n].to_vec();
+                        let up = upstream.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(hold).await;
+                            let _ = up.send(&held).await;
+                        });
+                    } else {
+                        let _ = upstream.send(&c2s[..n]).await;
+                    }
+                }
+                r = upstream.recv(&mut s2c) => {
+                    let n = match r { Ok(x) => x, Err(_) => continue };
+                    if let Some(ca) = client_addr {
+                        let _ = relay.send_to(&s2c[..n], ca).await;
+                    }
+                }
+            }
+        }
+    });
+    (relay_addr, armed)
+}
+
+/// A single reordered datagram must not destroy application data the peer already
+/// sent and got `Ok` for.
+///
+/// The close announcement is not `RELIABLE`, carries no stream offset and is never
+/// acknowledged, so nothing re-sends the data it overtakes: if the receiver acts on
+/// the close the instant it lands, the bytes behind it are gone with no error at
+/// either end — the sender's `send()` already returned `Ok`, its `disconnect()`
+/// returns `Ok`, and the receiver's error is indistinguishable from a normal close.
+/// Send order is the only ordering a sender can impose, and send order is not arrival
+/// order; that difference is the whole of what separates a datagram path from a byte
+/// pipe, and it is why the byte-pipe legs never needed this.
+///
+/// So the receiver drains: it records the close and keeps reading for a bounded
+/// window before tearing down. This pins that behaviour at the smallest displacement
+/// that can occur — one position, 60 ms — because the hazard is reordering as such
+/// and not reordering of some magnitude. It runs over a real socket because the
+/// discard has two independent causes on the server, the receive loop and the demux
+/// route table, and only an end-to-end run crosses both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_close_overtaking_data_does_not_discard_it() {
+    use std::sync::atomic::Ordering;
+
+    /// Comfortably larger than any other client→server frame in flight at that
+    /// moment, and comfortably under `MAX_APP_CHUNK` so it is exactly one datagram.
+    const REORDERED_PAYLOAD_LEN: usize = 600;
+    /// One position of displacement, held far enough inside the draining window that
+    /// a pass is the mechanism working and not a race with it.
+    const HOLD: Duration = Duration::from_millis(60);
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let server_addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+
+    let (first_tx, first_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept").session();
+        let mut received: Vec<Vec<u8>> = Vec::new();
+        received.push(session.recv().await.expect("server recv"));
+        let _ = first_tx.send(());
+        // Collect until the session ends. What ends it is the peer's close, once the
+        // draining window is over, so this loop is also the assertion that the drain
+        // terminates rather than lingering.
+        while let Ok(msg) = session.recv().await {
+            received.push(msg);
+        }
+        received
+    });
+
+    let (relay_addr, armed) =
+        spawn_reordering_relay(server_addr, REORDERED_PAYLOAD_LEN / 2, HOLD).await;
+    let transport = UdpClientTransport::connect(relay_addr)
+        .await
+        .expect("udp connect");
+    let client = PhantomSession::connect_with_transport(&relay_addr.to_string(), transport, key);
+
+    client.send(b"first".to_vec()).await.expect("client send");
+    timeout(Duration::from_secs(10), first_rx)
+        .await
+        .expect("the server sees the first message")
+        .expect("server task alive");
+
+    // Everything the client sends from here is one datagram: the payload, then the
+    // close copies. The relay holds the payload back, so the close overtakes it.
+    armed.store(true, Ordering::Relaxed);
+    let payload = vec![0xABu8; REORDERED_PAYLOAD_LEN];
+    client.send(payload.clone()).await.expect("client send");
+    client.disconnect().await.expect("disconnect");
+    drop(client);
+
+    let received = timeout(Duration::from_secs(20), server)
+        .await
+        .expect("the server session ends within the draining window")
+        .expect("server task");
+    assert_eq!(
+        received,
+        vec![b"first".to_vec(), payload],
+        "a close that overtook one datagram discarded the data behind it"
+    );
+}
+
+/// `disconnect()` pushes what is queued before it announces the close, so a write
+/// that fits the wire is not lost to the call that follows it.
+///
+/// This pins the half of `disconnect()`'s contract that is real. The method makes no
+/// delivery guarantee and its documentation says so: it raises a close signal and
+/// returns, and the pump then pushes until the socket, the congestion window or the
+/// peer's flow-control limit refuses the next byte, without waiting for an
+/// acknowledgement — so a payload larger than one window is mostly discarded. What is
+/// guaranteed, and what an embedder does rely on, is the ordinary case: one chunk
+/// handed to `send()` and then a `disconnect()` in the next statement must arrive,
+/// exactly as `send(x); drop(session)` does.
+///
+/// The other half is deliberately not asserted here. A test requiring that a large
+/// payload is *truncated* would pin a shortcoming as a contract, and the next person
+/// to lengthen the drain would have to delete the test to do it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_disconnect_pushes_a_queued_write_before_announcing() {
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+
+    let server = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept").session();
+        session.recv().await
+    });
+
+    let transport = UdpClientTransport::connect(addr)
+        .await
+        .expect("udp connect");
+    let client = PhantomSession::connect_with_transport(&addr.to_string(), transport, key);
+    client
+        .await_ready()
+        .await
+        .expect("the pinned handshake completes");
+
+    // No await between these two beyond the ones they make themselves: the write is
+    // still in the pump's queue when the close request is enqueued behind it.
+    let report = b"the-last-thing-said".to_vec();
+    client.send(report.clone()).await.expect("client send");
+    client.disconnect().await.expect("disconnect");
+    drop(client);
+
+    let received = timeout(Duration::from_secs(10), server)
+        .await
+        .expect("the server session ends promptly")
+        .expect("server task")
+        .expect("server recv");
+    assert_eq!(
+        received, report,
+        "a write queued immediately before disconnect() must still reach the peer"
+    );
 }

@@ -5,13 +5,21 @@ apps via UniFFI bindings.
 
 ## iOS (Swift)
 
-**Build setup.** Compile three slices then assemble an XCFramework:
+**Build setup.** Compile three slices then assemble an XCFramework.
+
+> **Why `cargo rustc --crate-type staticlib`.** `core`'s `[lib] crate-type` is
+> `["lib", "cdylib"]`, so a plain `cargo build` emits no `.a` and `lipo` would
+> have no input. `"staticlib"` is not added to the manifest on purpose: a
+> staticlib is a *final* artifact, so declaring it crate-wide makes cargo demand
+> a `#[panic_handler]` and a `#[global_allocator]` from the library on bare-metal
+> targets and breaks the `thumbv7em-none-eabihf` row of `cross.yml`. Requesting
+> it per invocation produces the same archive and leaves every other build alone.
 
 ```sh
 # Device (arm64), Apple Silicon simulator, Intel simulator
-cargo build --release --target aarch64-apple-ios        --manifest-path core/Cargo.toml
-cargo build --release --target aarch64-apple-ios-sim    --manifest-path core/Cargo.toml
-cargo build --release --target x86_64-apple-ios         --manifest-path core/Cargo.toml
+cargo rustc --release --target aarch64-apple-ios     --manifest-path core/Cargo.toml --crate-type staticlib
+cargo rustc --release --target aarch64-apple-ios-sim --manifest-path core/Cargo.toml --crate-type staticlib
+cargo rustc --release --target x86_64-apple-ios      --manifest-path core/Cargo.toml --crate-type staticlib
 
 # Merge simulator slices; then build the XCFramework
 lipo -create \
@@ -27,7 +35,7 @@ xcodebuild -create-xcframework \
 
 Auto-generated Swift sources in `tests/bindings/swift/`: `phantom_protocol.swift`,
 `phantom_protocolFFI.h`, `phantom_protocolFFI.modulemap`. Regenerate via
-`core/src/bin/uniffi-bindgen.rs` (uniffi 0.29 cli) after any surface change.
+`core/src/bin/uniffi-bindgen.rs` (uniffi 0.32 cli) after any surface change.
 
 **SwiftPM integration.**
 
@@ -77,10 +85,18 @@ Phantom Protocol's `HybridVerifyingKey` provides the post-quantum auth layer.
 
 **Background mode.** iOS suspends connections when the app backgrounds. Register
 for Background App Refresh (`BGAppRefreshTask`); on `sceneDidEnterBackground`
-persist `session.resumptionHint()` — a `ResumptionHint` with `sessionId` /
-`resumptionSecret` — to Keychain (`SecItemAdd`); on foreground reload pass it
-to `connectPinnedWithResumption` (0-RTT skips PQC keygen). Discard hints older
+persist `session.resumptionHint()` — a `ResumptionHint` whose `sessionId()` and
+`resumptionSecret()` accessors return the two 32-byte values — to Keychain
+(`SecItemAdd`); on foreground reload rebuild it with
+`ResumptionHint(sessionId:resumptionSecret:)` and pass that to
+`connectPinnedWithResumption` (0-RTT skips PQC keygen). Discard hints older
 than 1 hour (server default).
+
+The hint is a `class`, not a `struct`, and conforms to neither `Equatable` nor
+`Hashable`: `==`, `XCTAssertEqual` on two hints, and use as a `Set` member or
+dictionary key no longer compile. Compare and key on the bytes the accessors
+return instead, and note that assigning a hint copies a reference rather than
+the two byte arrays.
 
 ## Android (Kotlin)
 
@@ -129,7 +145,7 @@ import uniffi.phantom_protocol.*
 val pinnedKeyBytes = resources.openRawResource(R.raw.phantom_server_pk).use { it.readBytes() }
 
 // Shim: connectPinned(host, port, pinnedKey) — wraps connect_with_transport
-val session = PhantomProtocolKt.connectPinned(
+val session = connectPinned(
     host = "phantom.example.com", port = 4242u,
     pinnedKey = pinnedKeyBytes   // from PhantomListener::verifying_key_bytes()
 )
@@ -185,8 +201,12 @@ the app — iOS: `Bundle.main.url(forResource:withExtension:)`; Android:
 `R.raw.phantom_server_pk`. **Never** fetch the key at runtime — that voids the
 trust model. Rotating the signing key requires an app update.
 
-**Resumption ticket storage.** Persist the `ResumptionHint` (`sessionId`,
-`resumptionSecret`) from `session.resumptionHint()` to secure storage:
+**Resumption ticket storage.** `session.resumptionHint()` returns a
+`ResumptionHint` **object**; read the two 32-byte values out of it with the
+`sessionId()` / `resumptionSecret()` accessors — calls, not fields. The type is
+an object rather than a record because UniFFI gives a record a generated
+stringifier in every language, and the Python one printed both fields, which put
+the resumption secret one log line away. Persist those bytes to secure storage:
 
 - iOS: Keychain (`SecItemAdd`/`SecItemCopyMatching`),
   `kSecAttrAccessible = kSecAttrAccessibleAfterFirstUnlock`.
@@ -196,23 +216,55 @@ trust model. Rotating the signing key requires an app update.
 TTL: **1 hour** (server `SessionCache` default). Check saved timestamp before
 reuse; expired hints fall back to 1-RTT automatically.
 
-**Connection migration (Wi-Fi ↔ LTE) — reconnect with 0-RTT, not `migrate()`.**
-`PhantomSession.migrate(localAddr:)` is on the UniFFI surface (Phase 4), but it is
-**only effective on the native UDP transport** (`UdpClientTransport`), which is not
-yet exposed through the FFI/UniFFI surface. The FFI connect entry points
-(`connectPinned` / `connectPinnedWithResumption`) use the **TCP** transport
-(`TcpSessionTransport`), and TCP is connection-oriented — it cannot rebind its local
-address without a new connection. On every non-UDP transport `migrate()` falls back
-to its default **no-op** (`Ok(())`): it returns success but does *not* rebind the
-socket or move the path. So on a mobile network change, **reconnect** — register for
-`NWPathMonitor` (iOS) / `ConnectivityManager.NetworkCallback` (Android), then open a
-fresh session. Minimise the cost with **0-RTT resumption**: harvest a
-`ResumptionHint` after the first connect and reconnect via
-`connectPinnedWithResumption`, which folds the first request into the new
-`ClientHello`. (The sample apps in `examples/mobile/` implement exactly this
-reconnect-with-0-RTT model.) Seamless single-socket migration over the FFI surface
-— exposing the UDP transport, on which `migrate()` performs a real rebind+path
-validation without a re-handshake — is future work.
+**Android: close every hint.** The generated Kotlin class implements
+`Disposable`/`AutoCloseable` over a native handle, so each instance — the one
+`resumptionHint()` returns *and* each one you construct to reconnect — should be
+closed. An unclosed one is not lost for the life of the process: the class
+registers a cleaner at construction, so the handle is freed once a GC collects
+the wrapper. But nothing in the app schedules that, and the Rust-side allocation
+stays live until it happens, so on a path that runs per reconnect the
+uncollected hints accumulate. Closing is what puts the release at a point the
+code chooses. This is an obligation a record did not carry; `use { }` discharges
+it on both paths:
+
+```kotlin
+session.resumptionHint()?.use { hint ->
+    prefs.edit()
+        .putString("sid",    Base64.encodeToString(hint.sessionId(),        Base64.NO_WRAP))
+        .putString("secret", Base64.encodeToString(hint.resumptionSecret(), Base64.NO_WRAP))
+        .putLong("savedAt", System.currentTimeMillis())
+        .apply()
+}
+
+// Reconnecting: the hint you build is yours to close as well.
+val session = ResumptionHint(sessionId = sid, resumptionSecret = secret).use { hint ->
+    connectPinnedUdpWithResumption(host, port, pinnedKey, hint, earlyData)
+}
+```
+
+**Connection migration (Wi-Fi ↔ LTE) — use the UDP transport + `migrate()`.**
+`PhantomSession.migrate(localAddr:)` (Phase 4) performs a **real seamless
+single-socket migration — a local-socket rebind + path validation without a
+re-handshake — when the session runs over the production PhantomUDP transport**,
+which **is** exposed through the FFI/UniFFI surface. Build a UDP-backed session with
+the UDP connect entry points `connectPinnedUdp` / `connectPinnedUdpWithResumption` /
+`connectPinnedUdpWithConfig` (server side: `PhantomUdpListener.bindUdp` /
+`bindUdpWithSigningKeyBytes`). On a network change, register for `NWPathMonitor`
+(iOS) / `ConnectivityManager.NetworkCallback` (Android) and call
+`migrate(localAddr: "0.0.0.0:0")` from the callback — the session follows the
+handover with no re-handshake and no new session.
+
+The **TCP** connect entry points (`connectPinned` / `connectPinnedWithResumption`)
+use the connection-oriented `TcpSessionTransport`, which cannot rebind its local
+address; on a TCP session `migrate()` returns `Err(CoreError::Unsupported)` without
+moving the socket. If you must use TCP (e.g. a UDP-hostile network), handle a network
+change by **reconnecting** and minimise the cost with **0-RTT resumption**: harvest a
+`ResumptionHint` after the first connect, keep the bytes its `sessionId()` /
+`resumptionSecret()` accessors return, and reconnect via
+`connectPinnedWithResumption` with a hint rebuilt from them — which folds the
+first request into the new `ClientHello`. (The sample apps in
+`examples/mobile/` show the reconnect-with-0-RTT model; prefer the UDP path when
+seamless migration matters.)
 
 ## Performance considerations
 
@@ -237,9 +289,11 @@ Internally: parses `pinned_key: Vec<u8>` into a `HybridVerifyingKey`,
 opens a `TcpSessionTransport` via `tokio::net::TcpStream::connect`, and
 delegates to `PhantomSession::connect_with_transport` — Security
 Invariant 1 (server pinning) is enforced unconditionally. Available
-in all four binding languages (Swift, Kotlin, Python, C). The
-placeholder `connect(addr)` is still on the surface as the unpinned
-back-compat path — do NOT use it in production.
+in all four binding languages (Swift, Kotlin, Python, C). The legacy
+`connect(addr)` constructor is **inert**: it opens no transport, runs no
+handshake, and returns a session already in `ConnectionState::Failed`, so
+every `send`/`recv` on it errors immediately. Use `connectPinned` /
+`connectPinnedUdp` (or the Rust `PhantomSession::builder`) instead.
 
 **Resumption secret access.** Keychain / EncryptedSharedPreferences secrets are
 accessible to apps sharing the same team ID (iOS) or user ID (Android). Assess

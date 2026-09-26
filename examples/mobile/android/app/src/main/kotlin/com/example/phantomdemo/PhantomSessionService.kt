@@ -29,9 +29,9 @@ import kotlinx.coroutines.launch
  * usable network (Wi-Fi <-> cellular), it drives a
  * **reconnect-with-0-RTT** ([PhantomClient.reconnectUsingLastConfig]). Over the
  * TCP transport exposed by the `connectPinned` FFI surface, a TCP socket cannot
- * rebind to the new interface in place (and `session.migrate()` is a no-op
- * there), so recovery is a fresh 0-RTT session rather than an in-place
- * migration.
+ * rebind to the new interface in place, and `session.migrate()` returns
+ * `Err(Unsupported)` on TCP, so recovery is a fresh 0-RTT session. For real
+ * in-place migration use `connectPinnedUdp`.
  *
  * The hosted client and its UI state are exposed via [SharedSession] so the
  * Activity's ViewModel can observe the same [PhantomClient.state] flow.
@@ -76,9 +76,10 @@ class PhantomSessionService : Service(), NetworkChangeMonitor.Listener {
 
     override fun onNetworkAvailable(network: Network) {
         // A (possibly new) interface is usable. Over the TCP FFI surface we
-        // cannot rebind the existing socket (migrate() is a no-op on TCP), so
-        // recover by opening a fresh session with 0-RTT resumption, folding the
-        // first request into the new ClientHello. No-op if we never connected.
+        // cannot rebind the existing socket (migrate() returns Unsupported on
+        // TCP), so recover by opening a fresh session with 0-RTT resumption,
+        // folding the first request into the new ClientHello. No-op if we never
+        // connected.
         serviceScope.launch {
             SharedSession.client?.reconnectUsingLastConfig(
                 earlyData = "network changed (0-RTT)".encodeToByteArray(),

@@ -26,12 +26,13 @@ pub fn run(args: Args) -> Result<()> {
     // This compact form is documented in HybridSigningKey::to_bytes().
     let seed_bytes = signing_key.to_bytes();
 
-    // Create parent directory if it doesn't exist.
-    if let Some(parent) = args.out.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating directory {}", parent.display()))?;
-        }
+    // Create parent directory if it doesn't exist. A bare filename (`server.key`)
+    // yields an empty parent, which `create_dir_all` would reject — skip it.
+    if let Some(parent) = args.out.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating directory {}", parent.display()))?;
     }
 
     // Write the key file with restrictive permissions (0600 on Unix).

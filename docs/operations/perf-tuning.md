@@ -75,14 +75,16 @@ production canary before promoting.
 ### 4. Feature flags
 
 There is no `pqc-standard` feature: the post-quantum primitives
-(ML-KEM-768 / ML-DSA-65) are **unconditional** — every build links them.
+(ML-KEM-768 / ML-DSA-65) are pulled in by the `std` feature, so every std
+build — default, `fips`, `telemetry-otel` — links them. Only a
+`--no-default-features` bare-metal build (`embedded,no-std`) drops them.
 Default features are `["compression-zstd", "std", "bindings",
 "classical-crypto"]`.
 
 | Feature | Effect |
 | --- | --- |
-| `classical-crypto` (default-on) | The classical AEAD + KEM substrate (`ring` AES-256-GCM / ChaCha20-Poly1305 + `x25519-dalek`). Combined with the always-on PQC crates this gives the full hybrid X25519+ML-KEM-768 / Ed25519+ML-DSA-65 security guarantee. |
-| `--no-default-features` | Drops the `classical-crypto` substrate (and `std` / `bindings` / `compression-zstd`); the PQC half stays. Used by the bare-metal / cross-target rows and as the base for a FIPS build. Do not ship a classical-substrate-less build expecting the hybrid guarantee — re-add the substrate (or `fips`) you actually want. |
+| `classical-crypto` (default-on) | The classical AEAD + KEM substrate (`ring` AES-256-GCM / ChaCha20-Poly1305 + `x25519-dalek`). Combined with the `std`-gated PQC crates this gives the full hybrid X25519+ML-KEM-768 / Ed25519+ML-DSA-65 security guarantee. |
+| `--no-default-features` | Drops `classical-crypto`, `std`, `bindings` and `compression-zstd`. Because `ml-kem` / `ml-dsa` are gated on `std`, the PQC half goes with them unless a feature implying `std` is re-added (`std`, or `fips`). Used by the bare-metal / cross-target rows and as the base for a FIPS build — all of which name the substrate they want back explicitly. Do not ship a classical-substrate-less build expecting the hybrid guarantee. |
 | `fips` | FIPS-140-3 posture (shipped, off by default). Swaps the classical KEM half to ECDH-P-256, the AEAD to `aws-lc-rs` (ChaCha20-Poly1305 rejected), the KDF to HKDF-SHA256, and the RNG to a SP 800-90A CTR_DRBG. Native-only; built as `--no-default-features --features fips,bindings,compression-zstd`. |
 | `telemetry-otel` | Opt-in OpenTelemetry pipeline (Phase 8). |
 
@@ -200,9 +202,13 @@ packet — Phase 2.2 / 2.3 / 2.7 already removed the obvious sources.
 
 ### 11. RTT histograms
 
-Use the metrics exporter once Phase 4.5 lands; until then,
-`tokio-console` + `tracing` instrumentation will surface task-level
-latencies.
+Build with the `telemetry-otel` feature and read the
+`phantom.handshake.duration` histogram (Prometheus:
+`phantom_handshake_duration_seconds`) — see
+`docs/observability/metrics-catalog.md`. With the feature off,
+`metrics_snapshot()` still exposes the always-on atomic counters. For
+task-level latencies, `tokio-console` + `tracing` instrumentation remains
+useful.
 
 ---
 
@@ -221,8 +227,10 @@ A clean release build on a 2024-era server with hardware AES acceleration
 
 Numbers above ~5 GiB/s per stream on the application path indicate the
 bottleneck has moved to the socket / memory subsystem — crypto is no
-longer the ceiling. Reach for Phase 4 (multi-path, multi-stream) before
-adding more cores to a single session.
+longer the ceiling. Phantom is single-path (Phase 4 delivered seamless
+connection *migration*, not aggregation), so scale a single session with
+multi-stream concurrency, and scale the host with more concurrent
+sessions.
 
 See `BENCHMARKS.md` for the full snapshot, methodology, and capacity
 scenario derivations.
@@ -231,10 +239,14 @@ Reference benchmarks live in `core/benches/`:
 
 ```bash
 cargo bench --manifest-path core/Cargo.toml --bench transport_bench
-cargo bench --manifest-path core/Cargo.toml --bench protocol_comparison
+cargo bench --manifest-path core/Cargo.toml --bench protocol_comparison   # required-features classical-crypto
 cargo bench --manifest-path core/Cargo.toml --bench buffer_pool_bench
 cargo bench --manifest-path core/Cargo.toml --bench syn_flood_bench
+cargo bench --manifest-path core/Cargo.toml --bench observability_bench
 ```
 
-Commit baseline JSON output to `bench-baseline/` (Phase 0.6) so CI can
-flag regressions.
+CI's `bench.yml` runs these five targets on the PR head and again on the
+base commit on the **same runner**, then `scripts/bench_compare.py` fails
+the job on a >2× median regression (10× for the ML-DSA-65 signing
+benches, whose rejection sampling is noisy). No baseline files are
+committed.

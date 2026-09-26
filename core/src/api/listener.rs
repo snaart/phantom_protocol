@@ -10,6 +10,7 @@ use crate::transport::handshake::{
     HandshakeServer, ServerReply,
 };
 use crate::transport::types::LegType;
+use crate::transport::write_stall::DEFAULT_WRITE_STALL_TIMEOUT;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -39,6 +40,37 @@ const MAX_SERVER_RETRY_ROUNDS: u32 = 2;
 /// before the listener back-pressures to not accepting new TCP.
 const MAX_INFLIGHT_HANDSHAKES: usize = 256;
 
+/// TCP server listener — drives the hybrid PQC handshake on each accepted
+/// `TcpStream` and returns established [`PhantomSession`] handles via
+/// [`accept()`](Self::accept).
+///
+/// Use [`PhantomUdpListener`](crate::api::PhantomUdpListener) instead when
+/// clients need seamless connection migration (Wi-Fi ↔ LTE via
+/// [`PhantomSession::migrate`](crate::api::PhantomSession::migrate)).
+/// TCP sessions return [`CoreError::Unsupported`] from `migrate()`.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), phantom_protocol::CoreError> {
+/// use std::sync::Arc;
+/// use phantom_protocol::api::PhantomListener;
+///
+/// let listener = PhantomListener::builder("0.0.0.0:4242").bind().await?;
+/// let pinned_key = listener.verifying_key_bytes();   // share out-of-band
+///
+/// loop {
+///     let outcome = listener.accept().await?;
+///     let session = outcome.session();
+///     tokio::spawn(async move {
+///         let _req = session.recv().await?;
+///         session.send(b"pong".to_vec()).await?;
+///         Ok::<_, phantom_protocol::CoreError>(())
+///     });
+/// }
+/// # }
+/// ```
 #[cfg_attr(feature = "bindings", derive(uniffi::Object))]
 pub struct PhantomListener {
     /// Listening socket, owned by the background acceptor task (H4 decouple).
@@ -81,6 +113,12 @@ pub struct PhantomListener {
     /// of the leg (the server presents no SNI) but its presence selects the mimic
     /// accept path. Always `None` unless the `mimicry` feature built it.
     mimic_sni: Option<String>,
+    /// Optional liveness config derived from a `PhantomConfig` supplied at bind time.
+    /// When `Some`, applied to every accepted session immediately after the handshake.
+    liveness: Option<crate::transport::liveness::LivenessConfig>,
+    /// The write deadline every accepted connection's transport is built with: the
+    /// bind-time `PhantomConfig`'s `write_stall_timeout`, or thirty seconds without one.
+    write_stall_timeout: Duration,
 }
 
 // Rust-only constructors that take a non-UniFFI type (`Arc<dyn Runtime>`).
@@ -94,7 +132,7 @@ impl PhantomListener {
         addr: String,
         runtime: Arc<dyn Runtime>,
     ) -> Result<Arc<Self>, CoreError> {
-        Self::bind_inner(addr, runtime, None, None).await
+        Self::bind_inner(addr, runtime, None, None, None).await
     }
 
     /// Like [`bind`](Self::bind) but uses the caller-supplied long-lived
@@ -107,24 +145,14 @@ impl PhantomListener {
     /// listener's [`verifying_key_bytes`](Self::verifying_key_bytes)
     /// will return the verifying half of `signing_key`.
     ///
+    /// Thin shim over [`PhantomListener::builder`] + `.signing_key(key).bind()`.
     /// Rust-only (not UniFFI-exported because `HybridSigningKey` is
     /// not in the UniFFI surface).
     pub async fn bind_with_signing_key(
         addr: String,
         signing_key: HybridSigningKey,
     ) -> Result<Arc<Self>, CoreError> {
-        Self::bind_inner(addr, Arc::new(TokioRuntime), Some(signing_key), None).await
-    }
-
-    /// Composition of [`bind_with_signing_key`](Self::bind_with_signing_key)
-    /// and [`bind_with_runtime`](Self::bind_with_runtime): supply both a
-    /// long-lived signing key and a non-tokio [`Runtime`]. Rust-only.
-    pub async fn bind_with_signing_key_with_runtime(
-        addr: String,
-        signing_key: HybridSigningKey,
-        runtime: Arc<dyn Runtime>,
-    ) -> Result<Arc<Self>, CoreError> {
-        Self::bind_inner(addr, runtime, Some(signing_key), None).await
+        Self::builder(addr).signing_key(signing_key).bind().await
     }
 
     /// Like [`bind`](Self::bind), but every accepted connection first runs the
@@ -138,46 +166,26 @@ impl PhantomListener {
     /// probing** (a probe that completes a real TLS handshake / validates a cert is
     /// black-holed but still learns TLS never completes). Do not rely on it where
     /// active probing is in the threat model. The server generates a fresh
-    /// signing key per process — use [`bind_with_signing_key_mimic`](Self::bind_with_signing_key_mimic) for a pinned
-    /// persistent identity. Rust-only, native-only.
+    /// signing key per process — use [`ListenerBuilder::signing_key`] via
+    /// [`PhantomListener::builder`] for a pinned persistent identity with mimicry.
+    /// Rust-only, native-only.
     #[cfg(all(not(target_arch = "wasm32"), feature = "mimicry"))]
     pub async fn bind_mimic(addr: String) -> Result<Arc<Self>, CoreError> {
-        // The server side of the leg presents no SNI; a non-empty marker selects
-        // the mimic accept path.
-        Self::bind_inner(
-            addr,
-            Arc::new(TokioRuntime),
-            None,
-            Some(String::from("mimic")),
-        )
-        .await
-    }
-
-    /// [`bind_mimic`](Self::bind_mimic) with a caller-supplied long-lived
-    /// [`HybridSigningKey`] so the server's pinned verifying identity persists
-    /// across restarts. Rust-only, native-only, `mimicry`-gated.
-    #[cfg(all(not(target_arch = "wasm32"), feature = "mimicry"))]
-    pub async fn bind_with_signing_key_mimic(
-        addr: String,
-        signing_key: HybridSigningKey,
-    ) -> Result<Arc<Self>, CoreError> {
-        Self::bind_inner(
-            addr,
-            Arc::new(TokioRuntime),
-            Some(signing_key),
-            Some(String::from("mimic")),
-        )
-        .await
+        Self::builder(addr).mimic_sni("mimic").bind().await
     }
 
     /// Shared bind path. If `signing_key` is `Some`, the resulting
     /// [`HandshakeServer`] uses that long-lived key. Otherwise the
     /// historical generate-internal-key behavior is preserved.
+    /// If `config` is `Some`, liveness settings, session-cache sizing and the write
+    /// deadline are derived from it and applied to each accepted session; a zero
+    /// write deadline is refused before the port is bound.
     async fn bind_inner(
         addr: String,
         runtime: Arc<dyn Runtime>,
         signing_key: Option<HybridSigningKey>,
         mimic_sni: Option<String>,
+        config: Option<crate::config::PhantomConfig>,
     ) -> Result<Arc<Self>, CoreError> {
         // Under `--features fips`, run the FIPS 140-3 §7.7 POST
         // before standing up the listener. A failure short-circuits
@@ -189,15 +197,32 @@ impl PhantomListener {
         crate::crypto::self_tests::ensure_post_passed()
             .map_err(|e| CoreError::FipsSelfTestFailure(format!("{e:?}")))?;
 
+        let write_stall_timeout = match config.as_ref() {
+            Some(cfg) => cfg.stream_write_stall_timeout()?,
+            None => DEFAULT_WRITE_STALL_TIMEOUT,
+        };
         let listener = Self::bind_with_optional_reuseport(&addr).await?;
         let local_addr = listener
             .local_addr()
             .map_err(|e| CoreError::NetworkError(format!("local_addr: {}", e)))?;
-        let hs = match signing_key {
-            Some(sk) => HandshakeServer::with_signing_key(sk),
-            None => HandshakeServer::new(),
+        // Built before the `HandshakeServer` so the same shared handle can be installed
+        // as its metrics sink — the DoS gate (cookie / PoW), the resumption path, and
+        // 0-RTT early-data record through it, so their events land in the same
+        // listener-wide aggregate as the handshake / session / packet counters.
+        let observability = Observability::new(ObservabilityConfig::default());
+        let hs = match (signing_key, config.as_ref()) {
+            (Some(sk), Some(cfg)) => {
+                HandshakeServer::with_signing_key_and_cache(sk, cfg.session_cache())
+            }
+            (Some(sk), None) => HandshakeServer::with_signing_key(sk),
+            // Fresh per-process identity WITH a config-sized cache. Use new_with_cache
+            // (not an inline generate) so the FIPS pairwise-consistency check `new()`
+            // runs is preserved on the auto-generated signing key.
+            (None, Some(cfg)) => HandshakeServer::new_with_cache(cfg.session_cache()),
+            (None, None) => HandshakeServer::new(),
         }
-        .map_err(|e| CoreError::InternalError(e.to_string()))?;
+        .map_err(|e| CoreError::InternalError(e.to_string()))?
+        .with_observability(observability.clone());
         let (accepted_tx, accepted_rx) = mpsc::channel(MAX_INFLIGHT_HANDSHAKES);
         Ok(Arc::new(Self {
             listener: Arc::new(listener),
@@ -206,12 +231,14 @@ impl PhantomListener {
             shutting_down: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
             runtime,
-            observability: Observability::new(ObservabilityConfig::default()),
+            observability,
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_HANDSHAKES)),
             accepted_tx,
             accepted_rx: Mutex::new(accepted_rx),
             acceptor: parking_lot::Mutex::new(None),
             mimic_sni,
+            liveness: config.map(|c| c.liveness()),
+            write_stall_timeout,
         }))
     }
 
@@ -275,17 +302,74 @@ impl PhantomListener {
 
 #[cfg_attr(feature = "bindings", uniffi::export(async_runtime = "tokio"))]
 impl PhantomListener {
+    /// Bind a TCP listener with a **freshly generated** hybrid signing identity.
+    ///
+    /// The identity lives and dies with the process. Every client pins the
+    /// server's verifying key, so a restart invalidates every pin that was ever
+    /// handed out and each of those clients then fails with
+    /// [`CoreError::ServerIdentityMismatch`] — not with a reconnect. That is
+    /// correct behaviour for a pinned protocol and a footgun in production, which
+    /// is why it is said here rather than left to be discovered: for anything that
+    /// outlives one process, use
+    /// [`bind_with_signing_key_bytes`](Self::bind_with_signing_key_bytes) with a
+    /// seed you persist, or the builder's `.signing_key(...)`.
+    ///
+    /// This is the TCP entry point. PhantomUDP — the production transport — is
+    /// [`PhantomUdpListener::bind_udp`](crate::api::udp_listener::PhantomUdpListener::bind_udp),
+    /// whose contract is the same.
     #[cfg_attr(feature = "bindings", uniffi::constructor)]
     #[tracing::instrument(name = "phantom.listener.bind", skip_all, fields(addr = %addr))]
     pub async fn bind(addr: String) -> Result<Arc<Self>, CoreError> {
-        Self::bind_inner(addr, Arc::new(TokioRuntime), None, None).await
+        Self::bind_inner(addr, Arc::new(TokioRuntime), None, None, None).await
+    }
+
+    /// Bind a TCP listener using a persisted 64-byte signing seed (from
+    /// [`generate_signing_key`](crate::api::identity::generate_signing_key)) as the
+    /// server's long-lived identity, so `verifying_key_bytes()` — the value clients pin
+    /// — stays stable across restarts. The FFI analogue of the Rust-only
+    /// [`bind_with_signing_key`](Self::bind_with_signing_key).
+    #[cfg_attr(feature = "bindings", uniffi::constructor)]
+    #[tracing::instrument(name = "phantom.listener.bind_with_signing_key", skip_all, fields(addr = %addr))]
+    pub async fn bind_with_signing_key_bytes(
+        addr: String,
+        signing_key: Vec<u8>,
+    ) -> Result<Arc<Self>, CoreError> {
+        let sk = HybridSigningKey::from_bytes(&signing_key)
+            .map_err(|e| CoreError::CryptoError(format!("invalid signing key seed: {e}")))?;
+        Self::bind_inner(addr, Arc::new(TokioRuntime), Some(sk), None, None).await
+    }
+
+    /// Bind a TCP listener using a persisted 64-byte signing seed and a
+    /// [`PhantomConfig`](crate::config::PhantomConfig) that controls liveness settings,
+    /// session-cache sizing, and the write deadline of every accepted connection
+    /// ([`write_stall_timeout`](crate::config::PhantomConfig::write_stall_timeout) — a
+    /// zero one is refused with [`CoreError::ConfigError`] before the port is bound).
+    /// The FFI analogue of the Rust-only
+    /// [`bind_with_signing_key`](Self::bind_with_signing_key) + config combination.
+    #[cfg_attr(feature = "bindings", uniffi::constructor)]
+    #[tracing::instrument(name = "phantom.listener.bind_with_config", skip_all, fields(addr = %addr))]
+    pub async fn bind_with_config_bytes(
+        addr: String,
+        signing_key: Vec<u8>,
+        config: crate::config::PhantomConfig,
+    ) -> Result<Arc<Self>, CoreError> {
+        let sk = HybridSigningKey::from_bytes(&signing_key)
+            .map_err(|e| CoreError::CryptoError(format!("invalid signing key seed: {e}")))?;
+        Self::bind_inner(addr, Arc::new(TokioRuntime), Some(sk), None, Some(config)).await
     }
 
     /// The server's long-lived hybrid verifying key, serialized via
     /// `HybridVerifyingKey::to_bytes`. Clients MUST pin this value before
-    /// completing a handshake to defeat MITM (see Vuln 1 in security review).
+    /// completing a handshake to defeat MITM (Security Invariant 1).
     pub fn verifying_key_bytes(&self) -> Vec<u8> {
         self.handshake_server.verifying_key().to_bytes()
+    }
+
+    /// Flat snapshot of the listener's aggregated connection metrics (all
+    /// accepted sessions share this counter set). Lock-free read; available
+    /// with or without `telemetry-otel`.
+    pub fn metrics_snapshot(&self) -> crate::observability::MetricsSnapshotFfi {
+        self.observability.snapshot().into()
     }
 
     /// Local socket address the listener is actually bound to (resolved at
@@ -298,10 +382,10 @@ impl PhantomListener {
     /// Accept the next inbound connection and complete its handshake.
     ///
     /// Returns an [`AcceptOutcome`] — the established session plus any
-    /// 0-RTT early-data the client carried on a V3 ClientHello. Use
+    /// 0-RTT early-data the client carried in its `ClientHello`. Use
     /// `.session()` for the session and `.take_early_data()` for the
-    /// early-data (the latter is `None` for a plain V1/V2 handshake or
-    /// when the server rejected the early-data).
+    /// early-data (the latter is `None` for a standard 1-RTT handshake
+    /// or when the server rejected the early-data).
     #[tracing::instrument(name = "phantom.listener.accept", skip_all)]
     pub async fn accept(&self) -> Result<Arc<AcceptOutcome>, CoreError> {
         // Cheap fast-path: if shutdown was already signalled before this
@@ -346,6 +430,17 @@ impl PhantomListener {
     pub fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(Ordering::Acquire)
     }
+
+    /// Enable or disable 0-RTT early-data acceptance (default: enabled). When
+    /// disabled, resuming clients' early-data is rejected and resent in a 1-RTT
+    /// exchange — the zero-infrastructure defence against 0-RTT replay for a
+    /// deployment that cannot guarantee a single coherent resumption cache.
+    /// Resumption / early-data ride the transport-agnostic `ClientHello`, so
+    /// this applies to the TCP path too. See
+    /// [`HandshakeServer::set_early_data_enabled`].
+    pub fn set_early_data_enabled(&self, enabled: bool) {
+        self.handshake_server.set_early_data_enabled(enabled);
+    }
 }
 
 // Rust-only accessors (not UniFFI-exported because the return type
@@ -356,15 +451,6 @@ impl PhantomListener {
     /// to share the listener's counter set.
     pub fn observability(&self) -> Arc<Observability> {
         self.observability.clone()
-    }
-
-    /// Enable or disable 0-RTT early-data acceptance (A2b; default enabled). When disabled,
-    /// resuming clients' early-data is rejected and resent 1-RTT — the zero-infrastructure
-    /// defence against 0-RTT replay for a deployment that cannot guarantee a single coherent
-    /// resumption cache. Resumption / early-data ride the transport-agnostic `ClientHello`, so
-    /// this applies to the TCP path too. Rust-only. See [`HandshakeServer::set_early_data_enabled`].
-    pub fn set_early_data_enabled(&self, enabled: bool) {
-        self.handshake_server.set_early_data_enabled(enabled);
     }
 
     /// Install a distributed 0-RTT anti-replay store (A2b) for replay-safe 0-RTT in a
@@ -406,19 +492,23 @@ impl PhantomListener {
             self.runtime.clone(),
             self.observability.clone(),
             self.mimic_sni.clone(),
+            self.liveness,
+            self.write_stall_timeout,
         )));
         *guard = Some(handle);
     }
 }
 
-/// Outcome of a successful [`PhantomListener::accept`] — the accepted
-/// session plus any 0-RTT early-data the client carried on its V3
-/// ClientHello (wire V3, Phase 4.1).
+/// Outcome of a successful [`PhantomListener::accept`] — the established
+/// [`PhantomSession`] with any 0-RTT early-data the client carried in its
+/// `ClientHello`.
 ///
-/// A `uniffi::Object` rather than a record: it returns an
-/// `Arc<PhantomSession>` (itself a `uniffi::Object`) from a method,
-/// the same known-good pattern `accept()` used before V3. `take_*`
-/// is take-once so a ≤16 KiB blob is moved out, not cloned.
+/// Use [`session()`](Self::session) for the session and
+/// [`take_early_data()`](Self::take_early_data) for the optional 0-RTT
+/// payload. Both accessors are take-once — `take_early_data` returns `None`
+/// on the second call, and the session handle is `Arc`-cloned on each call.
+/// A `uniffi::Object` rather than a record so it can return an
+/// `Arc<PhantomSession>` (itself a `uniffi::Object`) from a method.
 #[cfg_attr(feature = "bindings", derive(uniffi::Object))]
 pub struct AcceptOutcome {
     session: Arc<PhantomSession>,
@@ -444,6 +534,14 @@ impl AcceptOutcome {
     /// Whether 0-RTT early-data is present and not yet taken.
     pub fn has_early_data(&self) -> bool {
         self.early_data.lock().is_some()
+    }
+
+    /// The remote socket address this session was accepted from, as a string
+    /// (e.g. `"203.0.113.4:51000"`) — for per-peer admission control / logging
+    /// from FFI consumers. The typed [`peer_addr`](Self::peer_addr) returning a
+    /// `SocketAddr` stays Rust-only.
+    pub fn peer_addr_string(&self) -> String {
+        self.peer_addr.to_string()
     }
 }
 
@@ -587,6 +685,8 @@ async fn run_acceptor(
     runtime: Arc<dyn Runtime>,
     observability: Arc<Observability>,
     mimic_sni: Option<String>,
+    liveness: Option<crate::transport::liveness::LivenessConfig>,
+    write_stall_timeout: Duration,
 ) {
     let mut accept_count: u64 = 0;
     loop {
@@ -640,13 +740,14 @@ async fn run_acceptor(
                 match crate::transport::legs::mimic_tls::MimicTlsLeg::accept(stream, &cfg).await {
                     Ok(leg) => {
                         serve_connection(
-                            leg,
+                            leg.with_write_stall_timeout(write_stall_timeout),
                             &hs,
                             peer,
                             &task_runtime,
                             &observability,
                             &accepted_tx,
                             LegType::FakeTls,
+                            liveness,
                         )
                         .await
                     }
@@ -656,7 +757,8 @@ async fn run_acceptor(
             }
             let _ = &mimic_sni; // (feature off: always None; silence unused)
 
-            let transport = TcpSessionTransport::new(stream);
+            let transport =
+                TcpSessionTransport::new(stream).with_write_stall_timeout(write_stall_timeout);
             serve_connection(
                 transport,
                 &hs,
@@ -665,6 +767,7 @@ async fn run_acceptor(
                 &observability,
                 &accepted_tx,
                 LegType::Tcp,
+                liveness,
             )
             .await;
         }));
@@ -684,6 +787,7 @@ async fn serve_connection<T: SessionTransport>(
     observability: &Arc<Observability>,
     accepted_tx: &mpsc::Sender<Arc<AcceptOutcome>>,
     leg_type: LegType,
+    liveness: Option<crate::transport::liveness::LivenessConfig>,
 ) {
     let started = Instant::now();
     // Scoped so the borrow of `transport` ends before it is moved into the session.
@@ -705,10 +809,14 @@ async fn serve_connection<T: SessionTransport>(
                 AeadAlgorithm::Aes256Gcm,
                 ProtocolVersion::Current,
             );
+            let arc_session = Arc::new(server_session);
+            if let Some(live) = liveness {
+                arc_session.set_liveness_config(live);
+            }
             let session = PhantomSession::from_accepted_server_session_with_runtime(
                 peer.to_string(),
                 transport,
-                Arc::new(server_session),
+                arc_session,
                 task_runtime.clone(),
                 observability.clone(),
                 leg_type,
@@ -744,6 +852,86 @@ impl Drop for PhantomListener {
     }
 }
 
+impl PhantomListener {
+    /// Create a [`ListenerBuilder`] for constructing a TCP listener.
+    ///
+    /// The builder collects configuration (optional signing key, runtime, config)
+    /// and then `.bind().await` stands up the listener. This is the ergonomic
+    /// alternative to calling [`bind_with_signing_key`](Self::bind_with_signing_key)
+    /// or [`bind_with_runtime`](Self::bind_with_runtime) with multiple arguments.
+    pub fn builder(addr: impl Into<String>) -> ListenerBuilder {
+        ListenerBuilder {
+            addr: addr.into(),
+            signing_key: None,
+            config: None,
+            runtime: None,
+            #[cfg(all(not(target_arch = "wasm32"), feature = "mimicry"))]
+            mimic_sni: None,
+        }
+    }
+}
+
+// ─── ListenerBuilder ────────────────────────────────────────────────────────
+
+/// Builder for [`PhantomListener`].
+///
+/// Created via [`PhantomListener::builder`]. Collects configuration, then
+/// `.bind().await` stands up the listener.
+pub struct ListenerBuilder {
+    addr: String,
+    signing_key: Option<HybridSigningKey>,
+    config: Option<crate::config::PhantomConfig>,
+    runtime: Option<Arc<dyn Runtime>>,
+    #[cfg(all(not(target_arch = "wasm32"), feature = "mimicry"))]
+    mimic_sni: Option<String>,
+}
+
+impl ListenerBuilder {
+    /// Use a long-lived [`HybridSigningKey`] so the server's verifying identity
+    /// persists across restarts (clients can pin it).
+    pub fn signing_key(mut self, key: HybridSigningKey) -> Self {
+        self.signing_key = Some(key);
+        self
+    }
+
+    /// Apply a [`PhantomConfig`](crate::config::PhantomConfig): liveness, session-cache
+    /// sizing, and the write deadline every accepted connection's transport is built with
+    /// ([`write_stall_timeout`](crate::config::PhantomConfig::write_stall_timeout)), on
+    /// the plain TCP and the mimicry path alike. `bind()` refuses a zero write deadline
+    /// with [`CoreError::ConfigError`] before the port is bound.
+    pub fn config(mut self, config: crate::config::PhantomConfig) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    /// Use a custom [`Runtime`] instead of the default [`TokioRuntime`].
+    pub fn runtime(mut self, runtime: Arc<dyn Runtime>) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
+    /// Enable TLS-over-TCP active-mimicry (anti-DPI obfuscation; `mimicry` feature).
+    /// **Obfuscation only** — see [`PhantomListener::bind_mimic`] for the security caveat.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "mimicry"))]
+    pub fn mimic_sni(mut self, sni: impl Into<String>) -> Self {
+        self.mimic_sni = Some(sni.into());
+        self
+    }
+
+    /// Bind the listener and return it.
+    pub async fn bind(self) -> Result<Arc<PhantomListener>, CoreError> {
+        let runtime = self
+            .runtime
+            .unwrap_or_else(|| Arc::new(TokioRuntime) as Arc<dyn Runtime>);
+        #[cfg(all(not(target_arch = "wasm32"), feature = "mimicry"))]
+        let mimic_sni = self.mimic_sni;
+        #[cfg(not(all(not(target_arch = "wasm32"), feature = "mimicry")))]
+        let mimic_sni: Option<String> = None;
+        PhantomListener::bind_inner(self.addr, runtime, self.signing_key, mimic_sni, self.config)
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -756,9 +944,7 @@ mod tests {
     async fn bind_with_signing_key_pins_verifying_identity() {
         // Serialise vs. the fips fault-injection test that flips
         // POST_RESULT. Harmless overhead on non-fips builds.
-        let _guard = crate::crypto::self_tests::tests_serial_guard()
-            .lock()
-            .unwrap();
+        let _guard = crate::crypto::self_tests::tests_serial_guard().lock().await;
         crate::crypto::self_tests::set_force_post_fail(false);
         let (signing_key, verifying_key) = HybridSigningKey::generate();
         let expected_vk_bytes = verifying_key.to_bytes();
@@ -780,9 +966,7 @@ mod tests {
     /// identity the on-disk key encodes.
     #[tokio::test]
     async fn bind_with_signing_key_round_trips_via_bytes() {
-        let _guard = crate::crypto::self_tests::tests_serial_guard()
-            .lock()
-            .unwrap();
+        let _guard = crate::crypto::self_tests::tests_serial_guard().lock().await;
         crate::crypto::self_tests::set_force_post_fail(false);
         let (orig_signing_key, orig_verifying_key) = HybridSigningKey::generate();
         let on_disk = orig_signing_key.to_bytes();
@@ -807,9 +991,7 @@ mod tests {
     /// verifying key. Pins the back-compat guarantee.
     #[tokio::test]
     async fn bind_still_generates_fresh_key_per_call() {
-        let _guard = crate::crypto::self_tests::tests_serial_guard()
-            .lock()
-            .unwrap();
+        let _guard = crate::crypto::self_tests::tests_serial_guard().lock().await;
         crate::crypto::self_tests::set_force_post_fail(false);
         let l1 = PhantomListener::bind("127.0.0.1:0".to_string())
             .await
@@ -832,9 +1014,7 @@ mod tests {
     async fn fips_post_failure_aborts_bind() {
         // Serialise with sibling fault-injection tests via the same
         // mutex they use.
-        let _guard = crate::crypto::self_tests::tests_serial_guard()
-            .lock()
-            .unwrap();
+        let _guard = crate::crypto::self_tests::tests_serial_guard().lock().await;
         crate::crypto::self_tests::set_force_post_fail(true);
         let result = PhantomListener::bind("127.0.0.1:0".to_string()).await;
         crate::crypto::self_tests::set_force_post_fail(false);
@@ -896,6 +1076,69 @@ mod tests {
             0,
             "a pre-cookie variant mismatch must not escalate the (possibly spoofed) IP's \
              reputation (M-4)"
+        );
+    }
+
+    /// `AcceptOutcome::peer_addr_string()` returns a non-empty address string in
+    /// `"ip:port"` form that round-trips back to a `SocketAddr` — confirms the FFI
+    /// admission-control accessor is wired to the real accepted `peer_addr`.
+    #[test]
+    fn accept_outcome_peer_addr_string_roundtrips() {
+        use crate::api::session::PhantomSession;
+        use std::net::SocketAddr;
+
+        let peer: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let session = PhantomSession::connect("127.0.0.1:54321".to_string());
+        let outcome = AcceptOutcome::new(session, None, peer);
+
+        let s = outcome.peer_addr_string();
+        assert!(!s.is_empty(), "peer_addr_string must not be empty");
+        assert!(
+            s.contains(':'),
+            "peer_addr_string must contain ':' (ip:port form)"
+        );
+        let parsed: SocketAddr = s
+            .parse()
+            .expect("peer_addr_string must parse as SocketAddr");
+        assert_eq!(
+            parsed, peer,
+            "peer_addr_string must round-trip to the original SocketAddr"
+        );
+    }
+
+    // ── ListenerBuilder tests ─────────────────────────────────────────────────
+
+    /// Verify `PhantomListener::builder` constructs a `ListenerBuilder` that can be
+    /// used to bind (smoke — just checks the builder wires through to `bind_inner`).
+    #[tokio::test]
+    async fn listener_builder_binds_successfully() {
+        let _guard = crate::crypto::self_tests::tests_serial_guard().lock().await;
+        crate::crypto::self_tests::set_force_post_fail(false);
+        let listener = PhantomListener::builder("127.0.0.1:0")
+            .bind()
+            .await
+            .expect("builder bind should succeed");
+        assert!(
+            listener.local_addr().starts_with("127.0.0.1:"),
+            "bound address must be on 127.0.0.1"
+        );
+    }
+
+    /// Builder with a signing key persists the verifying identity.
+    #[tokio::test]
+    async fn listener_builder_with_signing_key_pins_identity() {
+        let _guard = crate::crypto::self_tests::tests_serial_guard().lock().await;
+        crate::crypto::self_tests::set_force_post_fail(false);
+        let (signing_key, verifying_key) = HybridSigningKey::generate();
+        let listener = PhantomListener::builder("127.0.0.1:0")
+            .signing_key(signing_key)
+            .bind()
+            .await
+            .expect("builder bind with signing_key should succeed");
+        assert_eq!(
+            listener.verifying_key_bytes(),
+            verifying_key.to_bytes(),
+            "builder with signing_key must pin that key's verifying half"
         );
     }
 }

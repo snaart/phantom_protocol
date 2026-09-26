@@ -72,6 +72,49 @@ pub trait SessionTransport: Send + Sync + 'static {
     /// so the `+ Send` bound on the returned future is explicit. This is
     /// what lets the data pump spawn its task generically over any
     /// `T: SessionTransport` without an AFIT `return_type_notation` hack.
+    ///
+    /// # A write must not wait on the peer forever
+    ///
+    /// On a byte-stream transport a write can wait on the peer: once the peer
+    /// stops reading, the buffers between the two ends fill and stay full. The
+    /// session's data pump is the writer, and while one of its writes waits, the
+    /// rest of the pump waits with it — no liveness sweep, and no local close,
+    /// since `disconnect()` and dropping the handle are requests the pump reads
+    /// between writes. A peer could hold the session for as long as it liked.
+    ///
+    /// So an implementation whose write can wait on the peer bounds it: once a
+    /// write has made **no progress** for a bounded time, fail it with
+    /// [`CoreError::Timeout`]. Progress is the point — a peer still taking bytes,
+    /// however slowly, is a slow link and must not be cut off; only one that has
+    /// stopped. After such a failure, refuse every later write with the same error
+    /// without touching the connection, because the write that gave up may have
+    /// left a frame cut part-way through, and any byte written after it would be
+    /// read by the peer as the rest of that frame.
+    ///
+    /// The session treats `Timeout` from either I/O method as the transport
+    /// having given up on the peer, and nothing short of that: it writes nothing
+    /// more, stops reading, and ends in `ConnectionState::Dead`, reporting the
+    /// `Timeout` from `last_error()` and `recv()`. Any other error from a write is
+    /// the transport's own business and the session carries on.
+    ///
+    /// How each shipped transport stands:
+    ///
+    /// - `TcpSessionTransport` bounds every write by a progress deadline, thirty
+    ///   seconds unless set otherwise — with `with_write_stall_timeout` on a
+    ///   transport the caller builds, or through `PhantomConfig::write_stall_timeout`
+    ///   on the ones the listeners and the config-taking connects build.
+    /// - The TLS-mimicry leg does the same once its prelude is done; the prelude's
+    ///   writes already sit under the prelude's own deadline.
+    /// - The WASI leg does the same through `wasi:io/poll`.
+    /// - `EmbeddedLeg` has no clock of its own on a bare-metal target, so the bound
+    ///   is its writer's to impose: a writer that can block indefinitely (a USB
+    ///   CDC link whose host stopped reading, a UART under hardware flow control)
+    ///   should wrap its writes in the executor's timeout and report
+    ///   `ErrorKind::TimedOut`, which the leg turns into `Timeout` and treats as
+    ///   final. A UART without flow control never waits on its peer at all.
+    /// - The PhantomUDP transports and the browser WebSocket leg never wait on the
+    ///   peer: a datagram send completes or fails locally, and a browser WebSocket
+    ///   buffers whatever it is given.
     fn send_bytes(
         &self,
         data: &[u8],
@@ -141,20 +184,42 @@ pub trait SessionTransport: Send + Sync + 'static {
         false
     }
 
+    /// Whether this transport supports seamless connection migration without a
+    /// re-handshake. Returns `true` only for address-aware UDP transports
+    /// ([`UdpClientTransport`] / [`UdpServerTransport`]); all stream transports
+    /// (TCP, WebSocket, WASI, Embedded) return `false`.
+    ///
+    /// Use this to guard calls to [`migrate`](Self::migrate) at runtime.
+    ///
+    /// [`UdpClientTransport`]: crate::api::udp_transport::UdpClientTransport
+    /// [`UdpServerTransport`]: crate::api::udp_transport::UdpServerTransport
+    fn supports_migration(&self) -> bool {
+        false
+    }
+
     /// Migrate this transport to a new local address (Phase 4 / P4.2c — embedder-
     /// triggered connection migration). The address crosses as a `String` (parsed
     /// inside the concrete native transport) so the
     /// trait stays `SocketAddr`-free and no_std-clean — `std::net::SocketAddr` does
     /// not exist in `core`/`alloc`. Best-effort: a parse / bind / connect failure
     /// returns `Err` and the session is expected to keep running on its existing
-    /// socket — migration never tears it down. Default no-op `Ok(())` for transports
-    /// without migration (TCP / WebSocket / WASI / Embedded / the in-memory test
-    /// pipe); only the native UDP client implements it.
+    /// socket — migration never tears it down.
+    ///
+    /// Default: returns [`CoreError::Unsupported`] for transports without migration
+    /// (TCP / WebSocket / WASI / Embedded / the in-memory test pipe); only the native
+    /// UDP client (`UdpClientTransport`) overrides this with the real implementation.
+    /// Call [`supports_migration`](Self::supports_migration) before calling this method
+    /// to avoid receiving `Unsupported` on non-UDP sessions.
     fn migrate(
         &self,
         _local_addr: String,
     ) -> impl core::future::Future<Output = Result<(), CoreError>> + Send {
-        async { Ok(()) }
+        async {
+            Err(CoreError::Unsupported(
+                "this transport does not support connection migration; use a UDP-backed session"
+                    .into(),
+            ))
+        }
     }
 
     /// Migrate the **server side** of this transport to a new local send address — the
@@ -164,13 +229,19 @@ pub trait SessionTransport: Send + Sync + 'static {
     /// switches its send target the c2s frames are delivered transparently). The address
     /// crosses as a `String` to keep the trait `SocketAddr`-free / no_std-clean. Best-effort:
     /// a parse / bind failure returns `Err` and the session keeps running on the old socket.
-    /// Default no-op `Ok(())` — only the native UDP server implements it. Kept distinct from
-    /// [`migrate`](Self::migrate) so the FFI-exported client `migrate()` cannot trigger a
-    /// server migration.
+    ///
+    /// Default: returns [`CoreError::Unsupported`] — only the native UDP server
+    /// (`UdpServerTransport`) implements it. Kept distinct from [`migrate`](Self::migrate)
+    /// so the FFI-exported client `migrate()` cannot trigger a server migration.
     fn migrate_server(
         &self,
         _local_addr: String,
     ) -> impl core::future::Future<Output = Result<(), CoreError>> + Send {
-        async { Ok(()) }
+        async {
+            Err(CoreError::Unsupported(
+                "this transport does not support server-side migration; use a UDP-backed session"
+                    .into(),
+            ))
+        }
     }
 }

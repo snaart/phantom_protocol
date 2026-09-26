@@ -10,6 +10,20 @@ phantom-server
 
 For the full env-var reference see [`README.md`](README.md).
 
+> **TLS prerequisite.** The reference `phantom-server` builds
+> `opentelemetry-otlp` with `default-features = false` and the features
+> `grpc-tonic, metrics, trace, gzip-tonic` — **no TLS backend** (there is no
+> rustls / native-tls in `server/Cargo.lock`). As shipped it can only reach a
+> plaintext `http://` collector, which is why Recipe A is the supported path.
+> Recipes B–E (`https://` endpoints, mTLS) require rebuilding the server with
+> a TLS feature on `opentelemetry-otlp` (e.g. `tls-ring` + `tls-webpki-roots`)
+> — and the `OTEL_EXPORTER_OTLP_CERTIFICATE` / `_CLIENT_CERTIFICATE` /
+> `_CLIENT_KEY` variables are not read by the Rust exporter, so mTLS
+> additionally needs an explicit `.with_tls_config(...)` in
+> `server/src/telemetry.rs`. The zero-code-change alternative is to terminate
+> TLS in a local OTel Collector (Recipe A) and point the server at it over
+> `http://`.
+
 ## Recipe A: self-hosted (OTel Collector → Prometheus + Tempo + Loki)
 
 The "Phantom-shaped" stack: one Collector, three pull/push sinks for the
@@ -59,7 +73,10 @@ export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
 
 Prometheus scrapes `:8889/metrics` from the Collector. Grafana reads
 Prometheus for metrics and Tempo for traces; the `traces_to_metrics`
-datasource correlation wires exemplars into the latency panels.
+datasource correlation is what *would* wire exemplars into the latency
+panels — but no exemplars are emitted until an exemplar reservoir is
+configured on the `MeterProvider`, and the reference server configures none
+(see [`tracing-guide.md`](tracing-guide.md)).
 
 ## Recipe B: Datadog (direct)
 
@@ -81,7 +98,7 @@ appear in APM under the configured `service.name`.
 ```bash
 export OTEL_EXPORTER_OTLP_ENDPOINT="https://api.honeycomb.io:443"
 export OTEL_EXPORTER_OTLP_HEADERS="x-honeycomb-team=$HONEYCOMB_API_KEY,x-honeycomb-dataset=phantom"
-export OTEL_TRACES_SAMPLER_ARG=0.1   # 10% sampling on production traces
+export OTEL_TRACES_SAMPLER_ARG=0.1   # 10% sampling on production traces (default 1.0)
 phantom-server
 ```
 
@@ -150,10 +167,12 @@ service:
   `otel_sdk_exporter_metric_data_points` / `..._span` failure counters and the
   Collector's `otelcol_exporter_send_failed_*` — non-zero means the Collector
   / backend is congested or unreachable.
-- **Sampling for cost.** Default trace ratio is 1%. For incident
-  investigation flip `OTEL_TRACES_SAMPLER=always_on` per-instance; failure
-  paths remain visible via the metrics counters regardless of trace
-  sampling.
+- **Sampling for cost.** The default ratio is `1.0` (100 % export) — the server
+  installs `ParentBased(TraceIdRatioBased(ratio))` on the `TracerProvider`, so
+  lowering it is a deliberate act. To sample, set `--otel-trace-sample-ratio 0.01`
+  or `OTEL_TRACES_SAMPLER_ARG=0.01`; either form works on its own, and
+  `OTEL_TRACES_SAMPLER` is not consulted. Failure paths remain visible via the
+  metrics counters regardless of trace sampling.
 - **Resource attrs in containers.** Set `OTEL_RESOURCE_ATTRIBUTES` in
   the deployment manifest so every pod gets `deployment.environment`,
   `k8s.pod.name`, etc. automatically attached to all telemetry.

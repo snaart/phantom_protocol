@@ -12,9 +12,17 @@ TARGET="${REPO_ROOT}/target"
 OUT="${SCRIPT_DIR}/PhantomProtocol.xcframework"
 
 echo "==> Building iOS slices (aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios)"
-cargo build --release --target aarch64-apple-ios     --manifest-path "${REPO_ROOT}/core/Cargo.toml"
-cargo build --release --target aarch64-apple-ios-sim --manifest-path "${REPO_ROOT}/core/Cargo.toml"
-cargo build --release --target x86_64-apple-ios      --manifest-path "${REPO_ROOT}/core/Cargo.toml"
+# `--crate-type staticlib` is passed on the command line rather than declared in
+# core/Cargo.toml's `[lib] crate-type`: a staticlib is a final artifact, so
+# declaring it manifest-wide makes cargo require a `#[panic_handler]` and a
+# `#[global_allocator]` from the library on bare-metal targets and breaks the
+# thumbv7em-none-eabihf row of cross.yml. Requesting it per invocation gives the
+# same `libphantom_protocol.a` and leaves every other build untouched.
+for TRIPLE in aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios; do
+    cargo rustc --release --target "${TRIPLE}" \
+        --manifest-path "${REPO_ROOT}/core/Cargo.toml" \
+        --crate-type staticlib
+done
 
 echo "==> Merging simulator slices via lipo"
 mkdir -p "${TARGET}/universal-ios-sim/release"

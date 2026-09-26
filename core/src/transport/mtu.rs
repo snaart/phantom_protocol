@@ -1,0 +1,208 @@
+//! The path-MTU budget, and the application-chunk size derived from it.
+//!
+//! A datagram is this protocol's unit of loss. The sender therefore has to size an
+//! application chunk so that the packet it becomes still fits **one** PhantomUDP
+//! datagram: a chunk that overflows the budget by a single byte is fragmented into
+//! a full datagram plus a small tail, which
+//!
+//! - doubles the datagram rate for the same goodput;
+//! - makes the segment depend on *both* datagrams arriving, so an independent
+//!   per-datagram loss rate `p` becomes `1 − (1 − p)² ≈ 2p` per segment — and loss
+//!   recovery, the SACK loss detector and the BBR loss threshold all count
+//!   segments, not datagrams;
+//! - spends an 8-byte fragment subheader plus a fresh 28-byte IP/UDP header on a
+//!   tail that carries a hundred-odd bytes.
+//!
+//! The constants live here rather than beside the UDP envelope because the code
+//! that does the chunking (`api::session`'s data pump) also compiles for targets
+//! that never build the UDP transport at all — browser wasm, WASI, embedded UART.
+//! `phantom_udp::envelope` re-exports them, so there is still exactly one
+//! definition of the budget.
+//!
+//! On the byte-pipe legs (TCP, mimicry, WebSocket, WASI, embedded) the chunk size
+//! is not a correctness constraint at all — those transports frame whatever they
+//! are handed and never fragment — so sizing for the datagram budget only costs
+//! them a slightly higher share of per-packet overhead.
+
+use crate::crypto::adaptive_crypto::AEAD_OVERHEAD;
+use crate::transport::types::PacketHeader;
+
+/// Conservative fixed path-MTU budget: 1200 bytes is the QUIC-style floor that
+/// survives almost every Internet path without IP fragmentation. Static today —
+/// dynamic DPLPMTUD to raise it is future work.
+pub const PATH_MTU: usize = 1200;
+
+/// The PhantomUDP outer datagram header: one flags byte plus the 8-byte rotating
+/// `ConnId`. Unauthenticated transport framing, outside the frozen inner wire.
+/// `phantom_udp::envelope::HDR_LEN` is this constant, and asserts it agrees with
+/// `1 + CID_LEN` there.
+pub const DATAGRAM_HDR_LEN: usize = 1 + 8;
+
+/// Largest inner frame that fits one unfragmented datagram. Anything longer is
+/// split by `phantom_udp::datagram::encode_datagrams`.
+pub const MAX_INNER_UNFRAGMENTED: usize = PATH_MTU - DATAGRAM_HDR_LEN;
+
+/// Bytes the reliable path prefixes to the AEAD **plaintext**: the gap-free
+/// per-stream `stream_offset`, big-endian `u32` (A.5). Unreliable and control
+/// frames carry no prefix, so budgeting for this is the worst case — it leaves an
+/// unreliable datagram four bytes under the budget rather than over it.
+pub const RELIABLE_OFFSET_LEN: usize = 4;
+
+/// Everything one reliable application chunk costs on the wire beyond its own
+/// bytes, measured on the inner frame that the UDP transport is handed:
+/// `header ‖ AEAD(stream_offset ‖ chunk)`. Header protection masks the header in
+/// place and does not resize it; the AEAD tag is appended to the ciphertext.
+pub const PER_PACKET_OVERHEAD: usize = PacketHeader::SIZE + RELIABLE_OFFSET_LEN + AEAD_OVERHEAD;
+
+/// Largest application chunk the data pump hands to a stream, so that the packet
+/// it becomes is exactly one unfragmented PhantomUDP datagram:
+///
+/// ```text
+///   1200   PATH_MTU
+/// −    9   DATAGRAM_HDR_LEN        (outer [flags][ConnId])
+/// ------
+///   1191   MAX_INNER_UNFRAGMENTED
+/// −   15   PacketHeader::SIZE
+/// −    4   RELIABLE_OFFSET_LEN     (in-plaintext gap-free stream offset)
+/// −   16   AEAD_OVERHEAD           (Poly1305 / GCM tag)
+/// ------
+///   1156   MAX_APP_CHUNK
+/// ```
+///
+/// Derived, not chosen: raising `PATH_MTU` (say, once DPLPMTUD lands) widens the
+/// chunk automatically, and nothing else has to move.
+pub const MAX_APP_CHUNK: usize = MAX_INNER_UNFRAGMENTED - PER_PACKET_OVERHEAD;
+
+/// Largest inner frame the data pump will accept from a peer, in bytes.
+///
+/// Everything above is a sender-side budget: it says how this side chunks, and a
+/// peer is under no obligation to have read it. What the receive path was left
+/// with instead was whatever its byte pipe would hand over — 4 MiB on the TCP and
+/// mimicry legs once the frame phase goes to `Established`, a quarter-megabyte
+/// reassembly on PhantomUDP — and every one of those bytes came to rest in a
+/// per-stream delivery slot whose only limit is a slot *count*. A queue bounded
+/// in items holds whatever the items weigh, so the weight has to be bounded here.
+///
+/// It is **not** this side's own budget read backwards. "A frame this side would
+/// never emit is one it will not accept" is the tempting formulation and it is
+/// wrong, because it assumes every peer runs this build. The published 0.2.2
+/// chunks at [`LEGACY_APP_CHUNK`], which is 144 bytes more than this build does,
+/// and a gate set to this side's own budget would silently drop every full-size
+/// data frame such a peer sends. Nothing would report it: the frame is refused
+/// before the AEAD, so it is never acknowledged, its retransmits meet the same
+/// gate, and the session simply stops making progress. The ceiling is therefore
+/// the largest frame *any released version* emits, not the largest this one does.
+///
+/// Nothing on the wire changes — the format is untouched and no field carries a
+/// length — it is a receive-side rejection, so a peer that respects the chunking
+/// rule cannot tell it exists.
+///
+/// Three things set the post-handshake ceiling, and the asserts below hold each
+/// of them under it separately: a full reliable data chunk, which fills the budget
+/// exactly; anti-fingerprint padding, which has a lower ceiling of its own
+/// (`shaping::MAX_SHAPED_WIRE`) and so covers every padded frame including cover
+/// traffic; and the largest control frame, a full SACK at a few hundred bytes.
+/// The remaining control frames — keep-alive, window update, path challenge —
+/// are tens of bytes. Handshake messages are far larger, since a `ServerHello`
+/// carries an ML-DSA-65 signature, but they are exchanged before the pump exists
+/// and never reach this gate.
+pub const MAX_RECV_FRAME: usize = LEGACY_APP_CHUNK + PER_PACKET_OVERHEAD;
+
+/// The application chunk size shipped in 0.2.2, and the reason the receive gate
+/// above is not simply [`MAX_APP_CHUNK`].
+///
+/// That release chunked at a flat 1300 bytes, chosen without reference to the
+/// datagram budget it had to fit — which is the defect that moved the chunk size
+/// to a derived figure in the first place. A 0.2.2 peer is still a legitimate
+/// peer, so its largest frame has to pass, and the two ends of the connection
+/// must agree on what is deliverable even when they are different builds.
+///
+/// This is a compatibility floor and never a target: nothing emits chunks of this
+/// size any more. It can be lowered only when no reachable peer sends them, which
+/// is a release-policy question rather than a code one — see
+/// `docs/policy/versioning.md`.
+pub const LEGACY_APP_CHUNK: usize = 1300;
+
+/// Largest AEAD plaintext a peer can deliver in one frame: [`MAX_RECV_FRAME`]
+/// less the header it carries and the tag it is sealed with.
+///
+/// This is the figure that bounds one queued delivery item, and it is the reason
+/// the per-stream channels can be described in bytes at all rather than only in
+/// slots. The reliable path spends four more bytes of it on the in-plaintext
+/// stream offset, so a reliable segment is [`MAX_APP_CHUNK`]; an unreliable one
+/// keeps the whole plaintext, which is why the bound is stated here and not as
+/// the chunk size.
+pub const MAX_RECV_PAYLOAD: usize = MAX_RECV_FRAME - PacketHeader::SIZE - AEAD_OVERHEAD;
+
+// A full-size chunk must still fit the unfragmented budget. Tautological as long
+// as `MAX_APP_CHUNK` stays derived — which is the point: the day someone replaces
+// the derivation with a literal, this is what stops the build.
+const _: () = assert!(MAX_APP_CHUNK + PER_PACKET_OVERHEAD <= MAX_INNER_UNFRAGMENTED);
+
+// The receive gate has to admit everything this side sends, or the two ends of a
+// legitimate session disagree about what is deliverable. Each post-handshake
+// frame shape is checked against it separately, because "they all fit" is exactly
+// the kind of claim that stops being true one shape at a time.
+const _: () = assert!(MAX_APP_CHUNK + PER_PACKET_OVERHEAD <= MAX_RECV_FRAME);
+const _: () = assert!(crate::transport::shaping::MAX_SHAPED_WIRE <= MAX_RECV_FRAME);
+// And the shape that is not ours: the largest frame a released peer emits. Held
+// separately from the assert above because the two move independently — lowering
+// this side's chunk size must not narrow what the other side is allowed to send.
+const _: () = assert!(LEGACY_APP_CHUNK + PER_PACKET_OVERHEAD <= MAX_RECV_FRAME);
+const _: () = assert!(
+    PacketHeader::SIZE + crate::transport::sack::MAX_SACK_WIRE + AEAD_OVERHEAD <= MAX_RECV_FRAME
+);
+
+// Anti-fingerprint size padding rounds a packet *up* to a PADÉ bucket inside the
+// AEAD plaintext, so it has its own ceiling on the inner wire image. That ceiling
+// plus the outer header must also fit the path MTU, or enabling padding would
+// silently reintroduce the fragmentation this module exists to avoid.
+const _: () = assert!(crate::transport::shaping::MAX_SHAPED_WIRE + DATAGRAM_HDR_LEN <= PATH_MTU);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The arithmetic in the doc comment, asserted rather than trusted.
+    #[test]
+    fn the_chunk_plus_its_overhead_exactly_fills_the_unfragmented_budget() {
+        assert_eq!(
+            MAX_APP_CHUNK + PER_PACKET_OVERHEAD,
+            MAX_INNER_UNFRAGMENTED,
+            "a full-size chunk must fill the datagram, not merely fit it: leaving \
+             slack wastes the path on every packet"
+        );
+        assert_eq!(
+            DATAGRAM_HDR_LEN + MAX_INNER_UNFRAGMENTED,
+            PATH_MTU,
+            "the outer envelope plus the largest unfragmented inner frame is the MTU"
+        );
+    }
+
+    /// The chunk size is quoted as a bare number in prose that no compiler reads.
+    ///
+    /// It is derived, and deliberately so — raising `PATH_MTU` widens it and
+    /// nothing in the transport has to move. But the send-path API documentation
+    /// tells embedders the figure outright, because "boundaries are preserved
+    /// below some constant you can go look up" is advice nobody acts on, and an
+    /// embedder sizes its own framing against the number it was given. A silently
+    /// stale one is worse than none. This is the thing that has to move: when it
+    /// fails, update the figure in `PhantomSession::send`,
+    /// `PhantomStream::send_reliable` and `PhantomStream::send_unreliable`, and
+    /// in the `MAX_APP_CHUNK` arithmetic above, then change it here.
+    #[test]
+    fn the_chunk_size_quoted_in_the_send_path_docs_is_still_this_one() {
+        assert_eq!(MAX_APP_CHUNK, 1156);
+    }
+
+    /// The envelope module and this one must agree; they are the same constants,
+    /// and this fails if the re-export is ever replaced by a second definition.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn the_udp_envelope_uses_this_budget() {
+        use crate::transport::phantom_udp::envelope;
+        assert_eq!(envelope::PATH_MTU, PATH_MTU);
+        assert_eq!(envelope::HDR_LEN, DATAGRAM_HDR_LEN);
+        assert_eq!(envelope::MAX_INNER_UNFRAGMENTED, MAX_INNER_UNFRAGMENTED);
+    }
+}

@@ -187,12 +187,15 @@ Collector. Configure the push target via environment in the unit file
 # ── Telemetry (OTLP push) ──────────────────────────────────
 Environment="OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317"
 Environment="OTEL_SERVICE_NAME=phantom-server"
+# Head-sampling ratio for root spans; effective on its own (no
+# OTEL_TRACES_SAMPLER needed). Server default is 1.0 = export everything.
 Environment="OTEL_TRACES_SAMPLER_ARG=0.1"
 # For SaaS backends that need auth headers:
 # Environment="OTEL_EXPORTER_OTLP_HEADERS=authorization=Bearer <token>"
 ```
 
-The equivalent CLI flags are `--otlp-endpoint` and `--otel-service-name`.
+The equivalent CLI flags are `--otlp-endpoint`, `--otel-service-name`, and
+`--otel-trace-sample-ratio`.
 
 The data flows:
 

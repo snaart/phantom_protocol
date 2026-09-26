@@ -16,7 +16,7 @@ use ml_dsa::Signature as MlDsaSignature;
 use ml_dsa::SigningKey as MlDsaSigningKey;
 use ml_dsa::VerifyingKey as MlDsaVerifyingKey;
 use ml_dsa::{
-    EncodedSignature, EncodedVerifyingKey, KeyExport, KeyInit, Keypair, MlDsa65, Signer, Verifier,
+    EncodedSignature, EncodedVerifyingKey, KeyExport, KeyInit, Keypair, MlDsa65, Verifier,
 };
 use std::fmt;
 use zeroize::ZeroizeOnDrop;

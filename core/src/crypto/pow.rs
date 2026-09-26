@@ -272,6 +272,6 @@ mod tests {
     /// would be self-rejected.
     #[test]
     fn max_client_pow_difficulty_admits_the_server_max() {
-        assert!(MAX_CLIENT_POW_DIFFICULTY >= 20);
+        const { assert!(MAX_CLIENT_POW_DIFFICULTY >= 20) };
     }
 }

@@ -9,24 +9,149 @@
 use crate::api::session::{FramePhase, SessionTransport};
 use crate::errors::CoreError;
 use crate::transport::phantom_udp::datagram::{encode_datagrams, push_datagram, FragmentAssembler};
-use crate::transport::phantom_udp::envelope::{ConnId, PacketType, PATH_MTU};
+use crate::transport::phantom_udp::envelope::{decode_header, ConnId, PacketType, PATH_MTU};
 // `HDR_LEN` is referenced only by the test module (`super::HDR_LEN`); a plain top-level
 // import trips clippy's `--lib` unused-import check, which excludes `#[cfg(test)]` code.
 #[cfg(test)]
 use crate::transport::phantom_udp::envelope::HDR_LEN;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 
-/// Retransmit timeout for the Handshake phase stop-and-wait shim.
-const HANDSHAKE_RTO: Duration = Duration::from_millis(400);
-/// Max Handshake-phase retransmits before giving up (the outer 10s connect deadline still applies).
-const MAX_HANDSHAKE_RETX: u32 = 6;
+/// First retransmit timeout of the Handshake-phase stop-and-wait shim, used while the
+/// client has no round-trip measurement of its own.
+///
+/// One second is what RFC 6298 §2.1 asks of TCP before any RTT sample exists ("the sender
+/// SHOULD set RTO <- 1 second") and what RFC 9002 §6.2.2 arrives at for QUIC by a different
+/// route (a 333 ms assumed initial RTT "results in handshakes starting with a PTO of 1
+/// second, as recommended for TCP's initial RTO"). Both pick it because the cost of guessing
+/// low is asymmetric: a timer shorter than the path's round trip does not recover a lost
+/// flight any sooner — the reply was already on its way — it merely duplicates work at both
+/// ends and, if the budget is spent that way, abandons a connect that was about to succeed.
+///
+/// The value is deliberately not derived from anything measured on this connection. A
+/// round-trip sample is a quantity the peer writes: it is the interval between our
+/// transmission and *its* reply, so a peer that answers slowly dictates our timer. The
+/// handshake is at most a few flights long and has no sample for the first one anyway, so
+/// there is nothing to learn from and a fixed conservative start costs nothing.
+const HANDSHAKE_INITIAL_RTO: Duration = Duration::from_secs(1);
+
+/// Total time one `recv_bytes` call may spend waiting out the Handshake-phase
+/// retransmission schedule before reporting [`CoreError::Timeout`].
+///
+/// This is the whole reason the schedule terminates: the interval doubles on every expiry
+/// (RFC 6298 §5.5, "the host MUST set RTO <- RTO * 2"; RFC 9002 §6.2.1 says the same for the
+/// PTO), so only a ceiling on the *sum* bounds it. Eight seconds spends the schedule as
+/// 1 s → 3 s → 7 s (three retransmits, four flights in all) and gives up at 8 s, which leaves
+/// the last retransmit a full second to be answered.
+///
+/// The ceiling is sized against [`CLIENT_HANDSHAKE_DEADLINE`], the session-level bound this
+/// shim runs underneath. What precedes the first flight is one hybrid KEM keypair and one
+/// hybrid signing keypair: 48.7 µs and 225.7 µs at the criterion medians of
+/// `transport_bench`'s `pqc_keygen` group on an Apple Silicon release build, so under 0.3 ms
+/// together — around 10 ms in an unoptimized test build. Key generation is therefore not a
+/// term in this comparison at all, and 8 s of waiting refuses with the better part of two
+/// seconds of the deadline still in hand. (The half-second a handshake takes end to end on
+/// the measured WAN route is round trips, not key generation; attributing it to the keypairs
+/// is what made this margin look far tighter than it is.) Spending more than the budget
+/// would mean the last retransmit is sent after the session has already abandoned the
+/// connect — the work would be pure waste — and the reported error would come from the
+/// session's timer rather than from the transport that actually knows the path went silent.
+///
+/// The budget is also what a rejection costs. `run_client_handshake` reads past a bounded
+/// number of `ServerReject`s before believing one, and over PhantomUDP each of those reads
+/// is answered only once this schedule retransmits the flight — a version check is
+/// stateless, so a retransmitted hello is rejected again. A server that does not speak our
+/// version is therefore believed after three of these intervals rather than three 400 ms
+/// ones: 3.0 s measured, against 1.2 s before. That is accepted rather than worked around.
+/// The only way to shorten it is a first interval short enough to be the timer that
+/// abandoned honest connects on a path whose minimum round trip was 267 ms, and a rare
+/// terminal outcome paying two extra seconds is the cheaper side of that trade. Carrying
+/// one schedule across the successive
+/// reads instead of restarting it per read does not help either — it moves the retransmits
+/// to 1 s, 3 s and 7 s, so the same case costs 7 s. Should the path also fall silent after
+/// the reject, the cost is the whole budget, exactly as for any silent path, because the
+/// loop gives up on the first read that fails rather than on the fourth.
+///
+/// [`CLIENT_HANDSHAKE_DEADLINE`]: crate::api::session::CLIENT_HANDSHAKE_DEADLINE
+pub(crate) const HANDSHAKE_RETRANSMIT_BUDGET: Duration = Duration::from_secs(8);
+
+// The budget is only meaningful if it really is inside the deadline it is sized against;
+// a later edit to either constant that inverts them is a compile error rather than a
+// connect that fails one second before it would have succeeded.
+const _: () = assert!(
+    HANDSHAKE_RETRANSMIT_BUDGET.as_millis()
+        < crate::api::session::CLIENT_HANDSHAKE_DEADLINE.as_millis()
+);
+
+/// How long the Handshake-phase shim should wait before its `attempt`-th retransmit, given
+/// the time it has already spent waiting in this `recv_bytes` call.
+///
+/// `None` means the budget is exhausted and the call must report a timeout. Otherwise the
+/// wait is [`HANDSHAKE_INITIAL_RTO`] doubled once per expiry so far (RFC 6298 §5.5, "the
+/// host MUST set RTO <- RTO * 2"; RFC 9002 §6.2.1 requires the same of the PTO), clipped so
+/// the schedule lands exactly on [`HANDSHAKE_RETRANSMIT_BUDGET`] rather than overshooting it
+/// on the last doubling.
+///
+/// The whole schedule is here rather than spread across the receive loop because this is the
+/// part carrying an arithmetic obligation — that it backs off, that it terminates, and that
+/// it terminates inside the session deadline — and that obligation is worth checking without
+/// a socket or a clock.
+fn next_handshake_wait(attempt: u32, spent: Duration) -> Option<Duration> {
+    let remaining = HANDSHAKE_RETRANSMIT_BUDGET.checked_sub(spent)?;
+    if remaining.is_zero() {
+        return None;
+    }
+    // A doubling that would overflow is already far past the budget, so saturating to the
+    // budget and letting the clip below take over is exact, not an approximation.
+    let doublings = 1u32.checked_shl(attempt).unwrap_or(u32::MAX);
+    let rto = HANDSHAKE_INITIAL_RTO
+        .checked_mul(doublings)
+        .unwrap_or(HANDSHAKE_RETRANSMIT_BUDGET);
+    Some(rto.min(remaining))
+}
+
+/// The intervals a client actually waits out, in order, walked from
+/// [`next_handshake_wait`] exactly as the receive loop spends them.
+///
+/// Today that is `[1 s, 2 s, 4 s, 1 s]`: the flight is repeated at the end of each interval
+/// but the last, and the last interval is the one the client spends waiting for the answer
+/// to its final repeat before abandoning the connect.
+///
+/// Two numbers the **server** is sized against come out of this walk (PROTOCOL § 6.1), and
+/// they are different numbers, which is the reason the whole schedule is returned rather
+/// than either of them:
+///
+/// * `len() - 1` is the repeat count `MAX_FLIGHT_REPEATS` must equal — a server answering
+///   fewer leaves the client's last questions unanswered, one answering more offers work
+///   nobody will ask for.
+/// * the sum of all but the last interval is **when the last question is asked**, which is
+///   what `HANDSHAKE_FLIGHT_RETENTION` has to outlast. The *total* sum is not that number
+///   and cannot stand in for it: the total is an identity on
+///   [`HANDSHAKE_RETRANSMIT_BUDGET`] — every wait is clipped to what remains of the budget,
+///   so the walk terminates exactly on it for any initial RTO and any budget — and an
+///   assertion against an identity is an assertion about nothing.
+///
+/// Test-only, because its whole job is to be compared against those constants: production
+/// reads the constants, and this is what makes them answerable to the schedule.
+#[cfg(test)]
+pub(crate) fn handshake_retransmit_schedule() -> Vec<Duration> {
+    let mut attempt = 0u32;
+    let mut spent = Duration::ZERO;
+    let mut waits = Vec::new();
+    while let Some(wait) = next_handshake_wait(attempt, spent) {
+        waits.push(wait);
+        spent = spent.saturating_add(wait);
+        attempt = attempt.saturating_add(1);
+    }
+    waits
+}
 
 const PHASE_HANDSHAKE: u8 = 0;
 const PHASE_ESTABLISHED: u8 = 1;
@@ -123,6 +248,10 @@ pub struct UdpClientTransport {
     /// `confirm_authenticated_source` runs) can never clobber the candidate slot.
     last_recv_src: ArcSwap<Option<SocketAddr>>,
     last_frame_len: AtomicU64,
+    /// Notified by `migrate_to` after swapping the active socket, so a `recv_bytes` call
+    /// blocked on the OLD socket's `recv_from` wakes up and re-enters the loop on the new one
+    /// rather than staying stuck indefinitely.
+    migrate_notify: Arc<Notify>,
 }
 
 impl UdpClientTransport {
@@ -157,6 +286,7 @@ impl UdpClientTransport {
             cand_sent: AtomicU64::new(0),
             last_recv_src: ArcSwap::from_pointee(None),
             last_frame_len: AtomicU64::new(0),
+            migrate_notify: Arc::new(Notify::new()),
         })
     }
 
@@ -193,6 +323,9 @@ impl UdpClientTransport {
         let old = self.socket.load_full();
         self.prev_socket.store(Arc::new(Some(old)));
         self.socket.store(new_sock);
+        // Wake any `recv_bytes` call that is blocked on `recv_from` on the OLD socket,
+        // so it re-enters the loop and picks up the new socket and `prev_opt`.
+        self.migrate_notify.notify_one();
         Ok(())
     }
 
@@ -254,7 +387,23 @@ impl SessionTransport for UdpClientTransport {
         // Second recv buffer, lazily sized only during a migration overlap; the common
         // no-migration path keeps the single `buf`.
         let mut buf_prev: Vec<u8> = Vec::new();
-        let mut retx = 0u32;
+        // Handshake-phase retransmission state: how many intervals have expired (which sets
+        // the backoff) and how much waiting they have cost (which is what the budget is
+        // charged against).
+        let mut attempt = 0u32;
+        let mut spent = Duration::ZERO;
+        // When the current interval expires, as an absolute instant rather than a length.
+        //
+        // The loop below re-enters its `select!` on every datagram that does not complete a
+        // frame — a fragment whose siblings were lost, an advisory ICMP error, an
+        // undecodable spray — and each entry builds the timer future afresh. A future built
+        // from a *length* restarts the interval on every such re-entry, so anything arriving
+        // faster than the interval postpones the timer for as long as it keeps arriving, and
+        // the budget is never charged. The socket is unconnected and accepts datagrams from
+        // any source, so that "anything" is a quantity an off-path sender picks. Anchoring
+        // the interval to an instant computed once makes the re-entry cost nothing: the
+        // schedule advances on the clock, not on inbound traffic.
+        let mut retransmit_at: Option<tokio::time::Instant> = None;
         loop {
             let in_handshake = self.phase.load(Ordering::Relaxed) == PHASE_HANDSHAKE;
             // Snapshot both sockets as owned `Arc`s (never hold an `ArcSwap` guard
@@ -278,15 +427,19 @@ impl SessionTransport for UdpClientTransport {
                 // Migration is post-handshake only, so there is never a `prev` socket
                 // here; keep the original single-socket + RTO-retransmit logic.
                 let server = **self.server_addr.load();
+                let Some(wait) = next_handshake_wait(attempt, spent) else {
+                    return Err(CoreError::Timeout);
+                };
+                let deadline = *retransmit_at.get_or_insert(tokio::time::Instant::now() + wait);
                 tokio::select! {
                     // `biased;` polls the recv arm first: the RTO must be a true
-                    // "no data arrived for HANDSHAKE_RTO" timer, not a coin-flip against an
+                    // "no data arrived for the whole interval" timer, not a coin-flip against an
                     // already-queued datagram. With the default unbiased select, when BOTH a datagram
                     // is ready AND the sleep has elapsed (common under contention from concurrent PQ
                     // handshakes), the recv arm is starved ~50% of the time, so the client spuriously
-                    // retransmits instead of processing the already-arrived ServerHello — exhausting
-                    // MAX_HANDSHAKE_RETX and timing the handshake out. Biasing toward received data
-                    // makes the RTO fire only when recv is genuinely pending.
+                    // retransmits instead of processing the already-arrived ServerHello — spending
+                    // the retransmission budget and timing the handshake out. Biasing toward received
+                    // data makes the RTO fire only when recv is genuinely pending.
                     biased;
                     r = active.recv_from(&mut buf) => match classify_recv(r) {
                         RecvAction::Got(n, src) => (n, false, src),
@@ -298,11 +451,22 @@ impl SessionTransport for UdpClientTransport {
                             return Err(CoreError::NetworkError(format!("udp recv: {e}")))
                         }
                     },
-                    _ = tokio::time::sleep(HANDSHAKE_RTO) => {
-                        retx += 1;
-                        if retx > MAX_HANDSHAKE_RETX {
+                    _ = tokio::time::sleep_until(deadline) => {
+                        spent = spent.saturating_add(wait);
+                        attempt = attempt.saturating_add(1);
+                        // The budget can only be exhausted by a wait that was clipped to
+                        // land on it, so this is the give-up point rather than the top of
+                        // the loop: retransmitting here would send a flight with no time
+                        // left to answer it.
+                        let Some(next) = next_handshake_wait(attempt, spent) else {
                             return Err(CoreError::Timeout);
-                        }
+                        };
+                        // The next interval hangs off the deadline that just passed, not off
+                        // the current instant, so the retransmits themselves do not push the
+                        // schedule out: the sum of the intervals actually waited is the
+                        // budget, which is what makes the comparison against the session
+                        // deadline hold in practice and not just on paper.
+                        retransmit_at = Some(deadline + next);
                         for d in self.last_sent.lock().await.iter() {
                             let _ = active.send_to(d, server).await;
                         }
@@ -313,6 +477,14 @@ impl SessionTransport for UdpClientTransport {
                 if buf_prev.len() < PATH_MTU + 64 {
                     buf_prev.resize(PATH_MTU + 64, 0);
                 }
+                // Also wake on a migration that happens while we are parked in the
+                // overlap select. This covers (a) a SECOND migrate_to() during an
+                // existing overlap, and (b) a torn read at the loop top that snapshotted
+                // a stale (active, prev) pair across migrate_to()'s two ArcSwap stores —
+                // both would otherwise block on stale/silent sockets. migrate_to()'s
+                // Notify permit (stored before we reach this select) lets us re-enter the
+                // loop and re-snapshot both sockets instead of hanging.
+                let migrate_notified = self.migrate_notify.notified();
                 tokio::select! {
                     r = active.recv_from(&mut buf) => match classify_recv(r) {
                         RecvAction::Got(n, src) => (n, false, src),
@@ -334,21 +506,72 @@ impl SessionTransport for UdpClientTransport {
                             return Err(CoreError::NetworkError(format!("udp recv: {e}")))
                         }
                     },
-                }
-            } else {
-                match classify_recv(active.recv_from(&mut buf).await) {
-                    RecvAction::Got(n, src) => (n, false, src),
-                    RecvAction::Retry => {
-                        log::debug!("PhantomUDP: advisory recv error (ignored, RFC 8085 §5.5)");
+                    _ = migrate_notified => {
+                        // Re-snapshot active/prev on the next iteration (closes the
+                        // overlap-arm migration hang and the loop-top torn-read race).
                         continue;
                     }
-                    RecvAction::Fatal(e) => {
-                        return Err(CoreError::NetworkError(format!("udp recv: {e}")))
+                }
+            } else {
+                let migrate_notified = self.migrate_notify.notified();
+                tokio::select! {
+                    biased;
+                    r = active.recv_from(&mut buf) => match classify_recv(r) {
+                        RecvAction::Got(n, src) => (n, false, src),
+                        RecvAction::Retry => {
+                            log::debug!("PhantomUDP: advisory recv error (ignored, RFC 8085 §5.5)");
+                            continue;
+                        }
+                        RecvAction::Fatal(e) => {
+                            return Err(CoreError::NetworkError(format!("udp recv: {e}")))
+                        }
+                    },
+                    _ = migrate_notified => {
+                        // migrate_to() swapped the active socket — re-enter the loop
+                        // so the next iteration picks up the new socket and prev_opt.
+                        continue;
                     }
                 }
             };
-            retx = 0; // progress: reset the RTO budget
             let datagram = if from_prev { &buf_prev[..n] } else { &buf[..n] };
+            // PROTOCOL § 6.1 rule 6: while the handshake runs, nothing that is not a
+            // handshake datagram *of this connection* may reach the reply parser, and the
+            // two halves of that are guarding different things.
+            //
+            // The type is what a committed server's own traffic fails: it may already be
+            // sending short-header frames (an application greeting written on accept, a
+            // keepalive) while the client is still waiting for a `ServerHello` that went
+            // missing, and the caller parses whatever it is handed as a `ServerReply`, so
+            // handing one up ends the connect with "invalid server reply".
+            //
+            // The connection id is what an *unrelated sender* fails, and without it the
+            // type check narrows the attack rather than removing it: the type lives in the
+            // unauthenticated outer envelope, so a datagram addressed to a connecting
+            // client with that one byte set to `Initial` would be handed up and kill the
+            // connect. The socket is unconnected and accepts any source, so this is the
+            // only field on an unauthenticated datagram that an off-path sender cannot
+            // simply choose — `cid` is 64 bits of `getrandom` output that only appears on
+            // this connection's own datagrams. During the handshake `established_cid` is
+            // still unset (the pump raises the phase before stamping it), so the bootstrap
+            // id is the whole of what this connection answers to.
+            //
+            // Checked before `push_datagram` rather than after it so a spray cannot evict
+            // this connection's half-reassembled reply from the fragment assembler either,
+            // at the cost of one extra header decode per handshake datagram — a handful
+            // per connect, and never on the data path.
+            //
+            // Dropping here rather than at the caller keeps the retransmit schedule intact:
+            // `attempt` / `spent` / `retransmit_at` live across this `continue`, so a peer
+            // that talks cannot postpone the repeat the client's own timer is about to
+            // trigger, nor extend the budget it gives up on. The phase is re-read rather
+            // than reusing the loop-top snapshot so the check reflects the transport's
+            // state now.
+            if self.phase.load(Ordering::Relaxed) == PHASE_HANDSHAKE {
+                match decode_header(datagram) {
+                    Ok((hdr, _)) if hdr.ty == PacketType::Initial && hdr.cid == self.cid => {}
+                    _ => continue,
+                }
+            }
             let mut asm = self.reasm.lock().await;
             let decoded = push_datagram(&mut asm, datagram);
             // Overlap-drop (D7): a well-formed datagram on the NEW (active) socket means the
@@ -376,6 +599,10 @@ impl SessionTransport for UdpClientTransport {
                 Err(_) => continue,           // malformed datagram; drop and keep receiving
             }
         }
+    }
+
+    fn supports_migration(&self) -> bool {
+        true
     }
 
     fn set_frame_phase(&self, phase: FramePhase) {
@@ -487,6 +714,55 @@ impl SessionTransport for UdpClientTransport {
     }
 }
 
+/// A server handshake reply exactly as it went on the wire, together with the question it
+/// answers, so the listener can repeat it if the client asks the same question again
+/// (PROTOCOL § 6.1).
+///
+/// Three things about its shape are load-bearing rather than convenient.
+///
+/// It holds **datagrams, not a message**. A repeat has to be the bytes that were already
+/// sent, not a re-derivation: `process_client_hello` draws fresh randomness for the KEM
+/// encapsulation and the session id, so running it again would produce a different, equally
+/// valid `ServerHello` for a session the server has already committed under different keys.
+/// Repeating is therefore the only safe answer, and re-deriving is the unsafe one.
+///
+/// `question` is the digest of the frame the reply answers, and it is what decides whether a
+/// repeat is owed. That is not a heuristic for "is this the same client": the reply's
+/// signature covers the whole `ClientHello` (Invariant 7), so a retained reply is a valid
+/// answer to *that* hello and to no other. A hello that differs in any byte — a fresh nonce,
+/// a different cookie — needs a fresh handshake and would be rejected by the client's own
+/// transcript check if it were answered from here. Same question, same answer; different
+/// question, no answer.
+///
+/// `delivered` is shared with the live session and set the first time an inbound packet
+/// AEAD-opens. A peer can only produce such a packet from the session keys the reply
+/// carried, so the latch is proof of receipt that nothing off-path can forge, and once it is
+/// set the retained bytes are dead weight.
+pub(crate) struct HandshakeFlight {
+    /// The reply flight as it was sent, datagram for datagram. `Arc` so repeating it costs a
+    /// refcount rather than a copy of several kilobytes on the demux thread.
+    pub(crate) datagrams: Arc<Vec<Vec<u8>>>,
+    /// The only address a repeat is ever sent to — the one the original went to. A resend is
+    /// therefore not a reflector: its destination comes from the server's own record of a
+    /// completed handshake, never from the datagram that triggered it.
+    pub(crate) peer: SocketAddr,
+    /// SHA-256 of the handshake frame this reply answers.
+    pub(crate) question: [u8; 32],
+    /// Total wire bytes of `datagrams`, kept beside them so the amplification bound can be
+    /// checked once, at retention, rather than on every repeat.
+    pub(crate) wire_bytes: usize,
+    /// Wire bytes of the question, for the same reason — and **the same quantity**, which is
+    /// the whole point of storing it rather than the frame length that is to hand. An
+    /// anti-amplification bound compares what went out on the path against what came in on
+    /// it; a reassembled frame is neither, and dividing one by the other yields a number that
+    /// is not a ratio of anything. The receiving side never sees the question's datagrams, so
+    /// this is `wire_len` of its frame: exact for a sender that chunks as this implementation
+    /// does, and a lower bound on what any other sender spent, which is the safe direction.
+    pub(crate) question_wire_bytes: usize,
+    /// Set by the session the first time an inbound packet authenticates.
+    pub(crate) delivered: Arc<AtomicBool>,
+}
+
 /// Per-session server transport. The listener's demux task reassembles inbound datagrams and pushes
 /// the inner frames to `rx`; outbound frames are enveloped and sent to the captured `peer` from
 /// `send_socket`. A server migration ([`migrate_to`](Self::migrate_to)) swaps `send_socket` to a
@@ -535,6 +811,17 @@ pub struct UdpServerTransport {
     /// a spoofed (never-decrypting) datagram cannot clobber the candidate slot.
     last_recv_src: ArcSwap<Option<SocketAddr>>,
     last_frame_len: AtomicU64,
+    /// SHA-256 of the most recent frame received while still in the Handshake phase, with its
+    /// wire length — the question the next handshake-phase reply answers (PROTOCOL § 6.1).
+    /// Only the handshake task reads this channel before the phase flips, so at the moment a
+    /// reply is sent this really is the hello being replied to.
+    last_handshake_question: ArcSwap<Option<([u8; 32], usize)>>,
+    /// The most recent handshake-phase reply, retained for the listener to repeat. Taken
+    /// once, by the accept path, when the handshake succeeds; dropped with the transport on
+    /// every other path.
+    handshake_flight: parking_lot::Mutex<Option<HandshakeFlight>>,
+    /// Shared with any retained flight: set the first time an inbound packet AEAD-opens.
+    peer_authenticated: Arc<AtomicBool>,
 }
 
 impl UdpServerTransport {
@@ -560,7 +847,29 @@ impl UdpServerTransport {
             cand_sent: AtomicU64::new(0),
             last_recv_src: ArcSwap::from_pointee(None),
             last_frame_len: AtomicU64::new(0),
+            last_handshake_question: ArcSwap::from_pointee(None),
+            handshake_flight: parking_lot::Mutex::new(None),
+            peer_authenticated: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Take the retained handshake reply flight, if this transport sent one (PROTOCOL § 6.1).
+    ///
+    /// Taken rather than borrowed so exactly one holder owns the several kilobytes: the accept
+    /// path moves it into the listener's retention table when the handshake succeeds, and on
+    /// every other path it goes with the transport. A second call yields `None`, which makes
+    /// "at most one retained flight per handshake" a property of the type rather than of its
+    /// callers.
+    ///
+    /// Taking also forgets the question, which is what stops the slot refilling. The accept
+    /// path takes the flight before the data pump exists, and the pump moves the transport to
+    /// the Established phase a moment *after* it starts — so a frame sent in that window would
+    /// otherwise be retained as a handshake reply and held, unread by anyone, for the life of
+    /// the session. With no question on record nothing is a reply, and the window closes.
+    pub(crate) fn take_handshake_flight(&self) -> Option<HandshakeFlight> {
+        let taken = self.handshake_flight.lock().take();
+        self.last_handshake_question.store(Arc::new(None));
+        taken
     }
 
     /// Migrate the server's send path to a fresh local socket (the server-side mirror of
@@ -658,6 +967,26 @@ impl SessionTransport for UdpServerTransport {
                 .await
                 .map_err(|e| CoreError::NetworkError(format!("udp send_to: {e}")))?;
         }
+        // PROTOCOL § 6.1: keep a handshake reply as it went out, so the listener can repeat
+        // it byte for byte if the client's flight comes round again. Only the handshake phase
+        // retains: an established session's frames are carried by the ARQ, which is the
+        // mechanism this one exists to stand in for while there is none. The datagrams are
+        // moved rather than copied — they were built for this send and would otherwise be
+        // dropped here — and the question they answer is whatever `recv_bytes` last saw,
+        // which on this transport is the hello the handshake task is replying to.
+        if ty == PacketType::Initial {
+            if let Some((question, question_wire_bytes)) = **self.last_handshake_question.load() {
+                let wire_bytes = dgrams.iter().map(Vec::len).sum();
+                *self.handshake_flight.lock() = Some(HandshakeFlight {
+                    datagrams: Arc::new(dgrams),
+                    peer,
+                    question,
+                    wire_bytes,
+                    question_wire_bytes,
+                    delivered: self.peer_authenticated.clone(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -677,10 +1006,30 @@ impl SessionTransport for UdpServerTransport {
         self.last_recv_src.store(Arc::new(Some(src)));
         self.last_frame_len
             .store(frame.len() as u64, Ordering::Relaxed);
+        // PROTOCOL § 6.1: while the handshake runs, remember what was asked. The digest is
+        // taken here rather than in the listener because this is the one place that sees the
+        // reassembled frame the reply is computed from, and it costs a hash of a few kilobytes
+        // once per handshake — never on the data path, which is what the phase gate buys.
+        if self.phase.load(Ordering::Relaxed) == PHASE_HANDSHAKE {
+            let mut hasher = Sha256::new();
+            hasher.update(&frame);
+            let digest: [u8; 32] = hasher.finalize().into();
+            // Recorded as wire bytes, not frame bytes, because that is what the
+            // amplification bound is measured in on the other side of the comparison.
+            self.last_handshake_question.store(Arc::new(Some((
+                digest,
+                crate::transport::phantom_udp::datagram::wire_len(frame.len()),
+            ))));
+        }
         Ok(frame)
     }
 
     fn confirm_authenticated_source(&self) {
+        // PROTOCOL § 6.1: an inbound packet has AEAD-opened, so the peer holds keys it could
+        // only have derived from the reply this session's handshake sent — proof of receipt
+        // that nothing off-path can forge. Latched before the same-address early return
+        // below, because whether the peer moved has nothing to do with whether it heard us.
+        self.peer_authenticated.store(true, Ordering::Relaxed);
         // M-1: the frame from `last_recv_src` just authenticated (AEAD-opened), so it really is
         // the established peer — possibly at a NEW address (migration / NAT rebind). Register it
         // as the candidate the session challenges before switching, and (re)seed its
@@ -750,6 +1099,10 @@ impl SessionTransport for UdpServerTransport {
         }
     }
 
+    fn supports_migration(&self) -> bool {
+        true
+    }
+
     fn set_frame_phase(&self, phase: FramePhase) {
         let v = match phase {
             FramePhase::Handshake => PHASE_HANDSHAKE,
@@ -783,6 +1136,47 @@ mod tests {
     use crate::transport::phantom_udp::envelope::PacketType;
     use tokio::net::UdpSocket;
 
+    /// The Handshake-phase retransmission schedule, walked without a socket or a clock:
+    /// it must back off, it must terminate, and its total must be the budget exactly —
+    /// which is what makes the comparison against the session deadline meaningful.
+    #[test]
+    fn the_handshake_schedule_backs_off_and_terminates_on_the_budget() {
+        let mut attempt = 0u32;
+        let mut spent = Duration::ZERO;
+        let mut waits = Vec::new();
+        while let Some(wait) = next_handshake_wait(attempt, spent) {
+            waits.push(wait);
+            spent += wait;
+            attempt += 1;
+            assert!(
+                waits.len() < 64,
+                "the schedule must terminate; it reached {spent:?} in {} waits",
+                waits.len()
+            );
+        }
+        assert_eq!(
+            waits,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(1),
+            ],
+            "expected 1 s, 2 s, 4 s of backoff and a final 1 s clipped to the budget"
+        );
+        assert_eq!(
+            spent, HANDSHAKE_RETRANSMIT_BUDGET,
+            "the schedule must land on the budget, not overshoot or undershoot it"
+        );
+        // Three retransmits (the last wait is spent waiting, not retransmitting), so four
+        // flights leave the client in all.
+        assert_eq!(waits.len() - 1, 3);
+        assert!(
+            spent < crate::api::session::CLIENT_HANDSHAKE_DEADLINE,
+            "the whole schedule must fit inside the session-level handshake deadline"
+        );
+    }
+
     /// A framed frame round-trips client -> raw peer -> client, including a >MTU
     /// (fragmented) reply that `recv_bytes` reassembles.
     #[tokio::test]
@@ -800,6 +1194,10 @@ mod tests {
         assert_eq!(got.as_deref(), Some(&b"hello"[..]));
 
         // Peer replies with a >MTU frame (fragments); client reassembles via recv_bytes.
+        // Short-header traffic belongs to an established session — a client still waiting
+        // for its handshake reply discards it — so the phase moves first, as the pump moves
+        // it the moment `process_server_hello` returns.
+        client.set_frame_phase(FramePhase::Established);
         let big: Vec<u8> = (0..5000u32).map(|i| i as u8).collect();
         for d in encode_datagrams(PacketType::OneRtt, &client.cid(), 1, &big).expect("encode") {
             peer.send_to(&d, from).await.unwrap();
@@ -874,6 +1272,483 @@ mod tests {
         assert_eq!(&r.unwrap().unwrap()[..], &b"reply"[..]);
     }
 
+    /// A short-header datagram arriving mid-handshake is ignored, not mistaken for a reply.
+    ///
+    /// The caller above `recv_bytes` parses whatever it is handed as a `ServerReply` and
+    /// treats a parse failure as terminal, so a frame that cannot be one ends the connect.
+    /// A server that has committed its session is free to send short-header traffic — an
+    /// application greeting on accept, a keepalive — while the client is still waiting for a
+    /// `ServerHello` that went missing, and the client has no keys to open it with. Without
+    /// this gate the reply-repeat repair (PROTOCOL § 6.1) would hold only against a server
+    /// that happened to stay silent for the whole retransmit interval, which is not a
+    /// property anything guarantees.
+    ///
+    /// The second half is what keeps the gate from being a blanket drop: once the session is
+    /// Established the same datagram is delivered, because then it is exactly what the pump
+    /// is waiting for.
+    ///
+    /// This covers the type half of the gate only. The type is a field of the
+    /// unauthenticated envelope, so on its own it narrows what an unrelated sender has to
+    /// write rather than excluding it; the connection-id half is what excludes it, and
+    /// `a_handshake_datagram_for_another_connection_cannot_end_this_one` is where that is
+    /// pinned.
+    #[tokio::test]
+    async fn a_short_header_datagram_mid_handshake_is_ignored_rather_than_ending_the_connect() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let client = UdpClientTransport::connect(peer_addr).await.unwrap();
+        // Default phase is Handshake.
+        client.send_bytes(b"client-hello").await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        let (_n, from) = peer.recv_from(&mut buf).await.unwrap();
+
+        // The server speaks its session before this client can open anything, and only then
+        // does the reply arrive. Both go out back to back so ordering on loopback is fixed.
+        for d in encode_datagrams(
+            PacketType::OneRtt,
+            &client.cid(),
+            0,
+            b"committed-session-traffic",
+        )
+        .expect("encode")
+        {
+            peer.send_to(&d, from).await.unwrap();
+        }
+        for d in encode_datagrams(PacketType::Initial, &client.cid(), 1, b"server-hello")
+            .expect("encode")
+        {
+            peer.send_to(&d, from).await.unwrap();
+        }
+        let got = tokio::time::timeout(Duration::from_secs(3), client.recv_bytes())
+            .await
+            .expect("the reply must still be reachable")
+            .expect("recv");
+        assert_eq!(
+            &got[..],
+            &b"server-hello"[..],
+            "a mid-handshake short-header datagram was handed up as if it were a reply; the \
+             caller parses it as a ServerReply and fails the whole connect"
+        );
+
+        // And the gate is a phase gate, not a blanket refusal.
+        client.set_frame_phase(FramePhase::Established);
+        for d in
+            encode_datagrams(PacketType::OneRtt, &client.cid(), 2, b"session-data").expect("encode")
+        {
+            peer.send_to(&d, from).await.unwrap();
+        }
+        let got = tokio::time::timeout(Duration::from_secs(3), client.recv_bytes())
+            .await
+            .expect("established sessions must still receive short-header traffic")
+            .expect("recv");
+        assert_eq!(&got[..], &b"session-data"[..]);
+    }
+
+    /// A handshake datagram that does not carry this connection's id is not a reply, whoever
+    /// sent it and whatever type byte it claims.
+    ///
+    /// The type gate above is necessary and not sufficient, and the difference is the whole
+    /// of this test. `PacketType` lives in the unauthenticated outer envelope: it is a
+    /// two-bit field of a cleartext byte that any sender writes. A gate that only asks
+    /// "is this a handshake datagram" therefore leaves a connecting client killable by one
+    /// datagram from anyone who can reach its port — the caller parses whatever it is handed
+    /// as a `ServerReply` and treats a parse failure as terminal, so a payload of noise under
+    /// an `Initial` header ends the attempt. That is the same failure the type gate was added
+    /// to remove, reached by setting one byte instead of none.
+    ///
+    /// The connection id is what makes the gate a gate. It is 64 bits drawn from the system
+    /// CSPRNG at `connect`, it appears only on this connection's own datagrams, and during
+    /// the handshake it is the *bootstrap* id — the pump raises the frame phase before it
+    /// stamps the rotating chain, so there is no window in which a second id would be
+    /// legitimate. Deleting the `hdr.cid == self.cid` half of that check is the naive version
+    /// of this mechanism, and the first half of this test is what fails against it.
+    ///
+    /// The second half is the control: with the *right* id the same sender is answered, so
+    /// what the first half measures is the id and not the reply's provenance — nothing here
+    /// checks source addresses, and this test would pass against a listener that did while
+    /// saying nothing about the one that does not.
+    #[tokio::test]
+    async fn a_handshake_datagram_for_another_connection_cannot_end_this_one() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let client = UdpClientTransport::connect(peer_addr).await.unwrap();
+        // Default phase is Handshake.
+        client.send_bytes(b"client-hello").await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        let (_n, from) = peer.recv_from(&mut buf).await.unwrap();
+
+        // A third party that never saw this connection's datagrams: it can reach the port and
+        // it can set the type byte, and that is all it has.
+        let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut wrong = client.cid();
+        wrong[0] ^= 0xFF;
+        for d in
+            encode_datagrams(PacketType::Initial, &wrong, 0, b"not-your-reply").expect("encode")
+        {
+            stranger.send_to(&d, from).await.unwrap();
+        }
+        // ... and the real reply, after it, so the assertion is "the stranger's datagram was
+        // skipped" rather than "nothing arrived at all".
+        for d in encode_datagrams(PacketType::Initial, &client.cid(), 1, b"server-hello")
+            .expect("encode")
+        {
+            peer.send_to(&d, from).await.unwrap();
+        }
+        let got = tokio::time::timeout(Duration::from_secs(3), client.recv_bytes())
+            .await
+            .expect("the real reply must still be reachable")
+            .expect("recv");
+        assert_eq!(
+            &got[..],
+            &b"server-hello"[..],
+            "a handshake-typed datagram carrying a connection id that is not this \
+             connection's was handed up as if it were a reply; the caller parses it as a \
+             ServerReply and one datagram from anyone who can reach the port ends the connect"
+        );
+
+        // The control: the same stranger, the same socket, the right connection id.
+        for d in encode_datagrams(PacketType::Initial, &client.cid(), 2, b"second-reply")
+            .expect("encode")
+        {
+            stranger.send_to(&d, from).await.unwrap();
+        }
+        let got = tokio::time::timeout(Duration::from_secs(3), client.recv_bytes())
+            .await
+            .expect("a datagram carrying this connection's id must still be delivered")
+            .expect("recv");
+        assert_eq!(
+            &got[..],
+            &b"second-reply"[..],
+            "the gate is the connection id and nothing else: this transport never compares \
+             source addresses, and a test that passed only because the sender differed would \
+             be measuring a check that does not exist"
+        );
+    }
+
+    /// The handshake shim must still be waiting when an honest reply arrives later than a
+    /// degraded path's round trip — a reply that is merely late is not a lost reply, and
+    /// abandoning the connect while it is still in flight throws away the whole attempt.
+    ///
+    /// The reply here lands at 3.5 s, past the 2.8 s a fixed 400 ms timer × 6 retransmits
+    /// spends in total, and well inside the session-level [`CLIENT_HANDSHAKE_DEADLINE`].
+    /// The assertion is on the outcome (a completed exchange), not on how long it took.
+    #[tokio::test]
+    async fn handshake_outlasts_a_reply_slower_than_the_old_fixed_budget() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let client = UdpClientTransport::connect(peer_addr).await.unwrap();
+        // Default phase is Handshake — the retransmitting stop-and-wait shim.
+
+        let send = async {
+            client.send_bytes(b"client-hello").await.unwrap();
+        };
+        // The peer answers the first flight, but only after a delay longer than the
+        // retransmission budget the shim used to have. Its retransmits pile up unread in
+        // the socket buffer, exactly as a loaded server's backlog would.
+        let serve = async {
+            let mut buf = vec![0u8; 2048];
+            let (_n, from) = peer.recv_from(&mut buf).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(3500)).await;
+            for d in encode_datagrams(PacketType::Initial, &client.cid(), 0, b"server-hello")
+                .expect("encode")
+            {
+                peer.send_to(&d, from).await.unwrap();
+            }
+        };
+        let receive =
+            async { tokio::time::timeout(Duration::from_secs(8), client.recv_bytes()).await };
+        let (_s, _p, r) = tokio::join!(send, serve, receive);
+        let frame = r
+            .expect("recv_bytes must not be abandoned while the reply is still in flight")
+            .expect("a late but honest reply is not a failed handshake");
+        assert_eq!(&frame[..], b"server-hello");
+    }
+
+    /// A path that never answers must still be refused, and refused inside the
+    /// session-level deadline that governs the whole handshake — a shim that keeps
+    /// retransmitting past it turns a refusal into a hang whose error the session, not the
+    /// transport, ends up reporting.
+    #[tokio::test]
+    async fn a_silent_path_is_refused_inside_the_session_handshake_deadline() {
+        // A bound-but-never-read socket is a true black hole: datagrams are accepted by the
+        // kernel and answered by nobody, so no ICMP unreachable masks the silence.
+        let black_hole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = black_hole.local_addr().unwrap();
+        let client = UdpClientTransport::connect(addr).await.unwrap();
+        client.send_bytes(b"client-hello").await.unwrap();
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(20), client.recv_bytes())
+            .await
+            .expect("a silent path must be refused, not hang");
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(outcome, Err(CoreError::Timeout)),
+            "a silent path is a Timeout, got {outcome:?}"
+        );
+        // Upper bound: the refusal has to land before the session gives up, or the shim's
+        // last retransmit is spent after the connect has already been abandoned.
+        assert!(
+            elapsed < crate::api::session::CLIENT_HANDSHAKE_DEADLINE,
+            "gave up after {elapsed:?}, which is not inside the {:?} session deadline",
+            crate::api::session::CLIENT_HANDSHAKE_DEADLINE
+        );
+        // Lower bound: it must actually have spent its retransmission schedule rather than
+        // refusing on the first tick. Half the budget is a wide margin against scheduling.
+        assert!(
+            elapsed >= HANDSHAKE_RETRANSMIT_BUDGET / 2,
+            "gave up after only {elapsed:?}; the retransmission schedule was not spent"
+        );
+    }
+
+    /// The client socket is unconnected, so anyone who can reach it can put datagrams on
+    /// it; a datagram that fails to decode is dropped and the read resumes. That resumption
+    /// must not buy the sender any time. Here nothing the spray sends ever completes a
+    /// frame, and the honest peer never answers, so the read has to refuse on its own
+    /// schedule — a timer rearmed by arriving bytes would instead last exactly as long as
+    /// the spray does, which is a quantity the sender picks.
+    #[tokio::test]
+    async fn an_off_path_spray_cannot_postpone_the_handshake_refusal() {
+        let black_hole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = black_hole.local_addr().unwrap();
+        let client = UdpClientTransport::connect(server).await.unwrap();
+        client.send_bytes(b"client-hello").await.unwrap();
+
+        // A third socket, neither end of the session: it learns where to aim from the
+        // flight the black hole receives, which is all an on-path observer needs.
+        let off_path = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let spray = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            let (_n, victim) = black_hole.recv_from(&mut buf).await.unwrap();
+            loop {
+                // Four bytes cannot hold an envelope header, so this is dropped by the
+                // decode and influences nothing but the timer.
+                let _ = off_path.send_to(&[0xFFu8; 4], victim).await;
+                tokio::time::sleep(HANDSHAKE_INITIAL_RTO / 10).await;
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            crate::api::session::CLIENT_HANDSHAKE_DEADLINE,
+            client.recv_bytes(),
+        )
+        .await;
+        spray.abort();
+        let elapsed = started.elapsed();
+
+        let outcome =
+            outcome.expect("a spray of undecodable datagrams held the read past the deadline");
+        assert!(
+            matches!(outcome, Err(CoreError::Timeout)),
+            "a path that never answers is a Timeout, got {outcome:?}"
+        );
+        assert!(
+            elapsed < crate::api::session::CLIENT_HANDSHAKE_DEADLINE,
+            "the spray stretched the refusal to {elapsed:?}, past the {:?} session deadline",
+            crate::api::session::CLIENT_HANDSHAKE_DEADLINE
+        );
+    }
+
+    /// The datagrams a mid-handshake client now discards must not buy their sender anything
+    /// either — not a frame handed up, and not a moment of the schedule.
+    ///
+    /// The sibling above sprays bytes that cannot decode, which the read has always dropped.
+    /// This sprays the case that was added: well-formed short-header datagrams, each a
+    /// complete frame, of the shape a committed server's session traffic has. Discarding them
+    /// is what keeps a talkative server from ending a connect it is about to repair — but a
+    /// discard is also a resumption of the read, and a resumption that rearmed the timer would
+    /// hand an off-path sender the length of the wait. So both directions are asserted: the
+    /// refusal still arrives (it is not stretched by the spray) and it does not arrive early
+    /// (the schedule was genuinely spent, not skipped).
+    ///
+    /// Before the discard existed this test would not have reached either assertion: the first
+    /// sprayed datagram was handed up as a reply and the caller ended the connect on it.
+    #[tokio::test]
+    async fn a_short_header_spray_cannot_postpone_or_shorten_the_handshake_refusal() {
+        let black_hole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = black_hole.local_addr().unwrap();
+        let client = UdpClientTransport::connect(server).await.unwrap();
+        client.send_bytes(b"client-hello").await.unwrap();
+
+        let cid = client.cid();
+        let off_path = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let spray = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            let (_n, victim) = black_hole.recv_from(&mut buf).await.unwrap();
+            let mut packet_id = 0u32;
+            loop {
+                // A whole frame every time, so nothing here is dropped by the decode: the
+                // only thing that stops it being handed up is the phase gate.
+                if let Ok(dgrams) =
+                    encode_datagrams(PacketType::OneRtt, &cid, packet_id, b"session-traffic")
+                {
+                    for d in &dgrams {
+                        let _ = off_path.send_to(d, victim).await;
+                    }
+                }
+                packet_id = packet_id.wrapping_add(1);
+                tokio::time::sleep(HANDSHAKE_INITIAL_RTO / 10).await;
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            crate::api::session::CLIENT_HANDSHAKE_DEADLINE,
+            client.recv_bytes(),
+        )
+        .await;
+        spray.abort();
+        let elapsed = started.elapsed();
+
+        let outcome = outcome.expect("a short-header spray held the read past the deadline");
+        assert!(
+            matches!(outcome, Err(CoreError::Timeout)),
+            "a path that never answers is a Timeout even while short-header traffic arrives \
+             on it, got {outcome:?}"
+        );
+        assert!(
+            elapsed < crate::api::session::CLIENT_HANDSHAKE_DEADLINE,
+            "the spray stretched the refusal to {elapsed:?}, past the {:?} session deadline — \
+             a discard that rearmed the retransmit timer would last exactly as long as the \
+             sender kept sending",
+            crate::api::session::CLIENT_HANDSHAKE_DEADLINE
+        );
+        assert!(
+            elapsed >= HANDSHAKE_RETRANSMIT_BUDGET / 2,
+            "gave up after only {elapsed:?}; discarding a datagram must leave the schedule \
+             where it was, not consume it"
+        );
+    }
+
+    /// A lost first flight must be retransmitted promptly. "Promptly" is
+    /// [`HANDSHAKE_INITIAL_RTO`]: soon enough that a dropped flight costs one interval
+    /// rather than the whole connect, late enough that a reply merely in flight on a
+    /// long path is not raced by a duplicate. The bounds are a factor of two either side,
+    /// so a schedule that retransmits in a storm and one that simply waits longer
+    /// everywhere both fail.
+    #[tokio::test]
+    async fn a_lost_first_flight_is_retransmitted_at_the_initial_rto() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let client = UdpClientTransport::connect(peer_addr).await.unwrap();
+
+        let send = async {
+            client.send_bytes(b"client-hello").await.unwrap();
+        };
+        let serve = async {
+            let mut buf = vec![0u8; 2048];
+            let (_n, _from) = peer.recv_from(&mut buf).await.unwrap(); // the flight, dropped
+            let dropped_at = std::time::Instant::now();
+            let (_n2, from) = peer.recv_from(&mut buf).await.unwrap(); // the retransmit
+            let gap = dropped_at.elapsed();
+            for d in encode_datagrams(PacketType::Initial, &client.cid(), 0, b"server-hello")
+                .expect("encode")
+            {
+                peer.send_to(&d, from).await.unwrap();
+            }
+            gap
+        };
+        let receive =
+            async { tokio::time::timeout(Duration::from_secs(8), client.recv_bytes()).await };
+        let (_s, gap, r) = tokio::join!(send, serve, receive);
+
+        assert!(
+            gap >= HANDSHAKE_INITIAL_RTO / 2,
+            "retransmitted after {gap:?}, sooner than half the {HANDSHAKE_INITIAL_RTO:?} \
+             initial timeout — a duplicate flight this eager races honest replies"
+        );
+        assert!(
+            gap <= HANDSHAKE_INITIAL_RTO * 2,
+            "retransmitted after {gap:?}, later than twice the {HANDSHAKE_INITIAL_RTO:?} \
+             initial timeout — a lost flight costs that long to notice"
+        );
+        assert_eq!(&r.expect("no timeout").expect("recv")[..], b"server-hello");
+    }
+
+    /// Consecutive retransmits must be spaced further and further apart. A fixed interval
+    /// repeats the same duplicate work at exactly the moment the path has shown it needs
+    /// patience, and it is what spent the old budget in 2.8 s; the backoff is the mechanism
+    /// that buys a slow path time without buying a dead one a longer hang.
+    #[tokio::test]
+    async fn consecutive_handshake_retransmits_back_off() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let client = UdpClientTransport::connect(peer_addr).await.unwrap();
+
+        let send = async {
+            client.send_bytes(b"client-hello").await.unwrap();
+        };
+        let serve = async {
+            let mut buf = vec![0u8; 2048];
+            let _ = peer.recv_from(&mut buf).await.unwrap(); // the flight, dropped
+            let first = std::time::Instant::now();
+            let _ = peer.recv_from(&mut buf).await.unwrap(); // retransmit 1, dropped
+            let second = std::time::Instant::now();
+            let (_n, from) = peer.recv_from(&mut buf).await.unwrap(); // retransmit 2
+            let gaps = (second - first, second.elapsed());
+            for d in encode_datagrams(PacketType::Initial, &client.cid(), 0, b"server-hello")
+                .expect("encode")
+            {
+                peer.send_to(&d, from).await.unwrap();
+            }
+            gaps
+        };
+        let receive =
+            async { tokio::time::timeout(Duration::from_secs(10), client.recv_bytes()).await };
+        let (_s, (gap1, gap2), r) = tokio::join!(send, serve, receive);
+
+        // The schedule is 1 s then 2 s, so the second gap is twice the first. The band is
+        // 1.5×–3× — wide enough that scheduling jitter cannot move it, narrow enough that a
+        // constant interval (1×) sits outside it.
+        assert!(
+            gap2 >= gap1.mul_f32(1.5) && gap2 <= gap1 * 3,
+            "second retransmit gap {gap2:?} did not back off from the first {gap1:?}"
+        );
+        assert_eq!(&r.expect("no timeout").expect("recv")[..], b"server-hello");
+    }
+
+    /// A path fast enough to answer inside the first timeout costs exactly one flight.
+    /// This is the guard against "fix" the slow-path defect by waiting longer everywhere:
+    /// nothing here may delay the first transmission, and no duplicate may be emitted.
+    #[tokio::test]
+    async fn a_prompt_reply_costs_exactly_one_flight() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let client = UdpClientTransport::connect(peer_addr).await.unwrap();
+
+        let send = async {
+            client.send_bytes(b"client-hello").await.unwrap();
+        };
+        let serve = async {
+            let mut buf = vec![0u8; 2048];
+            let (_n, from) = peer.recv_from(&mut buf).await.unwrap();
+            for d in encode_datagrams(PacketType::Initial, &client.cid(), 0, b"server-hello")
+                .expect("encode")
+            {
+                peer.send_to(&d, from).await.unwrap();
+            }
+        };
+        let receive =
+            async { tokio::time::timeout(Duration::from_secs(5), client.recv_bytes()).await };
+        let (_s, _p, r) = tokio::join!(send, serve, receive);
+        assert_eq!(
+            &r.expect("a loopback reply is never slow").expect("recv")[..],
+            b"server-hello"
+        );
+
+        // No second copy of the flight: the reply beat the first timeout, so the schedule
+        // never fired. A probe well under HANDSHAKE_INITIAL_RTO distinguishes "no
+        // retransmit" from "a retransmit that has not come due yet".
+        let mut buf = vec![0u8; 2048];
+        let extra = tokio::time::timeout(HANDSHAKE_INITIAL_RTO / 4, peer.recv_from(&mut buf)).await;
+        assert!(
+            extra.is_err(),
+            "a flight answered inside the first timeout must not be retransmitted"
+        );
+    }
+
     #[tokio::test]
     async fn server_transport_send_and_recv() {
         use tokio::sync::mpsc;
@@ -899,6 +1774,93 @@ mod tests {
         let (hdr, got) = push_datagram(&mut asm, &buf[..n]).unwrap();
         assert_eq!(hdr.cid, [3u8; 8]);
         assert_eq!(got.as_deref(), Some(&b"to-peer"[..]));
+    }
+
+    /// The reply flight a handshake sent is retained exactly once, for exactly the hello it
+    /// answers, and only while the handshake is running (PROTOCOL § 6.1).
+    ///
+    /// Three properties, and the third is the one that is easy to lose. The accept path takes
+    /// the flight before the data pump exists, and the pump moves this transport to the
+    /// Established phase a moment *after* it starts — so without forgetting the question on
+    /// the way out, a frame sent in that window would be retained as a handshake reply and
+    /// held, unread by anyone, for the whole life of the session. That is a per-session leak
+    /// of a few kilobytes that no test of the repair itself would notice, because the repair
+    /// works either way.
+    #[tokio::test]
+    async fn a_handshake_reply_is_retained_once_and_only_while_the_handshake_runs() {
+        use tokio::sync::mpsc;
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel(8);
+        let st = UdpServerTransport::new(sock.clone(), peer_addr, [11u8; 8], tx.clone(), rx);
+
+        assert!(
+            st.take_handshake_flight().is_none(),
+            "a transport that has answered nothing retains nothing"
+        );
+
+        // The hello, then the reply to it — the shape of the accept path.
+        tx.send((Bytes::from_static(b"a-client-hello"), peer_addr))
+            .await
+            .unwrap();
+        let _ = st.recv_bytes().await.unwrap();
+        st.send_bytes(b"the-server-reply").await.unwrap();
+
+        let flight = st
+            .take_handshake_flight()
+            .expect("a handshake-phase reply is retained");
+        assert_eq!(
+            flight.peer, peer_addr,
+            "the retained destination is where the reply actually went"
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(b"a-client-hello");
+        let expected: [u8; 32] = hasher.finalize().into();
+        assert_eq!(
+            flight.question, expected,
+            "the retained flight names the hello it answers, not some other frame"
+        );
+        assert!(
+            flight.wire_bytes >= b"the-server-reply".len(),
+            "the retained wire size must count the envelope, since that is what the \
+             amplification bound is measured in"
+        );
+        assert_eq!(
+            flight.question_wire_bytes,
+            crate::transport::phantom_udp::datagram::wire_len(b"a-client-hello".len()),
+            "and the question must be recorded in that same quantity. The reassembled frame \
+             length is what is to hand here and it is the wrong one: dividing wire bytes by \
+             frame bytes is not a ratio of anything, and the error grows with every fragment"
+        );
+        assert!(
+            !flight.delivered.load(Ordering::Relaxed),
+            "nothing has authenticated yet"
+        );
+
+        assert!(
+            st.take_handshake_flight().is_none(),
+            "the flight has exactly one owner"
+        );
+
+        // The window between the accept path taking the flight and the pump declaring the
+        // session Established. Anything sent here is session traffic, not a reply.
+        st.send_bytes(b"still-in-the-handshake-phase")
+            .await
+            .unwrap();
+        assert!(
+            st.take_handshake_flight().is_none(),
+            "a frame sent after the reply was handed on must not be retained as a reply; \
+             otherwise every accepted session parks kilobytes nothing will ever read"
+        );
+
+        // And the latch the listener releases retention on is set by an authenticated packet.
+        st.confirm_authenticated_source();
+        assert!(
+            flight.delivered.load(Ordering::Relaxed),
+            "an inbound packet that AEAD-opened is proof the client received the reply, and \
+             the retained copy must learn it through the shared latch"
+        );
     }
 
     /// P4.1: a frame from a source other than the established peer registers a
@@ -1388,5 +2350,217 @@ mod tests {
             classify_recv(Ok((42, addr))),
             RecvAction::Got(42, s) if s == addr
         ));
+    }
+
+    /// Regression: a SECOND `migrate_to()` while `recv_bytes` is parked in
+    /// the dual-socket OVERLAP select must wake the recv future so it re-snapshots both sockets
+    /// onto the new path. Before the overlap-arm `migrate_notified` branch existed the second
+    /// migrate had no wake path: recv stayed blocked on the now-silent (first-new, original-old)
+    /// pair while live data flowed on the second-new socket, so the session hung forever.
+    ///
+    /// Mutation check: with the overlap-arm `_ = migrate_notified => continue` branch removed, the post-
+    /// second-migrate datagram is never delivered and this test times out (the `expect` below
+    /// fires). With the branch present recv re-snapshots and delivers it well within the timeout.
+    #[tokio::test]
+    async fn f6_second_migrate_while_parked_in_overlap_wakes_recv() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = Arc::new(UdpClientTransport::connect(server_addr).await.unwrap());
+        client.set_frame_phase(FramePhase::Established);
+
+        // Teach the server the client's ORIGINAL source address.
+        client.send_bytes(b"hi").await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        let (_n, _src0) = server.recv_from(&mut buf).await.unwrap();
+
+        // Park a single `recv_bytes` future in a background task. It starts on the
+        // non-overlap arm (no `prev` socket yet).
+        let recv_client = client.clone();
+        let recv = tokio::spawn(async move { recv_client.recv_bytes().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // First migrate: enters the dual-socket overlap (prev = Some(orig), active = new1).
+        // Its notify permit wakes the parked non-overlap recv, which re-snapshots and re-parks
+        // in the OVERLAP select listening on {new1 (active), orig (prev)}.
+        client
+            .migrate_to("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("first migrate binds a new socket");
+        assert!(
+            client.in_migration_overlap(),
+            "first migrate_to enters the overlap"
+        );
+        // Let recv re-enter and genuinely PARK in the overlap select (consuming the first
+        // migrate's notify permit) before the second migrate fires.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Second migrate WHILE recv is parked in the overlap select: prev = Some(new1),
+        // active = new2. Without the overlap-arm wake, recv stays blocked on the silent
+        // {new1, orig} pair and never sees data on new2 → hang.
+        client
+            .migrate_to("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("second migrate binds a new socket");
+        // Let recv re-snapshot onto {new2 (active), new1 (prev)}.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Teach the server the new2 source address (send_bytes loads the active = new2 socket).
+        client.send_bytes(b"probe-after-2nd-migrate").await.unwrap();
+        let (_pn, src_new2) =
+            tokio::time::timeout(Duration::from_secs(2), server.recv_from(&mut buf))
+                .await
+                .expect("server hears the post-second-migrate probe source")
+                .unwrap();
+
+        // Deliver a real datagram to new2. With the fix recv (parked on new2) wakes and
+        // returns it; without the fix recv is stuck on the old pair and this times out.
+        for d in encode_datagrams(
+            PacketType::OneRtt,
+            &client.cid(),
+            9,
+            b"after-double-migrate",
+        )
+        .unwrap()
+        {
+            server.send_to(&d, src_new2).await.unwrap();
+        }
+        let got = tokio::time::timeout(Duration::from_secs(5), recv)
+            .await
+            .expect("recv must make progress after a second migrate in the overlap")
+            .expect("recv task joined")
+            .expect("recv ok");
+        assert_eq!(&got[..], b"after-double-migrate");
+    }
+
+    /// Regression: the recv loop top reads the active socket and the prev
+    /// socket as two SEPARATE `ArcSwap` loads, while `migrate_to` stores `prev = Some(old)` then
+    /// `socket = new` then notifies. An interleave can make recv snapshot `active = old` AND
+    /// `prev = Some(old)` — entering the overlap arm on the OLD socket TWICE, which hangs once the
+    /// old socket goes silent. The notify permit (stored after both swaps) plus the overlap-arm
+    /// wake let recv re-enter the loop and re-snapshot a consistent pair.
+    ///
+    /// This drives a storm of rapid `migrate_to` calls concurrently with a live `recv_bytes` to
+    /// hit the loop-top torn-read window, asserting recv never hangs across many attempts.
+    ///
+    /// Mutation check: with the overlap-arm `migrate_notified` branch removed, a torn-read snapshot strands
+    /// recv on the silent old socket and the per-attempt timeout fires. With the branch present
+    /// recv always re-snapshots and the final datagram is delivered every attempt.
+    #[tokio::test]
+    async fn f5_torn_read_storm_does_not_hang_recv() {
+        const ATTEMPTS: usize = 40;
+        const MIGRATES_PER_ATTEMPT: usize = 12;
+
+        for attempt in 0..ATTEMPTS {
+            let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let server_addr = server.local_addr().unwrap();
+            let client = Arc::new(UdpClientTransport::connect(server_addr).await.unwrap());
+            client.set_frame_phase(FramePhase::Established);
+
+            // Park a single recv future for this attempt.
+            let recv_client = client.clone();
+            let mut recv = tokio::spawn(async move { recv_client.recv_bytes().await });
+
+            // Fire a storm of rapid migrate_to calls concurrently with the parked recv to hit
+            // the loop-top torn-read window (active read straddling migrate_to's two stores).
+            let storm_client = client.clone();
+            let storm = tokio::spawn(async move {
+                for _ in 0..MIGRATES_PER_ATTEMPT {
+                    // Ignore individual bind errors (ephemeral-port pressure) — the point is the
+                    // concurrency, not every single rebind succeeding.
+                    let _ = storm_client
+                        .migrate_to("127.0.0.1:0".parse().unwrap())
+                        .await;
+                    tokio::task::yield_now().await;
+                }
+            });
+            storm.await.unwrap();
+
+            // Settle on whatever the final active socket is, then teach the server its source.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            client.send_bytes(b"probe").await.unwrap();
+            let mut buf = vec![0u8; 2048];
+            let (_pn, src_final) =
+                tokio::time::timeout(Duration::from_secs(2), server.recv_from(&mut buf))
+                    .await
+                    .unwrap_or_else(|_| panic!("attempt {attempt}: server must hear the probe"))
+                    .unwrap();
+
+            // Deliver real datagrams to the final active socket. A torn-read snapshot that
+            // stranded recv on a silent socket (no fix) never wakes to read any of them and the
+            // timeout fires. With the fix recv re-snapshots and picks one up. Several copies are
+            // sent (each kernel-queued on the bound active socket) so a re-park between the
+            // re-snapshot and a single delivery cannot lose the only datagram — this only adds
+            // slack to the FIX path; a HUNG recv reads none of them regardless.
+            let resend = {
+                let server_addr_final = src_final;
+                let cid = client.cid();
+                async move {
+                    loop {
+                        for d in
+                            encode_datagrams(PacketType::OneRtt, &cid, 1, b"storm-payload").unwrap()
+                        {
+                            let _ = server.send_to(&d, server_addr_final).await;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
+            };
+
+            let delivered = tokio::select! {
+                joined = &mut recv => joined.expect("recv task joined").expect("recv ok"),
+                _ = resend => unreachable!("resend loops forever"),
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                    panic!("attempt {attempt}: recv hung after migrate storm")
+                }
+            };
+            assert_eq!(&delivered[..], b"storm-payload", "attempt {attempt}");
+        }
+    }
+
+    /// Companion guard: a QUIET migration overlap (no datagrams, no further migrate) must stay
+    /// PENDING — the overlap select must not busy-loop or spuriously complete off the
+    /// `migrate_notified` arm (which would burn CPU or return a bogus frame). The single
+    /// migrate's notify permit is consumed by the first overlap re-park; thereafter the overlap
+    /// select must block quietly until real data or a real migrate arrives.
+    #[tokio::test]
+    async fn overlap_select_does_not_busy_loop_or_spuriously_complete() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = Arc::new(UdpClientTransport::connect(server_addr).await.unwrap());
+        client.set_frame_phase(FramePhase::Established);
+
+        client.send_bytes(b"hi").await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        let (_n, _src0) = server.recv_from(&mut buf).await.unwrap();
+
+        // Enter the overlap and park a recv future in it.
+        client
+            .migrate_to("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("migrate binds a new socket");
+        assert!(client.in_migration_overlap());
+
+        let recv_client = client.clone();
+        let mut recv = tokio::spawn(async move { recv_client.recv_bytes().await });
+
+        // For ~400ms with no data and no further migrate, recv must stay pending (no spurious
+        // completion off the migrate arm, no spin returning an error).
+        tokio::select! {
+            r = &mut recv => panic!("overlap recv must stay pending while quiet, got {r:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(400)) => {}
+        }
+
+        // It is still alive and CAN still deliver real data afterwards.
+        client.send_bytes(b"probe").await.unwrap();
+        let (_pn, src_new) = server.recv_from(&mut buf).await.unwrap();
+        for d in encode_datagrams(PacketType::OneRtt, &client.cid(), 2, b"finally").unwrap() {
+            server.send_to(&d, src_new).await.unwrap();
+        }
+        let got = tokio::time::timeout(Duration::from_secs(2), recv)
+            .await
+            .expect("recv eventually delivers real data after a quiet overlap")
+            .expect("recv task joined")
+            .expect("recv ok");
+        assert_eq!(&got[..], b"finally");
     }
 }

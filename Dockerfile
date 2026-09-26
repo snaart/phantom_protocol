@@ -8,17 +8,17 @@
 #   - read-only rootfs friendly (signing key on a volume at /etc/phantom-server)
 #   - exposes 4242 (app — matches docs/operations/kubernetes.md + helm chart)
 #
-# Observability is OTLP push (Phase 8) — the server makes an outbound
+# Observability is OTLP push — the server makes an outbound
 # connection to an OTel Collector; there is no inbound /metrics port.
 #
 # Build:
-#   docker build -t phantom-server:0.2.2 .
+#   docker build -t phantom-server:0.3.0 .
 #
 # Run (single-host smoke):
 #   docker run --rm -p 4242:4242 \
 #       -e OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317 \
 #       -v phantom-signing-key:/etc/phantom-server \
-#       phantom-server:0.2.2
+#       phantom-server:0.3.0
 #
 # The first start auto-generates a HybridSigningKey at $PHANTOM_SIGNING_KEY_FILE
 # (mode 0600) and logs the corresponding verifying-key hex at WARN. Capture that
@@ -28,7 +28,8 @@
 FROM rust:1-slim-bookworm AS builder
 
 # Build deps for the sibling server crate. Phantom Protocol itself is pure-Rust
-# (ml-kem / ml-dsa swap in Phase 5.1 removed all C deps from the lib);
+# (the move to the RustCrypto ml-kem / ml-dsa crates removed all C deps from
+# the lib);
 # `pkg-config` covers transitive build scripts (e.g. the OTLP exporter's
 # tonic/prost stack).
 RUN apt-get update \
@@ -60,7 +61,7 @@ USER phantom
 WORKDIR /home/phantom
 
 # 4242 → Phantom transport (canonical port across kubernetes.md + helm).
-# No inbound metrics port — telemetry is OTLP push (Phase 8).
+# No inbound metrics port — telemetry is OTLP push.
 EXPOSE 4242
 
 # Default config — every value is overridable via -e on `docker run` or

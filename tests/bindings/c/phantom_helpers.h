@@ -65,6 +65,58 @@ static inline void phantom__free_err(PhantomRustBuffer err) {
 }
 
 /*
+ * Lower a `Vec<u8>` argument. UniFFI's `bytes` type crosses the FFI as a
+ * RustBuffer of `[i32 big-endian length][payload]` — unlike a top-level
+ * `String`, which is raw UTF-8 with NO prefix. Passing unprefixed bytes makes
+ * the call fail with `PhantomRustCallStatus.code == 2` ("Failed to convert
+ * arg"), so every `Vec<u8>` argument must go through this helper.
+ *
+ * Returns 0 on success (and fills `*out`), -1 on allocation failure. The
+ * returned buffer is consumed by the scaffolding call it is passed to.
+ */
+static inline int phantom__lower_bytes(const uint8_t *data, size_t len,
+                                       PhantomRustBuffer *out) {
+    PhantomRustCallStatus st = {0};
+    /* `rustbuffer_alloc(n)` returns a zeroed buffer whose `len` is already n. */
+    PhantomRustBuffer buf = ffi_phantom_protocol_rustbuffer_alloc((uint64_t)len + 4, &st);
+    if (st.code != 0 || buf.data == NULL) {
+        phantom__free_err(st.error_buf);
+        return -1;
+    }
+    buf.data[0] = (uint8_t)((len >> 24) & 0xFF);
+    buf.data[1] = (uint8_t)((len >> 16) & 0xFF);
+    buf.data[2] = (uint8_t)((len >> 8) & 0xFF);
+    buf.data[3] = (uint8_t)(len & 0xFF);
+    if (len) {
+        memcpy(buf.data + 4, data, len);
+    }
+    *out = buf;
+    return 0;
+}
+
+/*
+ * Clone a PhantomSession handle for one scaffolding call.
+ *
+ * A UniFFI method CONSUMES the handle it is given (it lifts it back into the
+ * owning `Arc<T>`), so every call must be handed a fresh `_clone_*` handle or
+ * the caller's own reference is dropped underneath it — for PhantomSession
+ * that drops the last `Arc`, whose `Drop` impl closes the session, and every
+ * later call sees a closed/dead session. The generated Python / Swift /
+ * Kotlin bindings clone before every call for exactly this reason.
+ *
+ * Returns NULL if the clone failed.
+ */
+static inline void *phantom__clone_session(void *session) {
+    PhantomRustCallStatus st = {0};
+    void *cloned = uniffi_phantom_protocol_fn_clone_phantomsession(session, &st);
+    if (st.code != 0) {
+        phantom__free_err(st.error_buf);
+        return NULL;
+    }
+    return cloned;
+}
+
+/*
  * Blocking pinned PQC connect. `pinned_key` is the server's `HybridVerifyingKey`
  * bytes (from `PhantomListener::verifying_key_bytes()`). Returns an opaque
  * `PhantomSession*` handle ready for `_send` / `_recv`, or NULL on error
@@ -75,21 +127,23 @@ static inline void *phantom_blocking_connect_pinned(const char *host, uint16_t p
                                                     const uint8_t *pinned_key,
                                                     size_t key_len) {
     PhantomRustCallStatus st = {0};
+    /* A top-level `String` lowers to RAW UTF-8 — no length prefix. */
     PhantomForeignBytes hb = {(int32_t)strlen(host), (uint8_t *)host};
     PhantomRustBuffer host_buf = ffi_phantom_protocol_rustbuffer_from_bytes(hb, &st);
     if (st.code != 0) {
         phantom__free_err(st.error_buf);
         return NULL;
     }
-    PhantomForeignBytes kb = {(int32_t)key_len, (uint8_t *)pinned_key};
-    PhantomRustBuffer key_buf = ffi_phantom_protocol_rustbuffer_from_bytes(kb, &st);
-    if (st.code != 0) {
-        phantom__free_err(st.error_buf);
+    /* A `Vec<u8>` lowers to [i32 big-endian length][payload]. */
+    PhantomRustBuffer key_buf;
+    if (phantom__lower_bytes(pinned_key, key_len, &key_buf) != 0) {
+        PhantomRustCallStatus fs = {0};
+        ffi_phantom_protocol_rustbuffer_free(host_buf, &fs);
         return NULL;
     }
     /* The RustBuffer args are consumed by the call — do not free them. */
     uint64_t fut = uniffi_phantom_protocol_fn_func_connect_pinned(host_buf, port, key_buf);
-    /* An object future completes to a `u64` handle (UniFFI 0.31 — no `_pointer`
+    /* An object future completes to a `u64` handle (UniFFI 0.32 — no `_pointer`
      * variant); the handle is the `void *` the object methods/free take. */
     phantom__block_on(fut, ffi_phantom_protocol_rust_future_poll_u64);
     PhantomRustCallStatus cst = {0};
@@ -102,16 +156,21 @@ static inline void *phantom_blocking_connect_pinned(const char *host, uint16_t p
     return (void *)(uintptr_t)handle;
 }
 
-/* Blocking send of `len` bytes on `session`. Returns 0 on success, -1 on error. */
+/* Blocking send of `len` bytes on `session`. Returns 0 on success, -1 on error.
+ * `session` stays owned by the caller — the call runs on a cloned handle. */
 static inline int phantom_blocking_send(void *session, const uint8_t *data, size_t len) {
-    PhantomRustCallStatus st = {0};
-    PhantomForeignBytes db = {(int32_t)len, (uint8_t *)data};
-    PhantomRustBuffer buf = ffi_phantom_protocol_rustbuffer_from_bytes(db, &st);
-    if (st.code != 0) {
-        phantom__free_err(st.error_buf);
+    void *sref = phantom__clone_session(session);
+    if (!sref) {
         return -1;
     }
-    uint64_t fut = uniffi_phantom_protocol_fn_method_phantomsession_send(session, buf);
+    /* `data` is a `Vec<u8>` argument — it needs the i32 BE length prefix. */
+    PhantomRustBuffer buf;
+    if (phantom__lower_bytes(data, len, &buf) != 0) {
+        PhantomRustCallStatus fs = {0};
+        uniffi_phantom_protocol_fn_free_phantomsession(sref, &fs);
+        return -1;
+    }
+    uint64_t fut = uniffi_phantom_protocol_fn_method_phantomsession_send(sref, buf);
     phantom__block_on(fut, ffi_phantom_protocol_rust_future_poll_void);
     PhantomRustCallStatus cst = {0};
     ffi_phantom_protocol_rust_future_complete_void(fut, &cst);
@@ -128,9 +187,14 @@ static inline int phantom_blocking_send(void *session, const uint8_t *data, size
  * the message length (which may exceed `cap` — bytes past `cap` are dropped), or
  * -1 on error / session closed. The returned `Vec<u8>` is UniFFI `bytes`: a
  * RustBuffer of `[i32-big-endian length][payload]`, which this strips for you.
+ * `session` stays owned by the caller — the call runs on a cloned handle.
  */
 static inline ptrdiff_t phantom_blocking_recv(void *session, uint8_t *out, size_t cap) {
-    uint64_t fut = uniffi_phantom_protocol_fn_method_phantomsession_recv(session);
+    void *sref = phantom__clone_session(session);
+    if (!sref) {
+        return -1;
+    }
+    uint64_t fut = uniffi_phantom_protocol_fn_method_phantomsession_recv(sref);
     phantom__block_on(fut, ffi_phantom_protocol_rust_future_poll_rust_buffer);
     PhantomRustCallStatus cst = {0};
     PhantomRustBuffer payload =
@@ -155,9 +219,15 @@ static inline ptrdiff_t phantom_blocking_recv(void *session, uint8_t *out, size_
     return n;
 }
 
-/* Blocking graceful disconnect. Returns 0 on success, -1 on error. */
+/* Blocking graceful disconnect. Returns 0 on success, -1 on error.
+ * `session` stays owned by the caller — the call runs on a cloned handle, so
+ * the caller must still `uniffi_phantom_protocol_fn_free_phantomsession`. */
 static inline int phantom_blocking_disconnect(void *session) {
-    uint64_t fut = uniffi_phantom_protocol_fn_method_phantomsession_disconnect(session);
+    void *sref = phantom__clone_session(session);
+    if (!sref) {
+        return -1;
+    }
+    uint64_t fut = uniffi_phantom_protocol_fn_method_phantomsession_disconnect(sref);
     phantom__block_on(fut, ffi_phantom_protocol_rust_future_poll_void);
     PhantomRustCallStatus cst = {0};
     ffi_phantom_protocol_rust_future_complete_void(fut, &cst);

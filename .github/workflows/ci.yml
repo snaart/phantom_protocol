@@ -26,7 +26,7 @@ jobs:
     name: cargo fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       # Pinned (not @stable): rustfmt's default style is version-sensitive, so a
       # stable bump can flip this red with no code change. Pin to the toolchain
       # the tree is formatted against and bump deliberately. (test/clippy stay on
@@ -35,34 +35,68 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --manifest-path core/Cargo.toml --check
+      # The sibling crates are not workspace members, so `core`'s check never
+      # saw them and both had drifted from the repo-root `.rustfmt.toml`.
+      - run: cargo fmt --manifest-path server/Cargo.toml --check
+      - run: cargo fmt --manifest-path cli/Cargo.toml --check
+      # The testbed is the third sibling and had drifted for the same reason.
+      # It stays in this job rather than in `testbed-check` so it gets the
+      # pinned rustfmt above; every other testbed gate runs on stable.
+      - run: cargo fmt --manifest-path testbed/Cargo.toml --check
 
   clippy:
+    # NOTE: "warn-only" in this `name:` is legacy wording — the audit lints are
+    # `deny` in core/src/lib.rs and the file-scope `RUSTFLAGS: -D warnings`
+    # makes this a hard gate. The string is kept verbatim because it is a pinned
+    # branch-protection required-status-check context — renaming it makes the
+    # required context never report and blocks every merge (same rule as the
+    # `integration` job below).
     name: cargo clippy (audit lints, warn-only)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: "."
-      # Audit-friendly lints (`clippy::unwrap_used`, `expect_used`,
-      # `indexing_slicing`, etc.) are configured at `warn` level in `lib.rs`
-      # so they surface as TODO markers in CI output without breaking the
-      # build. A follow-up phase will tighten them to `deny`.
+      # The audit lints (`clippy::unwrap_used`, `expect_used`, `panic`,
+      # `unreachable`, `todo`, `unimplemented`, `missing_safety_doc`) are
+      # `deny` at the crate root (core/src/lib.rs) — every surviving production
+      # panic-shaped call carries an inline `// PANIC-SAFETY:` comment plus a
+      # statement-scoped `#[allow(...)]` (inventory: docs/security/panic-sites.md).
+      # `clippy::indexing_slicing` is deliberately NOT enabled (too noisy on
+      # constant-bounded indexing). With the file-scope `RUSTFLAGS: -D warnings`
+      # above, any remaining warning is a hard failure — this job is a gate.
       - run: cargo clippy --manifest-path core/Cargo.toml --lib
+      # `--lib` compiles ONE target: the production library WITHOUT `cfg(test)`.
+      # It never builds the in-lib `#[cfg(test)]` modules, `core/tests/`,
+      # `core/benches/` or `core/examples/` — which is exactly how a
+      # non-compiling example and 267 findings (263 warnings + 4 `never_loop`
+      # errors) accumulated in this tree unnoticed while this job stayed green.
+      # `--all-targets` builds the lib a second time WITH `cfg(test)` plus every
+      # integration test, bench and example, so that debt cannot silently
+      # return. It reuses the artifacts the `--lib` step above just produced, so
+      # keeping that step costs almost nothing and preserves a fast, precise,
+      # production-code-only first failure.
+      - run: cargo clippy --manifest-path core/Cargo.toml --all-targets
 
   test:
     name: cargo test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: "."
       - run: cargo test --manifest-path core/Cargo.toml --lib
+      # The only gate on the code fences in the README — which is the docs.rs
+      # landing page — and on the compiled `# Example` blocks across the exported
+      # API. It ran in no workflow and no hook, so every one of them could rot to
+      # non-compiling with a fully green tree, on the page a new user reads first.
+      - run: cargo test --manifest-path core/Cargo.toml --doc
       # Formal negative-security tests pinning the documented invariants (server
       # pinning, AEAD/AAD binding, replay, rekey, flow-control, and the PhantomUDP
       # pre-auth DoS bounds). Always-on; a regression surfaces as a hard red here.
@@ -77,9 +111,53 @@ jobs:
       # crate-encoding regression that a self-referential round-trip cannot.
       - run: cargo test --manifest-path core/Cargo.toml --test nist_kat
       # End-to-end observability wiring: a real TCP session must populate the
-      # handshake/packet/byte metrics and drive the active-session gauge up AND
-      # back down. Runs on the default (no-otel) atomics path.
+      # handshake/packet/byte metrics, the encrypt/decrypt timings and the RTT
+      # sample, and drive the active-session AND active-stream gauges up and
+      # back down (including on an abnormal close). Runs on the default
+      # (no-otel) atomics path.
       - run: cargo test --manifest-path core/Cargo.toml --test observability_e2e
+      # Facade-level contracts the recording call sites depend on (gauge
+      # balance, sum-over-count averages, per-path RTT slots, and the pin that
+      # the OTel-only recorders touch no atomic).
+      - run: cargo test --manifest-path core/Cargo.toml --test observability_atomics
+      # The suites below were in the tree but in no workflow, so a regression in
+      # any of them reached main green. They are all fast — the six together run
+      # in about seven seconds against artifacts the steps above have already
+      # built — so they belong in this job rather than in one of their own.
+      #
+      # proptest over the AEAD round trip and its AAD-mismatch rejection, the
+      # replay window's monotonic-accept / duplicate-reject pair, and the wire
+      # codec's refusal to panic on arbitrary bytes. Randomised where the fixed
+      # vectors above are not, which is the point of having both.
+      - run: cargo test --manifest-path core/Cargo.toml --test property
+      # CAVP-style known-answer vectors for AES-256-GCM, HKDF-SHA256 (RFC 5869
+      # A.1) and SHA-256, plus ML-KEM-768 / ML-DSA-65 round trips. The fips job
+      # runs this suite under the aws-lc-rs substrate; nothing ran it under the
+      # default ring/RustCrypto one, which is the substrate that ships.
+      - run: cargo test --manifest-path core/Cargo.toml --test cavp
+      # PacketHeader to_wire/from_wire round trip, the 15-byte SIZE, and the
+      # version-first byte order.
+      - run: cargo test --manifest-path core/Cargo.toml --test check_wire
+      # Pins that the `Runtime` trait is a real seam: a substituted runtime must
+      # actually drive both a session and a listener. Untested, the indirection
+      # can be bypassed at one call site and the embedded / WASI runtimes stop
+      # being reachable without anything failing.
+      - run: cargo test --manifest-path core/Cargo.toml --test runtime_integration
+      # The no-telemetry path: recording still compiles, the atomics still
+      # count, and `PhantomInstruments` is still a ZST. This is the default
+      # build's observability behaviour, and the only job that touched
+      # observability under a feature flag was the one that turns the flag on.
+      - run: cargo test --manifest-path core/Cargo.toml --test observability_no_otel
+      # Randomised rejection of malformed and garbage ClientHellos against
+      # `process_client_hello`. The cargo-fuzz targets cover the same parser far
+      # harder, but they run in their own nightly workflow and are not a
+      # required context; this is the always-on floor.
+      - run: cargo test --manifest-path core/Cargo.toml --test fuzz_handshake
+      # `observability_instrument_wiring` is deliberately NOT here. Its whole
+      # file is `#![cfg(feature = "telemetry-otel")]`, so a step in this job
+      # would compile an empty binary and report "0 passed" — a green tick for
+      # nothing run. It is gated in the `telemetry-otel-feature` job, which is
+      # where the instruments it pins actually exist.
 
   # MSRV gate (M-8): the crate documents a Rust 1.93 MSRV (rust-version /
   # .clippy.toml / docs/policy/versioning.md) but nothing enforced it. Pin the
@@ -91,7 +169,7 @@ jobs:
     name: cargo check (MSRV 1.93)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # pinned action; 1.93 via input
         with:
           toolchain: "1.93"
@@ -106,7 +184,7 @@ jobs:
     name: cargo doc
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       # Pinned for the same reason as the fmt job: rustdoc's `-D warnings` set is
       # version-sensitive, so a stable bump can introduce new lints and flip this
       # red with no code change. Pin and bump deliberately.
@@ -117,13 +195,135 @@ jobs:
       - run: cargo doc --manifest-path core/Cargo.toml --no-deps --lib
         env:
           RUSTDOCFLAGS: "-D warnings"
+      - name: Check for UTF-8 mojibake in docs
+        run: |
+          if grep -rPl '\xc3\xa2\xc2|\xc3\x82\xc2\xb1' docs/ 2>/dev/null | grep -q .; then
+            echo "UTF-8 mojibake detected in docs/ - run the mojibake repair script"
+            grep -rPl '\xc3\xa2\xc2|\xc3\x82\xc2\xb1' docs/
+            exit 1
+          fi
+
+  package:
+    # Nothing in this workflow ever built the crate the way crates.io does, and
+    # the publication path was broken for two months without a single red tick:
+    # `#![doc = include_str!("../../README.md")]` resolves in the repository and
+    # not inside an extracted archive, where `src/lib.rs` sits one level below
+    # the root rather than two. `cargo package` verifies by unpacking its own
+    # tarball and building it, which is the only build that sees that layout.
+    #
+    # Cold by construction: the extracted crate compiles in its own target
+    # directory under target/package/, so rust-cache cannot warm it. The cache
+    # is still worth having for the registry downloads (~180 crates), but expect
+    # this job to spend minutes compiling dependencies on every run.
+    name: cargo package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: "."
+      # The archive's README is core/README.md, which is a copy of the
+      # repository-root landing page, and its LICENSE is core/LICENSE, a copy
+      # of the root LICENSE. Assert, never repair: a CI step that rewrote the
+      # tree would go green on a state nobody committed.
+      #
+      # The script's own cases run first. A gate whose report says only that two
+      # files have different sizes stops being useful the moment the drift is a
+      # same-length substitution, and nothing but these cases notices that.
+      - run: scripts/sync_readme_test.sh
+      - run: scripts/sync_readme.sh --check
+      # Build the tarball first without verifying it. Seconds, and it produces
+      # the archive the next step reads — so the payload is checked even when
+      # the verification build below fails.
+      - run: cargo package --manifest-path core/Cargo.toml --no-verify --locked
+      # What --verify structurally cannot see: it compiles the archive, and a
+      # crate compiles just as happily around the wrong README. This is the
+      # check that tells a stale 5 KiB stub from the 35 KiB landing page.
+      #
+      # It checks the file, not the manifest key. README.md reaches the archive
+      # because it is a tracked file under the manifest directory, so this step
+      # stays green if `readme` is repointed at some other file — and that file
+      # is what crates.io renders. The key itself is asserted from
+      # `cargo test --lib` (packaged_readme::manifest_readme_key_names_the_packaged_copy),
+      # which is a required context where this job is not.
+      - name: Archive ships the landing-page README
+        run: |
+          CRATE=$(ls target/package/phantom-protocol-*.crate)
+          NAME=$(basename "${CRATE}" .crate)
+          tar -xzOf "${CRATE}" "${NAME}/README.md" | cmp - README.md
+      # The same check for the license text. `license = "Apache-2.0"` is an SPDX
+      # identifier, not a file, so the archive carries license text only because
+      # core/LICENSE is a tracked file under the manifest directory, and
+      # Apache-2.0 §4(a) requires every redistribution to include it. --verify
+      # cannot see its absence either: nothing compiles against a LICENSE.
+      # A crate without one still turns this step red even though the default
+      # shell runs without pipefail: `tar` then writes nothing, and `cmp` of an
+      # empty stream against the 11 KiB root LICENSE reports EOF and fails.
+      - name: Archive ships the license text
+        run: |
+          CRATE=$(ls target/package/phantom-protocol-*.crate)
+          NAME=$(basename "${CRATE}" .crate)
+          tar -xzOf "${CRATE}" "${NAME}/LICENSE" | cmp - LICENSE
+      # Full verification: unpack and build the crate as a consumer would.
+      - run: cargo package --manifest-path core/Cargo.toml --locked
+
+  panic-sites:
+    # The inventory in docs/security/panic-sites.md is the entry point for an
+    # adversarial review, and it had drifted a whole row out of step with the
+    # code while every one of its stream.rs addresses pointed somewhere else.
+    # A document nobody can trust is worse than no document, so the agreement
+    # is now machine-checked. No toolchain needed — it is a text scan.
+    name: panic-site inventory
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - run: scripts/check_panic_sites.py
+
+  memory-arithmetic:
+    # The published receive-window-growth product has two factors in two crates
+    # that cannot see each other — a clap default in server/, a constant in
+    # core/ — and six documents plus one test restate it. The test written to
+    # stop that figure drifting held both factors as literals of its own, so it
+    # agreed with the tree it was written against and nothing else. This is the
+    # coupling. No toolchain needed — it is a text scan, like the job above, and
+    # it belongs in branch protection beside it.
+    name: published memory arithmetic
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # The script's own cases run first. A gate that has quietly stopped
+      # matching anything reports the same success as a tree that agrees, and
+      # nothing but these cases tells the two apart.
+      - run: scripts/check_memory_arithmetic_test.py
+      - run: scripts/check_memory_arithmetic.py
+
+  changelog-structure:
+    # `[Unreleased]` had two `### Documented` sections a thousand lines apart.
+    # Neither branch was wrong on its own — each added a heading that did not yet
+    # exist in its branch — and the union has a duplicate that no diff shows as
+    # a conflict, which is exactly the failure a merge produces and review does
+    # not catch. The second block is invisible to a reader who found the first,
+    # and after that entries land in whichever one the author's cursor was near.
+    #
+    # The same script gates the release path (`check_changelog_breaking.py` in
+    # release.yml, which needs a semver report); this runs its report-free half
+    # on every pull request, which is where a merge actually lands. Released
+    # sections are reported and deliberately not failed — see the script.
+    name: changelog structure
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # The script's own cases first, for the reason given in the job above.
+      - run: scripts/check_changelog_breaking_test.sh
+      - run: python3 scripts/check_changelog_breaking.py --structure-only
 
   deny:
     name: cargo deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           # Use the action's dedicated `manifest-path` input — passing
           # `--manifest-path` inside `arguments` collides with the flag the
@@ -144,7 +344,7 @@ jobs:
       contents: read
       checks: write
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -153,7 +353,7 @@ jobs:
     name: cargo audit (server + cli lockfiles)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -162,14 +362,24 @@ jobs:
       # The deployed `server`/`cli` binaries carry their own committed
       # lockfiles. The root `audit` job above does not see them, so
       # scan them explicitly — release artifacts build from these trees.
+      #
+      # (The job's display name still says "server + cli" while three lockfiles
+      # are scanned. It is a pinned branch-protection required-status-check
+      # context: renaming it makes the required context never report and blocks
+      # every merge, so the string is left alone — same rule as the
+      # `integration` job below.)
       - run: cargo audit -f server/Cargo.lock
       - run: cargo audit -f cli/Cargo.lock
+      # The testbed is also a deployed binary — `phantom-testd` runs as a
+      # service on a public VPS — and it pulls the widest third-party tree in
+      # the repository (quinn, rustls, rcgen). It had no advisory scan at all.
+      - run: cargo audit -f testbed/Cargo.lock
 
   embedded-feature:
     name: cargo test + clippy (--features embedded)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy
@@ -178,12 +388,21 @@ jobs:
           workspaces: "."
       - run: cargo test --manifest-path core/Cargo.toml --lib --features embedded
       - run: cargo clippy --manifest-path core/Cargo.toml --lib --features embedded -- -D warnings
+      # `--lib` above never builds `core/examples/` nor the leg's own
+      # `#[cfg(test)]` module, so both could rot unnoticed — an
+      # `embedded-io-async` trait bump once left `embedded_demo` (the only
+      # example needing this feature) failing to compile, and a `never_loop`
+      # error plus a `type_complexity` warning had since accumulated in exactly
+      # those two blind spots. `--all-targets` compiles AND lints the examples,
+      # tests and benches, so it strictly subsumes the `cargo check --examples`
+      # step it replaces here.
+      - run: cargo clippy --manifest-path core/Cargo.toml --all-targets --features embedded -- -D warnings
 
   mimicry-feature:
     name: cargo test + clippy (--features mimicry)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy
@@ -192,6 +411,11 @@ jobs:
           workspaces: "."
       - run: cargo test --manifest-path core/Cargo.toml --lib --features mimicry
       - run: cargo clippy --manifest-path core/Cargo.toml --lib --features mimicry -- -D warnings
+      # Widened for the same reason as the main `clippy` job: `--lib` never sees
+      # the leg's own `#[cfg(test)]` modules (`record.rs`, `client_hello.rs`) or
+      # `core/tests/mimic_tls_integration.rs`, and three lint findings had
+      # collected there unnoticed.
+      - run: cargo clippy --manifest-path core/Cargo.toml --all-targets --features mimicry -- -D warnings
       # Live end-to-end loopback: bind_mimic ↔ connect_pinned_mimic, full prelude +
       # inner PQ handshake + bidirectional data (the leg's own #[ignore] live tests
       # ride in --lib above but are not executed without --ignored).
@@ -202,7 +426,7 @@ jobs:
     name: cargo test + clippy (--features telemetry-otel)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy
@@ -211,7 +435,21 @@ jobs:
           workspaces: "."
       - run: cargo test --manifest-path core/Cargo.toml --lib --features telemetry-otel
       - run: cargo test --manifest-path core/Cargo.toml --test observability_otel --features telemetry-otel
+      # Regression pins for the seven OTel-ONLY recorders (cookie / pow /
+      # early_data / resumption / rekey / path_migration / path_validation).
+      # They touch no atomic, so `Observability::snapshot()` can never show
+      # them — this suite installs an in-memory SdkMeterProvider, drives real
+      # loopback code paths, and asserts the counter series actually moved.
+      # Only meaningful under this feature (the instruments are a ZST no-op
+      # otherwise), which is why it lives in this job.
+      - run: cargo test --manifest-path core/Cargo.toml --test observability_instrument_wiring --features telemetry-otel
       - run: cargo clippy --manifest-path core/Cargo.toml --lib --features telemetry-otel -- -D warnings
+      # `--lib` does not lint `core/tests/observability_otel.rs` or
+      # `observability_instrument_wiring.rs` — the two suites this job exists to
+      # run, and the only place the OTel-only recorders are exercised at all.
+      # `--all-targets` covers them (plus `observability_bench`, whose OTel path
+      # nothing else compiles under this feature).
+      - run: cargo clippy --manifest-path core/Cargo.toml --all-targets --features telemetry-otel -- -D warnings
 
   fips-feature:
     name: cargo test + clippy (--features fips)
@@ -220,7 +458,7 @@ jobs:
     # documented (CONTRIBUTING.md: `brew install pkg-config openssl@3`)
     # but the CI runner of record is ubuntu-latest.
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy
@@ -239,6 +477,11 @@ jobs:
       - run: cargo test --manifest-path core/Cargo.toml --no-default-features --features fips,bindings,compression-zstd --test cavp
       - run: cargo test --manifest-path core/Cargo.toml --no-default-features --features fips,bindings,compression-zstd --test nist_kat
       - run: cargo clippy --manifest-path core/Cargo.toml --no-default-features --features fips,bindings,compression-zstd --lib -- -D warnings
+      # `--lib` misses every test target this feature set still compiles —
+      # including the `cavp` / `nist_kat` suites run above and the in-lib
+      # `#[cfg(test)]` modules, whose fips-only branches nothing else lints.
+      # Verified clean when this gate was added; keeps them from rotting.
+      - run: cargo clippy --manifest-path core/Cargo.toml --no-default-features --features fips,bindings,compression-zstd --all-targets -- -D warnings
       # Supply-chain guard (SUPPLY-03): the FIPS build must NOT link the
       # non-FIPS `ring` / `x25519-dalek` crates. `cargo tree -i` exits
       # non-zero ("did not match any packages") when the crate is absent,
@@ -282,18 +525,26 @@ jobs:
     name: cli compiles against core
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: "."
       - run: cargo check --manifest-path cli/Cargo.toml
+      # The CLI is a shipped, operator-facing artifact (it writes long-term
+      # signing keys), but it was the one crate in the tree with no lint gate at
+      # all — `server-check` has linted with `--all-targets` all along, and this
+      # job only ever ran `cargo check`. A `collapsible_if` in `keygen.rs` had
+      # accumulated there unnoticed as a result. Mirror the server job.
+      - run: cargo clippy --manifest-path cli/Cargo.toml --all-targets -- -D warnings
 
   server-check:
     name: server compiles + tests against core
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy
@@ -331,6 +582,52 @@ jobs:
           wait "$PID" || true
           echo "server startup smoke OK"
 
+  testbed-check:
+    # Every performance number this project reports — in CHANGELOG.md, in the
+    # README, in the articles — comes out of `testbed/`, and the crate was in no
+    # workflow at all: no lint, no test run, no build, no advisory scan of its
+    # lockfile. An instrument nobody checks is how a measurement campaign ends
+    # up arguing about the instrument, and this one had already shipped
+    # unformatted and with a failing test without anything noticing.
+    #
+    # `testbed/` is a sibling crate with its own `[workspace]`, so nothing in
+    # the core manifest reaches it — every step names its manifest explicitly.
+    # (`cargo fmt --check` for it lives in the `fmt` job above, which pins
+    # rustfmt's version deliberately.)
+    name: testbed compiles + tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: "."
+          key: testbed
+      # `--all-targets` from the start: the crate is three binaries plus a
+      # library of shared measurement code, and a `--lib`-only lint would leave
+      # the binaries — the parts that actually run on the VPS, and the
+      # unprivileged wire check this job is the only home of — unlinted.
+      - run: cargo clippy --manifest-path testbed/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --manifest-path testbed/Cargo.toml
+      # The deployed artifact is the release build, and it is the only
+      # configuration the WAN campaign ever runs. A debug-only gate would let a
+      # release-only break — an overflow check, a profile-gated dependency —
+      # reach the VPS and be discovered as a bad measurement.
+      - run: cargo build --manifest-path testbed/Cargo.toml --release
+      # `analyze.py` is the other half of this instrument: every reading the
+      # campaign publishes is a sentence this script composed out of the
+      # artefact. It carries its own suite — a hundred and fifty-odd cases
+      # covering the arithmetic, the admissibility rules and the wording that
+      # decides what a figure is allowed to claim — and that suite ran in no
+      # workflow at all, which is exactly how the fictitious `refuted` column
+      # (a percentage computed from a field nothing ever writes) survived being
+      # printed under real measurements. Pure Python against fixtures it builds
+      # itself: no network, no artefact, no daemon.
+      - run: python3 testbed/analyze.py --self-test
+
   integration:
     # NOTE: this `name:` is a pinned branch-protection **required status check**
     # context — do NOT rename it (a rename makes the required context never report
@@ -342,7 +639,7 @@ jobs:
     # GitHub kills the job rather than burning a 6-hour runner.
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:

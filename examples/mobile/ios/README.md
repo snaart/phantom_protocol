@@ -6,7 +6,7 @@ client lifecycle: a **pinned** connect, **0-RTT resumption** from a Keychain-cac
 ticket, encrypted send/receive, live **connection-state** surfacing, and
 **reconnect-with-0-RTT recovery** on a network-interface change.
 
-> ## ⚠️ Not built in CI — requires Xcode + a running `phantom-server`; verify locally
+> ## Not built in CI — requires Xcode + a running `phantom-server`; verify locally
 >
 > There is no Xcode in CI, so this sample is **not** compiled by the project's
 > pipelines. `swift build` / Xcode resolution will fail until you build the
@@ -41,6 +41,15 @@ You need a macOS host with Xcode and the iOS Rust targets:
 rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 ```
 
+> **Note:** `core/Cargo.toml` declares `crate-type = ["lib", "cdylib"]`, so a
+> plain `cargo build` emits `libphantom_protocol.dylib` + `.rlib` but no
+> `libphantom_protocol.a`. The iOS slices are therefore built with
+> `cargo rustc … --crate-type staticlib`, which requests the archive per
+> invocation. It is kept out of the manifest deliberately: a staticlib is a final
+> artifact, so a crate-wide declaration makes cargo require a `#[panic_handler]`
+> and a `#[global_allocator]` from the library and breaks the bare-metal
+> `thumbv7em-none-eabihf` build. `build-xcframework.sh` already does this.
+
 The repository ships a ready-made script that compiles the three iOS slices,
 `lipo`s the simulator slices together, and assembles the XCFramework with the
 UniFFI C headers bundled:
@@ -53,10 +62,11 @@ UniFFI C headers bundled:
 Equivalently, by hand:
 
 ```sh
-# Device (arm64), Apple-silicon simulator, Intel simulator
-cargo build --release --target aarch64-apple-ios     --manifest-path core/Cargo.toml
-cargo build --release --target aarch64-apple-ios-sim --manifest-path core/Cargo.toml
-cargo build --release --target x86_64-apple-ios      --manifest-path core/Cargo.toml
+# Device (arm64), Apple-silicon simulator, Intel simulator.
+# `cargo rustc --crate-type staticlib` is what produces the .a — see the note above.
+cargo rustc --release --target aarch64-apple-ios     --manifest-path core/Cargo.toml --crate-type staticlib
+cargo rustc --release --target aarch64-apple-ios-sim --manifest-path core/Cargo.toml --crate-type staticlib
+cargo rustc --release --target x86_64-apple-ios      --manifest-path core/Cargo.toml --crate-type staticlib
 
 # Merge the two simulator slices into one fat library
 mkdir -p target/universal-ios-sim/release
@@ -166,10 +176,9 @@ You can either:
 Then build and run on a simulator or device. Tap **Connect**, send a message,
 and watch the connection-state banner. Tap **Reconnect (0-RTT)** to exercise the
 working recovery path (harvest a resumption hint, tear the session down, then
-re-establish via `connectPinnedWithResumption`). The **Call migrate() API
-(no-op over TCP)** button calls `PhantomSession.migrate(localAddr:)` for
-API-completeness only and logs that it does nothing on the TCP FFI surface —
-see the migration section below.
+re-establish via `connectPinnedWithResumption`). The **Call migrate() API** button
+calls `PhantomSession.migrate(localAddr:)` for API-completeness only; on the TCP
+FFI path it returns `Unsupported` — see the migration section below.
 
 ---
 
@@ -182,7 +191,7 @@ see the migration section below.
 | Encrypted I/O     | `send(_:)` → `session.send(data:)`; recv loop → `session.recv()` |
 | Connection state  | banner polls `session.connectionState()` (lock-free); `.migrating`/`.dead` trigger an automatic reconnect-with-0-RTT |
 | Recovery on net change | `reconnect()` (harvest hint → tear down → `connect()` → 0-RTT), wired to `NetworkPathMonitor` (Wi-Fi ↔ cellular) |
-| migrate() API     | `callMigrateAPI(to:)` → `session.migrate(localAddr:)` — **no-op over TCP**, kept for API-completeness (see below) |
+| migrate() API     | `callMigrateAPI(to:)` → `session.migrate(localAddr:)` — **returns `Unsupported` over TCP**; use `connectPinnedUdp` for real migration (see below) |
 | Ticket storage    | `KeychainStore` (Security framework, `kSecAttrAccessibleAfterFirstUnlock`, 1-hour TTL) |
 
 All networking awaits run off the main actor; every `@Published` mutation is on
@@ -191,27 +200,33 @@ down on `disconnect()`.
 
 ---
 
-## Migration model: reconnect-with-0-RTT, not `migrate()`
+## Migration model: reconnect-with-0-RTT on TCP, or `connectPinnedUdp` for real migration
 
-> **`migrate()` is a no-op on the mobile FFI path.** Do not rely on it for real
-> path migration in this sample.
+> **This sample app uses TCP (`connectPinned`), where `migrate()` returns
+> `Err(Unsupported)`.** For real seamless path migration use `connectPinnedUdp` instead.
 
-The UniFFI surface exposes only `connectPinned` and
-`connectPinnedWithResumption`, and **both ride the TCP transport**
-(`TcpSessionTransport`). On the `SessionTransport` trait, `migrate(localAddr:)`
-has a **default no-op implementation that returns `Ok(())`** for every transport
-*except* the native Rust UDP client — and that UDP transport is **not exposed
-through the FFI/UniFFI surface**. TCP is connection-oriented and cannot rebind
-its local address without reconnecting. So calling `session.migrate(...)` from
-Swift returns success but does **not** rebind the socket or perform any path
-migration.
+The UniFFI surface exposes **both** TCP and UDP entry points:
 
-Because of that, this sample's recovery on a Wi-Fi ↔ cellular change is
-**reconnect with 0-RTT resumption**, the genuinely-working pattern over the TCP
-FFI surface:
+- `connectPinned` / `connectPinnedWithResumption` — TCP transport
+  (`TcpSessionTransport`). TCP is connection-oriented and cannot rebind its local
+  address without reconnecting, so `migrate(localAddr:)` returns `Err(Unsupported)`
+  on these sessions.
+- `connectPinnedUdp` / `connectPinnedUdpWithResumption` / `connectPinnedUdpWithConfig`
+  — PhantomUDP transport. On these sessions `migrate(localAddr:)` performs a real
+  seamless single-path rebind (path validation + connection-ID continuity, no
+  re-handshake), and liveness / `Migrating` / `Dead` transitions are all live.
+  The server counterpart is `PhantomUdpListener.bindUdp`.
+
+This sample app was built on the **TCP** path, so it demonstrates the
+**reconnect-with-0-RTT resumption** recovery pattern:
 
 1. While connected, the app harvests a fresh `ResumptionHint`
-   (`session.resumptionHint()`) and persists it to the Keychain.
+   (`session.resumptionHint()`) and persists it to the Keychain. The hint is an
+   FFI object, not a struct: its two 32-byte fields come out through
+   `sessionId()` / `resumptionSecret()` — which is what removed the generated
+   stringifier that used to print the resumption secret — and it is a reference
+   type with no `Equatable`, so tests compare the accessor bytes rather than the
+   hints themselves. ARC frees the handle; there is nothing to close by hand.
 2. On a network change (`NetworkPathMonitor`) — or when the poller/recv-loop
    observes `.migrating` / `.dead` — the app harvests one more hint, tears the
    old session down, and calls `connect()` again.
@@ -220,11 +235,7 @@ FFI surface:
    the first request into the new `ClientHello`. The server's verdict is reported
    via `earlyDataAccepted()`.
 
-The **Call migrate() API (no-op over TCP)** button still invokes
-`session.migrate(localAddr:)` so the API is demonstrable, but it logs plainly
-that nothing migrated.
-
-Seamless single-socket connection migration *does* exist on the native (Rust)
-UDP client transport (path validation + connection-ID continuity); exposing that
-transport through the FFI surface so mobile embedders can use real migration is
-**future work**.
+The **Call migrate() API** button still invokes `session.migrate(localAddr:)` so the
+API is demonstrable; on the TCP path it logs the `Unsupported` error it receives.
+For real seamless migration, wire up `connectPinnedUdp` and call `migrate()` from
+the network-change callback instead.

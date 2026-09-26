@@ -65,10 +65,11 @@ fn pipe() -> Arc<TokioMutex<Pipe>> {
     }))
 }
 
-fn duplex_pair() -> (
-    (MockReader, MockWriter, Arc<AtomicUsize>),
-    (MockReader, MockWriter, Arc<AtomicUsize>),
-) {
+/// One end of the mock duplex: the reader half, the writer half, and the
+/// shared counter of bytes that end has written to the wire.
+type DuplexEnd = (MockReader, MockWriter, Arc<AtomicUsize>);
+
+fn duplex_pair() -> (DuplexEnd, DuplexEnd) {
     let (ab, ba) = (pipe(), pipe());
     let (n_ab, n_ba) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
     let (a_out, b_out) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
@@ -144,6 +145,12 @@ impl Write for MockWriter {
         self.bytes_out.fetch_add(data.len(), Ordering::Relaxed);
         self.notify.notify_waiters();
         Ok(data.len())
+    }
+
+    async fn flush(&mut self) -> Result<(), Infallible> {
+        // `write` pushes straight into the shared in-memory pipe under the
+        // lock, so nothing is ever buffered on this side — flush is a no-op.
+        Ok(())
     }
 }
 

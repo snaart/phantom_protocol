@@ -38,7 +38,7 @@ not a replacement.
 
 ## Style
 
-- Rust 2021 edition.
+- Rust 2021 edition for `core/` and `server/`; `cli/` is edition 2024 (allowed by the 1.93 MSRV).
 - `rustfmt` per [`.rustfmt.toml`](.rustfmt.toml). Every PR must pass `cargo fmt --check`.
 - `clippy` per [`.clippy.toml`](.clippy.toml). Every PR must pass
   `cargo clippy --manifest-path core/Cargo.toml --lib -- -D warnings`.
@@ -55,12 +55,16 @@ Files in these paths require **codeowner review** before merge:
 - `core/src/crypto/`
 - `core/src/transport/handshake.rs`
 - `core/src/transport/session.rs`
-- `core/src/transport/udp_transport.rs`
+- `core/src/api/udp_transport.rs`
 - `core/src/transport/legs/mimic_tls/`
 - `core/src/security/`
 
-The documented security invariants in [`SECURITY.md`](SECURITY.md) and
-[`docs/security/threat-model.md`](docs/security/threat-model.md) must be preserved.
+The eleven numbered security invariants listed in
+[`docs/security/invariants.md`](docs/security/invariants.md) must be preserved,
+along with the mitigations in
+[`docs/security/threat-model.md`](docs/security/threat-model.md). A change under
+one of the paths above should name, in its description, the invariant it
+touches.
 
 ## Adding a dependency
 
@@ -76,7 +80,9 @@ The documented security invariants in [`SECURITY.md`](SECURITY.md) and
 
 - New public functions need at least one positive and one negative test.
 - Security invariants must be covered by tests in `core/tests/` (especially
-  `tcp_integration.rs` and the `security_invariants.rs` suite (58 always-on tests)).
+  `tcp_integration.rs` and the `security_invariants.rs` suite (73 always-on tests));
+  [`docs/security/invariants.md`](docs/security/invariants.md) records which tests
+  pin each one.
 - Concurrency-sensitive code should have a loom test where practical.
 
 ## Commit messages

@@ -31,9 +31,9 @@ downgrade). Pin these first:
 
 | Constant | Value (default build) | Source of truth | Wire role |
 | --- | --- | --- | --- |
-| `WIRE_VERSION` | `6` | `core/src/transport/types.rs:79` | `PacketHeader.version` (byte 0, HP-masked) |
-| `PROTOCOL_VERSION` | `3` | `core/src/transport/handshake.rs:56` | `ClientHello.version`, transcript-bound |
-| `PROTOCOL_VARIANT` | `b"phantom-default-1"` | `core/src/transport/handshake.rs:48` | leading field of the signed transcript |
+| `WIRE_VERSION` | `8` | `core/src/transport/types.rs` | `PacketHeader.version` (byte 0, HP-masked) |
+| `PROTOCOL_VERSION` | `5` | `core/src/transport/handshake.rs` | `ClientHello.version`, transcript-bound |
+| `PROTOCOL_VARIANT` | `b"phantom-default-1"` | `core/src/transport/handshake.rs` | leading field of the signed transcript |
 
 A receiver **drops** any data frame whose `header.version != WIRE_VERSION`
 (`api/session.rs`), and the server rejects a `ClientHello` whose
@@ -41,6 +41,58 @@ A receiver **drops** any data frame whose `header.version != WIRE_VERSION`
 any KEM/signature work. The `PROTOCOL_VARIANT` is the leading field of the signed
 handshake transcript (PROTOCOL.md § 6.5/§ 6.7), so a cross-variant peer fails the
 signature check even if it forged the cleartext tag. See PROTOCOL.md § 1.
+
+Note the asymmetry between those two refusals, because it decides which one you will
+actually observe while building: the data-frame drop is **silent** — no reply, nothing the
+sender can distinguish from a black hole — while the `ServerReject` names both versions.
+That is why the two constants move together even when only the data plane changed, as at
+`WIRE_VERSION 6 → 7` / `PROTOCOL_VERSION 3 → 4` and again at `7 → 8` / `4 → 5`. If your
+peer establishes a session and then moves no data, check the version pair before anything
+else.
+
+The `7 → 8` bump is worth reading as a worked example, because it is the case where nothing
+on the header moved at all and the pairing rule is doing all the work. v8 gave the `CONTROL`
+flag a one-byte subtype inside its AEAD plaintext (PROTOCOL.md § 4.11); the header is byte
+for byte what it was at v7 apart from the version constant itself. Note carefully which half
+of the pair does what, because it is easy to get backwards. The `WIRE_VERSION` half is what
+stops a v7 receiver from ever reaching its flag dispatch with a v8 frame: the version check
+is step 1 of § 4.3 and it **drops** the frame there, before any flag is examined, so nothing
+is misread and nothing is corrupted. What that leaves is a peer that completes a handshake
+and then silently discards every packet it is sent — the most expensive failure a protocol
+can hand an implementer, because it looks like a working connection. The `PROTOCOL_VERSION`
+half is what converts that into a diagnosis: a typed `ServerReject` naming both versions,
+before a session exists. If you take one habit from this section, take this one: a change to
+what is *inside* the AEAD is a wire revision exactly as much as a change to the header —
+the header version will enforce it either way, and your only choice is whether the
+enforcement is legible.
+
+**A fourth constant is agreed off the wire: the AEAD suite.** There is no cipher
+field in any message; each peer independently resolves AES-256-GCM vs
+ChaCha20-Poly1305 from local CPU capability and derives its keys — and its
+header-protection mask primitive — accordingly (PROTOCOL.md § 2). Two peers that
+resolve it differently finish the handshake and then fail every packet.
+
+"Pin one suite on both ends" is the right instruction and it is not a knob. This
+implementation exposes no way to choose: the suite comes from `HwCaps::detect()`
+with no override, no constructor takes one, and `PhantomConfig` has no field for
+it. So a second implementation does not get to declare a suite — it has to
+reproduce the same decision, which is a property of the *target its peer was built
+for*: AES-256-GCM iff the CPU reports the AES extension on `x86`/`x86_64`
+(AES-NI) or `aarch64` (ARMv8 crypto), and **ChaCha20-Poly1305 unconditionally on
+every other target**, `wasm32` included — the capability probe is hard-coded
+`false` there. PROTOCOL.md § 2 has the table. The case that bites is a browser or
+WASI client against an `x86_64` server: both are conformant, both complete the
+handshake, and neither can read a byte the other sends. Under `--features fips`
+the question does not arise (AES only), but that build is out of scope here
+anyway (§ 6).
+
+**And one asymmetry is not a constant at all: which side swaps.** Every
+per-direction key pair is derived once and assigned by role — the initiator
+takes the `…-send-…` label as its send key, the responder takes `…-recv-…`
+(PROTOCOL.md § 3). Getting this backwards is the single most common way a second
+implementation passes every vector in this guide and still cannot exchange a
+packet, because no fixture covers it: the vectors freeze the *cleartext* wire
+image, and the key-role assignment only shows up under a live AEAD.
 
 ---
 
@@ -86,6 +138,41 @@ Cross-check your encoder/decoder against
 Python encoder's bytes both equal the `.bin`, the grammar is genuinely shared, not
 self-referential.
 
+### Rung 1b — Transport framing (no fixture; still mandatory)
+
+A `PhantomPacket` is not self-delimiting, so something has to carry it. This rung
+has no `.bin` because the framing sits *outside* the frozen wire — but a peer
+that skips it cannot exchange a byte, and the framing differs per transport:
+
+| Transport | Framing | Source |
+| --- | --- | --- |
+| PhantomUDP (the production transport) | 9-byte cleartext envelope `[flags: u8][ConnId: 8]` per datagram, plus an 8-byte fragment subheader when the `FRAG_BIT` is set — PROTOCOL.md § 4.9 | `transport/phantom_udp/envelope.rs` |
+| TCP | `[len: u32 big-endian] ‖ message`, the declared length capped at 64 KiB before the session establishes and 4 MiB after — PROTOCOL.md § 9 | `api/tcp_transport.rs` |
+| WASI (`wasi:sockets/tcp`) | the same `[len: u32 big-endian] ‖ message`; the cap is a flat 4 MiB rather than phase-gated | `transport/legs/wasi.rs` |
+| Embedded (UART/USB) | the same `[len: u32 big-endian] ‖ message`; the cap is the leg's fixed buffer size `N` | `transport/legs/embedded/framing.rs` |
+| Mimicry (TLS-over-TCP, `mimicry` feature) | the same `[len: u32 big-endian] ‖ message` byte-stream, then chunked `[chunk_len: u16 big-endian] ‖ chunk` into TLS ApplicationData records — PROTOCOL.md § 9.1 | `transport/legs/mimic_tls/record.rs` |
+| WebSocket (browser) | none — the substrate delivers whole binary messages | `transport/legs/websocket.rs` |
+
+**Four of the five stream transports share one framing**, byte-for-byte: a
+4-byte big-endian message length. Only the caps differ, and a cap is a receive-side
+refusal, not an encoding — so an embedded client and a TCP server frame each
+other's messages identically. WebSocket is the sole leg whose substrate already
+carries message boundaries, and it is the only one that adds no prefix; assuming
+that of the others desynchronizes the stream on the first message, which is the
+failure this rung exists to prevent.
+
+Two properties of the PhantomUDP envelope are easy to get wrong and fail closed
+only later: the reserved low five flag bits **must be zero** (a datagram with any
+of them set is rejected outright), and the `Initial` packet type carries a *bare*
+borsh `ClientHello` from the client but a **discriminant-framed** `ServerReply`
+(`[kind: u8] ‖ borsh(body)`) from the server — the asymmetry is deliberate
+(PROTOCOL.md § 4.9 / § 6).
+
+Because `recv_bytes` is message-framed on every transport, `payload` is simply
+the remainder after the 15-byte header (Rung 1) — which is exactly why v6 could
+drop the length prefixes. A stream transport that loses message boundaries turns
+that simplification into silent corruption.
+
 ### Rung 2 — Handshake messages (borsh, little-endian)
 
 Implement the borsh structs in PROTOCOL.md § 6.2–6.4 / § 6.10. Borsh rules
@@ -108,6 +195,55 @@ fields concatenate in **declaration order** (load-bearing).
 > not valid KEM/signature material — they freeze the serialization *container*.
 > Validating the PQ encodings themselves is Rung 0's job.
 
+**Four things about the exchange that no fixture can show you**, because a vector
+freezes one message and every one of these is about the sequence around it. Each
+has been the reason a byte-perfect encoder still could not connect:
+
+- **The first flight is always retried.** A hello with no cookie fails the
+  address-validation gate whatever the server's load is, so a non-resuming connect
+  is a `HelloRetryRequest` and then a second hello, every time (PROTOCOL.md § 6.8).
+  Treat the retry as the normal path, not the overload path.
+- **The retried hello is the *same* hello** — replace `cookie` and
+  `pow_solution`, carry everything else through byte for byte, and verify the
+  server's signature against the hello you finally sent. Regenerating the `nonce`
+  or the key package looks harmless and breaks 0-RTT keying and decapsulation
+  respectively.
+- **Nothing under the handshake is reliable on PhantomUDP.** The ARQ does not
+  exist yet, so every repair starts with the client re-sending its whole flight
+  on its own timer; the server holds no timer and only ever answers a hello in
+  front of it (PROTOCOL.md § 6.1). Build the client timer before you test on a
+  path that loses anything — and re-send the flight **unchanged**, because a
+  server whose reply was lost repeats the bytes it already sent and will only do
+  so for the exact hello that reply answers. A re-derived hello is a different
+  question and draws **nothing at all**, not a fresh handshake: it arrives on a
+  connection id the server already routes, so it is handed to the established
+  session, whose receive path does not parse handshake messages, and dropped
+  there. Your connect then fails on your own deadline with no error from the
+  server. Keep the encoded flight and re-send those bytes.
+- **While your client is still waiting for a reply, discard anything that is not
+  a handshake datagram carrying your own connection id** instead of feeding it to
+  your reply parser. Two different senders make this necessary. The server commits
+  its session when it sends the `ServerHello`, so from that instant it may send
+  short-header traffic your client has no keys for — and if the reply was the
+  flight that got lost, that traffic arrives first; treating it as a malformed
+  reply ends the connect before your own retransmit timer ever fires, which makes
+  the whole repair conditional on the server staying quiet. And `PacketType` is
+  two bits of a cleartext byte in the unauthenticated envelope, so a check on type
+  alone leaves your connect endable by one datagram of noise from anyone who can
+  reach your port. Require the outer `ConnId` to be the bootstrap id you are
+  connecting under: the server echoes it on every reply, `HelloRetryRequest` and
+  `ServerReject` included, and the rotating chain does not start until the session
+  is up. Do the check before reassembly, or a spray still displaces your
+  half-reassembled reply from the fragment buffer. Discarding must also leave the
+  timer alone, or a talkative peer postpones your retransmission for as long as it
+  keeps talking.
+- **There is no client authentication and no ticket message.**
+  `ClientHello.client_verify_key` is transcript-covered and verified by nobody
+  (PROTOCOL.md § 6.2), and a resumption "ticket" is never transmitted at all —
+  both ends derive the secret from the previous session and reuse its `session_id`
+  (PROTOCOL.md § 6.6). Looking for a `NewSessionTicket` is time spent on a message
+  that does not exist.
+
 ### Rung 3 — Transcript signing
 
 Compute the signed transcript hash per PROTOCOL.md § 6.5. The signing input is
@@ -118,10 +254,23 @@ version (Invariant 7) and build-variant (Invariant 10) downgrade-resistant.
 
 | Vector | Freezes |
 | --- | --- |
-| `transcript_hash.bin` (32 B) | the real `compute_transcript_hash` output over the deterministic transcript (asserted by the lib unit test `transport::handshake::tests::transcript_hash_wire_vector`) |
+| `transcript_hash.bin` (32 B) | the real `compute_transcript_hash` output over the deterministic transcript (asserted by the lib unit test `transport::handshake::tests::transcript_hash_wire_vector`, and independently by `tests/wire_vectors_decode.py`, which rebuilds the transcript from the message fixtures above and hashes it) |
 
 If your transcript hash matches this fixture byte-for-byte, your signing input is
 wire-compatible and your signatures will verify against a reference peer.
+
+This is the one rung where a round trip would prove nothing and only an encoder
+will do, so build that direction first. A digest cannot be decoded, which means
+there is no forgiving reader to meet your writer halfway: the bytes you hash are
+either the bytes the reference peer hashes or they are not. Three readings of § 6.5
+that the prose permits and the bytes refuse are worth checking against before you
+suspect anything else — the leading `protocol_variant` is a length-prefixed slice
+and not a fixed array (borsh gives it the `u32` little-endian prefix a `Vec<u8>`
+gets, while `server_nonce` and `session_id` are fixed arrays and get none), a
+nested message contributes exactly its own encoding with no wrapper, and
+`early_data_accepted` is the trailing field. Each of the three is pinned by a
+mutation in the Python check, so a divergence localises to one of them rather than
+to "the signature does not verify".
 
 ### Rung 4 — AEAD record protection + header protection
 
@@ -133,7 +282,157 @@ header — the exact sample offset, cipher, and apply step are in § 4.6). The H
 is keyed crypto and is **not** frozen as a `.bin` (it would require committing key
 material); it is verified in Rust separately. To interoperate you must reproduce
 the HP key-derivation labels exactly — see the KDF label inventory in
-PROTOCOL.md § 3.
+PROTOCOL.md § 3, and note that the negotiated-off-the-wire suite (§ 1 above)
+selects the mask primitive as well as the AEAD.
+
+**Start at the top of the schedule, with the KEM combiner, and expect no help from
+this guide's earlier rungs if you get it wrong.** Every key on this rung descends
+from one 32-byte value, and that value is not either raw shared secret: it is
+`HKDF-SHA-256` Extract-then-Expand over **four** concatenated inputs — the
+classical shared secret, the ML-KEM-768 shared key, the sender's ephemeral
+classical public key (the one on the wire in `HybridCiphertext`), and the
+recipient's classical public key from the `ClientHello` — under the label
+`HybridKEM_X25519_Kyber768`. PROTOCOL.md § 3 gives the byte lengths and the exact
+construction. Combining only the first two is the single highest-cost mistake in
+this document, and the reason is that nothing catches it: the signature does not
+depend on the shared secret, so the transcript verifies, the `session_id` matches
+because it is echoed rather than recomputed, your peer reports an established
+session — and then every packet in both directions fails its AEAD. That is the
+failure § 1 warns about, arrived at by way of a rung that passed.
+
+While you are in § 3, note that Extract-vs-Expand is decided **per label** and
+that half the call sites go each way. A schedule that uniformly extracts, or
+uniformly does not, is right at half its sites and produces this same symptom at
+the other half.
+
+### Rung 4b — The AEAD plaintext codecs
+
+Opening the AEAD gets you a plaintext, not a message. What is inside depends on
+the (authenticated) flags, and each shape has its own grammar in PROTOCOL.md
+§ 4.5 / § 4.8:
+
+| Flag | Plaintext |
+| --- | --- |
+| `RELIABLE` | `stream_offset: u32 be` then the application bytes — a frame shorter than the 4-byte prefix is malformed. The offset is a **frame counter from 0**, not a byte position (PROTOCOL.md § 4.5) |
+| `ACK` | a `Sack`, scoped to the packet's `stream_id` |
+| `WINDOW_UPDATE` | exactly 8 bytes: a big-endian `u64` **cumulative limit** — the total the receiver will let you send on that stream. Apply it as a maximum, never a sum |
+| `PATH_VALIDATION` | exactly 32 bytes: a challenge or its echo |
+| `KEEPALIVE` | empty (PING); `KEEPALIVE \| ACK` is the PONG |
+| `CONTROL` | `[subtype: u8]` then whatever that subtype defines — nothing, for the only assignment so far (PROTOCOL.md § 4.11) |
+| `COALESCED` | `[count: u16][len: u16][payload]…` |
+| `PADDED` | strip the `‹zeros› ‖ pad_n: u16 be` trailer **first**, then interpret the rest by the other flags |
+
+A minimal peer needs `RELIABLE` and `ACK` to move data at all; `COALESCED` is
+receive-only in this implementation (nothing emits a bundle), and `PADDED` /
+`COVER` are opt-in shaping a peer may simply never enable. Every one of these is
+inside the AEAD, so none of them is frozen by a `.bin` — but do not read that as
+meaning they are not a `WIRE_VERSION` concern. Two of the last two revisions changed
+nothing but a plaintext in this table (`WINDOW_UPDATE` at v7, `CONTROL` at v8) and
+both bumped the version pair.
+
+The reason is the one § 1 gives, and it is the opposite way round from the obvious
+one, so read it in that direction. **Nothing inside a plaintext identifies which
+grammar it was written to.** A peer built for the old one opens the AEAD
+successfully — the seal is over bytes, not over meaning — and then reads the result
+by the wrong rule: eight bytes of cumulative limit taken as four bytes of credit, a
+subtype byte taken as the first byte of a payload. That is the corruption, and
+nothing downstream of the plaintext can detect it, because there is nothing down
+there to detect it *with*. The version byte on the header is the only place the
+difference is visible at all, which is why moving it is not a formality: with the
+bump, the frame is dropped at step 1 of § 4.3 before any flag is read, and the
+corruption never happens. Without it, there is no gate anywhere in the receive path
+that the change would trip.
+
+So the `WIRE_VERSION` half is what converts a misreading into a drop, and — as § 1
+sets out — the `PROTOCOL_VERSION` half is what converts that drop into a diagnosis
+rather than a session that establishes and then moves nothing.
+
+**`CONTROL` is the one row a peer may not skip.** The others degrade gracefully —
+never emit a `COALESCED` bundle and you simply never receive one; ignore `PADDED` and
+you were never sent a padded frame. `CONTROL` is different because the dispatch is
+not optional even when the *frame* is. A peer that omits the branch does not fail to
+act on a control frame; it falls through to its application-data path and hands the
+subtype byte to its caller. So implement the branch first and its contents second:
+
+- Read the leading byte after the padding trailer is off. `0x01` is `CLOSE` — the
+  peer is ending the session; tear down as you would on any other teardown. It is
+  unacknowledged: do not `ACK` it, do not answer it with a close of your own.
+- **Do not tear down on the copy you first see — drain first.** The `CLOSE` is not
+  `RELIABLE` and nothing retransmits the application data it may have overtaken, and
+  on a datagram path one position of reordering is enough for it to. Record the close,
+  keep processing inbound for a bounded window (PROTOCOL.md § 4.11 gives the sizing
+  and both of its bounds), deliver what arrives, send nothing new, and tear down at
+  the end of it. This is the receiver rule most likely to be missed, because a peer
+  that omits it interoperates perfectly on a loopback test and silently truncates its
+  peers' last writes in production.
+- Drop the frame on **every** other byte, `0x00` included, and drop it if the
+  plaintext is empty. Never read a missing or zero byte as a default.
+- **Return on all of those paths.** That, not the `CLOSE` handling, is the
+  conformance requirement: sending the frame is optional and receiving it correctly
+  is not.
+
+A peer that never sends a `CLOSE` is fully conformant — its peer falls back to the
+liveness timer of PROTOCOL.md § 12.4 and reaches the same verdict more slowly, which
+is what every peer did before v8. Sending one is a courtesy to the other end's
+resources; dispatching one is a correctness obligation to your own caller's byte
+stream.
+
+Three of those shapes — `RELIABLE`, `ACK`, `WINDOW_UPDATE` — are scoped by the
+header's `stream_id`, and that id is allocated by parity: initiator odd from 3,
+responder even from 2, with 0 and 1 reserved (PROTOCOL.md § 4.4). It is the rule
+here with the least behind it: every
+committed vector carries a single hard-coded id, so a peer that allocates in the
+wrong parity passes every check in this guide and then fails quietly: its stream
+stalls, merges with its peer's, or is acknowledged and discarded, depending on
+what its peer holds for that id (PROTOCOL.md § 4.4).
+
+The flags combine, so the table above is only half the rule: which branch claims
+a packet carrying several of them is fixed, and PROTOCOL.md § 4.3 gives the
+receiver's dispatch order end to end — including the three orderings that are not
+guessable (`PADDED` strips before anything parses; `KEEPALIVE` is tested before
+`ACK`, because a PONG is `KEEPALIVE | ACK` and is not a `Sack`; and `CONTROL` is
+dispatched *after* the AEAD open and the replay window but *before* everything that
+could deliver data). That last one is a security property, not a layout choice:
+above the AEAD gate a one-byte `CLOSE` would end any session whose connection id
+could be guessed, and above the replay window a recorded one would be the same
+primitive with a capture step in front of it. Below both, a repeat is refused before
+your branch runs, so the branch needs no state of its own. The same section states
+what to do with a flag you do not recognise: ignore it, never reject the packet.
+
+Two last things about the reliable shape, both of which a peer gets wrong quietly
+rather than loudly. **Two counters run on one stream and the SACK depends on not
+conflating them.** The `stream_offset` counts *frames*: the first reliable frame
+on a stream carries `0` and each subsequent one carries one more, whatever its
+length — so three full-size chunks are offsets 0, 1, 2, and a SACK range of
+`(0, 2)` covers all three. The `WINDOW_UPDATE` total counts *application bytes*.
+Unreliable frames carry no offset and are outside both. Closing a stream is not a
+separate frame type either: it is a `RELIABLE | FIN` segment with its 4-byte
+offset and **zero bytes after it**, which takes the next offset in sequence and is
+acknowledged like any other segment. It closes one direction only. Send nothing on
+a stream after your own `FIN`; the other direction stays open, and this
+implementation keeps delivering what you send on a stream it has closed until your
+`FIN` arrives — unless its application lets go of the stream first, after which what
+you send on it is acknowledged and discarded, and `WINDOW_UPDATE` limits keep coming
+for it, worked out from the offsets you send rather than from any count it keeps, so
+your writes on it complete (PROTOCOL.md § 4.5, *A stream nobody reads*). Apply those
+limits like any other; nothing tells you the bytes went unread.
+Mind the near-collision with the persist
+probe — a `RELIABLE` frame with an empty payload and no `FIN` is a window probe,
+delivers nothing, and consumes no offset.
+
+**And there is a ceiling on what you may put in one frame.** This one is not a
+property of the format — nothing on the wire carries a length — but a limit of
+this implementation's receive path, and a peer that exceeds it stalls with no
+diagnostic at either end. The data pump drops any inbound frame over
+`MAX_RECV_FRAME` = 1335 bytes before header protection and before the AEAD,
+measured over the whole inner image (15-byte header + ciphertext + tag) and after
+a PhantomUDP datagram has been reassembled, so fragmenting does not evade it. In
+application bytes that is **1300 reliable, 1304 unreliable**, and those are the
+figures to size a sender against; PROTOCOL.md § 4.10 has the derivation. A refused
+frame is never acknowledged and its retransmits meet the same gate, so the symptom
+is a stream that stops rather than an error. A future revision may raise the number
+and offers no way to discover that it has, so do not build a sender that assumes
+more than the minimum above.
 
 ### Rung 5 — Migration & liveness (optional for a minimal peer)
 
@@ -141,6 +440,17 @@ The rotating outer connection ID, path validation, and liveness machinery are
 PROTOCOL.md § 4.7 and § 12. A minimal single-path client can defer these; a peer
 that wants seamless Wi-Fi↔cellular migration must implement the CID chain
 (§ 4.7) and the path-validation grammar (§ 12).
+
+One rule here has no wire representation at all and so cannot be read off a
+capture: **a path challenge and its echo are byte-identical frames.** Both are
+`ENCRYPTED | PATH_VALIDATION`, `stream_id` 0, 32 bytes of plaintext. Which one you
+have received follows from the state *your* path registry holds for the frame's
+`path_id`: `Validating` means it is the echo of the challenge you issued (compare
+in constant time, then consume — never echo); `Validated` or `Failed` means it is
+a late duplicate (ignore); anything else means it is the peer's challenge (echo
+the same 32 bytes back on the same `path_id`, to the peer address you are already
+established with). PROTOCOL.md § 12.1 has the table. Echoing unconditionally gives
+two peers running the same dispatch an exchange that never terminates.
 
 ---
 
@@ -184,12 +494,24 @@ Never hand-edit a `.bin`. See `core/tests/wire_vectors/README.md`.
 
 A peer is wire-conformant with the default build of this repository when:
 
-- [ ] It is built for `WIRE_VERSION = 6`, `PROTOCOL_VERSION = 3`, `PROTOCOL_VARIANT = phantom-default-1`, and treats a mismatch as a hard error (no downgrade).
+- [ ] It is built for `WIRE_VERSION = 8`, `PROTOCOL_VERSION = 5`, `PROTOCOL_VARIANT = phantom-default-1`, and treats a mismatch as a hard error (no downgrade).
+- [ ] It agrees with its peer on the AEAD suite (not negotiated, and not selectable in this implementation — § 1) and assigns the per-direction keys by role, initiator un-swapped and responder swapped (§ 1).
 - [ ] Its AEAD / KDF / hash / ML-KEM / ML-DSA primitives reproduce every KAT in `cavp.rs` (Rung 0).
+- [ ] Its hybrid-KEM combiner is Extract-then-Expand over all **four** inputs — both shared secrets, the classical ciphertext, the recipient's classical public key — under `HybridKEM_X25519_Kyber768` (PROTOCOL.md § 3, Rung 4).
 - [ ] `encode(value)` equals each packet `.bin`, and `decode(.bin)` equals the value, for the four packet fixtures (Rung 1).
+- [ ] It frames packets for its transport — the 9-byte PhantomUDP envelope with zeroed reserved bits, or the 4-byte big-endian message prefix every stream leg except WebSocket carries (Rung 1b).
+- [ ] It allocates stream ids in its own parity — odd from 3 as the initiator, even from 2 as the responder, with 0 and 1 reserved — uses each at most once per session, and refuses to open a stream past 65535 / 65534 rather than wrapping (PROTOCOL.md § 4.4).
 - [ ] The same holds for all borsh handshake / sub-struct fixtures (Rung 2).
+- [ ] It treats the cookie `HelloRetryRequest` as the normal first answer, replies with the *same* hello (only `cookie` / `pow_solution` replaced), and — on PhantomUDP — retransmits its own flight on a bounded timer (Rung 2, PROTOCOL.md § 6.1 / § 6.8).
+- [ ] While connecting, it discards every datagram that is not a handshake datagram carrying its own bootstrap `ConnId`, before reassembling it, and without disturbing its retransmit timer (Rung 2, PROTOCOL.md § 6.1 rule 6).
 - [ ] Its transcript hash equals `transcript_hash.bin` (Rung 3).
 - [ ] Its AEAD nonce/AAD construction and HP masking reproduce PROTOCOL.md § 4.6 / § 5; a tampered AAD byte (version included) fails decryption with no oracle (Rung 4).
+- [ ] It reads the AEAD plaintext by flag — reliable offset prefix, SACK, cumulative window limit, path challenge, padding trailer (Rung 4b).
+- [ ] It dispatches a `CONTROL` frame on its leading subtype byte and **returns on every arm**, the unknown subtype and the empty plaintext included, so no control byte can reach its application (Rung 4b, PROTOCOL.md § 4.11). Emitting a `CLOSE` is optional; dispatching one is not.
+- [ ] It applies an inbound `WINDOW_UPDATE` as a maximum, counts its own sent bytes once per byte, and never sends past the highest limit received (§ 4.5 of PROTOCOL.md).
+- [ ] It numbers reliable frames from 0 in steps of one — not by byte — and closes a stream with a zero-length `RELIABLE \| FIN` segment that consumes an offset (Rung 4b, PROTOCOL.md § 4.5).
+- [ ] It keeps every frame it emits within the 1300-byte reliable / 1304-byte unreliable receive ceiling (Rung 4b, PROTOCOL.md § 4.10).
+- [ ] (If migrating) it decides challenge-vs-echo from its own path-registry state and never echoes on a `Validating` or terminal path (Rung 5, PROTOCOL.md § 12.1).
 - [ ] `tests/wire_vectors_decode.py` agrees with the peer's serializer in both directions (§ 3).
 - [ ] (If migrating) the CID chain and path-validation grammar match PROTOCOL.md § 4.7 / § 12 (Rung 5).
 
@@ -205,3 +527,34 @@ transcript, a FIPS peer and a default peer fail each other's signature check on 
 first message — they do not, and are not meant to, interoperate. A FIPS↔FIPS
 conformance set would need its own committed vectors (the wire-vector test compiles
 to nothing under `--features fips`). See `docs/compliance/fips-readiness.md`.
+
+---
+
+## 7. Last verified against the code
+
+Checked against the source on **2026-08-15**, commit `41183f49` — the same
+sync as PROTOCOL.md § 13, which carries the itemised list of what was
+re-derived. Every fixture byte count quoted above was read off
+the committed `.bin` files at that commit, and every row of the Rung 1b framing
+table was read out of the leg named in its Source column rather than inferred
+from the transport's name.
+
+Two data-plane revisions have landed since and are reflected above:
+`WIRE_VERSION 6 → 7` / `PROTOCOL_VERSION 3 → 4` (the cumulative `WINDOW_UPDATE`
+limit) and `7 → 8` / `4 → 5` (the `CONTROL` subtype byte and the `CLOSE`
+announcement, Rung 4b). Both changed an AEAD plaintext and no header byte, so no
+fixture grammar moved — only the version byte inside the four packet fixtures and
+the two `ClientHello` fixtures, and `transcript_hash.bin` with them.
+
+**2026-08-22, commit `bb3f5936`.** This guide was audited against PROTOCOL.md and
+both against the source, on the question of whether a peer built strictly to the
+two would produce the same bytes. It would not, in nine places. The corrections
+land in PROTOCOL.md — which is where the grammar lives — and are summarised in its
+§ 13; the pointers here were updated with them. What changed above: § 1 gained the
+suite-resolution rule and the fact that it is not selectable; Rung 2 gained the
+four properties of the exchange that no single-message fixture can show; Rung 4
+gained the KEM combiner, which is the highest-cost mistake in the set precisely
+because every rung below it still passes; Rung 4b gained the two per-stream
+counters, the FIN sentinel and the receive-side frame ceiling; and Rung 5 gained
+the challenge-versus-echo rule. Nothing on the wire moved, so no fixture changed
+and no version was bumped.

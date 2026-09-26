@@ -15,17 +15,21 @@ Both demonstrate the same client lifecycle against a running
 2. **0-RTT resumption** — harvest a `ResumptionHint` after the first connect, persist
    it to platform secure storage (iOS Keychain / Android `EncryptedSharedPreferences`),
    and reconnect via `connectPinnedWithResumption(...)`, folding the first request into
-   the `ClientHello`.
+   the `ClientHello`. The hint crosses the FFI as an opaque object, so its two 32-byte
+   fields are accessor calls (`sessionId()` / `resumptionSecret()`) and no generated
+   stringifier can print the secret — the reason it is an object and not a record. On
+   Kotlin that also makes each hint an `AutoCloseable` native handle the sample closes
+   once it has been stored or used; ARC handles the same lifetime on Swift.
 3. **Encrypted send/recv** — a chat UI over `session.send` / `session.recv`.
 4. **Connection-state surfacing** — `connectionState()` polled lock-free, including the
    `Migrating` / `Dead` liveness states.
-5. **Recovery on network change** — reconnect-with-0-RTT (see the honesty note below).
+5. **Recovery on network change** — reconnect-with-0-RTT (see the migration note below).
 
-## ⚠️ Not built in CI — verify locally
+## Not built in CI — verify locally
 
-This environment has **no Xcode, Android SDK/NDK, or running server**, so these apps are
-**not compiled or run in CI**. They are complete, reviewed source you build and run
-yourself. Each app's `README.md` has the exact steps:
+CI has **no Xcode, Android SDK/NDK, or running server**, so these apps are **not
+compiled or run there**. Build and run them yourself; each app's `README.md` has the
+exact steps:
 
 - cross-compile the `core` library for the device ABIs,
 - generate + drop in the UniFFI binding (Swift sources / Kotlin `.kt`),
@@ -33,21 +37,23 @@ yourself. Each app's `README.md` has the exact steps:
   (via the [`phantom-cli`](../../cli/) `keygen` / `pubkey` subcommands),
 - open in Xcode / Android Studio and run.
 
-## Honesty note: migration is *reconnect-with-0-RTT*, not `migrate()`
+## Migration: these apps show TCP reconnect; the UDP path does seamless `migrate()`
 
-`PhantomSession.migrate(localAddr)` is on the UniFFI surface, but it is **only
-effective on the native UDP transport** (`UdpClientTransport`), which is **not exposed
-through the FFI surface**. The FFI connect functions (`connectPinned` /
-`connectPinnedWithResumption`) use the **TCP** transport (`TcpSessionTransport`), and on
-every non-UDP transport `migrate()` falls back to a **no-op** that returns `Ok` without
-rebinding the socket — TCP is connection-oriented and cannot move its local endpoint
-without a new connection.
+`PhantomSession.migrate(localAddr)` performs a **real seamless single-socket
+migration** (local-socket rebind + path validation, no re-handshake) — but **only on
+a session built over the production PhantomUDP transport**, which **is** exposed
+through the FFI surface as `connectPinnedUdp` (+ `…WithResumption` / `…WithConfig`;
+server side `PhantomUdpListener.bindUdp`). On a **TCP** session (`connectPinned` /
+`connectPinnedWithResumption`, `TcpSessionTransport`) `migrate()` returns
+`Err(Unsupported)` — TCP is connection-oriented and cannot move its local endpoint
+without a new connection, so migration is rejected rather than silently skipped.
 
-So on a real Wi-Fi ↔ cellular handover these apps **reconnect with 0-RTT resumption**
-(the genuinely-working pattern), not `migrate()`. Each app keeps a `migrate()` call
-behind a clearly-labelled "no-op over TCP" button for API completeness and logs that
-nothing migrated. Seamless single-socket migration over the FFI surface (exposing the
-UDP transport) is future work — see `docs/operations/mobile.md`.
+These particular sample apps were built on the **TCP** path, so they demonstrate
+**reconnect-with-0-RTT resumption** on a Wi-Fi ↔ cellular handover (the working
+pattern for a TCP session). The `migrate()` demo button shows the error the TCP
+transport now returns. **For seamless single-socket migration, build the client over
+the UDP path (`connectPinnedUdp`) and call `migrate()` from the network-change
+callback** — see `docs/operations/mobile.md`.
 
 ## See also
 

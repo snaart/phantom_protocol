@@ -3,22 +3,28 @@
 //! Uses `rand` to generate random inputs and verify robustness of
 //! state transitions and parsing logic.
 
+// Tests `.unwrap()` freely so failures surface as readable diagnostics; the
+// disallowed-methods list in `.clippy.toml` is for production code, not the test
+// harness. (Integration-test crates are their own crate and therefore do not
+// inherit `core/src/lib.rs`'s `#![cfg_attr(test, allow(...))]`.)
+#![allow(clippy::disallowed_methods)]
+
 use phantom_protocol::transport::handshake::{
     ClientHello, HandshakeClient, HandshakeResponse, HandshakeServer,
 };
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 const FUZZ_ITERATIONS: usize = 1000;
 
 #[test]
 fn fuzz_process_client_hello() {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let server = HandshakeServer::new().unwrap();
     let client_ip = "127.0.0.1".parse().unwrap();
 
     for _ in 0..FUZZ_ITERATIONS {
         let mut bytes = vec![0u8; 1024];
-        rng.fill(&mut bytes[..]);
+        rng.fill_bytes(&mut bytes[..]);
 
         // Attempt to deserialize random bytes as a ClientHello.
         if let Ok(hello) = borsh::from_slice::<ClientHello>(&bytes) {
@@ -30,14 +36,14 @@ fn fuzz_process_client_hello() {
 
 #[test]
 fn fuzz_garbage_input_to_server() {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let server = HandshakeServer::new().unwrap();
     let client_ip = "127.0.0.1".parse().unwrap();
 
     for _ in 0..FUZZ_ITERATIONS {
-        let len = rng.gen_range(0..5000);
+        let len = rng.random_range(0..5000);
         let mut bytes = vec![0u8; len];
-        rng.fill(&mut bytes[..]);
+        rng.fill_bytes(&mut bytes[..]);
 
         // Handshake protocol logic involves borsh deserialization first.
         if let Ok(hello) = borsh::from_slice::<ClientHello>(&bytes) {

@@ -3,7 +3,7 @@
 
     <!-- Open a TCP socket to the phantom-server. -->
     <uses-permission android:name="android.permission.INTERNET" />
-    <!-- Observe Wi-Fi <-> cellular changes to trigger a reconnect-with-0-RTT (migrate() is a no-op over the TCP FFI surface). -->
+    <!-- Observe Wi-Fi <-> cellular changes to trigger a reconnect-with-0-RTT (TCP migrate() returns Unsupported; connectPinnedUdp enables real migration). -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- Hold the session alive in a foreground service (survives Doze). -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />

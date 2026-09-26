@@ -6,18 +6,19 @@ pinned connect, 0-RTT resumption, **network-change recovery via
 reconnect-with-0-RTT**, and hosting the session in a foreground service so it
 survives Doze.
 
-> **Why reconnect, not migrate?** The UniFFI surface exposes only
-> `connectPinned` / `connectPinnedWithResumption`, and both establish the
-> session over the **TCP** transport (`TcpSessionTransport`). On that transport
-> `session.migrate(localAddr)` is a **no-op** — it returns success but does not
-> rebind the socket or move the path (a TCP socket cannot rebind its local
-> address without reconnecting). Real seamless single-socket migration that
-> retains keys + connection id exists on the native (Rust) **UDP** transport,
-> but that transport is not yet on the FFI surface. So the working mobile
-> recovery pattern here is to **reconnect with 0-RTT resumption**: while the
-> session is alive the app harvests a fresh `ResumptionHint`, and on a network
-> change it opens a new session via `connectPinnedWithResumption`, folding the
-> first request into the new ClientHello.
+> **Why reconnect, not migrate?** This sample app uses `connectPinned` /
+> `connectPinnedWithResumption`, which establish the session over the **TCP**
+> transport (`TcpSessionTransport`). On that transport `session.migrate(localAddr)`
+> returns **`Err(Unsupported)`** — a TCP socket cannot rebind its local address
+> without reconnecting, so migration is rejected rather than silently skipped.
+> Real seamless single-socket migration (retaining keys + connection id) is
+> available on the **UDP** transport via `connectPinnedUdp` /
+> `connectPinnedUdpWithResumption` (now on the FFI surface); on a UDP session
+> `migrate()` performs a real path rebind. This app uses TCP and therefore
+> models network-change recovery as **reconnect with 0-RTT resumption**: while
+> the session is alive the app harvests a fresh `ResumptionHint`, and on a
+> network change it opens a new session via `connectPinnedWithResumption`,
+> folding the first request into the new ClientHello.
 
 > **Not built in CI.** This sample requires the Android SDK + NDK and a running
 > `phantom-server`, none of which exist in the project's CI environment. Build
@@ -160,30 +161,53 @@ the network-change recovery path; **Disconnect** for a graceful close.
   `ConnectivityManager.NetworkCallback` in the service triggers this
   automatically on a Wi-Fi <-> cellular handover, and the client's state poller
   triggers it when the session goes `MIGRATING`/`DEAD` (or `recv()` fails).
-- **Call migrate() API (no-op over TCP)** — calls `session.migrate("0.0.0.0:0")`
-  purely to demonstrate the API. Over the TCP transport exposed by
-  `connectPinned` it is a no-op; the client appends a system message saying so.
-  Real path migration requires the native UDP transport (not yet on the FFI
-  surface).
+- **Call migrate() API** — calls `session.migrate("0.0.0.0:0")` to demonstrate
+  the API. Over the TCP transport exposed by `connectPinned` it returns
+  `Err(Unsupported)`; the client appends a system message with the error. Real
+  seamless path migration is available via the UDP path (`connectPinnedUdp`).
 - **Disconnect** — persists a final resumption ticket, `session.disconnect()`,
   stops the service.
 
 The colored banner reflects `session.connectionState()` (polled lock-free):
-amber during the handshake, green when `PQC_READY`/`CONNECTED`, blue while
+amber during the handshake and while draining, green when `CONNECTED`, blue while
 `MIGRATING`, red on `FAILED`/`DEAD`, grey when `CLOSED`. `MIGRATING`/`DEAD` are
 surfaced in the UI and also drive an automatic 0-RTT reconnect.
+
+## The resumption ticket is an object, and it has to be closed
+
+`ResumptionHint` crosses the FFI as an object rather than a data class. Two
+consequences show up in this app's code:
+
+- The two 32-byte fields are accessor calls — `hint.sessionId()`,
+  `hint.resumptionSecret()` — and there is no `copy()`, no destructuring, and no
+  data-class `equals`/`hashCode`/`toString()`. The missing `toString()` is the
+  point of the change: the generated one printed the resumption secret in full,
+  so anything that logged a hint logged a credential.
+- Every instance implements `Disposable`/`AutoCloseable` over a Rust-side
+  handle. `ResumptionStore.load()` hands ownership to the caller and
+  `PhantomClient` closes it in a `finally` once the connect attempt is over; the
+  harvest path does the same after `save()`. Skipping either is not a permanent
+  leak — the generated class registers a cleaner at construction, so an
+  unreachable hint is freed once a GC collects the wrapper — but nothing in the
+  app decides when that happens, and the allocation stays live until it does.
+  This app takes a hint on every established session, every reconnect and every
+  teardown, so the uncollected ones accumulate. Closing puts the release at a
+  point the code picks rather than one the collector does.
+
+`ResumptionStore.save()` only reads the two fields and leaves the handle to its
+caller.
 
 ## Migration vs. reconnect, in one paragraph
 
 Phantom's seamless connection migration (keep the keys + connection id, move to
-a new local socket without a re-handshake) is a property of the native **UDP**
-transport. The mobile FFI surface (`connectPinned` /
-`connectPinnedWithResumption`) runs over **TCP**, where `session.migrate()` is a
-default no-op and a socket cannot rebind in place. This sample therefore models
-network changes as **reconnect-with-0-RTT**: it keeps a fresh resumption ticket
-warm and, on a network change, opens a new session and folds the first request
-into the new ClientHello as early-data. Exposing the UDP transport (and thus
-real seamless migration) through the FFI surface is future work.
+a new local socket without a re-handshake) is a property of the **UDP** transport
+(`connectPinnedUdp` / `connectPinnedUdpWithResumption`), which **is** now on the
+FFI surface. On a UDP session, `session.migrate()` performs a real path rebind.
+This sample app uses **TCP** (`connectPinned` / `connectPinnedWithResumption`),
+where `session.migrate()` returns `Err(Unsupported)` — a TCP socket cannot rebind
+in place. This app therefore models network changes as **reconnect-with-0-RTT**: it
+keeps a fresh resumption ticket warm and, on a network change, opens a new session
+and folds the first request into the new ClientHello as early-data.
 
 ## Module map
 

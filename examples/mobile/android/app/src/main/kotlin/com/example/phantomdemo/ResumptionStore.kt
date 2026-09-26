@@ -10,10 +10,21 @@ import uniffi.phantom_protocol.ResumptionHint
 /**
  * Securely persists a single 0-RTT resumption ticket between app runs.
  *
- * The ticket is a [ResumptionHint] = (`sessionId`, `resumptionSecret`), each 32
- * bytes. The `resumptionSecret` is key material and is stored only inside
+ * The ticket is a [ResumptionHint] = (`sessionId()`, `resumptionSecret()`), each
+ * 32 bytes. It crosses the FFI as an opaque object rather than a data class, so
+ * the two fields are read through accessor calls — that is what removed the
+ * generated `toString()` which used to print the resumption secret in full.
+ * The `resumptionSecret` is key material and is stored only inside
  * [EncryptedSharedPreferences], whose entries are encrypted with a
  * hardware-backed [MasterKey] (AES-256-GCM via the Android Keystore).
+ *
+ * Being an object also makes it a native resource: it implements `Disposable` /
+ * `AutoCloseable`, and every instance holds a Rust handle. Closing releases it
+ * at a point the code picks; dropping it leaves the release to the cleaner the
+ * generated class registers, which runs whenever a GC gets to the wrapper.
+ * [load] hands ownership of the returned hint to the caller, which should close
+ * it once the connect attempt is over; [save] only reads its bytes and leaves
+ * ownership where it was.
  *
  * The server-side `SessionCache` expires tickets after one hour and consumes
  * them one-shot, so [load] returns `null` once the saved ticket is older than
@@ -35,11 +46,16 @@ class ResumptionStore(context: Context) {
         )
     }
 
-    /** Persist a fresh resumption hint, stamped with the current wall-clock. */
+    /**
+     * Persist a fresh resumption hint, stamped with the current wall-clock.
+     *
+     * Reads the two fields through the object's accessors and does not take
+     * ownership: closing [hint] stays the caller's job.
+     */
     fun save(hint: ResumptionHint) {
         prefs.edit()
-            .putString(KEY_SESSION_ID, encode(hint.sessionId))
-            .putString(KEY_SECRET, encode(hint.resumptionSecret))
+            .putString(KEY_SESSION_ID, encode(hint.sessionId()))
+            .putString(KEY_SECRET, encode(hint.resumptionSecret()))
             .putLong(KEY_SAVED_AT, System.currentTimeMillis())
             .apply()
     }
@@ -47,6 +63,12 @@ class ResumptionStore(context: Context) {
     /**
      * Load the saved hint, or `null` if there is none or it has expired
      * ([TTL_MILLIS]). Expired tickets are proactively cleared.
+     *
+     * A returned hint is a live native handle owned by the caller: close it
+     * (`close()`, or `use { … }`) once the connect attempt it was loaded
+     * for has finished. Dropping it instead defers the release to the cleaner
+     * the generated class registers — the allocation stays live until a GC
+     * gets to the wrapper, at a moment nothing here chooses.
      */
     fun load(): ResumptionHint? {
         val savedAt = prefs.getLong(KEY_SAVED_AT, 0L)

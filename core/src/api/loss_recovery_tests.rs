@@ -107,8 +107,9 @@
 //! was measured as NOT required to meet the L1 ceiling/cliff goal and is left as a
 //! future optimisation. `loss_recovery_high_loss_recovers_but_is_slow` keeps the
 //! RTO-only synchronous baseline as an `#[ignore]`d reference.
-
-#![cfg(test)]
+//!
+//! The module is declared `#[cfg(test)]` in `api/mod.rs`, so it carries no
+//! inner `#![cfg(test)]` of its own.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -120,6 +121,7 @@ use tokio::time::timeout;
 use crate::api::session::{ConnectionState, PhantomSession, SessionTransport};
 use crate::errors::CoreError;
 use crate::test_harness::fault_transport::{FaultControl, LossyTransport};
+use crate::transport::bandwidth_estimator::BbrState;
 use crate::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer, ServerReply};
 
 // ── Local in-memory transport (mirrors the one in session::tests) ────────────
@@ -152,6 +154,94 @@ impl SessionTransport for ChannelTransport {
             .send(data.to_vec())
             .await
             .map_err(|_| CoreError::NetworkError("channel closed".into()))
+    }
+
+    async fn recv_bytes(&self) -> Result<Bytes, CoreError> {
+        let mut rx = self.rx.lock().await;
+        let v = rx
+            .recv()
+            .await
+            .ok_or_else(|| CoreError::NetworkError("channel closed".into()))?;
+        Ok(Bytes::from(v))
+    }
+}
+
+/// A [`ChannelTransport`] whose *send* side behaves like a link rather than a
+/// function call: a fixed one-way propagation delay, and a minimum spacing
+/// between consecutive frames.
+///
+/// Both halves are load-bearing for anything that reasons about acknowledgement
+/// *timing*, and an in-memory channel has neither.
+///
+/// The delay must be a delay **line**, not a `sleep` inside `send_bytes`. An
+/// inline sleep blocks the pump that called it, which stalls acknowledgement
+/// processing as well as emission: the round trip a sender then measures swings
+/// by up to a whole delay depending on what else that pump had queued, and
+/// RACK's time threshold — `srtt·9/8`, an eighth of a round trip of margin —
+/// disappears into that noise. Here `send_bytes` stamps a release deadline and
+/// returns; one forwarding task releases frames at their deadlines.
+///
+/// The spacing is what makes a receiver's acknowledgements arrive *spread out*.
+/// Without it, everything a peer emits in one scheduling slice is released in
+/// one burst, the far pump drains its whole inbound queue before it next looks
+/// at its send path, and no acknowledgement can ever land in the interval
+/// between a retransmission and its answer — the interval where SACK-driven loss
+/// detection actually lives. A real bottleneck serialises frames; this is that,
+/// with the link rate expressed as time per frame.
+struct DelayLine {
+    line: mpsc::Sender<(tokio::time::Instant, Vec<u8>)>,
+    delay: Duration,
+    spacing: Duration,
+    /// Release deadline of the previously accepted frame, so the next is placed
+    /// at least `spacing` after it. Deadlines stay monotonic, which is what lets
+    /// the single forwarding task preserve order with a plain `sleep_until`.
+    last_release: std::sync::Mutex<Option<tokio::time::Instant>>,
+    rx: Mutex<mpsc::Receiver<Vec<u8>>>,
+}
+
+impl DelayLine {
+    fn new(inner: ChannelTransport, delay: Duration, spacing: Duration) -> Self {
+        let (line_tx, mut line_rx) = mpsc::channel::<(tokio::time::Instant, Vec<u8>)>(256);
+        let out = inner.tx;
+        tokio::spawn(async move {
+            while let Some((release_at, frame)) = line_rx.recv().await {
+                tokio::time::sleep_until(release_at).await;
+                if out.send(frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            line: line_tx,
+            delay,
+            spacing,
+            last_release: std::sync::Mutex::new(None),
+            rx: inner.rx,
+        }
+    }
+
+    fn schedule(&self) -> tokio::time::Instant {
+        let mut last = self
+            .last_release
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let earliest = tokio::time::Instant::now() + self.delay;
+        let release_at = match *last {
+            Some(prev) => earliest.max(prev + self.spacing),
+            None => earliest,
+        };
+        *last = Some(release_at);
+        release_at
+    }
+}
+
+impl SessionTransport for DelayLine {
+    async fn send_bytes(&self, data: &[u8]) -> Result<(), CoreError> {
+        let release_at = self.schedule();
+        self.line
+            .send((release_at, data.to_vec()))
+            .await
+            .map_err(|_| CoreError::NetworkError("delay line closed".into()))
     }
 
     async fn recv_bytes(&self) -> Result<Bytes, CoreError> {
@@ -209,50 +299,52 @@ async fn run_lossy_round_trips(
         let client_hello =
             borsh::from_slice::<ClientHello>(&hello_bytes).expect("deserialize ClientHello");
 
-        // Process — may retry with cookie/PoW.
-        let inner_session = loop {
-            match server_hs.process_client_hello(&client_hello, 0, client_ip) {
-                HandshakeResponse::Retry(retry) => {
-                    let retry_bytes = ServerReply::Retry(retry)
-                        .to_wire()
-                        .expect("serialize retry");
-                    server_channel
-                        .send_bytes(&retry_bytes)
-                        .await
-                        .expect("server send retry");
-                    let next_bytes = server_channel
-                        .recv_bytes()
-                        .await
-                        .expect("server recv retry ClientHello");
-                    let next_hello = borsh::from_slice::<ClientHello>(&next_bytes)
-                        .expect("deserialize retry ClientHello");
-                    match server_hs.process_client_hello(&next_hello, 0, client_ip) {
-                        HandshakeResponse::Success(server_hello, session, _) => {
-                            let b = ServerReply::Hello(server_hello)
-                                .to_wire()
-                                .expect("serialize ServerHello");
-                            server_channel
-                                .send_bytes(&b)
-                                .await
-                                .expect("server send ServerHello");
-                            break session;
-                        }
-                        other => panic!("expected Success after retry, got {:?}", other),
+        // Process. The DoS gate may answer the first hello with a cookie/PoW
+        // `Retry`; the client then re-sends with the cookie and that second
+        // hello is admitted. That is at most ONE retry round — the gate never
+        // challenges a cookie-bearing hello again — so this is a straight-line
+        // match, not a loop.
+        let inner_session = match server_hs.process_client_hello(&client_hello, 0, client_ip) {
+            HandshakeResponse::Retry(retry) => {
+                let retry_bytes = ServerReply::Retry(retry)
+                    .to_wire()
+                    .expect("serialize retry");
+                server_channel
+                    .send_bytes(&retry_bytes)
+                    .await
+                    .expect("server send retry");
+                let next_bytes = server_channel
+                    .recv_bytes()
+                    .await
+                    .expect("server recv retry ClientHello");
+                let next_hello = borsh::from_slice::<ClientHello>(&next_bytes)
+                    .expect("deserialize retry ClientHello");
+                match server_hs.process_client_hello(&next_hello, 0, client_ip) {
+                    HandshakeResponse::Success(server_hello, session, _) => {
+                        let b = ServerReply::Hello(server_hello)
+                            .to_wire()
+                            .expect("serialize ServerHello");
+                        server_channel
+                            .send_bytes(&b)
+                            .await
+                            .expect("server send ServerHello");
+                        session
                     }
+                    other => panic!("expected Success after retry, got {other:?}"),
                 }
-                HandshakeResponse::Success(server_hello, session, _) => {
-                    let b = ServerReply::Hello(server_hello)
-                        .to_wire()
-                        .expect("serialize ServerHello");
-                    server_channel
-                        .send_bytes(&b)
-                        .await
-                        .expect("server send ServerHello");
-                    break session;
-                }
-                HandshakeResponse::Reject(r) => panic!("unexpected Reject: {:?}", r),
-                HandshakeResponse::Fail(e) => panic!("handshake failed: {:?}", e),
             }
+            HandshakeResponse::Success(server_hello, session, _) => {
+                let b = ServerReply::Hello(server_hello)
+                    .to_wire()
+                    .expect("serialize ServerHello");
+                server_channel
+                    .send_bytes(&b)
+                    .await
+                    .expect("server send ServerHello");
+                session
+            }
+            HandshakeResponse::Reject(r) => panic!("unexpected Reject: {r:?}"),
+            HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
         };
 
         // Wrap the negotiated inner Session in a full PhantomSession so the real
@@ -347,50 +439,49 @@ async fn run_pipelined_echo(
         let client_hello =
             borsh::from_slice::<ClientHello>(&hello_bytes).expect("deserialize ClientHello");
         // The server's DoS gate may answer the first hello with a cookie Retry;
-        // handle that round before Success (mirrors `run_lossy_round_trips`).
-        let inner = loop {
-            match server_hs.process_client_hello(&client_hello, 0, client_ip) {
-                HandshakeResponse::Retry(retry) => {
-                    let retry_bytes = ServerReply::Retry(retry)
-                        .to_wire()
-                        .expect("serialize retry");
-                    server_channel
-                        .send_bytes(&retry_bytes)
-                        .await
-                        .expect("server send retry");
-                    let next_bytes = server_channel
-                        .recv_bytes()
-                        .await
-                        .expect("server recv retry ClientHello");
-                    let next_hello = borsh::from_slice::<ClientHello>(&next_bytes)
-                        .expect("deserialize retry ClientHello");
-                    match server_hs.process_client_hello(&next_hello, 0, client_ip) {
-                        HandshakeResponse::Success(server_hello, session, _) => {
-                            let b = ServerReply::Hello(server_hello)
-                                .to_wire()
-                                .expect("serialize ServerHello");
-                            server_channel
-                                .send_bytes(&b)
-                                .await
-                                .expect("server send ServerHello");
-                            break session;
-                        }
-                        other => panic!("expected Success after retry, got {other:?}"),
+        // handle that one round before Success (mirrors `run_lossy_round_trips`).
+        // At most one retry is possible, so this is a match, not a loop.
+        let inner = match server_hs.process_client_hello(&client_hello, 0, client_ip) {
+            HandshakeResponse::Retry(retry) => {
+                let retry_bytes = ServerReply::Retry(retry)
+                    .to_wire()
+                    .expect("serialize retry");
+                server_channel
+                    .send_bytes(&retry_bytes)
+                    .await
+                    .expect("server send retry");
+                let next_bytes = server_channel
+                    .recv_bytes()
+                    .await
+                    .expect("server recv retry ClientHello");
+                let next_hello = borsh::from_slice::<ClientHello>(&next_bytes)
+                    .expect("deserialize retry ClientHello");
+                match server_hs.process_client_hello(&next_hello, 0, client_ip) {
+                    HandshakeResponse::Success(server_hello, session, _) => {
+                        let b = ServerReply::Hello(server_hello)
+                            .to_wire()
+                            .expect("serialize ServerHello");
+                        server_channel
+                            .send_bytes(&b)
+                            .await
+                            .expect("server send ServerHello");
+                        session
                     }
+                    other => panic!("expected Success after retry, got {other:?}"),
                 }
-                HandshakeResponse::Success(server_hello, session, _) => {
-                    let b = ServerReply::Hello(server_hello)
-                        .to_wire()
-                        .expect("serialize ServerHello");
-                    server_channel
-                        .send_bytes(&b)
-                        .await
-                        .expect("server send ServerHello");
-                    break session;
-                }
-                HandshakeResponse::Reject(r) => panic!("unexpected Reject: {r:?}"),
-                HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
             }
+            HandshakeResponse::Success(server_hello, session, _) => {
+                let b = ServerReply::Hello(server_hello)
+                    .to_wire()
+                    .expect("serialize ServerHello");
+                server_channel
+                    .send_bytes(&b)
+                    .await
+                    .expect("server send ServerHello");
+                session
+            }
+            HandshakeResponse::Reject(r) => panic!("unexpected Reject: {r:?}"),
+            HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
         };
         let server = PhantomSession::from_accepted_server_session(
             "test-client".into(),
@@ -450,6 +541,479 @@ async fn run_pipelined_echo(
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// **One drop, one loss report.** The end-to-end form of the unit tests in
+/// `transport::stream`: a real session, a real data pump, a real SACK-driven
+/// loss detector, and exactly one segment removed from the wire.
+///
+/// The detector's packet threshold compares `largest_acked` against the hole's
+/// offset, and `largest_acked` only grows — so once it has fired for an offset
+/// it would fire for that offset on every acknowledgement thereafter, and this
+/// implementation acknowledges every packet it receives. Each firing is a fresh
+/// `Session::on_packet_lost`, and each is also a fresh Pass-0 copy on the wire.
+/// `bbr_bytes_lost()` is the counter that makes that visible from outside: on a
+/// path that dropped 1300 bytes it must read 1300 bytes, not a multiple of them.
+///
+/// The drop is armed immediately before the application write, so the frame
+/// removed is the payload's first chunk. If that ever stopped being true the
+/// assertion would read zero rather than silently passing.
+///
+/// The acknowledgement path runs through a [`DelayLine`] and not a bare channel,
+/// because the defect is a *timing* one and an in-memory channel has no timing:
+/// with everything released in one burst the receiving pump drains its whole
+/// inbound queue before it looks at its send path, so no acknowledgement ever
+/// lands in the window between a retransmission and its answer, which is the
+/// only window in which the re-declaration can happen. With a round trip and a
+/// per-frame spacing the storm reproduces: one dropped segment was reported as
+/// three segments' worth of loss, on every run.
+#[tokio::test]
+async fn a_single_dropped_segment_is_reported_to_congestion_control_once() {
+    /// `PhantomSession::send` splits at this boundary, so the payload below is
+    /// exactly `CHUNKS` reliable segments and the assertion can name a size.
+    /// Taken from the library rather than restated: the split point is derived
+    /// from the PhantomUDP datagram budget, and a literal here would silently
+    /// stop describing whole segments the next time that budget moves.
+    const CHUNK: usize = crate::transport::mtu::MAX_APP_CHUNK;
+    /// Enough segments that the packet threshold (three offsets past the hole)
+    /// is reached from the acknowledgements of the surviving chunks alone, with
+    /// a long tail of further acknowledgements behind it — the tail is what a
+    /// re-declaring detector turns into a storm.
+    const CHUNKS: usize = 40;
+    /// One-way delay on the acknowledgement path, and so the round trip the
+    /// server measures. It has to be large against the pumps' scheduling jitter:
+    /// the RACK time threshold sits at `srtt·9/8`, so the margin between "the
+    /// retransmission's acknowledgement came back" and "the retransmission looks
+    /// lost too" is an eighth of a round trip, and at single-digit milliseconds
+    /// that margin *is* the jitter.
+    const ACK_PATH_DELAY: Duration = Duration::from_millis(80);
+    /// Minimum spacing between acknowledgements on that path — the link rate,
+    /// expressed as time per frame.
+    const ACK_SPACING: Duration = Duration::from_millis(3);
+
+    let server_hs = HandshakeServer::new().expect("HandshakeServer::new");
+    let server_pinned_key = server_hs.verifying_key().clone();
+    let (client_channel, server_channel) = ChannelTransport::pair();
+
+    // The client's pump runs in the background from here; the server handshake
+    // is driven inline so the negotiated `Session` stays in reach.
+    let client = PhantomSession::connect_with_transport(
+        "test-server:9000",
+        DelayLine::new(client_channel, ACK_PATH_DELAY, ACK_SPACING),
+        server_pinned_key,
+    );
+
+    let client_ip = "127.0.0.1".parse().expect("parse IP");
+    let hello_bytes = server_channel
+        .recv_bytes()
+        .await
+        .expect("server recv ClientHello");
+    let client_hello =
+        borsh::from_slice::<ClientHello>(&hello_bytes).expect("deserialize ClientHello");
+    let inner_session = match server_hs.process_client_hello(&client_hello, 0, client_ip) {
+        HandshakeResponse::Retry(retry) => {
+            let retry_bytes = ServerReply::Retry(retry)
+                .to_wire()
+                .expect("serialize retry");
+            server_channel
+                .send_bytes(&retry_bytes)
+                .await
+                .expect("server send retry");
+            let next_bytes = server_channel
+                .recv_bytes()
+                .await
+                .expect("server recv retry ClientHello");
+            let next_hello =
+                borsh::from_slice::<ClientHello>(&next_bytes).expect("deserialize retry hello");
+            match server_hs.process_client_hello(&next_hello, 0, client_ip) {
+                HandshakeResponse::Success(server_hello, session, _) => {
+                    let b = ServerReply::Hello(server_hello)
+                        .to_wire()
+                        .expect("serialize ServerHello");
+                    server_channel
+                        .send_bytes(&b)
+                        .await
+                        .expect("server send ServerHello");
+                    session
+                }
+                other => panic!("expected Success after retry, got {other:?}"),
+            }
+        }
+        HandshakeResponse::Success(server_hello, session, _) => {
+            let b = ServerReply::Hello(server_hello)
+                .to_wire()
+                .expect("serialize ServerHello");
+            server_channel
+                .send_bytes(&b)
+                .await
+                .expect("server send ServerHello");
+            session
+        }
+        HandshakeResponse::Reject(r) => panic!("unexpected Reject: {r:?}"),
+        HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
+    };
+
+    let inner = Arc::new(inner_session);
+    let congestion = inner.clone();
+    let faults = FaultControl::new();
+    let server = PhantomSession::from_accepted_server_session(
+        "test-client".into(),
+        LossyTransport::new(server_channel, faults.clone()),
+        inner,
+    );
+
+    let mut established = false;
+    for _ in 0..200 {
+        if client.connection_state() == ConnectionState::Connected {
+            established = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(established, "client session never became established");
+
+    // Distinct bytes throughout, so a truncation or a reordering shows up as a
+    // mismatch rather than as a length that happens to agree.
+    let payload: Vec<u8> = (0..CHUNK * CHUNKS).map(|i| (i % 251) as u8).collect();
+    // Take exactly one frame off the wire — the first chunk, since the write
+    // below is the next thing this pump sends.
+    faults.arm_drop_next(1);
+    server.send(payload.clone()).await.expect("server send");
+
+    let mut received = Vec::with_capacity(payload.len());
+    for i in 0..CHUNKS {
+        let chunk = timeout(Duration::from_secs(30), client.recv())
+            .await
+            .unwrap_or_else(|_| panic!("client recv timed out on chunk {i} — loss not recovered"))
+            .expect("client recv error");
+        received.extend_from_slice(&chunk);
+    }
+    assert_eq!(
+        received, payload,
+        "the dropped segment must be recovered byte-exact and in order"
+    );
+
+    assert_eq!(
+        congestion.bbr_bytes_lost(),
+        CHUNK as u64,
+        "one dropped segment of {CHUNK} B must reach congestion control as exactly \
+         {CHUNK} B of loss; a larger figure is the same segment re-reported once \
+         per acknowledgement"
+    );
+
+    // And the record must say which rule ordered the repair, through the live
+    // pump rather than through a helper that mirrors it. This is the only
+    // end-to-end reach of the attribution: the drain reads the cause off the
+    // segment and hands it to the estimator, and replacing that read with any
+    // constant leaves every other test in the crate green. The drop here is
+    // recovered by the packet threshold — the surviving chunks' acknowledgements
+    // carry `largest_acked` three offsets past the hole long before `srtt·9/8`
+    // elapses, and the RTO is an order of magnitude further out still.
+    let (by_packet, by_time, by_rto) = congestion.bbr_repairs_by_cause();
+    assert_eq!(
+        (by_packet, by_rto),
+        (1, 0),
+        "the one repair was ordered by the packet threshold and must be recorded \
+         under it: got packet={by_packet}, RACK={by_time}, RTO={by_rto}"
+    );
+
+    server.disconnect().await.expect("server clean disconnect");
+    client.disconnect().await.expect("client clean disconnect");
+}
+
+/// Drive the handshake by hand and hand back a live pair, with the server's
+/// send path wrapped in a [`LossyTransport`] the caller can arm.
+///
+/// Three tests below differ only in what they wrap the *client's* channel in and
+/// what they then do to the wire, so the twenty lines of hello/retry/hello are
+/// here rather than in each of them. The third return value is the server's
+/// negotiated `Session` — the congestion counters live there, and the
+/// `PhantomSession` wrapper does not expose them.
+async fn establish_pair<T, F>(
+    wrap_client: F,
+    server_faults: FaultControl,
+) -> (
+    PhantomSession,
+    Arc<PhantomSession>,
+    Arc<crate::transport::session::Session>,
+)
+where
+    T: SessionTransport,
+    F: FnOnce(ChannelTransport) -> T,
+{
+    let server_hs = HandshakeServer::new().expect("HandshakeServer::new");
+    let server_pinned_key = server_hs.verifying_key().clone();
+    let (client_channel, server_channel) = ChannelTransport::pair();
+
+    // The client's pump runs in the background from here; the server handshake
+    // is driven inline so the negotiated `Session` stays in reach.
+    let client = PhantomSession::connect_with_transport(
+        "test-server:9000",
+        wrap_client(client_channel),
+        server_pinned_key,
+    );
+
+    let client_ip = "127.0.0.1".parse().expect("parse IP");
+    let hello_bytes = server_channel
+        .recv_bytes()
+        .await
+        .expect("server recv ClientHello");
+    let client_hello =
+        borsh::from_slice::<ClientHello>(&hello_bytes).expect("deserialize ClientHello");
+    // The DoS gate may answer the first hello with a cookie/PoW `Retry`; the
+    // client re-sends with the cookie and that second hello is admitted. At most
+    // one retry round — the gate never challenges a cookie-bearing hello again.
+    let inner_session = match server_hs.process_client_hello(&client_hello, 0, client_ip) {
+        HandshakeResponse::Success(server_hello, session, _) => {
+            let b = ServerReply::Hello(server_hello)
+                .to_wire()
+                .expect("serialize ServerHello");
+            server_channel
+                .send_bytes(&b)
+                .await
+                .expect("server send ServerHello");
+            session
+        }
+        HandshakeResponse::Retry(retry) => {
+            let retry_bytes = ServerReply::Retry(retry)
+                .to_wire()
+                .expect("serialize retry");
+            server_channel
+                .send_bytes(&retry_bytes)
+                .await
+                .expect("server send retry");
+            let next_bytes = server_channel
+                .recv_bytes()
+                .await
+                .expect("server recv retry ClientHello");
+            let next_hello =
+                borsh::from_slice::<ClientHello>(&next_bytes).expect("deserialize retry hello");
+            match server_hs.process_client_hello(&next_hello, 0, client_ip) {
+                HandshakeResponse::Success(server_hello, session, _) => {
+                    let b = ServerReply::Hello(server_hello)
+                        .to_wire()
+                        .expect("serialize ServerHello");
+                    server_channel
+                        .send_bytes(&b)
+                        .await
+                        .expect("server send ServerHello");
+                    session
+                }
+                other => panic!("expected Success after retry, got {other:?}"),
+            }
+        }
+        HandshakeResponse::Reject(r) => panic!("unexpected Reject: {r:?}"),
+        HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
+    };
+
+    let inner = Arc::new(inner_session);
+    let congestion = inner.clone();
+    let server = PhantomSession::from_accepted_server_session(
+        "test-client".into(),
+        LossyTransport::new(server_channel, server_faults),
+        inner,
+    );
+
+    let mut established = false;
+    for _ in 0..200 {
+        if client.connection_state() == ConnectionState::Connected {
+            established = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(established, "client session never became established");
+
+    (client, server, congestion)
+}
+
+/// **A path that only reorders is charged as a path that drops — once per hole —
+/// and this endpoint has no way to find out otherwise.**
+///
+/// The sibling test above takes a segment off the wire; this one takes the same
+/// segment and merely puts it behind its own successors, which is what the
+/// reference route's raw controls actually show (0.48% of upstream datagrams
+/// late, the worst of them 225 positions late, and late in *time* by 0.7 ms).
+/// RFC 9002's packet threshold cannot tell those two inputs apart — both leave a
+/// hole three offsets behind `largest_acked` — so the sender retransmits either
+/// way, and reports the hole either way.
+///
+/// **What the test is for, given that the report is wrong.** It bounds the cost
+/// of being wrong and it records the cost honestly. The copy still goes out, so
+/// recovery is unaffected; the data still arrives byte-exact and in order; and
+/// the overtaking is charged as **one** hole rather than one per acknowledgement
+/// that observes it, which is the difference between a percent of false loss and
+/// a saturated loss rate. Nothing here refutes the report, because on this wire
+/// nothing can: see `reordering_and_a_drop_leave_the_sender_the_same_counters`
+/// in `transport::stream` for why. An attempt to tell the two apart was made and
+/// withdrawn: an acknowledgement names stream offsets, not packet numbers, so
+/// nothing the sender observes separates an overtaken datagram from a lost one.
+///
+/// **Why the displacement is derived and not chosen.** A held frame has to come
+/// out from behind at least [`PACKET_THRESHOLD`] of its successors or the
+/// detector never looks at it. The first flight is whatever the opening
+/// congestion window admits, so the depth is read from the window the session
+/// actually reports rather than assumed; if that arithmetic ever stops working,
+/// the retransmission assertion below goes red rather than the test passing on a
+/// path where nothing was ever declared.
+#[tokio::test]
+async fn a_reordered_segment_is_retransmitted_and_charged_once_end_to_end() {
+    /// `PhantomSession::send` splits here, so a payload of `CHUNKS × CHUNK` is
+    /// exactly that many reliable segments.
+    const CHUNK: usize = crate::transport::mtu::MAX_APP_CHUNK;
+    const CHUNKS: usize = 12;
+    /// One-way delay on the acknowledgement path, and so the round trip the
+    /// server measures. Large against the spacing below so the acknowledgement
+    /// stream is a stream and not a burst.
+    const ACK_PATH_DELAY: Duration = Duration::from_millis(200);
+    /// Minimum spacing between acknowledgements on that path — the link rate,
+    /// expressed as time per frame.
+    const ACK_SPACING: Duration = Duration::from_millis(3);
+
+    let faults = FaultControl::new();
+    let (client, server, congestion) = establish_pair(
+        |ch| DelayLine::new(ch, ACK_PATH_DELAY, ACK_SPACING),
+        faults.clone(),
+    )
+    .await;
+
+    // How many segments the opening window admits, and therefore how many
+    // successors the held frame can hide behind before the sender runs out of
+    // window and the only thing left to send is the copy.
+    let first_flight = congestion.bandwidth_snapshot().cwnd_bytes as usize / CHUNK;
+    let depth = first_flight.saturating_sub(1);
+    assert!(
+        depth >= crate::transport::stream::PACKET_THRESHOLD as usize,
+        "the opening window admits {first_flight} segments, so a held frame can \
+         only be put {depth} positions late — below the packet threshold, where \
+         the detector never looks and this test would prove nothing"
+    );
+
+    let payload: Vec<u8> = (0..CHUNK * CHUNKS).map(|i| (i % 251) as u8).collect();
+    // The next frame this pump sends is the payload's first chunk. It is held —
+    // not dropped — until `depth` of its successors have gone out.
+    faults.arm_hold_next(depth as u64);
+    server.send(payload.clone()).await.expect("server send");
+
+    let mut received = Vec::with_capacity(payload.len());
+    for i in 0..CHUNKS {
+        let chunk = timeout(Duration::from_secs(30), client.recv())
+            .await
+            .unwrap_or_else(|_| panic!("client recv timed out on chunk {i} — not recovered"))
+            .expect("client recv error");
+        received.extend_from_slice(&chunk);
+    }
+    assert_eq!(
+        received, payload,
+        "a reordered segment must still be delivered byte-exact and in order"
+    );
+
+    // The positive control: the detector did fire and a copy did go on the wire.
+    // Without this the test would also pass on a build that had simply stopped
+    // detecting anything.
+    assert!(
+        congestion.bbr_bytes_retransmitted() >= CHUNK as u64,
+        "the reordering must have cost at least one retransmission ({} B seen) — \
+         otherwise nothing was declared and there is no false detection here to \
+         bound",
+        congestion.bbr_bytes_retransmitted()
+    );
+    // And it is charged, once. A build that dropped the loss report on the floor
+    // would read zero here and would have handed the peer the switch that does
+    // it; a build that charged per acknowledgement would read a multiple of the
+    // segment size, which is the shape that pinned the inflight bound to its
+    // floor for whole connections.
+    let lost = congestion.bbr_bytes_lost();
+    assert_eq!(
+        lost,
+        CHUNK as u64,
+        "one hole must be charged exactly once: {lost} B against a {CHUNK} B \
+         segment, with {} B retransmitted",
+        congestion.bbr_bytes_retransmitted()
+    );
+
+    server.disconnect().await.expect("server clean disconnect");
+    client.disconnect().await.expect("client clean disconnect");
+}
+
+/// **A peer that stops acknowledging altogether does not read as a clean path.**
+///
+/// Withholding is the cheapest move a peer has: it costs it nothing, it needs no
+/// forged content, and every byte it has already received it keeps. So the loss
+/// signal must not be conditioned on an acknowledgement arriving — and here none
+/// does. The client receives the whole payload and every acknowledgement it
+/// sends is taken off the wire, so from the server's side the connection is one
+/// that delivered nothing and answered nothing.
+///
+/// The server's RTO is a local timer, so it resends anyway, and the resend is
+/// the report. A build that waited for the acknowledgement instead reports
+/// nothing, for as long as the peer cares to keep quiet — while any other stream
+/// on the connection goes on closing rounds and relaxing the inflight bound as
+/// though the path were healthy.
+#[tokio::test]
+async fn a_peer_that_never_acknowledges_a_retransmission_is_not_a_clean_path() {
+    const CHUNK: usize = crate::transport::mtu::MAX_APP_CHUNK;
+    /// Comfortably inside the opening congestion window, so the whole payload is
+    /// on the wire before the first acknowledgement would have been due. Without
+    /// that the sender would simply be window-blocked and the test would be
+    /// asserting on a connection that never retransmitted anything.
+    const CHUNKS: usize = 4;
+    /// Long enough for the initial 1 s retransmission timer to expire and for
+    /// the resulting drain to run.
+    const AFTER_THE_TIMER: Duration = Duration::from_millis(2500);
+
+    // The client's own send path — which after the handshake carries nothing but
+    // acknowledgements — is armed to drop everything, once the handshake itself
+    // is safely through. A dropped `ClientHello` has no retransmit and would
+    // wedge the handshake, so the fault is armed after establishment.
+    let ack_blackout = FaultControl::with_seed(1, 1.0, 0.0, 0.0, 0);
+    ack_blackout.arm_stochastic(false);
+    let blackout_handle = ack_blackout.clone();
+    let (client, server, congestion) = establish_pair(
+        move |ch| LossyTransport::new(ch, ack_blackout),
+        FaultControl::new(),
+    )
+    .await;
+
+    let payload: Vec<u8> = (0..CHUNK * CHUNKS).map(|i| (i % 251) as u8).collect();
+    blackout_handle.arm_stochastic(true);
+    server.send(payload.clone()).await.expect("server send");
+
+    // The data direction is untouched, so the client still gets everything —
+    // this is a peer that will not talk, not a broken path.
+    let mut received = Vec::with_capacity(payload.len());
+    for i in 0..CHUNKS {
+        let chunk = timeout(Duration::from_secs(30), client.recv())
+            .await
+            .unwrap_or_else(|_| panic!("client recv timed out on chunk {i}"))
+            .expect("client recv error");
+        received.extend_from_slice(&chunk);
+    }
+    assert_eq!(received, payload, "the payload itself was never obstructed");
+    assert_eq!(
+        congestion.bbr_bytes_lost(),
+        0,
+        "precondition: nothing has timed out yet, so nothing is charged yet"
+    );
+
+    tokio::time::sleep(AFTER_THE_TIMER).await;
+
+    let retransmitted = congestion.bbr_bytes_retransmitted();
+    assert!(
+        retransmitted >= CHUNK as u64,
+        "precondition: the retransmission timer must have fired at least once \
+         ({retransmitted} B resent) — otherwise the assertion below would pass on \
+         a connection that had nothing to report"
+    );
+    assert!(
+        congestion.bbr_bytes_lost() >= CHUNK as u64,
+        "a peer that answers nothing must not be reported as a path that lost \
+         nothing: {} B charged against {retransmitted} B resent",
+        congestion.bbr_bytes_lost()
+    );
+
+    server.disconnect().await.expect("server clean disconnect");
+    client.disconnect().await.expect("client clean disconnect");
+}
 
 /// **Seeded-loss survival.** A real session survives seeded packet loss + light
 /// reorder on every application send, recovering every message byte-exact and in
@@ -602,4 +1166,233 @@ async fn pipelined_recovers_at_20pct_loss() {
         Duration::from_secs(30),
     )
     .await;
+}
+
+/// Complete a handshake over an in-memory pair and hand back the client session,
+/// the server's negotiated `Session` — so a test can read the server's
+/// congestion controller directly while its own pump drives it — and the server
+/// session handle, which must be kept alive or the pump stops.
+async fn handshaken_pair() -> (
+    PhantomSession,
+    Arc<crate::transport::session::Session>,
+    Arc<PhantomSession>,
+) {
+    let server_hs = HandshakeServer::new().expect("HandshakeServer::new");
+    let server_pinned_key = server_hs.verifying_key().clone();
+    let (client_channel, server_channel) = ChannelTransport::pair();
+
+    let client = PhantomSession::connect_with_transport(
+        "test-server:9000",
+        client_channel,
+        server_pinned_key,
+    );
+
+    let client_ip = "127.0.0.1".parse().expect("parse IP");
+    let mut inner_session = None;
+    // At most one HelloRetryRequest round, then the hello must succeed.
+    for _ in 0..2 {
+        let hello_bytes = server_channel
+            .recv_bytes()
+            .await
+            .expect("server recv ClientHello");
+        let hello = borsh::from_slice::<ClientHello>(&hello_bytes).expect("deserialize hello");
+        match server_hs.process_client_hello(&hello, 0, client_ip) {
+            HandshakeResponse::Retry(retry) => {
+                let bytes = ServerReply::Retry(retry)
+                    .to_wire()
+                    .expect("serialize retry");
+                server_channel
+                    .send_bytes(&bytes)
+                    .await
+                    .expect("server send retry");
+            }
+            HandshakeResponse::Success(server_hello, session, _) => {
+                let bytes = ServerReply::Hello(server_hello)
+                    .to_wire()
+                    .expect("serialize ServerHello");
+                server_channel
+                    .send_bytes(&bytes)
+                    .await
+                    .expect("server send ServerHello");
+                inner_session = Some(session);
+                break;
+            }
+            HandshakeResponse::Reject(r) => panic!("unexpected Reject: {r:?}"),
+            HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
+        }
+    }
+    let inner = Arc::new(inner_session.expect("handshake never succeeded"));
+    let congestion = inner.clone();
+    let server =
+        PhantomSession::from_accepted_server_session("test-client".into(), server_channel, inner);
+
+    let mut established = false;
+    for _ in 0..200 {
+        if client.connection_state() == ConnectionState::Connected {
+            established = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(established, "client session never became established");
+    (client, congestion, server)
+}
+
+/// **The app-limited signal, through the real pump.**
+///
+/// The plumbing under test spans four places: the drain classifies why it
+/// stopped, the pump turns that into `Session::note_app_limited_drain`,
+/// `Stream::poll_send` stamps the resulting phase onto each segment it puts on
+/// the wire, and the acknowledgement path carries that stamp back into the
+/// `DeliverySample`. Each hop has a unit test; none of them proves the four are
+/// wired to one another, and the defect they fix was precisely that the last hop
+/// was a literal `false`.
+///
+/// A single small message is entirely application-limited — the drain runs dry
+/// with the whole window free — and the connection must say so. A bulk transfer
+/// that fills the window many times over is not, and both of the things the flag
+/// gates must be visible afterwards: the bandwidth filter must have taken the
+/// transfer's far higher delivery rate, and Startup must have been judged and
+/// left. `check_startup_full_bandwidth` returns early on an app-limited round,
+/// so a sender that marks every round can never conclude the pipe is full, never
+/// leaves Startup, and (`update_state` excludes Startup) never runs ProbeRTT for
+/// the life of the connection.
+///
+/// That second half is what makes this two-sided against the trivial "mark
+/// everything" implementation.
+#[tokio::test]
+async fn the_app_limited_flag_reaches_the_estimator_through_the_pump() {
+    const CHUNK: usize = crate::transport::mtu::MAX_APP_CHUNK;
+    /// Far more than the 5600 B opening window, so the drain is repeatedly
+    /// stopped by the congestion window rather than by an empty send buffer.
+    const BULK_CHUNKS: usize = 60;
+
+    let (client, congestion, server) = handshaken_pair().await;
+
+    assert_eq!(
+        congestion.bandwidth_snapshot().bottleneck_bw_bps,
+        0,
+        "precondition: a fresh session has measured no bandwidth"
+    );
+
+    // ── One small message: the sender has nothing else to give ──────────
+    let hello = b"one-small-message".to_vec();
+    server.send(hello.clone()).await.expect("server send");
+    let got = timeout(Duration::from_secs(5), client.recv())
+        .await
+        .expect("client recv timed out")
+        .expect("client recv error");
+    assert_eq!(got, hello, "the message must arrive byte-exact");
+
+    // Let the acknowledgement for the server's echo land.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let snap = congestion.bandwidth_snapshot();
+    assert!(
+        snap.app_limited,
+        "after a single small message the sender is plainly application-limited, and \
+         the connection is not marked"
+    );
+    let application_rate = snap.bottleneck_bw_bps;
+    assert_eq!(
+        snap.state,
+        BbrState::Startup,
+        "precondition: nothing has told the controller the pipe is full yet"
+    );
+
+    // ── A bulk transfer that fills the window ───────────────────────────
+    let bulk: Vec<u8> = (0..CHUNK * BULK_CHUNKS).map(|i| (i % 251) as u8).collect();
+    server.send(bulk.clone()).await.expect("server bulk send");
+    let mut received = Vec::with_capacity(bulk.len());
+    while received.len() < bulk.len() {
+        let chunk = timeout(Duration::from_secs(30), client.recv())
+            .await
+            .expect("client recv timed out on the bulk transfer")
+            .expect("client recv error");
+        received.extend_from_slice(&chunk);
+    }
+    assert_eq!(received, bulk, "the bulk transfer must arrive byte-exact");
+
+    let snap = congestion.bandwidth_snapshot();
+    assert!(
+        snap.bottleneck_bw_bps > application_rate * 10,
+        "the bulk transfer moved the bandwidth estimate from {application_rate} B/s only \
+         to {} B/s — the flight that filled the window was labelled with a phase that \
+         opened after it left, and its samples were excluded from the filter",
+        snap.bottleneck_bw_bps
+    );
+    assert_ne!(
+        snap.state,
+        BbrState::Startup,
+        "the connection is still in Startup after a transfer that filled the window \
+         several times over — `check_startup_full_bandwidth` returns early on an \
+         app-limited round, so a sender marked in every round can never judge that \
+         the pipe is full, and never runs ProbeRTT either"
+    );
+
+    server.disconnect().await.expect("server clean disconnect");
+    client.disconnect().await.expect("client clean disconnect");
+}
+
+/// **A sender whose every write is smaller than a congestion window must still
+/// be able to measure the path.**
+///
+/// Request/response is the shape of most of what runs over a transport, and it
+/// is the shape of the reference server's own echo handler: a few kilobytes go
+/// out, the peer answers, a few more go out. Each of those writes empties the
+/// send buffer, so every drain pass ends because the application ran dry — which
+/// is exactly what the app-limited signal is for.
+///
+/// It must not follow from that that the connection never measures anything.
+/// `cwnd = 2 × btl_bw × min_rtt`, so a `btl_bw` that stays at zero leaves the
+/// window on its `4 × MIN_PACKET_SIZE` floor, which on a long path is a hard cap
+/// of a few tens of kilobytes per second — for a flow whose problem was never
+/// congestion.
+///
+/// The observable is the estimate itself rather than the window it sizes. The
+/// window cannot be observed here: this harness is an in-memory channel, so
+/// `min_rtt` is microseconds, `bdp = btl_bw × min_rtt` rounds to nothing, and
+/// the floor governs whatever the estimate says. On a real path the two are the
+/// same statement.
+#[tokio::test]
+async fn repeated_small_exchanges_still_measure_the_path() {
+    /// Comfortably under the 5600-byte opening window, so no exchange can fill
+    /// it and every drain ends on an empty send buffer.
+    const REQUEST: usize = 4_000;
+    const EXCHANGES: usize = 40;
+
+    let (client, congestion, server) = handshaken_pair().await;
+
+    for i in 0..EXCHANGES {
+        let msg = vec![(i % 251) as u8; REQUEST];
+        server.send(msg.clone()).await.expect("server send");
+        let mut got = Vec::with_capacity(REQUEST);
+        while got.len() < REQUEST {
+            let chunk = timeout(Duration::from_secs(5), client.recv())
+                .await
+                .expect("client recv timed out")
+                .expect("client recv error");
+            got.extend_from_slice(&chunk);
+        }
+        assert_eq!(got, msg, "exchange {i} must arrive byte-exact");
+        // The answer travelling the other way is what carries the
+        // acknowledgement the estimator learns from.
+        client.send(b"ack".to_vec()).await.expect("client reply");
+        let _ = timeout(Duration::from_secs(5), server.recv())
+            .await
+            .expect("server recv timed out")
+            .expect("server recv error");
+    }
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let snap = congestion.bandwidth_snapshot();
+    assert!(
+        snap.bottleneck_bw_bps > 0,
+        "{EXCHANGES} exchanges of {REQUEST} B produced no bandwidth estimate at all — \
+         every sample was discarded, so the window can only ever be its floor"
+    );
+
+    server.disconnect().await.expect("server clean disconnect");
+    client.disconnect().await.expect("client clean disconnect");
 }

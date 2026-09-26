@@ -68,8 +68,17 @@ pub type SequenceNumber = u32;
 pub type PacketNumber = u64;
 
 /// The sole on-wire packet-header version byte. Pinned — the wire format is not
-/// negotiated (pre-1.0, no users); a decoder rejects anything else. `6` is the
-/// anti-fingerprint diet: the version byte is now itself HP-masked (the WHOLE
+/// negotiated (pre-1.0, no users); a decoder rejects anything else. `8` gives
+/// [`PacketFlags::CONTROL`] a meaning: its AEAD plaintext now leads with a
+/// [`ControlSubtype`] byte, and the first assignment is the session-close announcement
+/// (see [`ControlSubtype::CLOSE`]). This byte is what a `7` receiver checks first, so it
+/// would drop every `8` frame before looking at a flag — completing a handshake and then
+/// moving no data at all, with nothing to say why.
+/// [`crate::transport::handshake::PROTOCOL_VERSION`] moved with this so such a peer is
+/// refused at the handshake, where the refusal has a name. `7` changes the
+/// `WINDOW_UPDATE` plaintext from a 4-byte relative credit to an 8-byte cumulative limit
+/// (see [`PacketFlags::WINDOW_UPDATE`]); `PROTOCOL_VERSION` moved with it too.
+/// `6` was the anti-fingerprint diet: the version byte became itself HP-masked (the WHOLE
 /// 15-byte header `[0..15]` is masked — no constant cleartext byte), and the two
 /// cleartext `u32` length prefixes are dropped (`payload` is the message
 /// remainder — `recv_bytes` is message-framed — and `extensions` leave the wire),
@@ -79,7 +88,50 @@ pub type PacketNumber = u64;
 /// header to 15 bytes. `4` (T4.6) added QUIC-style header protection (RFC 9001
 /// §5.4) over a 47-byte header; `3` (Phase 4) widened the packet number to `u64`.
 /// See PROTOCOL.md § 4.2.
-pub const WIRE_VERSION: u8 = 6;
+pub const WIRE_VERSION: u8 = 8;
+
+/// Subtype byte leading the AEAD **plaintext** of an `ENCRYPTED | CONTROL` frame
+/// (WIRE v8) — see [`PacketFlags::CONTROL`].
+///
+/// It is a one-byte enumeration rather than a length-prefixed record because every
+/// in-session control frame this protocol has needed so far is a bare signal, and a
+/// receiver that dispatches on a fixed set of bytes has nothing to parse and therefore
+/// nothing to be tricked into allocating. A frame that needs a body carries it after the
+/// subtype byte, and the branch for that subtype — which knows the exact shape it
+/// expects — is what reads it.
+///
+/// Assignments grow from the bottom. `0x00` is deliberately left unassigned so that a
+/// zeroed buffer is not a valid control frame; a receiver treats it, and every other
+/// unassigned byte, as unknown and drops the frame.
+pub struct ControlSubtype;
+
+impl ControlSubtype {
+    /// The sender is closing this session and will send nothing further on it.
+    ///
+    /// It exists because PhantomUDP has no socket-level end-of-stream. On a byte pipe a
+    /// departing peer's transport drop makes the other side's read fail, and its pump
+    /// exits within the second; on a datagram socket that same departure is
+    /// indistinguishable from silence, so the slot survived until the liveness timer
+    /// eventually declared it dead — over two minutes, during which the server kept
+    /// firing keep-alives at a closed port and kept a NAT binding warm for a
+    /// conversation that had ended.
+    ///
+    /// The frame is **not** an acknowledged part of the protocol: it is sent
+    /// best-effort, it is never retransmitted, and a session that never receives one
+    /// still ends by the timer exactly as before. What it changes is the common case, in
+    /// which the peer did have one last chance to speak.
+    pub const CLOSE: u8 = 0x01;
+}
+
+/// Length of the [`ControlSubtype`] byte that leads a `CONTROL` frame's plaintext. A
+/// control frame with a shorter plaintext than this names no subtype and is dropped.
+pub const CONTROL_SUBTYPE_LEN: usize = 1;
+
+/// Exact `WINDOW_UPDATE` AEAD-plaintext length: a big-endian `u64` cumulative limit. The
+/// receive path rejects any other length outright rather than reading a prefix, so a frame
+/// from a peer speaking a different flow-control encoding is dropped instead of being
+/// half-understood. See [`PacketFlags::WINDOW_UPDATE`].
+pub const WINDOW_UPDATE_PAYLOAD_LEN: usize = 8;
 
 /// Wire offset where the header-protected region begins. **WIRE v6
 /// (anti-fingerprint): `0`** — the masked region now covers the WHOLE 15-byte
@@ -136,9 +188,28 @@ impl PacketFlags {
     pub const PRIORITY: u16 = 0x0010;
     /// Payload is encrypted
     pub const ENCRYPTED: u16 = 0x0020;
-    /// Payload is compressed
+    /// Payload is compressed — **reserved; nothing sets it and nothing tests it.**
+    /// No send path in this crate calls [`crate::transport::compression`], so every
+    /// packet this library emits is uncompressed, and the receive path never reads
+    /// this bit either: a peer that set it would have its payload handed to the
+    /// AEAD-plaintext parser unchanged, which is a decode failure and not a
+    /// decompression. It sits among flags the sender really does set, which is why
+    /// it says so here rather than only in the wire specification — the module
+    /// documentation of [`crate::transport::compression`] explains why connecting it
+    /// is a wire decision rather than a cleanup. Do not emit.
     pub const COMPRESSED: u16 = 0x0040;
-    /// Control message (handshake, migration)
+    /// In-session control frame (WIRE v8). The AEAD **plaintext** leads with a
+    /// one-byte [`ControlSubtype`] and carries whatever that subtype defines after it
+    /// (nothing, for every subtype assigned so far); the frame is always padded to a
+    /// bucket, because an unpadded one would be a distinctive fixed-size datagram at a
+    /// distinctive moment. It carries no application bytes, so it never reaches
+    /// `recv()`.
+    ///
+    /// The subtype byte is the reason this rides the already-declared `CONTROL` bit
+    /// rather than the single remaining spare (`0x8000`): three in-session control
+    /// frames were added in the two revisions before this one, and spending the last
+    /// bit on the first of them would have left the fourth with nowhere to go. One
+    /// flag plus a byte of namespace costs the same on the wire and does not run out.
     pub const CONTROL: u16 = 0x0080;
     /// Sender is rekeying — receiver must derive the next AEAD key from the
     /// traffic-secret rekey chain (`HKDF-Expand(current, "phantom-rekey-v1", 32)`,
@@ -148,12 +219,21 @@ impl PacketFlags {
     /// (Phase 4.2). Payload carries the 32-byte challenge or response.
     pub const PATH_VALIDATION: u16 = 0x0200;
     /// Payload is a coalesced bundle of inner packets in
-    /// `[count: u16][len1: u16][payload1]...` format (Phase 2.5).
+    /// `[count: u16][len1: u16][payload1]...` format (Phase 2.5). **Accepted but never
+    /// emitted:** the receive path splits an inbound bundle
+    /// ([`crate::transport::packet_coalescer_codec::unwrap_coalesced_packet`], wired
+    /// into the data pump), while no send path in this crate sets the bit. Unlike
+    /// `COMPRESSED` that asymmetry is interoperable in the direction that matters — a
+    /// peer that bundles is understood — so this bit is live on the wire even though
+    /// this implementation only ever reads it.
     pub const COALESCED: u16 = 0x0400;
-    /// Per-stream flow control update (Phase 4.3). Payload is a
-    /// big-endian `u32` carrying the receiver's newly-available
-    /// window in bytes (absolute window size, NOT a delta — simpler
-    /// and self-correcting under packet loss).
+    /// Per-stream flow control update (Phase 4.3). Payload is
+    /// [`WINDOW_UPDATE_PAYLOAD_LEN`] bytes: a big-endian `u64` **cumulative limit** — the
+    /// total the receiver is willing to have sent on that stream, counted from its first
+    /// byte. The sender takes the maximum of it and the limit it already held, so the frame
+    /// is idempotent, reorder-safe and loss-tolerant: nothing is destroyed by a duplicate, a
+    /// stale one is discarded, and one that never arrives is repaired by the next, which
+    /// states the whole truth rather than the difference since the last.
     pub const WINDOW_UPDATE: u16 = 0x0800;
     /// Idle keep-alive PING (download-only liveness). A small
     /// `ENCRYPTED | KEEPALIVE` packet with an **empty** payload that an idle
@@ -297,7 +377,7 @@ impl fmt::Debug for PacketFlags {
 /// ε CID collapse), reconstructed by the receiver from session context.
 ///
 /// ```text
-/// off  0  version        u8       (= WIRE_VERSION = 6)            HP-MASKED ┐
+/// off  0  version        u8       (= WIRE_VERSION = 8)            HP-MASKED ┐
 /// off  1  packet_number  u64 be   (per-direction monotonic)      HP-MASKED │
 /// off  9  flags          u16 be                                  HP-MASKED │ [0..15]
 /// off 11  stream_id      u16 be                                  HP-MASKED │
@@ -939,9 +1019,15 @@ mod tests {
             PacketHeader::SIZE,
             "v6 masks the whole 15-byte header"
         );
+        // The layout below is the one the anti-fingerprint diet introduced at version 6 and
+        // is unchanged since; the constant has moved on to 8. Both moves since — the
+        // `WINDOW_UPDATE` plaintext at 7 and the `CONTROL` subtype byte at 8 — changed an
+        // AEAD plaintext rather than anything in the header, which is precisely why they
+        // still had to move the version: the header check is the only thing that could
+        // have refused a peer reading those bytes by the older rules, and it reads this.
         assert_eq!(
-            WIRE_VERSION, 6,
-            "anti-fingerprint diet bumps the wire version"
+            WIRE_VERSION, 8,
+            "the wire version must move whenever anything on the wire does"
         );
 
         let header = PacketHeader::new(

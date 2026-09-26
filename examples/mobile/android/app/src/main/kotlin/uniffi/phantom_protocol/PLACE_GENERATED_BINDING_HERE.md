@@ -21,9 +21,19 @@ does this for you. The resulting file declares:
 - `package uniffi.phantom_protocol`
 - top-level `suspend fun connectPinned(...)` / `connectPinnedWithResumption(...)`
 - `interface PhantomSessionInterface` + `class PhantomSession`
-- `data class ResumptionHint`
+- `interface ResumptionHintInterface` + `class ResumptionHint`
 - `enum class ConnectionState`
 - `sealed class CoreException`
+
+`ResumptionHint` is an object rather than a data class, which changes how it is
+used: the two fields are accessor calls (`hint.sessionId()`,
+`hint.resumptionSecret()`), there is no `copy()`, no destructuring and no
+value-based `equals`/`hashCode`, and no `toString()` that would print the
+resumption secret — that last one is why it is an object. It also implements
+`Disposable`/`AutoCloseable`, so every instance owns a native handle: close it
+(`close()`, or `use { … }`) once the ticket has been stored or the connect
+attempt it was loaded for is over. `ResumptionStore` and `PhantomClient` in this
+sample show both ends of that lifetime.
 
 Do **not** hand-edit the generated file. The Gradle module's
 `sourceSets.main.java.srcDirs += "src/main/kotlin"` picks it up automatically

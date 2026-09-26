@@ -1,38 +1,114 @@
 //! Formal negative-security tests for the documented invariants.
 //!
-//! Each test pins a specific property from `SECURITY.md` / `docs/security/threat-model.md` so that
-//! a future regression which silently weakens one of them surfaces as a hard
-//! red here. These run on every `cargo test --test security_invariants` path —
-//! they are NOT `#[ignore]`-gated. Most are pure (no sockets); the PhantomUDP
-//! pre-auth DoS-bound tests bind a loopback `UdpSocket` (fast + deterministic).
+//! "Invariant N" below refers to the numbered list in `docs/security/invariants.md`, which
+//! states each invariant, where it is enforced, and which tests here pin it. Each test pins a
+//! specific property from that list or from `docs/security/threat-model.md` so that a future
+//! regression which silently weakens one of them surfaces as a hard red here. These run on
+//! every `cargo test --test security_invariants` path — they are NOT `#[ignore]`-gated. Most
+//! are pure (no sockets); the PhantomUDP pre-auth DoS-bound tests bind a loopback `UdpSocket`
+//! (fast + deterministic).
 //!
 //! Coverage map:
 //!   - AEAD authenticated decryption rejects bit-flipped ciphertext.
 //!   - AEAD AAD-binding: a tampered `PacketHeader` (used as AAD) is rejected
 //!     even if the ciphertext bytes are intact.
+//!   - The receive path drops a forged unencrypted post-handshake packet
+//!     (Invariant 2), driven through a live session's pump.
 //!   - Malformed wire bytes are rejected as a typed parse error, not a panic.
 //!   - The handshake cookie path uses constant-time equality (smoke check).
 //!   - Server identity mismatch fails the handshake at the client side.
-//!   - The AEAD `AEAD_MAX_INVOCATIONS` ceiling is reachable through a
-//!     synthetic counter-bump and yields `NonceExhausted`.
+//!   - The per-direction AEAD invocation counter — the input to the
+//!     `AEAD_MAX_INVOCATIONS` ceiling — advances once per successful operation
+//!     and not at all on a failed open. The ceiling itself (2^48) is not
+//!     reachable from a test; what is pinned here is the counter feeding it.
 //!   - Cookie tampering yields a `Retry` (not `Success`) on the server side.
 
+// Tests `.unwrap()` freely so failures surface as readable diagnostics; the
+// disallowed-methods list in `.clippy.toml` is for production code, not the test
+// harness. (Integration-test crates are their own crate and therefore do not
+// inherit `core/src/lib.rs`'s `#![cfg_attr(test, allow(...))]`.)
+#![allow(clippy::disallowed_methods)]
+
 use bytes::Bytes;
+use phantom_protocol::api::session::{
+    DELIVERY_ITEM_OVERHEAD_BYTES, RECV_DELIVERY_HARD_CAP, STREAM_RECV_CHANNEL_DEPTH,
+};
 use phantom_protocol::crypto::adaptive_crypto::{CipherSuite, CryptoSession, AEAD_OVERHEAD};
 use phantom_protocol::crypto::hybrid_sign::{HybridSigningKey, HybridVerifyingKey};
 use phantom_protocol::transport::handshake::{
     ClientHello, HandshakeClient, HandshakeError, HandshakeResponse, HandshakeServer, ServerHello,
+    PROTOCOL_VERSION, REJECT_UNSUPPORTED_VERSION,
 };
+use phantom_protocol::transport::mtu::MAX_RECV_PAYLOAD;
+use phantom_protocol::transport::multiplexer::{StreamDemultiplexer, StreamMessage};
 use phantom_protocol::transport::path::PathStateKind;
 use phantom_protocol::transport::session::{
     CryptoState, Session, MAX_REKEY_CATCHUP, REBIND_VALIDATION_PATH_ID,
 };
 use phantom_protocol::transport::shaping::{self, PaddingPolicy, MAX_SHAPED_WIRE};
-use phantom_protocol::transport::stream::{Stream, INITIAL_STREAM_WINDOW};
-use phantom_protocol::transport::types::{
-    PacketFlags, PacketHeader, PhantomPacket, SchedulerMode, SessionId, WIRE_VERSION,
+use phantom_protocol::transport::stream::{
+    SendBlocked, SharedRecvTuning, Stream, INITIAL_STREAM_WINDOW, MAX_RECV_REORDER,
+    MAX_RECV_WINDOW, REORDER_ENTRY_OVERHEAD_BYTES, SESSION_RECV_WINDOW_GROWTH_BUDGET,
 };
+use phantom_protocol::transport::types::{
+    ControlSubtype, PacketFlags, PacketHeader, PhantomPacket, SchedulerMode, SessionId,
+    WIRE_VERSION,
+};
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+use std::sync::Arc;
 use std::time::Duration;
+
+// ── Heap accounting ────────────────────────────────────────────────────────
+//
+// The receive-memory tests below are the only place in this suite that asserts a
+// *quantity* rather than a behaviour, and a quantity asserted against the expression it
+// came from proves nothing. So they measure: this allocator reports live heap bytes, and
+// each published per-buffer figure is checked against what that buffer is observed to take
+// when it is driven to its own cap.
+//
+// The counter is per thread, not global, so a measurement is unaffected by whatever the
+// other tests in this binary are allocating in parallel. Measured regions therefore keep
+// all of their work on the calling thread (`flavor = "current_thread"`).
+
+thread_local! {
+    /// Live heap bytes attributed to this thread. `const`-initialised and destructor-free
+    /// so that touching it from inside the allocator cannot itself allocate or recurse.
+    static LIVE_HEAP: Cell<isize> = const { Cell::new(0) };
+}
+
+struct AccountingAllocator;
+
+// SAFETY: every method forwards to `System` unchanged; the added work is a `Cell` update on
+// a `const`-initialised, destructor-free thread-local, which allocates nothing and so cannot
+// re-enter the allocator. `try_with` tolerates the window during thread teardown when the
+// thread-local is no longer accessible.
+unsafe impl GlobalAlloc for AccountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let _ = LIVE_HEAP.try_with(|c| c.set(c.get() + layout.size() as isize));
+        unsafe { System.alloc(layout) }
+    }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let _ = LIVE_HEAP.try_with(|c| c.set(c.get() + layout.size() as isize));
+        unsafe { System.alloc_zeroed(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let _ = LIVE_HEAP.try_with(|c| c.set(c.get() - layout.size() as isize));
+        unsafe { System.dealloc(ptr, layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let _ = LIVE_HEAP.try_with(|c| c.set(c.get() - layout.size() as isize + new_size as isize));
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static HEAP: AccountingAllocator = AccountingAllocator;
+
+/// Live heap bytes this thread currently holds.
+fn live_heap() -> isize {
+    LIVE_HEAP.with(|c| c.get())
+}
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -557,13 +633,19 @@ fn server_identity_mismatch_aborts_handshake() {
     }
 }
 
-/// The `AEAD_MAX_INVOCATIONS` ceiling must be reachable: when the per-direction
-/// counter reaches the limit, encrypt/decrypt return `CryptoError::NonceExhausted`
-/// rather than wrapping past safe usage.
+/// **Invariant 8, the reachable half.** The `AEAD_MAX_INVOCATIONS` ceiling is
+/// checked against a per-direction counter, and this pins that the counter is
+/// real: it starts at zero, advances once per encrypt, and is readable through
+/// the API the check itself reads.
 ///
-/// We can't actually push the counter to 2^48 in a test (~9 years of packets);
-/// instead we encrypt one record and observe that the API exposes the counter,
-/// confirming the safety-check plumbing exists.
+/// It does not reach the ceiling and does not claim to. Driving a counter to
+/// 2^48 is roughly nine years of packets, and no test in this repository takes
+/// the `NonceExhausted` branch — it is held by inspection of the five sites in
+/// `crypto/adaptive_crypto.rs` that compare against the limit, and nothing more.
+/// The complement that *is* driven is
+/// `failed_decrypt_does_not_advance_recv_invocation_counter`, the property an
+/// attacker could otherwise abuse: a forged packet must not push anyone toward
+/// the ceiling.
 #[test]
 fn aead_invocations_counter_increments_per_op() {
     let secret = [0xC3u8; 32];
@@ -702,11 +784,16 @@ fn tampered_epoch_or_path_id_is_rejected() {
     assert!(server.decrypt_packet(&tampered_path, &ct2, &[]).is_err());
 }
 
-/// Replay window: re-feeding a fresh ciphertext that reuses an
-/// already-accepted `(stream_id, sequence)` must fail with
-/// `CoreError::ReplayDetected`, and the per-session counter must increment.
-/// The window keys on `(stream_id, sequence)` only — independent of epoch /
-/// path_id.
+/// Replay window: re-feeding a fresh ciphertext that reuses an already-accepted
+/// packet number must fail with `CoreError::ReplayDetected`, and the per-session
+/// counter must increment. There is one window per direction, keyed on the u64
+/// `packet_number` alone — not per stream, and independent of epoch and path_id;
+/// `per_direction_window_accepts_interleaved_streams` is the test for that half.
+///
+/// What this does not establish is the *ordering* against the AEAD open (the other
+/// half of Invariant 4). The replayed ciphertext here is freshly sealed and opens
+/// cleanly, so a window consulted before the open would reject it identically. The
+/// ordering is a property of `Session::decrypt_packet`'s structure.
 #[test]
 fn replay_window_rejects_duplicate_sequence() {
     use phantom_protocol::CoreError;
@@ -1485,6 +1572,14 @@ fn concurrent_rekeys_keep_epoch_and_key_in_lockstep() {
 }
 
 // ── Multi-path / migration (Phase 4.2) ────────────────────────────────────
+//
+// The four path-validation tests below pin the state-machine half of Invariant 6:
+// a path is not trusted until it answers its own challenge, a wrong answer fails it
+// for good, and an unchallenged path cannot be completed at all. They say nothing
+// about the other half — that the comparison is constant-time. A functional test
+// cannot: `subtle::ConstantTimeEq` and `==` agree on every input, so a rewrite to
+// `==` would leave all four green. That half is held by code review, recorded in
+// `docs/compliance/constant-time-audit.md`.
 
 /// New paths must NOT be implicitly trusted. After session creation,
 /// path 0 is the validated default; an unfamiliar path id starts at
@@ -1564,6 +1659,67 @@ fn packet_roundtrip_preserves_fields() {
     assert_eq!(decoded.payload, vec![0xDE, 0xAD]);
 }
 
+/// **A peer speaking an older protocol is refused, not left to stall.**
+///
+/// The data-plane version check drops a mismatched frame *silently*: nothing is logged to
+/// the peer, no error is raised, the packet simply vanishes. That is the right behaviour for
+/// a frame — an attacker must not learn anything from spraying them — and it is exactly why
+/// a wire-format change cannot rely on `WIRE_VERSION` alone. An older peer would complete a
+/// handshake, believe itself connected, and then sit with its packets disappearing: a stall
+/// with no diagnosis, which is the failure mode a format change is normally made to remove.
+///
+/// So the handshake version moves with the wire version, and this pins both halves of that
+/// argument: the hello is refused with a typed reject naming the version this build speaks,
+/// **before** any KEM or signature work; and the packet-level check really is the silent
+/// drop that makes the refusal necessary.
+#[test]
+fn an_older_peer_is_refused_at_the_handshake_rather_than_dropped_on_the_wire() {
+    let server = HandshakeServer::new().unwrap();
+    let client = HandshakeClient::new().unwrap();
+    let client_ip = "127.0.0.1".parse().unwrap();
+
+    let mut hello = client.create_client_hello();
+    hello.version = PROTOCOL_VERSION - 1;
+
+    match server.process_client_hello(&hello, 0, client_ip) {
+        HandshakeResponse::Reject(reject) => {
+            assert!(reject.has_marker(), "reject must carry the marker");
+            assert_eq!(reject.code, REJECT_UNSUPPORTED_VERSION);
+            assert_eq!(
+                reject.supported_version, PROTOCOL_VERSION,
+                "the reject must name the version this build speaks, or an operator \
+                 reading it learns nothing actionable"
+            );
+        }
+        other => panic!(
+            "an older peer's hello was not refused with a typed reject: {other:?} — it \
+             would have established a session and then stalled"
+        ),
+    }
+
+    // The contrast that makes the bump load-bearing. The packet codec carries the version
+    // byte but does not judge it: a frame at the previous wire version parses cleanly here,
+    // and what refuses it is the receive loop's gate, whose only action is to skip the frame
+    // — no reply, no error, nothing the peer can observe. So the version byte can tell a
+    // receiver that a frame is foreign, and can tell the *sender* nothing at all; that is
+    // the whole argument for refusing an older peer one layer earlier, at the handshake.
+    let header = PacketHeader::new(
+        SessionId::from_bytes([7u8; 32]),
+        1,
+        1,
+        PacketFlags::new(PacketFlags::ENCRYPTED),
+    );
+    let mut wire = PhantomPacket::new(header, vec![0u8; 32]).to_wire();
+    wire[0] = WIRE_VERSION - 1;
+    let decoded = PhantomPacket::from_wire(&wire)
+        .expect("the codec parses the header before anything judges its version");
+    assert_eq!(
+        decoded.header.version,
+        WIRE_VERSION - 1,
+        "the version byte a receiver gates on must survive decoding"
+    );
+}
+
 // ── Flow-control enforcement invariants (receive-backpressure decoupling) ────
 //
 // With backpressure decoupled from the recv reader, the SEND side is where flow
@@ -1575,8 +1731,10 @@ fn packet_roundtrip_preserves_fields() {
 
 /// New (first-transmission) data is admitted only within the advertised
 /// flow-control window AND the congestion window — `min` of the two. A segment
-/// that does not fit is withheld and, crucially, does NOT debit the window (so
-/// the credit is not leaked while the segment waits).
+/// that does not fit is withheld and, crucially, does not advance the sent
+/// total. The window is the peer's cumulative limit less what has gone out, so
+/// charging bytes the wire never carried would retire room against nothing, and
+/// only a later and larger limit could ever return it.
 #[tokio::test]
 async fn flow_control_bounds_new_data_to_the_advertised_window() {
     // ── Flow-control window bound ──
@@ -1592,22 +1750,28 @@ async fn flow_control_bounds_new_data_to_the_advertised_window() {
     s.send_reliable(Bytes::from(vec![0u8; 60])).await.unwrap(); // seq 1
 
     let first = s
-        .poll_send(u64::MAX)
+        .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
         .await
         .expect("first segment fits the window");
     assert!(!first.retransmit);
     assert_eq!(first.data.len(), 60);
     assert_eq!(s.peer_send_window(), 40, "window debited by the sent bytes");
 
-    // The second 60-byte segment exceeds the remaining 40-byte window → withheld.
-    assert!(
-        s.poll_send(u64::MAX).await.is_none(),
+    // The second 60-byte segment exceeds the remaining 40-byte window → withheld,
+    // and withheld for that reason: the congestion budget is unbounded here, so a
+    // stream reporting anything else has consulted the wrong budget.
+    assert_eq!(
+        s.poll_send(u64::MAX, 0, std::time::Instant::now(), false)
+            .await
+            .err(),
+        Some(SendBlocked::FlowControl),
         "new data exceeding the flow-control window must be withheld"
     );
     assert_eq!(
         s.peer_send_window(),
         40,
-        "a withheld segment must NOT debit the window (no credit leak)"
+        "a withheld segment advanced the sent total — the room it costs was spent on bytes \
+         the wire never carried"
     );
 
     // ── Congestion window bound ──
@@ -1615,14 +1779,60 @@ async fn flow_control_bounds_new_data_to_the_advertised_window() {
     s2.send_reliable(Bytes::from(vec![0u8; 100])).await.unwrap();
     // cwnd budget smaller than the segment → withheld by congestion control,
     // BEFORE the flow-control window is even consulted.
-    assert!(
-        s2.poll_send(50).await.is_none(),
+    assert_eq!(
+        s2.poll_send(50, 0, std::time::Instant::now(), false)
+            .await
+            .err(),
+        Some(SendBlocked::CongestionWindow),
         "new data exceeding the congestion window must be withheld"
     );
     assert_eq!(
         s2.peer_send_window(),
         INITIAL_STREAM_WINDOW,
         "a cwnd-blocked segment must not debit the flow-control window"
+    );
+}
+
+/// The one frame a closed window does not stop is the flow-control persist probe, and the
+/// reason it is not an exception to the invariant above is that it carries **no application
+/// payload**. A stream the peer's window has stopped with nothing outstanding has no event
+/// left that could free it — no acknowledgement is coming, and the raised limit that would
+/// free it rides in a frame nothing retransmits — so it asks, with an empty reliable
+/// segment. What the peer is charged for the asking is one stream offset; what it is
+/// charged in buffer is nothing, which is what keeps a receiver whose application has
+/// stopped reading able to hold this side still.
+///
+/// Pinned here, next to the bound it must not breach: a probe that ever carried queued data
+/// would be new data admitted past the advertised window, and this fails on the first one.
+#[tokio::test]
+async fn the_persist_probe_carries_no_application_payload() {
+    tokio::time::pause();
+    let s = Stream::new(1);
+    // A window closes by sending, so one segment has already gone out and been acknowledged.
+    s.send_reliable(Bytes::from(vec![0u8; 1200])).await.unwrap();
+    let sent = s
+        .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
+        .await
+        .expect("the initial window admits the first segment");
+    s.ack(sent.stream_offset).await;
+    // Close what is left of it, with a full segment still queued behind.
+    assert!(s.try_consume_send_window(s.peer_send_window()));
+    s.send_reliable(Bytes::from(vec![0u8; 1200])).await.unwrap();
+
+    let probe = s
+        .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
+        .await
+        .expect("a blocked stream with nothing outstanding probes rather than waiting");
+    assert!(
+        probe.data.is_empty(),
+        "the probe carried {} application bytes past a closed flow-control window",
+        probe.data.len()
+    );
+    assert!(probe.reliable && !probe.fin);
+    assert_eq!(
+        s.peer_send_window(),
+        0,
+        "the probe must not debit a window that has nothing in it"
     );
 }
 
@@ -1637,7 +1847,10 @@ async fn retransmissions_bypass_congestion_and_flow_control_windows() {
     s.send_reliable(Bytes::from(vec![0u8; 200])).await.unwrap(); // seq 0
 
     // First transmission debits the window (200 bytes) under an unbounded cwnd.
-    let first = s.poll_send(u64::MAX).await.expect("first transmission");
+    let first = s
+        .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
+        .await
+        .expect("first transmission");
     assert!(!first.retransmit);
     assert_eq!(first.data.len(), 200);
     assert_eq!(s.peer_send_window(), INITIAL_STREAM_WINDOW - 200);
@@ -1647,7 +1860,14 @@ async fn retransmissions_bypass_congestion_and_flow_control_windows() {
     assert_eq!(s.peer_send_window(), 0);
     // … and an immediate re-poll (cwnd 0, window 0) yields nothing — the
     // segment is in-flight, not yet timed out.
-    assert!(s.poll_send(0).await.is_none());
+    assert_eq!(
+        s.poll_send(0, 0, std::time::Instant::now(), false)
+            .await
+            .err(),
+        Some(SendBlocked::Idle),
+        "an in-flight segment that has not timed out is nothing to send, not a \
+         budget the sender is up against"
+    );
 
     // Advance past the initial 1s RTO so the unacked segment is due to retransmit.
     tokio::time::advance(Duration::from_millis(1100)).await;
@@ -1655,7 +1875,7 @@ async fn retransmissions_bypass_congestion_and_flow_control_windows() {
     // The retransmit is produced despite cwnd == 0 AND window == 0 (Karn: the
     // bytes were accounted on first send; loss recovery must always proceed).
     let rtx = s
-        .poll_send(0)
+        .poll_send(0, 0, std::time::Instant::now(), false)
         .await
         .expect("retransmission must bypass both the congestion and flow-control windows");
     assert!(rtx.retransmit, "must be flagged as a retransmission");
@@ -2059,9 +2279,9 @@ fn reset_congestion_returns_controller_to_initial() {
     let (fresh, _f) = make_session_pair([0x95u8; 32]);
     let initial_cwnd = fresh.bandwidth_snapshot().cwnd_bytes;
 
-    // Perturb the controller: register inflight + a loss.
+    // Perturb the controller: register inflight + a retransmission.
     s.on_packet_sent(200_000);
-    s.on_packet_lost(100_000);
+    s.on_packet_retransmitted(100_000);
     assert!(
         s.bandwidth_snapshot().inflight_bytes > 0,
         "precondition: on_packet_sent should register inflight bytes"
@@ -2202,6 +2422,193 @@ async fn udp_cookieless_initials_get_no_slot_until_address_validated() {
     );
 }
 
+/// PROTOCOL § 6.1: repeating a lost `ServerHello` must not turn the listener into an
+/// amplifier, and must never send anything to whoever asked for the repeat.
+///
+/// The repair being pinned here is the server answering a client that repeats its handshake
+/// flight, which before it existed was dropped: a single lost reply datagram cost the whole
+/// connect. The hazard it introduces is the obvious one — a ~3.5 KB question drawing a
+/// ~6.7 KB answer, now on demand rather than once — so both halves of the bound are measured
+/// against real traffic rather than argued.
+///
+/// The first half is RFC 9000 § 8.2 read as a ratio at the path: everything the server sent
+/// towards this client, including the flight the relay swallowed, against everything the
+/// client sent it. The relay swallows the first fragmented downstream flight, which is the
+/// `ServerHello` — the only message in this handshake large enough to fragment — so a repeat
+/// is genuinely required to complete the connect and the measurement covers the repair path
+/// rather than the quiet one.
+///
+/// The second half is stronger than a ratio: an off-path source that replays the captured
+/// hello verbatim — the best position anyone can occupy against a gate whose key is
+/// possession of the exact bytes — receives nothing at all. A repeat's destination comes
+/// from the server's record of a completed handshake, and the address in that record echoed
+/// an IP-bound cookie, which is what proves it is a real source. The listener's
+/// `initial_flights_on_committed_route_total` is what keeps that half from being vacuous: it
+/// says the replay reassembled and reached the branch that decides whether to repeat, and
+/// that the branch chose to send nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_handshake_reply_repeat_stays_inside_the_anti_amplification_bound() {
+    use phantom_protocol::api::session::connect_pinned_udp;
+    use phantom_protocol::api::udp_listener::PhantomUdpListener;
+    use phantom_protocol::transport::phantom_udp::envelope::{
+        decode_header, PacketType, FRAG_SUBHDR_LEN, PATH_MTU,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::UdpSocket;
+
+    /// RFC 9000 § 8.2. The listener enforces this when it decides to retain a reply at all;
+    /// what is checked here is the traffic that results.
+    const AMPLIFICATION_LIMIT: usize = 3;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let server_addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let pinned = listener.verifying_key_bytes();
+    let acceptor = listener.clone();
+    let accepted = tokio::spawn(async move { acceptor.accept().await });
+
+    // Relay: counts both directions, swallows the first fragmented downstream flight, and
+    // keeps the client's handshake datagrams so they can be replayed from elsewhere.
+    let downstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = downstream.local_addr().unwrap();
+    let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    upstream.connect(server_addr).await.unwrap();
+    let to_server = Arc::new(AtomicUsize::new(0));
+    let from_server = Arc::new(AtomicUsize::new(0));
+    let swallowed = Arc::new(AtomicUsize::new(0));
+    let captured: Arc<std::sync::Mutex<std::collections::HashMap<u32, Vec<Vec<u8>>>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    {
+        let (up, down) = (to_server.clone(), from_server.clone());
+        let lost = swallowed.clone();
+        let sink = captured.clone();
+        tokio::spawn(async move {
+            let mut c2s = vec![0u8; PATH_MTU + 64];
+            let mut s2c = vec![0u8; PATH_MTU + 64];
+            let mut client: Option<std::net::SocketAddr> = None;
+            let mut owed: Option<usize> = None;
+            loop {
+                tokio::select! {
+                    r = downstream.recv_from(&mut c2s) => {
+                        let Ok((n, from)) = r else { continue };
+                        client = Some(from);
+                        up.fetch_add(n, Ordering::Relaxed);
+                        let datagram = &c2s[..n];
+                        if let Ok((hdr, rest)) = decode_header(datagram) {
+                            if hdr.ty == PacketType::Initial
+                                && hdr.fragmented
+                                && rest.len() >= FRAG_SUBHDR_LEN
+                            {
+                                let pid = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
+                                sink.lock()
+                                    .unwrap()
+                                    .entry(pid)
+                                    .or_default()
+                                    .push(datagram.to_vec());
+                            }
+                        }
+                        let _ = upstream.send(datagram).await;
+                    }
+                    r = upstream.recv(&mut s2c) => {
+                        let Ok(n) = r else { continue };
+                        down.fetch_add(n, Ordering::Relaxed);
+                        let datagram = &s2c[..n];
+                        if let Ok((hdr, rest)) = decode_header(datagram) {
+                            if hdr.fragmented && rest.len() >= FRAG_SUBHDR_LEN {
+                                let total = u16::from_be_bytes([rest[6], rest[7]]) as usize;
+                                let left = owed.get_or_insert(total);
+                                if *left > 0 {
+                                    *left -= 1;
+                                    lost.fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                }
+                            }
+                        }
+                        if let Some(c) = client {
+                            let _ = downstream.send_to(datagram, c).await;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    let client = connect_pinned_udp("127.0.0.1".to_string(), relay_addr.port(), pinned)
+        .await
+        .expect("client socket");
+    client
+        .await_ready()
+        .await
+        .expect("the handshake completes through the repair");
+    // Snapshot before any application byte moves, so the ratio is the handshake's own.
+    let sent_by_server = from_server.load(Ordering::Relaxed);
+    let sent_by_client = to_server.load(Ordering::Relaxed);
+    let _outcome = accepted.await.expect("accept task").expect("session");
+
+    assert!(
+        swallowed.load(Ordering::Relaxed) > 0,
+        "the relay must have swallowed a reply flight, or this measures the path that never \
+         needed a repeat"
+    );
+    assert!(
+        sent_by_server <= sent_by_client * AMPLIFICATION_LIMIT,
+        "the server sent {sent_by_server} bytes for the client's {sent_by_client} — past the \
+         {AMPLIFICATION_LIMIT}× RFC 9000 §8.2 bound. A reply repeated on demand is only safe \
+         while each repeat costs the asker a whole flight"
+    );
+
+    // And an off-path source with a perfect capture gets nothing back.
+    let flight = {
+        let seen = captured.lock().unwrap();
+        let newest = seen
+            .keys()
+            .copied()
+            .max()
+            .expect("a captured client flight");
+        seen.get(&newest).cloned().expect("its datagrams")
+    };
+    let before = listener
+        .metrics_snapshot()
+        .initial_flights_on_committed_route_total;
+    let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    attacker.connect(server_addr).await.unwrap();
+    let mut asked = 0usize;
+    for _ in 0..8 {
+        for d in &flight {
+            attacker.send(d).await.expect("replay");
+            asked += d.len();
+        }
+    }
+    let mut buf = vec![0u8; PATH_MTU + 64];
+    let heard = tokio::time::timeout(Duration::from_secs(2), attacker.recv(&mut buf)).await;
+    assert!(
+        heard.is_err(),
+        "an off-path source that replayed {asked} bytes of captured hello received bytes \
+         back; the amplification factor towards whoever asks must be exactly zero"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while listener
+        .metrics_snapshot()
+        .initial_flights_on_committed_route_total
+        == before
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        listener
+            .metrics_snapshot()
+            .initial_flights_on_committed_route_total
+            > before,
+        "the replay must have reached the branch that decides whether to repeat; if it never \
+         got there, the zero above is about routing rather than about the bound"
+    );
+
+    listener.shutdown();
+}
+
 /// H-3 (audit 2026-06-11): the per-stream out-of-order reorder buffer must be bounded by
 /// BYTES, not just entries. A peer that leaves the head (offset 0) missing and streams future
 /// segments must not pin unbounded receiver RAM — each entry can be ~253 KiB (UDP) / 4 MiB
@@ -2228,8 +2635,11 @@ async fn reorder_buffer_is_byte_bounded_when_the_head_is_missing() {
 
 /// Idle keep-alive (`KEEPALIVE` PING/PONG) is invariant-safe: a keep-alive packet is
 /// `ENCRYPTED | KEEPALIVE` with an **empty** payload, so it
-///  (1) carries the post-handshake `ENCRYPTED` invariant flag (Inv-2 — the recv
-///      path drops every unencrypted post-handshake packet, including empty ones),
+///  (1) carries the post-handshake `ENCRYPTED` invariant flag, which is what the
+///      recv gate requires of it — the gate itself is driven by
+///      `forged_unencrypted_post_handshake_packet_is_dropped_by_the_recv_path`;
+///      the header here is one this test built, so this is a statement about the
+///      keep-alive's shape, not about the receiver,
 ///  (2) is AEAD-authenticated (the empty plaintext seals to a bare tag and opens
 ///      back to empty — an off-path peer cannot forge one),
 ///  (3) draws a per-direction packet number like any other packet, so a replayed
@@ -2294,6 +2704,112 @@ fn idle_keepalive_is_encrypted_authenticated_and_replay_protected() {
     assert!(
         matches!(replay, Err(CoreError::ReplayDetected(_))),
         "a replayed keep-alive must be rejected by the replay window (Inv-4); got {replay:?}"
+    );
+}
+
+/// The session-close frame (WIRE v8) is invariant-safe by exactly the mechanisms that
+/// make every other in-session control frame safe, and by nothing of its own:
+///  (1) it rides the already-declared `CONTROL` bit, which overlaps no other flag, and
+///      it does **not** spend `0x8000` — the one bit still unassigned. That is the
+///      point of putting a subtype byte inside the plaintext: a flag is a scarce
+///      16-entry namespace and three in-session control frames were added in the two
+///      revisions before this one, so the next one still has somewhere to go;
+///  (2) it carries `ENCRYPTED`, which is what the receive gate requires of it. That
+///      the gate holds is pinned by
+///      `forged_unencrypted_close_frame_cannot_end_a_session`, driven through a live
+///      pump; the header here is one this test built, so this is a statement about
+///      the frame's shape;
+///  (3) it AEAD-seals a one-byte plaintext and opens back to that byte — an off-path
+///      peer cannot forge one;
+///  (4) it draws a per-direction packet number, so a replay of a captured close is
+///      refused by the sliding window **after** AEAD verify (Inv-4). That is what
+///      makes the receive branch idempotent without the branch doing anything: a
+///      recorded close datagram is not a session-kill primitive.
+#[test]
+fn session_close_frame_is_encrypted_authenticated_and_replay_protected() {
+    use phantom_protocol::CoreError;
+
+    // (1a) CONTROL overlaps nothing else on the wire.
+    for other in [
+        PacketFlags::RELIABLE,
+        PacketFlags::ACK,
+        PacketFlags::FIN,
+        PacketFlags::UNRELIABLE,
+        PacketFlags::PRIORITY,
+        PacketFlags::ENCRYPTED,
+        PacketFlags::COMPRESSED,
+        PacketFlags::REKEY,
+        PacketFlags::PATH_VALIDATION,
+        PacketFlags::COALESCED,
+        PacketFlags::WINDOW_UPDATE,
+        PacketFlags::KEEPALIVE,
+        PacketFlags::PADDED,
+        PacketFlags::COVER,
+    ] {
+        assert_eq!(
+            PacketFlags::CONTROL & other,
+            0,
+            "CONTROL (0x{:04x}) must not overlap an existing flag (0x{other:04x})",
+            PacketFlags::CONTROL
+        );
+    }
+
+    // (1b) The last free bit is still free. A close frame that had taken it would
+    // have left the next in-session control frame with no bit at all.
+    let assigned = PacketFlags::RELIABLE
+        | PacketFlags::ACK
+        | PacketFlags::FIN
+        | PacketFlags::UNRELIABLE
+        | PacketFlags::PRIORITY
+        | PacketFlags::ENCRYPTED
+        | PacketFlags::COMPRESSED
+        | PacketFlags::CONTROL
+        | PacketFlags::REKEY
+        | PacketFlags::PATH_VALIDATION
+        | PacketFlags::COALESCED
+        | PacketFlags::WINDOW_UPDATE
+        | PacketFlags::KEEPALIVE
+        | PacketFlags::PADDED
+        | PacketFlags::COVER;
+    assert_eq!(
+        assigned & 0x8000,
+        0,
+        "0x8000 is the only unassigned flag bit; the close frame must not have spent it"
+    );
+
+    let (client, server) = make_session_pair([0x3Cu8; 32]);
+    let pn = client.next_send_pn();
+    let header = PacketHeader::new(
+        *server.id(),
+        1,
+        pn,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::CONTROL),
+    )
+    .with_epoch(client.current_epoch());
+    // (2) it carries ENCRYPTED.
+    assert!(
+        header.flags.contains(PacketFlags::ENCRYPTED),
+        "a close frame must be ENCRYPTED (Inv-2 downgrade defense)"
+    );
+
+    // (3) it AEAD-seals the subtype byte and opens back to it — authenticated.
+    let body = [ControlSubtype::CLOSE];
+    let ct = client
+        .encrypt_packet(&header, &body, &[])
+        .expect("seal close frame");
+    let pt = server
+        .decrypt_packet(&header, &ct, &[])
+        .expect("authenticated close frame opens");
+    assert_eq!(
+        pt, body,
+        "the control body is the close subtype and nothing else"
+    );
+
+    // (4) a replayed close (same PN) is rejected AFTER AEAD verify (Inv-4).
+    let replay = server.decrypt_packet(&header, &ct, &[]);
+    assert!(
+        matches!(replay, Err(CoreError::ReplayDetected(_))),
+        "a replayed close must be rejected by the replay window (Inv-4); got {replay:?}"
     );
 }
 
@@ -2406,5 +2922,1228 @@ async fn client_server_migration_candidate_is_anti_amp_capped_and_never_the_send
             .await
             .is_err(),
         "an unvalidated candidate must never receive app data — it is not the c2s send target"
+    );
+}
+
+/// Receive-side memory amplification by an authenticated peer (threat-model §5 §D).
+///
+/// A peer chooses how many streams to open, how much it sends and how long it leaves a
+/// reassembly hole open, so every receive-side buffer is a commitment this side makes on
+/// the peer's word. The advertised receive window is the head of that chain — it sizes
+/// both what one stream may hold unconsumed and the reorder budget that tracks it — which
+/// is why window growth is drawn from **one allowance per session** rather than granted
+/// per stream: a per-stream ceiling multiplies by `MAX_STREAMS`, a session-wide one does
+/// not.
+///
+/// The bound is per **session**, deliberately (a process-wide pool would let one peer's
+/// growth decide another peer's window). What this pins is that the per-session bound
+/// really is per-session: N sessions of M streams hold no more than N budgets between them.
+#[tokio::test]
+async fn recv_window_growth_is_bounded_per_session_not_per_stream() {
+    tokio::time::pause();
+    const SESSIONS: usize = 3;
+    const STREAMS_PER_SESSION: usize = 32;
+
+    // Every stream of every session consumes far more than the whole budget is worth, so
+    // growth stops because the session ran out of allowance, not because an application
+    // stopped reading.
+    let mut per_session_growth = Vec::new();
+    for i in 0..SESSIONS {
+        let (session, _peer) = make_session_pair([0x40 + i as u8; 32]);
+        let streams: Vec<_> = (0..STREAMS_PER_SESSION)
+            .map(|_| session.open_stream().expect("open a stream"))
+            .collect();
+        for s in &streams {
+            s.record_app_consumed(1, true); // open each measurement interval
+        }
+        for _ in 0..40 {
+            tokio::time::advance(Duration::from_millis(400)).await;
+            for s in &streams {
+                s.record_app_consumed(MAX_RECV_WINDOW, true);
+            }
+        }
+        per_session_growth.push(
+            streams
+                .iter()
+                .map(|s| u64::from(s.advertised_recv_window() - INITIAL_STREAM_WINDOW))
+                .sum::<u64>(),
+        );
+    }
+
+    for (i, growth) in per_session_growth.iter().enumerate() {
+        assert!(
+            *growth <= u64::from(SESSION_RECV_WINDOW_GROWTH_BUDGET),
+            "session {i}'s {STREAMS_PER_SESSION} streams grew by {growth} B against a \
+             {SESSION_RECV_WINDOW_GROWTH_BUDGET} B session budget — the budget is being \
+             handed out per stream, so the commitment scales with stream count"
+        );
+    }
+    let total: u64 = per_session_growth.iter().sum();
+    assert!(
+        total <= SESSIONS as u64 * u64::from(SESSION_RECV_WINDOW_GROWTH_BUDGET),
+        "{SESSIONS} sessions × {STREAMS_PER_SESSION} streams grew by {total} B; the \
+         documented bound is one budget per session"
+    );
+
+    // Positive control: the assertions above are not vacuous. The naive removal of the
+    // mechanism is one budget per stream — exactly what a stream built without a shared
+    // handle gets — and under it the same streams blow past the bound.
+    let mut unshared_total = 0u64;
+    for _ in 0..SESSIONS {
+        let streams: Vec<Stream> = (0..STREAMS_PER_SESSION)
+            .map(|id| Stream::with_recv_tuning(id as u16, Arc::new(SharedRecvTuning::default())))
+            .collect();
+        for s in &streams {
+            s.record_app_consumed(1, true);
+        }
+        for _ in 0..40 {
+            tokio::time::advance(Duration::from_millis(400)).await;
+            for s in &streams {
+                s.record_app_consumed(MAX_RECV_WINDOW, true);
+            }
+        }
+        unshared_total += streams
+            .iter()
+            .map(|s| u64::from(s.advertised_recv_window() - INITIAL_STREAM_WINDOW))
+            .sum::<u64>();
+    }
+    assert!(
+        unshared_total > SESSIONS as u64 * u64::from(SESSION_RECV_WINDOW_GROWTH_BUDGET),
+        "this test no longer exercises the budget: without it these streams took only \
+         {unshared_total} B, which one budget per session already covers"
+    );
+}
+
+/// The growth allowance is per session, so what a *process* commits is its session cap
+/// times one allowance — and that arithmetic is published, which makes it a thing that can
+/// go stale.
+///
+/// `CHANGELOG.md`, `docs/security/threat-model.md` §5 §D.1,
+/// `docs/operations/deployment.md` and the Helm chart's `values.yaml` all state the figure
+/// for the reference server's default `PHANTOM_MAX_SESSIONS` of 1024. This test pins it
+/// against what sessions are *observed* to draw rather than against the constant it was
+/// typed from: if the allowance ever stopped being enforced, the observed per-session
+/// maximum would exceed it and the published product would silently understate the process
+/// by whatever factor the enforcement was out.
+///
+/// The two constants below are literals in a crate that cannot see `server/`, so this test
+/// on its own could only ever agree with the tree it was written against.
+/// `scripts/check_memory_arithmetic.py` is what couples them: it reads
+/// `PHANTOM_MAX_SESSIONS`'s clap default out of `server/src/config.rs`, reads
+/// `SESSION_RECV_WINDOW_GROWTH_BUDGET` out of `core/src/transport/stream.rs`, recomputes
+/// the product, and fails when this file or any published statement of it disagrees. Change
+/// the server's default and that script is what says so — this test would stay green.
+///
+/// Companion to `recv_window_growth_is_bounded_per_session_not_per_stream`, which pins the
+/// *per-session* half. This one pins the multiplier.
+#[tokio::test]
+async fn the_published_process_growth_figure_is_the_session_cap_times_what_a_session_draws() {
+    tokio::time::pause();
+    const SESSIONS: usize = 4;
+    const STREAMS_PER_SESSION: usize = 16;
+    // Both figures below are checked against `server/src/config.rs` and
+    // `core/src/transport/stream.rs` by `scripts/check_memory_arithmetic.py`, which parses
+    // these two lines by name. Keep the names and the literal forms.
+    /// `PHANTOM_MAX_SESSIONS`'s default in the reference server.
+    const REFERENCE_DEFAULT_SESSION_CAP: u64 = 1024;
+    /// The receive-window growth those sessions commit, as published alongside that cap.
+    const PUBLISHED_PROCESS_GROWTH: u64 = 8 * 1024 * 1024 * 1024;
+
+    // Drive every stream of every session far past what any window could absorb, so growth
+    // stops where the session runs out of allowance rather than where an application
+    // stopped reading. Sessions are built and driven one at a time: what is being measured
+    // is the maximum one of them reaches, and that is the multiplicand of the arithmetic.
+    let mut per_session_growth = Vec::new();
+    for i in 0..SESSIONS {
+        let (session, _peer) = make_session_pair([0x70 + i as u8; 32]);
+        let streams: Vec<_> = (0..STREAMS_PER_SESSION)
+            .map(|_| session.open_stream().expect("open a stream"))
+            .collect();
+        for s in &streams {
+            s.record_app_consumed(1, true); // open each stream's measurement interval
+        }
+        for _ in 0..40 {
+            tokio::time::advance(Duration::from_millis(400)).await;
+            for s in &streams {
+                s.record_app_consumed(MAX_RECV_WINDOW, true);
+            }
+        }
+        per_session_growth.push(
+            streams
+                .iter()
+                .map(|s| u64::from(s.advertised_recv_window() - INITIAL_STREAM_WINDOW))
+                .sum::<u64>(),
+        );
+    }
+
+    let worst = *per_session_growth
+        .iter()
+        .max()
+        .expect("SESSIONS is non-zero, so there is a maximum");
+
+    // The multiplicand has to be the real per-session maximum from both sides. Too high and
+    // the published product is not a bound at all; too low — a session that never managed
+    // to spend its allowance — and the product would look safe for a reason that has
+    // nothing to do with enforcement. The smallest step a window can grow by is one
+    // `INITIAL_STREAM_WINDOW` (the first doubling of a fresh stream), so a session within
+    // one of those of the allowance has spent everything a doubling could claim.
+    assert!(
+        worst <= u64::from(SESSION_RECV_WINDOW_GROWTH_BUDGET),
+        "a session drew {worst} B of window growth against a \
+         {SESSION_RECV_WINDOW_GROWTH_BUDGET} B allowance — the per-session bound is not \
+         holding, so every published process figure derived from it understates by the \
+         same factor"
+    );
+    assert!(
+        worst + u64::from(INITIAL_STREAM_WINDOW) > u64::from(SESSION_RECV_WINDOW_GROWTH_BUDGET),
+        "a session only managed {worst} B of the {SESSION_RECV_WINDOW_GROWTH_BUDGET} B \
+         allowance, so this test is not measuring the maximum and the arithmetic below \
+         would pass for the wrong reason"
+    );
+
+    let total: u64 = per_session_growth.iter().sum();
+    assert!(
+        total <= SESSIONS as u64 * u64::from(SESSION_RECV_WINDOW_GROWTH_BUDGET),
+        "{SESSIONS} sessions drew {total} B between them; nothing divides the allowance \
+         across sessions, so the process figure is the session count times one allowance"
+    );
+
+    // The published product, checked against the observed multiplicand rather than against
+    // the constant it was written from.
+    assert!(
+        REFERENCE_DEFAULT_SESSION_CAP * worst <= PUBLISHED_PROCESS_GROWTH,
+        "{REFERENCE_DEFAULT_SESSION_CAP} sessions each drawing the observed {worst} B come \
+         to more than the published {PUBLISHED_PROCESS_GROWTH} B, so every document that \
+         states the product is out"
+    );
+    assert!(
+        REFERENCE_DEFAULT_SESSION_CAP * (worst + u64::from(INITIAL_STREAM_WINDOW))
+            > PUBLISHED_PROCESS_GROWTH,
+        "the published {PUBLISHED_PROCESS_GROWTH} B is loose against what \
+         {REFERENCE_DEFAULT_SESSION_CAP} sessions of {worst} B actually reach; a figure \
+         with slack in it invites being read as headroom that is not there"
+    );
+}
+
+/// Bytes the real delivery queue takes to park `n` one-byte items, over and above the
+/// payload — measured, not modelled. The payloads are allocated before the measurement
+/// starts and sliced inside it, exactly as the reliable receive path does
+/// (`plaintext.slice(4..)`), so what the delta captures is the queue slot plus the
+/// reference block that slice allocates.
+fn measured_backlog_structure_per_item(n: usize) -> f64 {
+    let payloads: Vec<Bytes> = (0..n).map(|_| Bytes::from(vec![0u8; 1])).collect();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<StreamMessage>();
+    let before = live_heap();
+    for p in &payloads {
+        tx.send(StreamMessage::Data(p.slice(0..1)))
+            .expect("receiver alive");
+    }
+    let used = live_heap() - before;
+    drop(rx);
+    drop(payloads);
+    used as f64 / n as f64
+}
+
+/// A queued delivery item costs more than the bytes it carries, so a cap that counts only
+/// payload does not cap memory.
+///
+/// The item count, not the byte count, is what a peer choosing minimum-size segments
+/// controls: at one byte per item a payload-only cap of `RECV_DELIVERY_HARD_CAP` admits
+/// four million items, and an item is not one byte. This measures what one really costs
+/// and requires `DELIVERY_ITEM_OVERHEAD_BYTES` — the figure the accounting charges on top
+/// of the payload — to cover it, which is what turns the cap into a bound on resident
+/// bytes.
+#[test]
+fn a_queued_delivery_item_costs_more_than_the_payload_it_carries() {
+    let per_item = measured_backlog_structure_per_item(1 << 15);
+
+    // Positive control: a measurement that cannot see anything would satisfy the bound
+    // below for free.
+    assert!(
+        per_item > 8.0,
+        "the heap measurement saw only {per_item:.1} B per queued item — it is not \
+         observing the queue, so the bound below would hold vacuously"
+    );
+    assert!(
+        per_item <= DELIVERY_ITEM_OVERHEAD_BYTES as f64,
+        "one queued delivery item really costs {per_item:.1} B of structure, but the \
+         backlog charges {DELIVERY_ITEM_OVERHEAD_BYTES} B for it — with that charge \
+         {RECV_DELIVERY_HARD_CAP} B of counted backlog is {:.0} MiB resident, so the cap \
+         bounds a number rather than a memory",
+        RECV_DELIVERY_HARD_CAP as f64 / (1.0 + DELIVERY_ITEM_OVERHEAD_BYTES as f64) * per_item
+            / (1024.0 * 1024.0)
+    );
+}
+
+/// Each of the two per-stream receive buffers must stay inside the figure published for it.
+///
+/// These are stated separately and never added up. A per-session total has to enumerate
+/// every allocation the receive path makes, including the ones under this crate's own
+/// abstractions — the byte pipe's accumulator, PhantomUDP's fragment reassembly, the
+/// `Stream` structures — and a total that misses one reads as a bound while being an
+/// estimate. What is checked here is what each row of the published table claims, measured
+/// against the real structure driven to its own cap.
+///
+/// The reorder buffer is held at its entry cap by a hole that never fills, using one-byte
+/// segments: that is the shape the byte budget does not bound, and the entry-structure
+/// figure is what covers it. The delivery channel is filled to its depth with the largest
+/// payload the frame gate admits, which is now a figure this side enforces rather than the
+/// chunk size the *sender* happens to use.
+#[tokio::test(flavor = "current_thread")]
+async fn the_per_stream_receive_buffers_stay_inside_the_figures_published_for_them() {
+    // ── One stream's reorder buffer, held at its entry cap ──
+    let stream = Stream::new(11);
+    let before = live_heap();
+    for i in 0..MAX_RECV_REORDER {
+        let offset = 1 + i as u32 * 2;
+        stream
+            .accept_in_order(offset, vec![Bytes::from(vec![0u8; 1])])
+            .await;
+    }
+    let reorder_resident = (live_heap() - before).max(0) as u64;
+
+    // ── One stream's delivery channel, filled to its depth at the largest admitted item ──
+    let (demux, _control_rx) = StreamDemultiplexer::new_with_role(16, false);
+    let handle = demux.register_stream(21, STREAM_RECV_CHANNEL_DEPTH);
+    let before = live_heap();
+    for _ in 0..STREAM_RECV_CHANNEL_DEPTH {
+        assert!(
+            demux
+                .route_data_async(21, Bytes::from(vec![0u8; MAX_RECV_PAYLOAD]))
+                .await,
+            "the registered stream must accept up to its channel depth"
+        );
+    }
+    let channel_resident = (live_heap() - before).max(0) as u64;
+    drop(handle);
+
+    // Positive control: both measurements have to be seeing the structures they name, or
+    // the comparisons below are satisfied by measuring nothing.
+    assert!(
+        reorder_resident > MAX_RECV_REORDER as u64
+            && channel_resident > (STREAM_RECV_CHANNEL_DEPTH * MAX_RECV_PAYLOAD) as u64,
+        "the heap measurement is not observing the buffers: reorder {reorder_resident} B, \
+         channel {channel_resident} B"
+    );
+
+    let reorder_published = MAX_RECV_REORDER as u64 * (REORDER_ENTRY_OVERHEAD_BYTES as u64 + 1);
+    assert!(
+        reorder_resident <= reorder_published,
+        "a reorder buffer held at its entry cap takes {reorder_resident} B against a \
+         published {reorder_published} B ({REORDER_ENTRY_OVERHEAD_BYTES} B of structure \
+         per entry)"
+    );
+
+    let channel_published =
+        STREAM_RECV_CHANNEL_DEPTH as u64 * (MAX_RECV_PAYLOAD as u64 + DELIVERY_ITEM_OVERHEAD_BYTES);
+    assert!(
+        channel_resident <= channel_published,
+        "one stream's delivery channel at its depth takes {channel_resident} B against a \
+         published {channel_published} B ({STREAM_RECV_CHANNEL_DEPTH} slots of \
+         {MAX_RECV_PAYLOAD} B plus {DELIVERY_ITEM_OVERHEAD_BYTES} B of structure each)"
+    );
+}
+
+// ── Invariant 2: the receive path rejects unencrypted post-handshake packets ──
+//
+// The neighbouring AAD tests above say a genuine packet cannot have its `ENCRYPTED`
+// flag stripped without breaking the tag. That is a different statement from the one
+// Invariant 2 makes, which is about a packet that was never sealed at all: the recv
+// loop drops it before it can be routed, empty payload included (the M-2 forged
+// standalone FIN). Reaching that gate means going through the real pump — header
+// protection, the version gate, the session-id bind — so this drives a live
+// `PhantomSession` against a hand-run server and puts the forgeries on the wire.
+
+/// The wire between the client under test and the server this test plays. Message
+/// oriented like every other `SessionTransport`, so a frame handed to `to_peer` is
+/// exactly one frame out of the client's `recv_bytes` — which is what lets the test
+/// forge a single packet rather than a byte stream.
+///
+/// A leaf transport, not a wrapper: it has no address and no migration, so the
+/// defaulted control surface of the trait is the right answer for every method it
+/// does not implement. The EPS-04 forwarding obligation is on types that wrap
+/// another `SessionTransport` and would otherwise silence its control calls.
+struct PipeTransport {
+    to_peer: tokio::sync::mpsc::Sender<Bytes>,
+    from_peer: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Bytes>>,
+}
+
+impl phantom_protocol::api::session::SessionTransport for PipeTransport {
+    async fn send_bytes(&self, data: &[u8]) -> Result<(), phantom_protocol::CoreError> {
+        self.to_peer
+            .send(Bytes::copy_from_slice(data))
+            .await
+            .map_err(|_| phantom_protocol::CoreError::NetworkError("pipe closed".into()))
+    }
+
+    async fn recv_bytes(&self) -> Result<Bytes, phantom_protocol::CoreError> {
+        self.from_peer
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or_else(|| phantom_protocol::CoreError::NetworkError("pipe closed".into()))
+    }
+}
+
+/// **Invariant 2.** A post-handshake packet that arrives without `ENCRYPTED` is
+/// dropped by the receive path — it is never decrypted, never routed to a stream,
+/// and its `FIN` never closes one. This is the stripped-flag downgrade defence, and
+/// the case it exists for is the smallest possible forgery: a standalone FIN
+/// carrying no application data, which under the pre-M-2 rule (drop only *non-empty*
+/// unencrypted payloads) would have torn a stream down without any AEAD verification.
+///
+/// The frames ride an `open_stream()` stream rather than the reserved raw-app id,
+/// because that is the only place a FIN means anything: the delivery router discards
+/// `DeliverItem::Close` for ids 0 and 1 outright ("not used in the current
+/// protocol"), and the raw-app `recv()` reads a plain channel that has no EOF at
+/// all. A forged FIN aimed there could not close a thing even with the gate deleted,
+/// so an assertion about it would be unfalsifiable.
+///
+/// Four frames go down the wire, in order, and the stream's own `recv()` is the
+/// barrier that proves each was processed before the next was read:
+///
+///  1. a forged FIN with a literally empty payload. On the v6 wire this cannot even
+///     reach the flag gate: header protection samples the first 16 ciphertext bytes,
+///     so a frame with no payload fails to unmask and is dropped one layer earlier.
+///     Pinned here because it is the shape the audit named — the gate is required to
+///     hold it, whichever layer happens to reach it first;
+///  2. a forged FIN at the smallest size header protection admits — 16 payload
+///     bytes, masked with the server's real send key so it unmasks into a valid
+///     header on the client. Its bytes are laid out as a reliable frame at stream
+///     offset 0, so a receiver that skipped the gate would hand `downgraded!!` to
+///     the application;
+///  3. a genuine `ENCRYPTED | RELIABLE` frame on the same stream and path;
+///  4. a second genuine frame, the next segment on the same stream.
+///
+/// (3) and (4) fail for different regressions, which is why both are here.
+///
+/// (3) is what a *deleted* gate breaks: the forgery's bytes are delivered and the
+/// stream yields `downgraded!!` where `authentic` was expected.
+///
+/// (4) is what a *partial* gate breaks — one that refuses the forgery's payload but
+/// still records its FIN. That the two come apart at all is a consequence of the FIN
+/// release being order-gated: `note_remote_fin` only files the offset, and
+/// `take_in_order_fin` releases the EOF later, once the in-order cursor has passed
+/// it. So a gate that drops the bytes and notes the FIN leaves (3) intact — the
+/// authentic frame is delivered, and is itself what advances the cursor past the
+/// forged offset — and surfaces one frame later as `Ok(None)` in place of (4). Only
+/// (4) catches that; hoisting the FIN bookkeeping above the gate, on the reasoning
+/// that a FIN arriving over a reorder gap must not be lost, produces exactly it.
+///
+/// Both are also the two-sidedness: a receive path that dropped *everything* would
+/// satisfy any assertion about the forgeries and fail (3) and (4) both. The drop
+/// counter is the third leg — it separates "refused" from "never arrived".
+#[tokio::test]
+async fn forged_unencrypted_post_handshake_packet_is_dropped_by_the_recv_path() {
+    use phantom_protocol::api::PhantomSession;
+    use phantom_protocol::transport::handshake::ServerReply;
+
+    let (to_client_tx, to_client_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+    let (to_server_tx, mut to_server_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+    let client_transport = PipeTransport {
+        to_peer: to_server_tx,
+        from_peer: tokio::sync::Mutex::new(to_client_rx),
+    };
+
+    let server_hs = HandshakeServer::new().expect("server handshake state");
+    let pinned = server_hs.verifying_key().clone();
+    let session = PhantomSession::connect_with_transport("pipe-peer:0", client_transport, pinned);
+
+    // Run the server side by hand: the DoS gate answers the first hello with a
+    // cookie `Retry`, and the re-sent hello succeeds. Looping rather than
+    // straight-lining keeps the test correct if the gate ever adds a round.
+    let client_ip = "127.0.0.1".parse().expect("client ip");
+    let server_session = loop {
+        let hello_bytes = to_server_rx.recv().await.expect("client hello");
+        let hello = borsh::from_slice::<ClientHello>(&hello_bytes).expect("decode client hello");
+        match server_hs.process_client_hello(&hello, 0, client_ip) {
+            HandshakeResponse::Retry(retry) => {
+                let wire = ServerReply::Retry(retry).to_wire().expect("encode retry");
+                to_client_tx
+                    .send(Bytes::from(wire))
+                    .await
+                    .expect("send retry");
+            }
+            HandshakeResponse::Success(server_hello, negotiated, _) => {
+                let wire = ServerReply::Hello(server_hello)
+                    .to_wire()
+                    .expect("encode server hello");
+                to_client_tx
+                    .send(Bytes::from(wire))
+                    .await
+                    .expect("send server hello");
+                break negotiated;
+            }
+            HandshakeResponse::Reject(r) => panic!("server rejected its own client: {r:?}"),
+            HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
+        }
+    };
+
+    session
+        .await_ready()
+        .await
+        .expect("the pinned handshake completes");
+
+    assert_eq!(
+        session.metrics_snapshot().unencrypted_dropped_total,
+        0,
+        "nothing has been dropped yet — the handshake itself must not trip the gate"
+    );
+
+    let session_id = *server_session.id();
+
+    // The target stream. `open_stream()` registers it in the demux and in the stream
+    // table the pump reads, both of which the session created before the pump was
+    // spawned, so no wire traffic and no cooperation from the server side is needed
+    // to make the client route frames stamped with this id to it.
+    let app_stream = session.open_stream().expect("open a stream");
+    let target: u16 = app_stream
+        .stream_id()
+        .try_into()
+        .expect("a locally-opened stream id fits the wire field");
+
+    // (1) The empty-payload forged FIN. Unmasked on purpose: there is nothing to
+    // mask it against, since header protection derives its mask from a ciphertext
+    // sample this frame does not have.
+    let empty_fin = PhantomPacket::new(
+        PacketHeader::new(
+            session_id,
+            target,
+            1,
+            PacketFlags::new(PacketFlags::RELIABLE | PacketFlags::FIN),
+        ),
+        Vec::new(),
+    );
+    to_client_tx
+        .send(Bytes::from(empty_fin.to_wire()))
+        .await
+        .expect("send empty forged FIN");
+
+    // (2) The same forgery at the smallest size the wire admits. The payload of an
+    // unencrypted packet IS its plaintext, so these bytes are laid out exactly as the
+    // reliable receive path expects — `[stream_offset: u32 BE][data]` at offset 0 —
+    // to make a missing gate deliver something recognisable rather than something
+    // that happens to be discarded further down.
+    let mut forged_payload = 0u32.to_be_bytes().to_vec();
+    forged_payload.extend_from_slice(b"downgraded!!");
+    assert_eq!(
+        forged_payload.len(),
+        16,
+        "the minimum header-protected size"
+    );
+    let forged_fin = PhantomPacket::new(
+        PacketHeader::new(
+            session_id,
+            target,
+            2,
+            PacketFlags::new(PacketFlags::RELIABLE | PacketFlags::FIN),
+        ),
+        forged_payload,
+    );
+    let forged_wire = server_session
+        .protect_packet(&forged_fin)
+        .expect("mask the forgery with the real send key");
+    to_client_tx
+        .send(Bytes::from(forged_wire))
+        .await
+        .expect("send forged FIN");
+
+    // (3) The authentic frame — first reliable frame server→client on this stream, so
+    // its gap-free stream offset is 0.
+    let genuine_header = PacketHeader::new(
+        session_id,
+        target,
+        3,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
+    )
+    .with_epoch(server_session.current_epoch());
+    let mut genuine_plaintext = 0u32.to_be_bytes().to_vec();
+    genuine_plaintext.extend_from_slice(b"authentic");
+    let ciphertext = server_session
+        .encrypt_packet(&genuine_header, &genuine_plaintext, &[])
+        .expect("seal the authentic frame");
+    let genuine_wire = server_session
+        .protect_packet(&PhantomPacket::new(genuine_header, ciphertext))
+        .expect("protect the authentic frame");
+    to_client_tx
+        .send(Bytes::from(genuine_wire))
+        .await
+        .expect("send authentic frame");
+
+    // The pipe is FIFO and the reader task drains it in order, so a delivered
+    // authentic payload proves both forgeries were seen and disposed of first. The
+    // timeout is only there so that a build which swallowed the frame fails instead
+    // of hanging.
+    let delivered = tokio::time::timeout(Duration::from_secs(10), app_stream.recv())
+        .await
+        .expect("the authentic frame is delivered")
+        .expect("recv")
+        .expect("the stream is open, so this is data and not a peer FIN");
+    assert_eq!(
+        delivered, b"authentic",
+        "the forged unencrypted frame must not reach the application"
+    );
+
+    // (4) The other half of what a forged FIN would have done. Not delivering its
+    // bytes is only one of the two effects the gate prevents; the other is the FIN
+    // itself, which half-closes the stream and makes everything after it unreachable.
+    // A second authentic frame is what separates "the forged bytes were discarded"
+    // from "the forged FIN was not acted on" — a receiver that did the first but not
+    // the second returns `Ok(None)` here. Its prefix is 1, not the byte length of the
+    // frame before it: the `[stream_offset: u32 BE]` field the reliable path reorders
+    // on counts segments, one per frame, whatever each one carries.
+    let second_header = PacketHeader::new(
+        session_id,
+        target,
+        4,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
+    )
+    .with_epoch(server_session.current_epoch());
+    let mut second_plaintext = 1u32.to_be_bytes().to_vec();
+    second_plaintext.extend_from_slice(b"still-open");
+    let second_ciphertext = server_session
+        .encrypt_packet(&second_header, &second_plaintext, &[])
+        .expect("seal the follow-up frame");
+    let second_wire = server_session
+        .protect_packet(&PhantomPacket::new(second_header, second_ciphertext))
+        .expect("protect the follow-up frame");
+    to_client_tx
+        .send(Bytes::from(second_wire))
+        .await
+        .expect("send follow-up frame");
+
+    let after_fin = tokio::time::timeout(Duration::from_secs(10), app_stream.recv())
+        .await
+        .expect("a follow-up frame arrives")
+        .expect("recv");
+    assert_eq!(
+        after_fin.as_deref(),
+        Some(&b"still-open"[..]),
+        "the forged FIN must not have half-closed the stream — `None` here is the \
+         peer's EOF, released from a FIN that was never authenticated"
+    );
+
+    // The counter is what separates "the gate refused something" from "nothing ever
+    // arrived" — the two are otherwise indistinguishable from outside. It is asserted
+    // as a floor rather than as an exact figure on purpose: today it reads exactly 1,
+    // because forgery (1) is refused one layer earlier by header protection, whose
+    // mask needs a 16-byte ciphertext sample an empty payload cannot supply
+    // (`Session::hp_sample`). Which layer catches the empty case is that layer's
+    // business and is pinned with it; pinning it here would turn a change in the
+    // header-protection minimum into a failure of an invariant-2 test.
+    let dropped = session.metrics_snapshot().unencrypted_dropped_total;
+    assert!(
+        dropped >= 1,
+        "the ENCRYPTED gate never fired, so nothing above shows the forgery was \
+         refused rather than lost (unencrypted_dropped_total = {dropped})"
+    );
+}
+
+/// **Invariant 2, for the close frame.** A `CONTROL` frame that arrives without
+/// `ENCRYPTED` must not end a session.
+///
+/// This is the one new attack surface the close frame opens, and it is the reason the
+/// receive branch sits below the AEAD gate rather than above it. Above the gate, a
+/// single short datagram — a header, a `CONTROL` flag and one plaintext byte — sent by
+/// anyone who can guess a connection id would tear down a live session. Below it, the
+/// forgery is refused before anything reads its subtype, because a frame that no key
+/// sealed is not a frame the peer sent.
+///
+/// The liveness probe afterwards is the two-sidedness: a receive path that dropped
+/// *everything* would satisfy any assertion about the forgery alone. The authentic
+/// frame delivered after it proves the session survived rather than that the pipe went
+/// quiet, and the drop counter separates "refused" from "never arrived".
+#[tokio::test]
+async fn forged_unencrypted_close_frame_cannot_end_a_session() {
+    use phantom_protocol::api::PhantomSession;
+    use phantom_protocol::transport::handshake::ServerReply;
+
+    let (to_client_tx, to_client_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+    let (to_server_tx, mut to_server_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+    let client_transport = PipeTransport {
+        to_peer: to_server_tx,
+        from_peer: tokio::sync::Mutex::new(to_client_rx),
+    };
+
+    let server_hs = HandshakeServer::new().expect("server handshake state");
+    let pinned = server_hs.verifying_key().clone();
+    let session = PhantomSession::connect_with_transport("pipe-peer:0", client_transport, pinned);
+
+    let client_ip = "127.0.0.1".parse().expect("client ip");
+    let server_session = loop {
+        let hello_bytes = to_server_rx.recv().await.expect("client hello");
+        let hello = borsh::from_slice::<ClientHello>(&hello_bytes).expect("decode client hello");
+        match server_hs.process_client_hello(&hello, 0, client_ip) {
+            HandshakeResponse::Retry(retry) => {
+                let wire = ServerReply::Retry(retry).to_wire().expect("encode retry");
+                to_client_tx
+                    .send(Bytes::from(wire))
+                    .await
+                    .expect("send retry");
+            }
+            HandshakeResponse::Success(server_hello, negotiated, _) => {
+                let wire = ServerReply::Hello(server_hello)
+                    .to_wire()
+                    .expect("encode server hello");
+                to_client_tx
+                    .send(Bytes::from(wire))
+                    .await
+                    .expect("send server hello");
+                break negotiated;
+            }
+            HandshakeResponse::Reject(r) => panic!("server rejected its own client: {r:?}"),
+            HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
+        }
+    };
+
+    session
+        .await_ready()
+        .await
+        .expect("the pinned handshake completes");
+    let session_id = *server_session.id();
+    let app_stream = session.open_stream().expect("open a stream");
+    let target: u16 = app_stream
+        .stream_id()
+        .try_into()
+        .expect("a locally-opened stream id fits the wire field");
+
+    // The forgery. Its payload IS its plaintext (nothing sealed it), laid out exactly
+    // as the control path reads one — the close subtype first — so that a branch which
+    // ran above the AEAD gate would find a well-formed close and act on it. Sixteen
+    // bytes because that is the smallest ciphertext sample header protection can mask
+    // against; anything shorter is refused a layer earlier and would prove nothing
+    // about this gate.
+    let mut forged_body = vec![ControlSubtype::CLOSE];
+    forged_body.resize(16, 0);
+    let forged = PhantomPacket::new(
+        PacketHeader::new(
+            session_id,
+            target,
+            1,
+            PacketFlags::new(PacketFlags::CONTROL),
+        ),
+        forged_body,
+    );
+    let forged_wire = server_session
+        .protect_packet(&forged)
+        .expect("mask the forgery with the real send key");
+    to_client_tx
+        .send(Bytes::from(forged_wire))
+        .await
+        .expect("send forged close");
+
+    // The liveness probe: first reliable frame server→client on this stream, so its
+    // gap-free stream offset is 0.
+    let genuine_header = PacketHeader::new(
+        session_id,
+        target,
+        2,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
+    )
+    .with_epoch(server_session.current_epoch());
+    let mut genuine_plaintext = 0u32.to_be_bytes().to_vec();
+    genuine_plaintext.extend_from_slice(b"still-here");
+    let ciphertext = server_session
+        .encrypt_packet(&genuine_header, &genuine_plaintext, &[])
+        .expect("seal the authentic frame");
+    let genuine_wire = server_session
+        .protect_packet(&PhantomPacket::new(genuine_header, ciphertext))
+        .expect("protect the authentic frame");
+    to_client_tx
+        .send(Bytes::from(genuine_wire))
+        .await
+        .expect("send authentic frame");
+
+    // The pipe is FIFO and the reader drains it in order, so a delivered authentic
+    // payload proves the forgery was seen and disposed of first. The timeout is only
+    // there so that a build which tore the session down fails instead of hanging.
+    let delivered = tokio::time::timeout(Duration::from_secs(10), app_stream.recv())
+        .await
+        .expect("the session is still alive after the forged close")
+        .expect("recv")
+        .expect("the stream is open, so this is data and not a peer FIN");
+    assert_eq!(
+        delivered, b"still-here",
+        "a forged unencrypted close must not end the session"
+    );
+
+    let dropped = session.metrics_snapshot().unencrypted_dropped_total;
+    assert!(
+        dropped >= 1,
+        "the ENCRYPTED gate never fired, so nothing above shows the forged close was \
+         refused rather than lost (unencrypted_dropped_total = {dropped})"
+    );
+}
+
+/// An authenticated close does not discard what is behind it, and the window in which
+/// it does not is **bounded**.
+///
+/// Both halves are one property and neither is safe alone. The close is not
+/// `RELIABLE`, carries no stream offset and is never acknowledged, so nothing re-sends
+/// data it overtakes; a receiver that tore down on the first copy would destroy bytes
+/// the peer's `send()` had already returned `Ok` for, silently at both ends. But a
+/// receiver that simply kept reading would have turned an unacknowledged one-byte
+/// frame into a way for a peer to decide how long this side holds a session's
+/// resources. So it drains: it keeps reading for a window it computes itself, and
+/// then it goes.
+///
+/// The two frames go down a FIFO pipe in the order a reordering path would deliver
+/// them — close first, data behind it — and the stream's own `recv()` is the barrier
+/// proving the close was processed before the data was read. The teardown assertion
+/// afterwards is what stops this from passing on a build that never closes at all.
+#[tokio::test]
+async fn an_authenticated_close_drains_trailing_data_and_then_ends_the_session() {
+    use phantom_protocol::api::session::ConnectionState;
+    use phantom_protocol::api::PhantomSession;
+    use phantom_protocol::transport::handshake::ServerReply;
+
+    let (to_client_tx, to_client_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+    let (to_server_tx, mut to_server_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+    let client_transport = PipeTransport {
+        to_peer: to_server_tx,
+        from_peer: tokio::sync::Mutex::new(to_client_rx),
+    };
+
+    let server_hs = HandshakeServer::new().expect("server handshake state");
+    let pinned = server_hs.verifying_key().clone();
+    let session = PhantomSession::connect_with_transport("pipe-peer:0", client_transport, pinned);
+
+    let client_ip = "127.0.0.1".parse().expect("client ip");
+    let server_session = loop {
+        let hello_bytes = to_server_rx.recv().await.expect("client hello");
+        let hello = borsh::from_slice::<ClientHello>(&hello_bytes).expect("decode client hello");
+        match server_hs.process_client_hello(&hello, 0, client_ip) {
+            HandshakeResponse::Retry(retry) => {
+                let wire = ServerReply::Retry(retry).to_wire().expect("encode retry");
+                to_client_tx
+                    .send(Bytes::from(wire))
+                    .await
+                    .expect("send retry");
+            }
+            HandshakeResponse::Success(server_hello, negotiated, _) => {
+                let wire = ServerReply::Hello(server_hello)
+                    .to_wire()
+                    .expect("encode server hello");
+                to_client_tx
+                    .send(Bytes::from(wire))
+                    .await
+                    .expect("send server hello");
+                break negotiated;
+            }
+            HandshakeResponse::Reject(r) => panic!("server rejected its own client: {r:?}"),
+            HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
+        }
+    };
+
+    session
+        .await_ready()
+        .await
+        .expect("the pinned handshake completes");
+    let session_id = *server_session.id();
+    let app_stream = session.open_stream().expect("open a stream");
+    let target: u16 = app_stream
+        .stream_id()
+        .try_into()
+        .expect("a locally-opened stream id fits the wire field");
+
+    // The close, sealed by the real key. Deliberately unpadded: a receiver must not
+    // require `PADDED` — the flag means only "a trailer is present" — so this is also
+    // the conformance case for a peer whose shaping policy differs from ours.
+    let close_header = PacketHeader::new(
+        session_id,
+        1,
+        1,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::CONTROL),
+    )
+    .with_epoch(server_session.current_epoch());
+    let close_ct = server_session
+        .encrypt_packet(&close_header, &[ControlSubtype::CLOSE], &[])
+        .expect("seal the close frame");
+    let close_wire = server_session
+        .protect_packet(&PhantomPacket::new(close_header, close_ct))
+        .expect("protect the close frame");
+    to_client_tx
+        .send(Bytes::from(close_wire))
+        .await
+        .expect("send close");
+
+    // The data the close overtook: first reliable frame server→client on this stream,
+    // so its gap-free stream offset is 0.
+    let data_header = PacketHeader::new(
+        session_id,
+        target,
+        2,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
+    )
+    .with_epoch(server_session.current_epoch());
+    let mut data_plaintext = 0u32.to_be_bytes().to_vec();
+    data_plaintext.extend_from_slice(b"behind-the-close");
+    let data_ct = server_session
+        .encrypt_packet(&data_header, &data_plaintext, &[])
+        .expect("seal the trailing frame");
+    let data_wire = server_session
+        .protect_packet(&PhantomPacket::new(data_header, data_ct))
+        .expect("protect the trailing frame");
+    to_client_tx
+        .send(Bytes::from(data_wire))
+        .await
+        .expect("send trailing data");
+
+    let delivered = tokio::time::timeout(Duration::from_secs(10), app_stream.recv())
+        .await
+        .expect("data behind an authenticated close is still delivered")
+        .expect("recv")
+        .expect("the stream is open, so this is data and not a peer FIN");
+    assert_eq!(
+        delivered, b"behind-the-close",
+        "a close that overtook a data frame must not discard it"
+    );
+
+    // …and the draining window ends. Polled rather than slept on so the assertion is
+    // "this happens", not "this happens at time T": the window is derived from the
+    // session's own round-trip measurement, so its length is not a constant this test
+    // is entitled to know. The cap is far above any value the window can take.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while session.connection_state() != ConnectionState::Closed
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        session.connection_state(),
+        ConnectionState::Closed,
+        "the draining window must be bounded — a session that keeps reading after its \
+         peer left is a resource a peer decided to hold"
+    );
+}
+
+/// While a session is draining its peer's close, **no API returns `Ok` for a payload
+/// it will not send**, and every accessor that describes the session agrees about it.
+///
+/// The draining window removed a silent data loss on the receive side and, left at
+/// that, would have installed the same defect on the send side. For the 200–600 ms
+/// the window lasts the pump refuses application writes — it has to, the peer's
+/// session is over — and the API in front of it kept reporting `Connected`,
+/// data-ready, nothing queued, no error, and returned `Ok(())` for every byte the
+/// pump then dropped. A caller in any of the four bound languages had no way to learn
+/// its write was discarded, which is the thing the window was built to stop.
+///
+/// So the session publishes `ConnectionState::Draining` at the packet that carried
+/// the close, and this pins the whole surface against it at once: the state, the
+/// readiness answer derived from it, the session write, the stream writes, the queue
+/// depth, the readiness wait and the error slot. They are asserted together on
+/// purpose — the failure this reproduces was not any one of them being wrong, it was
+/// four of them agreeing with each other and disagreeing with the pump.
+///
+/// The final assertion that the window still ends is what stops this passing on a
+/// build that simply never leaves `Draining`: refusing every write forever would
+/// satisfy everything above it and would be a worse session than the one it replaced.
+#[tokio::test]
+async fn a_draining_session_refuses_writes_instead_of_discarding_them_behind_an_ok() {
+    use phantom_protocol::api::session::ConnectionState;
+    use phantom_protocol::api::PhantomSession;
+    use phantom_protocol::transport::handshake::ServerReply;
+    use phantom_protocol::CoreError;
+
+    let (to_client_tx, to_client_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+    let (to_server_tx, mut to_server_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+    let client_transport = PipeTransport {
+        to_peer: to_server_tx,
+        from_peer: tokio::sync::Mutex::new(to_client_rx),
+    };
+
+    let server_hs = HandshakeServer::new().expect("server handshake state");
+    let pinned = server_hs.verifying_key().clone();
+    let session = PhantomSession::connect_with_transport("pipe-peer:0", client_transport, pinned);
+
+    let client_ip = "127.0.0.1".parse().expect("client ip");
+    let server_session = loop {
+        let hello_bytes = to_server_rx.recv().await.expect("client hello");
+        let hello = borsh::from_slice::<ClientHello>(&hello_bytes).expect("decode client hello");
+        match server_hs.process_client_hello(&hello, 0, client_ip) {
+            HandshakeResponse::Retry(retry) => {
+                let wire = ServerReply::Retry(retry).to_wire().expect("encode retry");
+                to_client_tx
+                    .send(Bytes::from(wire))
+                    .await
+                    .expect("send retry");
+            }
+            HandshakeResponse::Success(server_hello, negotiated, _) => {
+                let wire = ServerReply::Hello(server_hello)
+                    .to_wire()
+                    .expect("encode server hello");
+                to_client_tx
+                    .send(Bytes::from(wire))
+                    .await
+                    .expect("send server hello");
+                break negotiated;
+            }
+            HandshakeResponse::Reject(r) => panic!("server rejected its own client: {r:?}"),
+            HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
+        }
+    };
+
+    session
+        .await_ready()
+        .await
+        .expect("the pinned handshake completes");
+
+    // Everything below the close has to be true of a healthy session first, or the
+    // assertions after it would be satisfied by a session that was never usable.
+    assert_eq!(session.connection_state(), ConnectionState::Connected);
+    assert!(session.is_data_ready());
+    let app_stream = session.open_stream().expect("open a stream");
+    session
+        .send(b"before-the-close".to_vec())
+        .await
+        .expect("a connected session accepts a write");
+
+    let session_id = *server_session.id();
+    let close_header = PacketHeader::new(
+        session_id,
+        1,
+        1,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::CONTROL),
+    )
+    .with_epoch(server_session.current_epoch());
+    let close_ct = server_session
+        .encrypt_packet(&close_header, &[ControlSubtype::CLOSE], &[])
+        .expect("seal the close frame");
+    let close_wire = server_session
+        .protect_packet(&PhantomPacket::new(close_header, close_ct))
+        .expect("protect the close frame");
+    to_client_tx
+        .send(Bytes::from(close_wire))
+        .await
+        .expect("send close");
+
+    // Poll rather than sleep: the state has to be published at the packet, not at the
+    // send loop's next tick, and a sleep long enough to hide that difference is
+    // exactly the interval the defect lived in. The cap is far above the window.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while session.connection_state() != ConnectionState::Draining
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        session.connection_state(),
+        ConnectionState::Draining,
+        "a session whose peer has announced its close must say so; reporting Connected \
+         while the pump discards every write is the silent loss this window exists to \
+         remove, moved to the other direction"
+    );
+    assert!(
+        !session.is_data_ready(),
+        "data-ready must not claim a session can carry data the pump will discard"
+    );
+
+    match session.send(b"after-the-close".to_vec()).await {
+        Err(CoreError::ConnectionClosed) => {}
+        Err(other) => panic!("send() while draining must be ConnectionClosed, got {other:?}"),
+        Ok(()) => panic!(
+            "send() returned Ok for a payload the pump discards — the caller has no \
+             way to learn its write was dropped"
+        ),
+    }
+    match app_stream.send_reliable(b"after-the-close".to_vec()).await {
+        Err(CoreError::ConnectionClosed) => {}
+        Err(other) => {
+            panic!("stream send_reliable while draining must be ConnectionClosed, got {other:?}")
+        }
+        Ok(()) => {
+            panic!("a stream write reaches the same pump and must be refused the same way")
+        }
+    }
+    match app_stream
+        .send_unreliable(b"after-the-close".to_vec())
+        .await
+    {
+        Err(CoreError::ConnectionClosed) => {}
+        Err(other) => {
+            panic!("stream send_unreliable while draining must be ConnectionClosed, got {other:?}")
+        }
+        Ok(()) => panic!("an unreliable stream write is discarded by the same arm"),
+    }
+    match app_stream.disconnect().await {
+        Err(CoreError::ConnectionClosed) => {}
+        Err(other) => {
+            panic!("stream disconnect while draining must be ConnectionClosed, got {other:?}")
+        }
+        Ok(()) => panic!("the FIN is a reliable write and the peer will never see it"),
+    }
+
+    assert_eq!(
+        session.queued_count().await,
+        0,
+        "a refused write must not be queued either — a non-zero depth here would mean \
+         bytes are waiting for a pump that will never send them"
+    );
+    match session.await_ready().await {
+        Err(CoreError::ConnectionClosed) => {}
+        other => {
+            panic!("await_ready() must not report a draining session ready to send; got {other:?}")
+        }
+    }
+    assert!(
+        session.last_error().await.is_none(),
+        "a peer leaving in an orderly way is not a failure, and reporting one would be \
+         as misleading in the other direction"
+    );
+
+    // The window is still bounded. Without this, refusing every write forever would
+    // satisfy every assertion above.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while session.connection_state() != ConnectionState::Closed
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        session.connection_state(),
+        ConnectionState::Closed,
+        "draining must end; a session that never leaves it is a resource the peer holds"
+    );
+}
+
+/// A frame stamped at the **previous** wire version is dropped before the flag
+/// dispatch, so it can neither end a session nor reach an application.
+///
+/// This is the mechanism the version-pairing rule actually rests on, and it is worth
+/// a test because the natural way to describe that rule is the wrong way round. The
+/// tempting story is that an older peer *misreads* a newer frame — that a `CONTROL`
+/// frame it has no branch for falls through to its data path and its subtype byte
+/// arrives at the caller as a byte of the stream. It does not: the version check is
+/// step 1 of the receive dispatch and nothing downstream of it runs. What the older
+/// peer does instead is drop the whole flow — every data-plane packet carries the
+/// version byte — so it completes a handshake and then moves nothing, with no error
+/// at either end. That, and not corruption, is why `PROTOCOL_VERSION` moves with
+/// `WIRE_VERSION`: it converts a silent total stall into a typed refusal before a
+/// session exists.
+///
+/// The close subtype is the sharpest probe available for it, because acting on that
+/// one byte is the most consequential thing a receiver could do with a frame it was
+/// never meant to see.
+#[tokio::test]
+async fn a_previous_wire_version_frame_is_dropped_before_the_flag_dispatch() {
+    use phantom_protocol::api::session::ConnectionState;
+    use phantom_protocol::api::PhantomSession;
+    use phantom_protocol::transport::handshake::ServerReply;
+
+    let (to_client_tx, to_client_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+    let (to_server_tx, mut to_server_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+    let client_transport = PipeTransport {
+        to_peer: to_server_tx,
+        from_peer: tokio::sync::Mutex::new(to_client_rx),
+    };
+
+    let server_hs = HandshakeServer::new().expect("server handshake state");
+    let pinned = server_hs.verifying_key().clone();
+    let session = PhantomSession::connect_with_transport("pipe-peer:0", client_transport, pinned);
+
+    let client_ip = "127.0.0.1".parse().expect("client ip");
+    let server_session = loop {
+        let hello_bytes = to_server_rx.recv().await.expect("client hello");
+        let hello = borsh::from_slice::<ClientHello>(&hello_bytes).expect("decode client hello");
+        match server_hs.process_client_hello(&hello, 0, client_ip) {
+            HandshakeResponse::Retry(retry) => {
+                let wire = ServerReply::Retry(retry).to_wire().expect("encode retry");
+                to_client_tx
+                    .send(Bytes::from(wire))
+                    .await
+                    .expect("send retry");
+            }
+            HandshakeResponse::Success(server_hello, negotiated, _) => {
+                let wire = ServerReply::Hello(server_hello)
+                    .to_wire()
+                    .expect("encode server hello");
+                to_client_tx
+                    .send(Bytes::from(wire))
+                    .await
+                    .expect("send server hello");
+                break negotiated;
+            }
+            HandshakeResponse::Reject(r) => panic!("server rejected its own client: {r:?}"),
+            HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
+        }
+    };
+
+    session
+        .await_ready()
+        .await
+        .expect("the pinned handshake completes");
+    let session_id = *server_session.id();
+    let app_stream = session.open_stream().expect("open a stream");
+    let target: u16 = app_stream
+        .stream_id()
+        .try_into()
+        .expect("a locally-opened stream id fits the wire field");
+
+    // A close sealed by the real key, and correct in every respect except its version
+    // byte — stamped before the seal, so the AEAD it carries is self-consistent at the
+    // older version and the frame is refused by the version check rather than by a tag
+    // mismatch. That is the whole point: it is the version alone that refuses it.
+    let mut close_header = PacketHeader::new(
+        session_id,
+        1,
+        1,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::CONTROL),
+    )
+    .with_epoch(server_session.current_epoch());
+    close_header.version = WIRE_VERSION - 1;
+    let close_ct = server_session
+        .encrypt_packet(&close_header, &[ControlSubtype::CLOSE], &[])
+        .expect("seal the previous-version close");
+    let close_wire = server_session
+        .protect_packet(&PhantomPacket::new(close_header, close_ct))
+        .expect("protect the previous-version close");
+    to_client_tx
+        .send(Bytes::from(close_wire))
+        .await
+        .expect("send previous-version close");
+
+    // The probe behind it, at the current version. The pipe is FIFO and the reader
+    // drains it in order, so a delivered payload proves the older frame was seen and
+    // disposed of first rather than still sitting unread.
+    let data_header = PacketHeader::new(
+        session_id,
+        target,
+        2,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
+    )
+    .with_epoch(server_session.current_epoch());
+    let mut data_plaintext = 0u32.to_be_bytes().to_vec();
+    data_plaintext.extend_from_slice(b"still-here");
+    let data_ct = server_session
+        .encrypt_packet(&data_header, &data_plaintext, &[])
+        .expect("seal the probe");
+    let data_wire = server_session
+        .protect_packet(&PhantomPacket::new(data_header, data_ct))
+        .expect("protect the probe");
+    to_client_tx
+        .send(Bytes::from(data_wire))
+        .await
+        .expect("send probe");
+
+    let delivered = tokio::time::timeout(Duration::from_secs(10), app_stream.recv())
+        .await
+        .expect("the session survives a previous-version frame")
+        .expect("recv")
+        .expect("the stream is open, so this is data and not a peer FIN");
+    assert_eq!(
+        delivered, b"still-here",
+        "a previous-version frame must be dropped, not delivered and not acted on"
+    );
+
+    // Long enough that a close which *had* been acted on would have finished draining
+    // and published `Closed`, which is the state this asserts the absence of. The
+    // ceiling on the draining window is well under a second.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        session.connection_state(),
+        ConnectionState::Connected,
+        "a close stamped at the previous wire version must not end the session — the \
+         version check runs before anything reads a flag"
     );
 }
