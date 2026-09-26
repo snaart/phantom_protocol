@@ -1641,13 +1641,17 @@ Pointers only: each item is set out in full in the entry named.
   is: no keys, no security claim, the same receive-side parser and caps. The WASI leg now
   writes through the non-blocking half of `wasi:io/streams` and waits on the stream's
   readiness together with a monotonic-clock timer through `wasi:io/poll`, so frames of any
-  size go through. `EmbeddedLeg` has no clock on a bare-metal target, so the bound there is
-  its writer's to impose: a writer that can block indefinitely — a USB CDC link whose host
-  stopped reading, a UART under hardware flow control — should wrap its writes in its
-  executor's timeout and report `ErrorKind::TimedOut`, which the leg now turns into
-  `CoreError::Timeout` and treats as final, where it used to report a generic
-  `NetworkError` and let the session go on writing into a cut frame. The PhantomUDP
-  transports and the browser WebSocket leg never wait on the peer and are unchanged.
+  size go through. A `WasiLeg` dropped after such a stall leaves its output stream and
+  socket to the host until the instance ends instead of releasing them, because a host may
+  finish the pending write before it lets the stream go — `wasmtime` does — and the
+  instance would then wait on the peer it gave up on. `EmbeddedLeg` has no clock on a
+  bare-metal target, so the bound there is its writer's to impose: a writer that can block
+  indefinitely — a USB CDC link whose host stopped reading, a UART under hardware flow
+  control — should wrap its writes in its executor's timeout and report
+  `ErrorKind::TimedOut`, which the leg now turns into `CoreError::Timeout` and treats as
+  final, where it used to report a generic `NetworkError` and let the session go on writing
+  into a cut frame. The PhantomUDP transports and the browser WebSocket leg never wait on
+  the peer and are unchanged.
 
   The session treats `Timeout` from either I/O method of its transport as the transport
   giving up on the peer: it writes nothing more, stops reading, and ends in
