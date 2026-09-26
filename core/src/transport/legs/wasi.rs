@@ -60,7 +60,7 @@ use wasi::sockets::instance_network::instance_network;
 use wasi::sockets::network::{
     IpAddressFamily, IpSocketAddress, Ipv4SocketAddress, Ipv6SocketAddress,
 };
-use wasi::sockets::tcp::{InputStream, OutputStream, TcpSocket};
+use wasi::sockets::tcp::{InputStream, OutputStream, ShutdownType, TcpSocket};
 use wasi::sockets::tcp_create_socket::create_tcp_socket;
 
 use crate::errors::CoreError;
@@ -122,11 +122,11 @@ pub struct WasiLeg {
 // because it is never dereferenced through a shared `&self` — no method
 // on `WasiLeg` reads or mutates it. It exists solely to keep the host
 // socket fd (and therefore the derived streams) alive for the leg's
-// lifetime. Its only access is the implicit `resource-drop` WIT call
-// when `WasiLeg` is dropped, which runs with unique ownership of the
-// field (the drop glue holds `&mut`-equivalent exclusive access), so it
-// cannot race a concurrent read — there are no concurrent reads of it at
-// all. A bare `Resource<T>` with exactly one accessor, the destructor,
+// lifetime. Its only accesses are `Drop for WasiLeg`, which may shut the
+// socket down, and the implicit `resource-drop` WIT call after it; both run
+// with unique ownership of the field (`&mut self`, then the drop glue), so
+// neither can race a concurrent read — there are no concurrent reads of it
+// at all. A bare `Resource<T>` with exactly one accessor, the destructor,
 // needs no interior synchronization to be `Send`/`Sync`-sound.
 //
 // `WasiLeg` itself is the unit we mark `Send`/`Sync`. The argument
@@ -146,6 +146,22 @@ pub struct WasiLeg {
 // WIT parent-after-children invariant.
 unsafe impl Send for WasiLeg {}
 unsafe impl Sync for WasiLeg {}
+
+/// A leg whose write stalled out shuts its socket down before its streams go.
+///
+/// The stalled write can leave bytes the host accepted but never delivered,
+/// because the peer stopped reading, and dropping the output stream then waits
+/// for them — so an instance that gave up on its peer would hang on the way
+/// out instead. Shutting the socket down first makes that pending write fail
+/// and the drop complete. A leg that never stalled is left to close as before,
+/// flushing what it wrote.
+impl Drop for WasiLeg {
+    fn drop(&mut self) {
+        if self.write_stalled.load(Ordering::Acquire) {
+            let _ = self._socket.shutdown(ShutdownType::Both);
+        }
+    }
+}
 
 impl WasiLeg {
     /// Connect to `remote` over TCP via the default WASI network
