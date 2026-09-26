@@ -9,7 +9,10 @@ UNIFFI_BINDGEN="${REPO_ROOT}/target/release/uniffi-bindgen"
 CDYLIB="${REPO_ROOT}/target/release/libphantom_protocol.dylib"
 OUT_DIR="${REPO_ROOT}/tests/bindings/kotlin"
 
-cargo build --release --manifest-path "${REPO_ROOT}/core/Cargo.toml" --features uniffi-cli
+# uniffi-bindgen 0.32 reads the exported metadata from an ELF library's symbol
+# table, which the release profile's `strip = "symbols"` removes; the library it
+# reads is built unstripped. Stripping never changes what is generated.
+CARGO_PROFILE_RELEASE_STRIP=none cargo build --release --manifest-path "${REPO_ROOT}/core/Cargo.toml" --features uniffi-cli
 
 # Pick up the cdylib for the current platform
 if [[ ! -f "${CDYLIB}" ]]; then
