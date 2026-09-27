@@ -483,15 +483,18 @@ Pointers only: each item is set out in full in the entry named.
   one a reader copies, now ends with `await_ready()`, and the two sentences that said
   `.connect().await` performs the handshake say what it actually does.
 
-- **Forty-six commit ids cited across `docs/` no longer resolved** — 37 distinct ids across
-  nine documents, counted as citations because several of them are cited more than once. The
-  history up to the `v0.3.0` tag was rewritten and nothing recorded it, so the two 2026-06
-  audit reports, the remediation plan, the 20-row rollout table in
-  `docs/observability/refactor-plan.md`, the FIPS inventory in
+- **Forty-five commit ids cited across `docs/` no longer resolved** — 36 distinct ids across
+  nine documents, counted as citations because several are cited more than once. Re-derive
+  the figure rather than trusting it: take every 7-to-40-character hex token on a removed
+  line of `git diff v0.3.0..HEAD -- docs/`, drop the ones `git cat-file -e <id>^{commit}`
+  accepts, and count what is left. The history up to the `v0.3.0` tag was rewritten and
+  nothing recorded it, so the two 2026-06 audit reports, the remediation plan, the 20-row
+  rollout table in `docs/observability/refactor-plan.md`, the FIPS inventory in
   `docs/compliance/fips-readiness.md`, `docs/operations/{mobile,wasi}.md`,
   `docs/security/panic-sites.md` and the ALC_CMC.1 evidence row in
   `docs/compliance/cc-pp-mapping.md` all pointed at objects this repository does not
-  contain. Commit *subjects*
+  contain. No citation was left behind: every hex token still in `docs/` is a decimal
+  sysctl value. Commit *subjects*
   survived the rewrite, so most were re-derived with `git log --all --grep`; the rest were
   replaced with a path, a tag or a date. Each re-pointed citation now names the implementing
   file as well. `docs/policy/versioning.md` § 10 gains "Commit ids before 0.3.0", which
