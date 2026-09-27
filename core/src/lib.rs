@@ -244,6 +244,13 @@ pub use api::{
     ConnectionState, PaddingPolicy, PhantomSession, PhantomStream, ResumptionHint,
     TrafficShapingConfig,
 };
+/// The pinned server identity every client entry point requires (Invariant 1).
+///
+/// A consumer cannot use the builder without naming it — `.pinned_key()` takes one — and it
+/// lived only at `phantom_protocol::crypto::hybrid_sign`, two modules in from anywhere the
+/// builder is documented.
+#[cfg(feature = "std")]
+pub use crypto::hybrid_sign::HybridVerifyingKey;
 /// The flat metrics record [`PhantomSession::metrics_snapshot`] returns.
 #[cfg(feature = "std")]
 pub use observability::MetricsSnapshotFfi;
@@ -1680,6 +1687,8 @@ mod crate_root_paths {
         let _: Option<crate::TrafficShapingConfig> = None;
         let _: Option<crate::PaddingPolicy> = None;
         let _: Option<crate::MetricsSnapshotFfi> = None;
+        let _: Option<crate::HybridVerifyingKey> = None;
+        let _: Option<crate::api::PhantomConfig> = None;
     }
 
     /// The server side, which is native-only in both places — so a browser-wasm build

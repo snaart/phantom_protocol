@@ -54,7 +54,10 @@ mod stream_close_tests;
 // `PaddingPolicy` are the argument to `set_traffic_shaping`. They were reachable
 // only at their defining modules — one of them in `transport::shaping`, which a
 // caller of an `api` method has no reason to have opened — so the import that
-// matched the method signature did not compile.
+// matched the method signature did not compile. `PhantomConfig` is the same case
+// from the other side: it was at the crate root and in `config`, but not beside
+// the builders whose `.config()` takes it.
+pub use crate::config::PhantomConfig;
 pub use crate::transport::shaping::PaddingPolicy;
 pub use session::{
     ConnectionState, NoTransport, PhantomSession, ResumptionHint, SessionBuilder, SessionTransport,
