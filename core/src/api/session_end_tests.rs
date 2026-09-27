@@ -401,6 +401,155 @@ async fn a_failed_handshake_releases_the_streams_opened_while_it_ran() {
     drop(ours);
 }
 
+// ── An orderly end is not a failure, and a failure is not an orderly end ─────
+
+/// An orderly close reaches the reader as a typed close with nothing recorded against the
+/// session, and a byte pipe that ended without one reaches it as a death with a cause.
+///
+/// The two used to be byte-for-byte identical at the surface — `state=Closed`,
+/// `last_error=None`, `recv=NetworkError("Session closed")`, `send=NetworkError("Cannot send
+/// in state Closed")` — while calling for opposite reactions: take the result and stop,
+/// against reconnect. `ConnectionState::Dead` and [`CoreError::ConnectionClosed`] both
+/// existed and were documented for exactly this, and neither was reachable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_orderly_close_and_a_broken_connection_are_told_apart() {
+    // ── (a) the peer leaves in an orderly way ──
+    let (client, server, _cut) = establish().await;
+    client.send(b"hi".to_vec()).await.expect("send");
+    assert_eq!(
+        timeout(STEP, server.recv())
+            .await
+            .expect("recv")
+            .expect("hi"),
+        b"hi".to_vec()
+    );
+    client.disconnect().await.expect("disconnect");
+    tokio::time::sleep(AFTER_THE_DRAIN).await;
+    wait_for_state(&server, ConnectionState::Closed, "server").await;
+
+    let orderly_recv = timeout(STEP, server.recv())
+        .await
+        .expect("recv returned")
+        .expect_err("the session is over");
+    assert!(
+        matches!(orderly_recv, CoreError::ConnectionClosed),
+        "an orderly peer close must reach the reader as a typed close; got {orderly_recv:?}"
+    );
+    assert!(
+        server.last_error().await.is_none(),
+        "nothing failed: the peer left"
+    );
+    let orderly_send = server
+        .send(b"after".to_vec())
+        .await
+        .expect_err("a closed session takes no writes");
+    assert!(
+        matches!(orderly_send, CoreError::ConnectionClosed),
+        "got {orderly_send:?}"
+    );
+    drop(client);
+
+    // ── (b) the connection breaks under a live session ──
+    let (client, server, cut) = establish().await;
+    client.send(b"hi".to_vec()).await.expect("send");
+    assert_eq!(
+        timeout(STEP, server.recv())
+            .await
+            .expect("recv")
+            .expect("hi"),
+        b"hi".to_vec()
+    );
+    cut.send_replace(true);
+    wait_for_state(&client, ConnectionState::Dead, "client").await;
+
+    let broken_recv = timeout(STEP, client.recv())
+        .await
+        .expect("recv returned")
+        .expect_err("the connection is gone");
+    let cause = client
+        .last_error()
+        .await
+        .expect("a connection that broke records why");
+    assert!(
+        !matches!(cause, CoreError::ConnectionClosed),
+        "a broken connection must not report itself as an orderly close; got {cause:?}"
+    );
+    assert!(
+        matches!(broken_recv, CoreError::NetworkError(_)),
+        "the reader gets the cause the transport failed with; got {broken_recv:?}"
+    );
+    drop(server);
+}
+
+/// A session the caller closed itself reports no failure — anywhere.
+///
+/// `last_error()` returns `None`, which the crate documents as meaning nothing went wrong.
+/// `await_ready()` used to synthesise `NetworkError("session failed")` alongside it, and
+/// `send()` a formatted state name, so the two disagreed about the same session and neither
+/// gave a caller anything to match on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_the_caller_asked_for_is_not_a_failure() {
+    let (client, server, _cut) = establish().await;
+    client.disconnect().await.expect("disconnect");
+
+    assert!(
+        client.last_error().await.is_none(),
+        "the caller's own close is not a failure"
+    );
+    assert_eq!(client.connection_state(), ConnectionState::Closed);
+    let ready = timeout(STEP, client.await_ready())
+        .await
+        .expect("await_ready returned")
+        .expect_err("a closed session is not ready");
+    assert!(
+        matches!(ready, CoreError::ConnectionClosed),
+        "got {ready:?}"
+    );
+    let write = client
+        .send(b"late".to_vec())
+        .await
+        .expect_err("a closed session takes no writes");
+    assert!(
+        matches!(write, CoreError::ConnectionClosed),
+        "got {write:?}"
+    );
+    drop(server);
+}
+
+/// A session that never tried is not reported as closed.
+///
+/// The typed close is a statement about a session that ran and ended, so it is not the
+/// answer for the inert `connect()`, which builds no transport and runs no handshake and
+/// reports `Failed` from the moment it returns. Nothing was recorded against it either —
+/// nothing failed, because nothing happened — so it is the one session for which "ended with
+/// no cause" must keep the generic answer rather than borrow a close that never occurred.
+#[tokio::test]
+async fn a_session_that_never_tried_is_not_reported_as_closed() {
+    let session = PhantomSession::connect("inert:0".into());
+    assert_eq!(session.connection_state(), ConnectionState::Failed);
+    assert!(
+        session.last_error().await.is_none(),
+        "the inert constructor records no cause"
+    );
+
+    let ready = timeout(STEP, session.await_ready())
+        .await
+        .expect("await_ready must resolve at once on a session with no pump")
+        .expect_err("an inert session is not ready");
+    assert!(
+        !matches!(ready, CoreError::ConnectionClosed),
+        "a session that never opened has not been closed; got {ready:?}"
+    );
+    let write = session
+        .send(b"never".to_vec())
+        .await
+        .expect_err("an inert session takes no writes");
+    assert!(
+        !matches!(write, CoreError::ConnectionClosed),
+        "got {write:?}"
+    );
+}
+
 // ── The concurrency cap ──────────────────────────────────────────────────────
 
 /// Past [`MAX_STREAMS`] open at once, `open_stream()` refuses, and the refusal costs

@@ -2654,6 +2654,13 @@ async fn run_data_pump<T: SessionTransport>(
         // waiter is registered once rather than on every packet.
         let given_up = transport_recv.given_up();
         tokio::pin!(given_up);
+        // Why this loop stopped, when it stopped because the byte pipe underneath it did.
+        // The session ends either way, but not in the same way: a pipe that ended without
+        // the peer having announced its close ended abnormally, and a caller has to be able
+        // to tell that from the orderly departure it is otherwise indistinguishable from.
+        // `None` while the loop is running, and on the two exits that are not the pipe's
+        // doing — the peer's announced close, and this side's own.
+        let mut ended_with: Option<CoreError> = None;
         loop {
             // Flow-control / anti-flood gate: if the app-delivery backlog
             // has blown past the cap, the peer is not honouring the window —
@@ -2665,6 +2672,12 @@ async fn run_data_pump<T: SessionTransport>(
                      control; closing session",
                     undelivered_reader.load(Ordering::Acquire)
                 );
+                // Ended by this side, against a peer that would not stop. Recorded as a
+                // cause so the session does not read as an orderly close, which is what a
+                // caller would otherwise be told about a peer it should stop trusting.
+                ended_with = Some(CoreError::NetworkError(
+                    "peer ignored flow control: the receive backlog passed its cap".into(),
+                ));
                 break;
             }
             // A read abandoned here may be part-way through a frame, which is harmless:
@@ -2672,7 +2685,10 @@ async fn run_data_pump<T: SessionTransport>(
             let data = tokio::select! {
                 received = transport_recv.recv_bytes() => match received {
                     Ok(b) => b,
-                    Err(_) => break,
+                    Err(e) => {
+                        ended_with = Some(e);
+                        break;
+                    }
                 },
                 () = &mut given_up => break,
             };
@@ -2787,9 +2803,23 @@ async fn run_data_pump<T: SessionTransport>(
         // the tick arm's `Draining` follows a peer close, which rules this path out;
         // and `disconnect()`, called from the application's thread, leaves `Dead` and
         // `Failed` in place.
-        if transport_recv.has_given_up() && !crypto_recv.peer_closed() {
-            record_terminal_cause(&terminal_error_recv, CoreError::Timeout);
-            state_recv.store(ConnectionState::Dead as u8, Ordering::Relaxed);
+        if !crypto_recv.peer_closed() {
+            if transport_recv.has_given_up() {
+                record_terminal_cause(&terminal_error_recv, CoreError::Timeout);
+                state_recv.store(ConnectionState::Dead as u8, Ordering::Relaxed);
+            } else if let Some(cause) = ended_with {
+                // The byte pipe ended and the peer never said it was leaving: a stream
+                // transport whose far end vanished, a datagram socket that will not carry
+                // another packet, a peer that ignored the window. `Dead` with the cause
+                // behind it, because the alternative — the `Closed` the teardown would
+                // otherwise publish, with nothing recorded — is the same answer an orderly
+                // departure gives, and the two call for opposite reactions: take the result
+                // and stop, against reconnect. Published without overwriting an end the
+                // session had already reached, so a close this side asked for first stays
+                // this side's close.
+                record_terminal_cause(&terminal_error_recv, cause);
+                publish_end(&state_recv, ConnectionState::Dead);
+            }
         }
         // Reader exiting → drop `deliver_tx` so the delivery task drains any
         // queued items and then sees the channel closed and exits.
@@ -3254,7 +3284,7 @@ async fn run_data_pump<T: SessionTransport>(
     // already published `ConnectionState::Dead`; only a normal teardown (graceful close
     // / transport drop) publishes `Closed`.
     if !died {
-        state.store(ConnectionState::Closed as u8, Ordering::Relaxed);
+        publish_end(&state, ConnectionState::Closed);
     }
     // Retire every stream still open on this session so the active-streams gauge
     // comes back down on EVERY pump exit — graceful close, handle drop, transport
@@ -3662,6 +3692,31 @@ fn apply_liveness(
 /// what they said. A verdict landing after one of them must not walk it back: a caller
 /// that read `Dead`, then `Connected`, then `Dead` again was told the session recovered.
 /// The check and the write are one atomic step, so no end published in between is lost.
+/// Publish `next` — an end the session has just reached — unless it has already reached
+/// one, in which case the first end is the one to report.
+///
+/// The ends are not interchangeable, which is why the order matters. `Closed` says the
+/// session finished in the orderly way and nothing is owed an explanation;
+/// [`last_error`](PhantomSession::last_error) stays `None` and `send`/`recv` answer
+/// [`CoreError::ConnectionClosed`]. `Dead` and `Failed` each come with a recorded cause.
+/// Overwriting one with another loses whichever was true: the pump's teardown publishes
+/// `Closed` on the way out however the session ended, so without this it turned a death the
+/// receive task had already diagnosed into an orderly close, and a caller could not tell
+/// "the peer said goodbye" from "the connection broke".
+///
+/// Two deaths deliberately do not go through this: the transport giving up on a peer that
+/// stopped taking bytes, which `disconnect`'s own documentation says replaces the `Closed`
+/// it published, and the liveness sweep's idle timeout. Both are the session failing on its
+/// way out, and both record a cause.
+fn publish_end(state: &AtomicU8, next: ConnectionState) {
+    let _ = state.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        match ConnectionState::from_u8(current) {
+            ConnectionState::Closed | ConnectionState::Failed | ConnectionState::Dead => None,
+            _ => Some(next as u8),
+        }
+    });
+}
+
 fn publish_unless_ended(state: &AtomicU8, next: ConnectionState) {
     let _ = state.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         match ConnectionState::from_u8(current) {
@@ -6608,7 +6663,12 @@ impl PhantomSession {
     /// - If the session is `Failed` or `Dead`: returns the captured terminal
     ///   error (from the handshake or the data pump) so the caller gets the
     ///   *specific* cause (e.g. [`CoreError::ServerIdentityMismatch`]) rather
-    ///   than the generic `"Cannot send in state Failed"` message.
+    ///   than a generic message.
+    /// - If the session is `Closed`: returns [`CoreError::ConnectionClosed`]. That is the
+    ///   whole answer — a session closed in the orderly way, by this side or by the peer,
+    ///   has no cause to report and [`last_error`](Self::last_error) stays `None`. It is
+    ///   how a caller tells an orderly end from a failed one: this error with no cause
+    ///   behind it is the first, a cause is the second.
     ///
     /// # ⚠ This is a byte stream, not a message channel
     ///
@@ -6645,16 +6705,21 @@ impl PhantomSession {
             self.cmd_tx
                 .send(SessionCommand::Send(data))
                 .await
-                .map_err(|_| CoreError::NetworkError("Session closed".into()))?;
+                .map_err(|_| CoreError::ConnectionClosed)?;
         } else if state == ConnectionState::Connecting {
             // Still handshaking — queue
             self.send_queue.lock().await.push(data);
         } else {
-            // Surface the captured terminal error (e.g. ServerIdentityMismatch)
-            // instead of the generic "Cannot send in state …" message.
-            return Err(self.terminal_error.lock().clone().unwrap_or_else(|| {
-                CoreError::NetworkError(format!("Cannot send in state {state:?}"))
-            }));
+            // The captured terminal cause when there is one (e.g. ServerIdentityMismatch),
+            // and the typed close when there is not. A session that ended in the orderly
+            // way has no cause, and the answer to "why can I not write?" is that it is
+            // over — which is a fact with a variant of its own, not a state name formatted
+            // into a string a caller would have to match on.
+            return Err(self
+                .terminal_error
+                .lock()
+                .clone()
+                .unwrap_or_else(|| self.end_without_a_cause()));
         }
 
         Ok(())
@@ -6668,17 +6733,26 @@ impl PhantomSession {
     /// refcount the Vec is moved out of the underlying buffer, otherwise
     /// `Bytes::to_vec` copies.
     ///
-    /// When the session is `Failed` or `Dead` and the recv channel has been
-    /// dropped, returns the captured terminal error (if any) rather than the
-    /// generic `"Session closed"` message.
+    /// # The end of the session
+    ///
+    /// Once the session is over and everything it delivered has been read, this returns
+    /// [`CoreError::ConnectionClosed`] for an orderly end — this side's own
+    /// [`disconnect`](Self::disconnect), or the peer's — and the captured terminal cause
+    /// for any other: [`CoreError::Timeout`] for a path the transport gave up on, whatever
+    /// the handshake failed with, and so on. So the two cases a reader has to tell apart —
+    /// "the peer is finished, take the result" and "the connection broke, retry" — differ
+    /// in the value returned rather than only in a message, and agree with
+    /// [`connection_state`](Self::connection_state) (`Closed` against `Dead`) and with
+    /// [`last_error`](Self::last_error) (`None` against the cause).
     pub async fn recv(&self) -> Result<Vec<u8>, CoreError> {
         let mut rx = self.recv_rx.lock().await;
         let bytes = rx.recv().await.ok_or_else(|| {
-            // Surface the captured terminal error on channel-closed.
+            // Surface the captured terminal cause on channel-closed, and the typed close
+            // when there is none to surface: nothing failed, the session is simply over.
             self.terminal_error
                 .lock()
                 .clone()
-                .unwrap_or_else(|| CoreError::NetworkError("Session closed".into()))
+                .unwrap_or_else(|| self.end_without_a_cause())
         })?;
         Ok(bytes.to_vec())
     }
@@ -6719,6 +6793,11 @@ impl PhantomSession {
     /// captured terminal error on failure. This is the preferred alternative
     /// to polling `connection_state()` in a loop.
     ///
+    /// A session that is over rather than failed — closed by this side or by the peer, with
+    /// nothing recorded against it — answers [`CoreError::ConnectionClosed`]. It is not
+    /// ready and never will be, but nothing went wrong, and
+    /// [`last_error`](Self::last_error) still reports `None`.
+    ///
     /// Because the readiness signal is carried on a `watch` channel, a call
     /// made *after* the handshake has already resolved (either direction)
     /// returns immediately — there is no lost-notification race.
@@ -6746,12 +6825,15 @@ impl PhantomSession {
             // the same one, and it is not "failed" either.
             ConnectionState::Draining => Err(CoreError::ConnectionClosed),
             ConnectionState::Failed | ConnectionState::Dead | ConnectionState::Closed => {
-                // Surface the captured terminal error, or a generic fallback.
+                // The captured terminal cause, or the typed close when there is none. A
+                // session the caller closed itself has nothing recorded against it —
+                // `last_error()` says so — and calling that a failure was a statement of
+                // fact that was false.
                 Err(self
                     .terminal_error
                     .lock()
                     .clone()
-                    .unwrap_or(CoreError::NetworkError("session failed".into())))
+                    .unwrap_or_else(|| self.end_without_a_cause()))
             }
             _ => Ok(()),
         }
@@ -6796,7 +6878,7 @@ impl PhantomSession {
             self.cmd_tx
                 .send(SessionCommand::Send(msg))
                 .await
-                .map_err(|_| CoreError::NetworkError("Session closed during flush".into()))?;
+                .map_err(|_| CoreError::ConnectionClosed)?;
         }
         Ok(count)
     }
@@ -7023,6 +7105,24 @@ impl PhantomSession {
 }
 
 impl PhantomSession {
+    /// What a session that cannot carry a call any more reports when nothing was recorded
+    /// against it.
+    ///
+    /// An end this side or the peer asked for is [`CoreError::ConnectionClosed`] and nothing
+    /// else: it is the one fact there is about the session, and [`last_error`](Self::last_error)
+    /// says `None` beside it because nothing failed. `Failed` and `Dead` are the other
+    /// answer, and they always carry a cause — with one exception, the inert `connect()`,
+    /// which starts `Failed` without ever having tried anything. Its generic answer is kept
+    /// as it is rather than dressed up as the close of a session that never opened.
+    fn end_without_a_cause(&self) -> CoreError {
+        match self.connection_state() {
+            ConnectionState::Failed | ConnectionState::Dead => {
+                CoreError::NetworkError("session failed".into())
+            }
+            _ => CoreError::ConnectionClosed,
+        }
+    }
+
     /// Get the stream demultiplexer (internal use, not exposed to UniFFI)
     pub fn demux(&self) -> Arc<StreamDemultiplexer> {
         self.demux.clone()
@@ -15464,19 +15564,24 @@ mod tests {
             "a peer flooding past the delivery hard cap must get its session torn down"
         );
 
-        // Definitive: the session ends up Closed.
-        let mut closed = false;
+        // Definitive: the session ends up `Dead`, with a cause. Not `Closed` — that is the
+        // answer for a session that ended in the orderly way, by either side's request, and
+        // it is the answer a reader gets `None` from `last_error()` alongside. A peer that
+        // would not stop sending is the opposite of an orderly departure, and a caller has
+        // to be able to tell the two apart: this one is not a result to accept and stop on.
+        let mut dead = false;
         for _ in 0..200 {
-            if server.connection_state() == ConnectionState::Closed {
-                closed = true;
+            if server.connection_state() == ConnectionState::Dead {
+                dead = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         drainer.abort();
+        assert!(dead, "session state must be Dead after the hard cap trips");
         assert!(
-            closed,
-            "session state must be Closed after the hard cap trips"
+            server.last_error().await.is_some(),
+            "a session torn down over the peer's behaviour must report a cause"
         );
     }
 

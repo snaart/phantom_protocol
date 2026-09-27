@@ -141,7 +141,7 @@ impl PhantomStream {
                 data: Bytes::from(data),
             })
             .await
-            .map_err(|_| CoreError::NetworkError("Session closed".into()))
+            .map_err(|_| CoreError::ConnectionClosed)
     }
 
     /// Queue `data` for best-effort delivery on this stream — no retransmit, no
@@ -176,7 +176,7 @@ impl PhantomStream {
                 data: Bytes::from(data),
             })
             .await
-            .map_err(|_| CoreError::NetworkError("Session closed".into()))
+            .map_err(|_| CoreError::ConnectionClosed)
     }
 
     /// Receive the next data frame from this stream.
@@ -285,7 +285,7 @@ impl PhantomStream {
                 stream_id: self.stream_id,
             })
             .await
-            .map_err(|_| CoreError::NetworkError("Session closed".into()))
+            .map_err(|_| CoreError::ConnectionClosed)
     }
 }
 
