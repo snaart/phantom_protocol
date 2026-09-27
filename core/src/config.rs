@@ -117,6 +117,16 @@ pub struct PhantomConfig {
     /// once, which on a busy connection is almost every write — and the entry points
     /// that use it refuse a shorter one with `CoreError::ConfigError` before any I/O.
     ///
+    /// That floor belongs to this field rather than to the deadline itself. A Rust
+    /// caller who builds a transport of their own sets the deadline with
+    /// `with_write_stall_timeout`, which takes any duration and hands back the
+    /// transport rather than a `Result`, so the same sub-second value is refused
+    /// here and accepted there. The difference is deliberate: a value in this record
+    /// is one an operator supplied for connections the library builds on their
+    /// behalf, out of their sight, while a duration handed straight to a transport is
+    /// a choice its author made about that one transport — and making it is how the
+    /// in-crate stall tests reach a stall in 250 ms instead of a second.
+    ///
     /// Read by the TCP and TLS-mimicry listeners and by `connect_pinned_with_config`
     /// (and the mimicry connect that takes a config); ignored over PhantomUDP, whose
     /// sends never wait on the peer. An entry point that takes no `PhantomConfig` uses
