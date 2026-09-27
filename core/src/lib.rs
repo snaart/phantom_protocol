@@ -1544,6 +1544,15 @@ mod pinned_version_claims {
 /// **dev**-dependency happened to enable them — and dev-dependencies are not part of
 /// what a consumer inherits, so such a test would be green for the exact change it
 /// is supposed to catch.
+///
+/// It reads the manifest as written, which is the one being guarded. `cargo package`
+/// normalizes the copy it puts in an archive — every comment gone, each dependency in a
+/// table of its own — but nothing runs these tests from there: `cargo package --verify`
+/// builds the extracted crate and does not test it, and `cargo test` inside one does not
+/// compile at all, because `pinned_version_claims` beside this module includes documents
+/// that live outside `core/`. The one shape assumption that could be dropped for free was:
+/// the tokio features are found by content rather than by walking to a table, so the
+/// search reads either form.
 #[cfg(test)]
 mod inherited_dependency_features {
     /// This crate's manifest, read as text. It sits inside the package, so this
@@ -1566,44 +1575,54 @@ mod inherited_dependency_features {
         ("io-std", "a consumer's `tokio::io::stdin` / `stdout`"),
     ];
 
-    /// The native dependency block's `tokio` entry, as text.
+    /// Every `features = [...]` list in the manifest that names tokio's `net`.
     ///
-    /// Taken from the target table rather than from the whole file, so the
-    /// cross-target `tokio` entry near the top — which names `time`, a tokio feature
-    /// with nothing to do with the `time` crate below — cannot satisfy an assertion
-    /// about the native one.
-    fn native_tokio_entry() -> &'static str {
-        let table = "[target.'cfg(not(target_arch = \"wasm32\"))'.dependencies]";
-        let after = MANIFEST
-            .split_once(table)
-            .unwrap_or_else(|| panic!("the manifest has no {table} table"))
-            .1;
-        let entry = after
-            .split_once("\ntokio = ")
-            .unwrap_or_else(|| panic!("the {table} table declares no tokio"))
-            .1;
-        // To the end of the inline table, which spans several lines.
-        let end = entry
-            .find(" }")
-            .unwrap_or_else(|| panic!("tokio's entry in {table} does not close"));
-        &entry[..=end]
+    /// Located by content rather than by walking to the native target table, because the
+    /// manifest has two shapes: an inline table as written, and a `[target.….dependencies.
+    /// tokio]` table of its own after `cargo package` has normalized it. `net` is what
+    /// identifies the native entry either way — the cross-target one does not name it, and
+    /// it does name `time`, which is a tokio feature with nothing to do with the `time`
+    /// crate asserted below.
+    fn tokio_feature_lists_naming_net() -> Vec<&'static str> {
+        let mut found = Vec::new();
+        let mut rest = MANIFEST;
+        while let Some((_, after)) = rest.split_once("features = [") {
+            let Some((list, tail)) = after.split_once(']') else {
+                break;
+            };
+            rest = tail;
+            if list.contains("\"net\"") {
+                found.push(list);
+            }
+        }
+        found
     }
 
-    /// Every feature above is still named in the native `tokio` entry.
+    /// Every feature above is still named on the native `tokio` dependency.
     #[test]
-    fn the_native_tokio_entry_still_names_every_inherited_feature() {
-        let entry = native_tokio_entry();
-        for (feature, who_needs_it) in INHERITED_TOKIO_FEATURES {
-            assert!(
-                entry.contains(&format!("\"{feature}\"")),
-                "core/Cargo.toml no longer enables tokio's `{feature}` for native \
-                 targets, which is what provides {who_needs_it}. Cargo unifies features \
-                 across the graph, so taking it away breaks the build of every consumer \
-                 that relied on inheriting it and named fewer features itself — a \
-                 breaking change, and one no other gate here can see. It may go in a \
-                 major release, with a note a consumer reads before upgrading, and not \
-                 before. The entry reads: {entry}"
-            );
+    fn the_native_tokio_dependency_still_names_every_inherited_feature() {
+        let lists = tokio_feature_lists_naming_net();
+        assert_eq!(
+            lists.len(),
+            1,
+            "expected exactly one feature list naming tokio's `net` — the native \
+             dependency — and found {}. The search below cannot say which one it is \
+             checking otherwise.",
+            lists.len()
+        );
+        for list in &lists {
+            for (feature, who_needs_it) in INHERITED_TOKIO_FEATURES {
+                assert!(
+                    list.contains(&format!("\"{feature}\"")),
+                    "core/Cargo.toml no longer enables tokio's `{feature}` for native \
+                     targets, which is what provides {who_needs_it}. Cargo unifies \
+                     features across the graph, so taking it away breaks the build of \
+                     every consumer that relied on inheriting it and named fewer features \
+                     itself — a breaking change, and one no other gate here can see. It \
+                     may go in a major release, with a note a consumer reads before \
+                     upgrading, and not before. The list reads: {list}"
+                );
+            }
         }
     }
 
