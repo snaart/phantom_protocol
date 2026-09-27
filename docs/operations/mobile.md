@@ -117,9 +117,25 @@ let session = try await PhantomProtocol.connectPinned(
     host: "phantom.example.com", port: 4242,
     pinnedKey: keyData   // from PhantomListener::verifying_key_bytes()
 )
+
+// WAIT FOR THE HANDSHAKE BEFORE TRUSTING THE SESSION. connectPinned returns as
+// soon as the TCP connect completes; the hybrid PQC handshake — and the pinned
+// identity check it carries — runs on a background task. Skip this call and a
+// WRONG pinned key still gives you a session object whose send() returns
+// success, with the mismatch appearing later as a failed read. awaitReady()
+// throws the typed reason instead.
+do {
+    try await session.awaitReady()
+} catch {
+    // CoreError.serverIdentityMismatch — the server is not the pinned one.
+    // CoreError.timeout / .networkError — the path, not the identity.
+    print("handshake failed: \(error)")
+    return
+}
+
 try await session.send(data: "hello".data(using: .utf8)!)
 let reply = try await session.recv()
-await session.disconnect()
+try await session.disconnect()   // `disconnect()` is `async throws`
 ```
 
 **App Transport Security note.** iOS ATS blocks non-TLS connections by default.
@@ -193,6 +209,19 @@ val session = connectPinned(
     host = "phantom.example.com", port = 4242u,
     pinnedKey = pinnedKeyBytes   // from PhantomListener::verifying_key_bytes()
 )
+
+// WAIT FOR THE HANDSHAKE BEFORE TRUSTING THE SESSION. connectPinned returns as
+// soon as the TCP connect completes; the hybrid PQC handshake — and the pinned
+// identity check it carries — runs on a background task. Skip this call and a
+// WRONG pinned key still gives you a session whose send() succeeds, with the
+// mismatch appearing later as a failed read.
+try {
+    session.awaitReady()
+} catch (e: CoreException.ServerIdentityMismatch) {
+    // The server is not the one this key pins. Do not retry against it.
+    throw e
+}
+
 session.send("hello".encodeToByteArray())
 val reply = session.recv()
 session.disconnect()

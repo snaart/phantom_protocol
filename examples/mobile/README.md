@@ -10,8 +10,14 @@ transport SDK through its UniFFI bindings:
 Both demonstrate the same client lifecycle against a running
 [`phantom-server`](../../server/):
 
-1. **Pinned connect** — `connectPinned(host, port, pinnedKey)`. Server identity is
-   pinned unconditionally (Security Invariant 1); there is no unpinned path.
+1. **Pinned connect** — `connectPinned(host, port, pinnedKey)` followed by
+   `awaitReady()`. Server identity is pinned unconditionally (Security
+   Invariant 1); there is no unpinned path. The second call is not optional:
+   `connectPinned*` returns as soon as the socket is connected and runs the
+   handshake — the pin check included — on a background task, so a wrong pinned
+   key yields a session object whose `send()` succeeds. `awaitReady()` is where
+   `ServerIdentityMismatch` is raised, and both samples call it before reporting
+   a connection or reading any session state.
 2. **0-RTT resumption** — harvest a `ResumptionHint` after the first connect, persist
    it to platform secure storage (iOS Keychain / Android `EncryptedSharedPreferences`),
    and reconnect via `connectPinnedWithResumption(...)`, folding the first request into

@@ -5,12 +5,14 @@
 //
 //   * connect()            — 0-RTT resume if a fresh Keychain hint exists (the
 //                            hint is consumed on load — tickets are one-shot),
-//                            else a pinned 1-RTT connect; starts the recv loop
-//                            and state poller. A fresh resumption hint for next
-//                            time is harvested by the state poller once the
-//                            session first reaches an established state, because
-//                            connectPinned* returns before the handshake
-//                            finishes.
+//                            else a pinned 1-RTT connect, then awaitReady() to
+//                            let the background handshake finish before anything
+//                            is reported as connected; starts the recv loop and
+//                            state poller. A fresh resumption hint for next time
+//                            is harvested by the state poller once the session
+//                            first reaches an established state, because
+//                            resumptionHint() is empty until the server has
+//                            issued a ticket.
 //   * send(_:)             — UTF-8 app-data send, echoed into the transcript.
 //   * a recv loop Task     — pulls messages until disconnect / .dead.
 //   * reconnect()          — the recovery path on a network change: harvest a
@@ -107,9 +109,11 @@ public final class PhantomChatViewModel: ObservableObject {
 
     // MARK: - Connect (with optional 0-RTT)
 
-    /// Establishes a session. Prefers a 0-RTT resume when a fresh hint is in the
-    /// Keychain; otherwise a pinned 1-RTT connect. Idempotent: a no-op while a
-    /// connect is in flight or already connected.
+    /// Establishes a session and waits for its handshake. Prefers a 0-RTT resume
+    /// when a fresh hint is in the Keychain; otherwise a pinned 1-RTT connect.
+    /// Returns only once `awaitReady()` has confirmed the server's pinned
+    /// identity, or with the session in `.failed` and the reason reported.
+    /// Idempotent: a no-op while a connect is in flight or already connected.
     public func connect() async {
         guard !isBusy, session == nil else { return }
         isBusy = true
@@ -139,13 +143,14 @@ public final class PhantomChatViewModel: ObservableObject {
 
         let established: PhantomSession
         do {
+            let pending: PhantomSession
             if let hint {
                 // Fold a tiny first request into the ClientHello as early-data.
                 // Best-effort: if the server rejects 0-RTT the handshake still
                 // completes as 1-RTT and earlyDataAccepted() reports false.
                 let earlyData = Data("hello-0rtt".utf8)
                 appendSystem("Attempting 0-RTT resume…")
-                established = try await connectPinnedWithResumption(
+                pending = try await connectPinnedWithResumption(
                     host: host,
                     port: port,
                     pinnedKey: pinnedKey,
@@ -154,12 +159,24 @@ public final class PhantomChatViewModel: ObservableObject {
                 )
             } else {
                 appendSystem("Performing full 1-RTT handshake (ML-KEM-768 + ML-DSA-65)…")
-                established = try await connectPinned(
+                pending = try await connectPinned(
                     host: host,
                     port: port,
                     pinnedKey: pinnedKey
                 )
             }
+
+            // AWAIT THE HANDSHAKE. connectPinned* resolves as soon as the socket
+            // is connected; the hybrid PQC handshake — and with it the pinned
+            // identity check that is the whole point of passing a pinned key —
+            // runs on a background task afterwards. Without this call the app
+            // would announce a connection, read earlyDataAccepted() and start a
+            // recv loop while the peer's identity was still unproven, and a wrong
+            // pinned key would surface much later as a failed read. awaitReady()
+            // throws the typed reason (serverIdentityMismatch, timeout, …), which
+            // is what the catch below reports.
+            try await pending.awaitReady()
+            established = pending
         } catch {
             // A stale ticket can legitimately fail; clear it so the next attempt
             // is a clean 1-RTT connect.
@@ -172,7 +189,8 @@ public final class PhantomChatViewModel: ObservableObject {
         self.session = established
         self.isConnected = true
 
-        // Reflect the post-handshake state and report the 0-RTT verdict.
+        // Reflect the post-handshake state and report the 0-RTT verdict. Both
+        // reads are meaningful only because awaitReady() returned above.
         let liveState = established.connectionState()
         updateState(liveState, status: statusLine(for: liveState))
 
@@ -184,10 +202,10 @@ public final class PhantomChatViewModel: ObservableObject {
 
         appendSystem("Session established to \(host):\(port).")
 
-        // Arm hint harvesting for this session. We do NOT harvest here:
-        // connectPinned* returns while the handshake still runs in a background
-        // task, so resumptionHint() is nil right after connect. Instead the
-        // state poller harvests once the session is first observed in an
+        // Arm hint harvesting for this session. We do NOT harvest here even
+        // now that awaitReady() has returned: a hint exists only once the server
+        // has issued a ticket for this session, which readiness does not promise.
+        // The state poller harvests the first time the session is observed in an
         // established, data-ready state (harvestHintIfNeeded), with
         // harvest-on-disconnect/-reconnect as a fallback.
         hasHarvestedHint = false
@@ -497,10 +515,10 @@ public final class PhantomChatViewModel: ObservableObject {
         let live = session.connectionState()
 
         // Harvest a fresh resumption hint the first time we observe this session
-        // in an established, data-ready state. Done here (not right after
-        // connect) because connectPinned* returns before the background
-        // handshake finishes, so resumptionHint() is nil until the session is
-        // actually up. Guarded once-per-session by hasHarvestedHint.
+        // in an established, data-ready state. Done here rather than in connect()
+        // because a ticket is the server's to issue and readiness does not imply
+        // one has arrived, so resumptionHint() can still be nil at that point.
+        // Guarded once-per-session by hasHarvestedHint.
         await harvestHintIfNeeded(observing: live, from: session)
 
         guard live != state else { return }

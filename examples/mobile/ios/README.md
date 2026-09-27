@@ -216,7 +216,7 @@ FFI path it returns `Unsupported` — see the migration section below.
 
 | Capability        | Where                                                            |
 |-------------------|------------------------------------------------------------------|
-| Pinned connect    | `PhantomChatViewModel.connect()` → `connectPinned(...)`          |
+| Pinned connect    | `PhantomChatViewModel.connect()` → `connectPinned(...)` → `awaitReady()` before anything is reported as connected |
 | 0-RTT resumption  | `connect()` → `connectPinnedWithResumption(...)` when a fresh Keychain hint exists; verdict via `earlyDataAccepted()` |
 | Encrypted I/O     | `send(_:)` → `session.send(data:)`; recv loop → `session.recv()` |
 | Connection state  | banner polls `session.connectionState()` (lock-free); `.migrating`/`.dead` trigger an automatic reconnect-with-0-RTT |

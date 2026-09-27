@@ -129,10 +129,13 @@ class PhantomClient(
     val state: StateFlow<UiState> = _state.asStateFlow()
 
     /**
-     * Establish a session. Tries 0-RTT resumption first (using a stored,
-     * still-fresh [ResumptionHint] plus an optional [earlyData] payload folded
-     * into the ClientHello); falls back to a normal pinned 1-RTT connect when
-     * no usable ticket exists.
+     * Establish a session and wait for its handshake. Tries 0-RTT resumption
+     * first (using a stored, still-fresh [ResumptionHint] plus an optional
+     * [earlyData] payload folded into the ClientHello); falls back to a normal
+     * pinned 1-RTT connect when no usable ticket exists.
+     *
+     * Returns only once `awaitReady()` has confirmed the server's pinned
+     * identity; a handshake failure is thrown, not published as a connection.
      *
      * Server pinning is unconditional (Security Invariant 1): both entry points
      * take the pinned verifying key, and there is no unpinned path.
@@ -183,7 +186,7 @@ class PhantomClient(
             }
 
             val newSession: PhantomSession = try {
-                if (storedHint != null) {
+                val pending = if (storedHint != null) {
                     appendSystem("Found resumption ticket — attempting 0-RTT.")
                     connectPinnedWithResumption(
                         host = config.host,
@@ -200,6 +203,25 @@ class PhantomClient(
                         pinnedKey = config.pinnedKey,
                     )
                 }
+                // AWAIT THE HANDSHAKE. connectPinned* returns as soon as the
+                // socket is connected; the hybrid PQC handshake — and with it the
+                // pinned identity check that is the reason a pinned key is passed
+                // at all — runs on a background task afterwards. Without this the
+                // app would publish "Connected", read earlyDataAccepted() and
+                // start a recv loop against a peer whose identity was still
+                // unproven, and a wrong pin would surface later as a failed read.
+                // awaitReady() raises the typed reason (ServerIdentityMismatch,
+                // Timeout, …) for the catch below to report.
+                try {
+                    pending.awaitReady()
+                } catch (t: Throwable) {
+                    // The handle is ours and nothing else has seen it yet, so
+                    // release it here rather than leaving a native session for
+                    // the collector to reach eventually.
+                    pending.close()
+                    throw t
+                }
+                pending
             } catch (e: CoreException) {
                 // A stale/invalid ticket can surface here; drop it so the next
                 // attempt is a clean 1-RTT connect. (The stored hint was already
@@ -215,6 +237,7 @@ class PhantomClient(
             sessionMutex.withLock { session = newSession }
 
             // Report the server's 0-RTT verdict (null = no early-data sent).
+            // Meaningful only because awaitReady() returned above.
             val accepted = runCatchingCore { newSession.earlyDataAccepted() }
             _state.update { it.copy(earlyDataAccepted = accepted) }
             when (accepted) {
@@ -223,10 +246,11 @@ class PhantomClient(
                 null -> { /* no early-data was offered on this connect */ }
             }
 
-            // NOTE: do NOT harvest here. connectPinned* returns while the
-            // handshake still runs in a background task, so resumptionHint()
-            // returns null at this point. The state poller harvests once the
-            // session first reaches an ESTABLISHED state (see onStateTransition);
+            // NOTE: do NOT harvest here, even though awaitReady() has returned
+            // by now: a hint exists only once the server has issued a ticket for
+            // this session, which readiness does not promise, so resumptionHint()
+            // can still be null. The state poller harvests once the session first
+            // reaches an ESTABLISHED state (see onStateTransition);
             // teardownSession(persistHint = true) is the fallback harvest.
 
             publishStatus("Connected", newSession.connectionState())
@@ -451,10 +475,10 @@ class PhantomClient(
         _state.update { it.copy(connectionState = current, connected = isLive(current)) }
 
         // Harvest a fresh resumption ticket the first time this session reaches a
-        // data-ready (ESTABLISHED) state. connectPinned* returns while the
-        // handshake is still running in the background, so resumptionHint() is
-        // only meaningful once the session has actually established — observed
-        // here. One harvest per session (the flag is reset on connect/teardown).
+        // data-ready (ESTABLISHED) state. A ticket is the server's to issue, so
+        // resumptionHint() is only reliably populated once the session has been
+        // observed established — observed here rather than assumed in connect().
+        // One harvest per session (the flag is reset on connect/teardown).
         if (isEstablished(current) && hintHarvestedThisSession.compareAndSet(false, true)) {
             harvestResumptionHint(active)
         }

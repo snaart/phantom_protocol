@@ -151,8 +151,10 @@ the network-change recovery path; **Disconnect** for a graceful close.
 - **Connect** — starts the foreground `PhantomSessionService`, then calls
   `connectPinnedWithResumption` if a fresh resumption ticket is stored (0-RTT,
   folding a small early-data payload into the ClientHello) or `connectPinned`
-  otherwise (full 1-RTT PQC handshake). On success it harvests a new ticket
-  into `EncryptedSharedPreferences` and starts the recv loop + state poller. The
+  otherwise (full 1-RTT PQC handshake), and then `awaitReady()` — which is where
+  a wrong pinned key is refused, since the connect call itself returns before the
+  handshake has run. On success it harvests a new ticket into
+  `EncryptedSharedPreferences` and starts the recv loop + state poller. The
   config is remembered so the recovery path can reconnect without it.
 - **Send** — UTF-8 `session.send(...)`.
 - **Reconnect (0-RTT)** — the genuinely-working mobile recovery pattern: harvest
