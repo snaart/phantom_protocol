@@ -5372,17 +5372,23 @@ public func connectPinned(host: String, port: UInt16, pinnedKey: Data)async thro
  * extra address in a name's DNS answer — an added AAAA record, a poisoned resolver, a
  * hostile split-horizon zone — is contacted first on every one of these calls and gets
  * the whole `ClientHello`, so being told that something answered for this name and was
- * not the server you pinned is the point of the pin. Where every address merely failed
- * to answer, the returned [`CoreError::NetworkError`] names each one and what it said.
+ * not the server you pinned is the point of the pin. The returned
+ * [`CoreError::NetworkError`] carries the roster — every address tried and what each one
+ * said — in one case only: where no candidate's socket could be created at all, so no
+ * session ever existed to hand back. An address that merely fails to *answer* does not
+ * reach it, because the last candidate goes back as `Ok` without being awaited, which is
+ * the contract this entry point documents; what the earlier candidates said goes to the
+ * log, and [`await_ready`](PhantomSession::await_ready) is where the outcome comes from.
  * A deployment whose addresses genuinely hold *different* identities has to pin per
  * address; one key cannot be the right answer for all of them.
- * * **The share has a floor**, so the call is not guaranteed to fit inside the single
- * handshake deadline. A share shorter than a handshake decides nothing and abandons
- * reachable addresses — a name with eight records divided a ten-second budget into
- * 1.25 s while a handshake on a 600 ms path takes about 1.8 s — so the share is floored
- * at two seconds. Below six addresses that changes nothing. Above six the walk stops
- * waiting once the deadline is spent and hands back the next candidate unawaited, which
- * bounds the call by the deadline plus one share.
+ * * **The attempts overlap and the call fits inside the one handshake deadline.** Each
+ * address is contacted 250 ms after the one before it — RFC 8305 § 5's Connection Attempt
+ * Delay — unless an earlier one has answered, and each attempt is waited on for at most an
+ * even share of the 10 s handshake deadline, floored at 2 s, since a wait shorter than a
+ * handshake decides nothing and abandons reachable addresses. The floor can make the
+ * shares add up to past the deadline at six addresses or more, which leaves such a name a
+ * tail the walk never reaches; the deadline is the outer authority either way, so the call
+ * is bounded by it rather than by it plus a share, as the serial walk was.
  *
  * Server-key pinning is mandatory (security invariant 1). Native-only, like
  * [`connect_pinned`].
@@ -5673,7 +5679,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_func_connect_pinned() != 13736) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp() != 4269) {
+    if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp() != 40975) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_config() != 35502) {

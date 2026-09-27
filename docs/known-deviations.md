@@ -157,17 +157,24 @@ under **Documented**.
 
 ## 7. A multi-address name makes `connect_pinned_udp*` behave unlike its single-address self
 
-**Observed.** Three surprises, all on a name with more than one A/AAAA record. The
-call can take longer than the ten-second client handshake deadline. Abandoned
+**Observed.** Three surprises, all on a name with more than one A/AAAA record. More
+than one address can be holding a live handshake at the same moment. Abandoned
 candidates keep running. And the error that names every address tried is not the one
 a caller usually gets.
 
-**The rule.** Only the handshake can tell UDP candidates apart, so the walk gives
-each candidate but the last a share of the deadline. The share has a 2 s floor, so
-at six addresses or more `floor × count` exceeds the deadline: the walk then stops
-waiting once the deadline is spent and hands back the next candidate unawaited,
-bounding the call at the deadline plus one share and leaving a tail of addresses it
-never reaches. An abandoned candidate is not cut short — its close request is read
+**The rule.** Only the handshake can tell UDP candidates apart, so the walk contacts
+each address 250 ms after the one before it — RFC 8305 § 5's Connection Attempt Delay
+— and hands back the first handshake to complete. An address that has answered stops
+the schedule, so a name whose first address works is still the only one contacted.
+Each attempt is waited on for at most an even share of the deadline, floored at 2 s;
+at six addresses or more `floor × count` exceeds the deadline, which leaves such a
+name a tail of addresses the walk never reaches. The deadline is the outer authority,
+so the whole call fits inside it — that was not true before 0.3.1, where the walk ran
+the addresses strictly in turn and could take the deadline plus a share. One property
+is narrower than the serial walk's: an impostor that says nothing at all before a
+later address completes is not reported, where the serial walk would have waited out
+its whole share for it. One that answers still ends the walk. An abandoned candidate
+is not cut short — its close request is read
 inside the data pump, which a session abandoned mid-handshake never reaches — so up
 to `n − 1` sockets and background tasks stay alive until their own deadlines. And
 the roster error (`CoreError::NetworkError`, naming every address and what each
