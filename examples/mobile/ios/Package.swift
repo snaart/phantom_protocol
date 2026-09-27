@@ -19,7 +19,10 @@ import PackageDescription
 //      here to avoid drift with the generated source of truth.
 //
 // This mirrors the project's "not built in CI — verify locally with Xcode"
-// posture for the mobile samples.
+// posture for the mobile samples. Once both are in place, `swift build` and
+// `swift test` complete on a macOS host against the framework's macOS slice,
+// which is the cheapest way to check a change to PhantomDemoKit before opening
+// Xcode.
 
 let package = Package(
     name: "PhantomDemoApp",

@@ -48,14 +48,22 @@ public struct PhantomServerConfig {
     public static let pinnedKeyExtension = "bin"
 
     /// Loads the pinned key from the app bundle. Pass the bundle that actually
-    /// carries the resource — in this sample it is bundled with `PhantomDemoKit`,
-    /// so `Bundle.module` is the right default.
+    /// carries the resource, or `nil` to use the one this module's resources are
+    /// compiled into — in this sample that is `PhantomDemoKit`'s own bundle.
+    ///
+    /// The parameter is `Bundle?` rather than defaulting to `.module` because
+    /// SwiftPM generates `Bundle.module` as an `internal` static property, and an
+    /// internal symbol cannot appear in a `public` function's default argument:
+    /// `static property 'module' is internal and cannot be referenced from a
+    /// default argument value`. Resolving it in the body keeps the call sites
+    /// unchanged.
     ///
     /// If the bundled resource is missing or empty, falls back to the
     /// `developmentPinnedKeyHex` constant below so the sample is runnable out of
     /// the box against a locally-keyed dev server. In a shipping app you should
     /// treat a missing bundled key as a fatal misconfiguration instead.
-    public static func loadPinnedKey(from bundle: Bundle = .module) throws -> Data {
+    public static func loadPinnedKey(from bundle: Bundle? = nil) throws -> Data {
+        let bundle = bundle ?? .module
         if let url = bundle.url(forResource: pinnedKeyResource, withExtension: pinnedKeyExtension),
            let data = try? Data(contentsOf: url),
            !data.isEmpty,
@@ -76,7 +84,7 @@ public struct PhantomServerConfig {
     /// pinned key.
     public static func bundled(host: String,
                                port: UInt16,
-                               bundle: Bundle = .module) throws -> PhantomServerConfig {
+                               bundle: Bundle? = nil) throws -> PhantomServerConfig {
         let key = try loadPinnedKey(from: bundle)
         return PhantomServerConfig(host: host, port: port, pinnedKey: key)
     }

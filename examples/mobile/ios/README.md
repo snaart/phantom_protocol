@@ -121,6 +121,15 @@ cp -R tests/bindings/swift/PhantomProtocol.xcframework \
       examples/mobile/ios/Frameworks/PhantomProtocol.xcframework
 ```
 
+With that and the generated binding from step 2 in place, the package builds on
+the Mac itself against the framework's macOS slice — worth doing before opening
+Xcode, since it type-checks `PhantomDemoKit` in a couple of seconds:
+
+```sh
+swift build --package-path examples/mobile/ios
+swift test  --package-path examples/mobile/ios
+```
+
 See also `docs/operations/mobile.md` for the canonical build recipe and the
 background/foreground + battery notes.
 
