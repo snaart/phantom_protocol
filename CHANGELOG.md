@@ -405,7 +405,12 @@ Pointers only: each item is set out in full in the entry named.
   which lints run at all: of cargo-semver-checks' 253 lints a `minor` run performs the 196
   major-severity ones, while a `patch` run performs 223, the extra 27 being minor-severity
   checks for changes a minor bump would excuse and `docs/policy/versioning.md` § 2 says a
-  patch release must not make. The type is now read out of the tree — `core/Cargo.toml`'s
+  patch release must not make. Those four figures are one tool version's inventory —
+  0.48.0's, which is what this was measured against; CI installs 0.50.0, so read them as the
+  shape of the difference and re-derive them from the `Checked … N checks` line of a run.
+  Nothing the script does depends on them: it reads the release type out of the tree and the
+  step out of the tool's own output, so a changed inventory moves the numbers in this
+  paragraph and not the behaviour. The type is now read out of the tree — `core/Cargo.toml`'s
   version against the newest release heading below it in `CHANGELOG.md`, falling back to the
   strictest when there is no step to read — the report's first line records it and where it
   came from, and after the run the script re-derives the step from the tool's own

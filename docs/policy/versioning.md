@@ -52,7 +52,9 @@ rather than written into the workflow: `scripts/semver_report.sh` compares
 `CHANGELOG.md`, so `0.3.0 → 0.3.1` is checked as the patch release this section
 defines as "bugfix / docs only" and `0.3.1 → 0.4.0` as the minor one it lets break.
 It matters because the narrower type skips lints rather than relabelling findings: a
-`minor` run of this crate performs 196 checks where a `patch` run performs 223. Until
+`minor` run of this crate performs 196 checks where a `patch` run performs 223 — counts from
+cargo-semver-checks 0.48.0, against the 0.50.0 CI installs, so treat them as illustrative and
+take the real ones from the `Checked … N checks` line of the run in front of you. Until
 0.3.1 the type was the fixed word `minor`, which was the right assumption before a
 version had been bumped and the wrong one after, and the script now also refuses to
 report at all if the type it used permitted more than the step the tool says it
