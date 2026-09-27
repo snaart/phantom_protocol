@@ -139,7 +139,9 @@ independent multiplexed streams with per-stream flow control.
   OTLP/gRPC push to any backend (Datadog, Honeycomb, Grafana Cloud,
   self-hosted via OTel Collector). Pre-built Grafana dashboard + Prometheus
   alert rules in `docs/observability/`.
-- **SLSA-3 build provenance** — OIDC attestation on every release artifact.
+- **Signed build provenance** — every release artifact carries a sigstore-backed
+  in-toto attestation naming the workflow, commit and runner that produced it
+  (SLSA v1.0 Build **L2**; verify with `gh attestation verify`).
 - **Cross-platform** — every CI target is a hard gate (Linux x4, macOS x2,
   iOS x2, Windows x2, wasm32-unknown-unknown, wasm32-wasip2,
   thumbv7em-none-eabihf); **no `allow_failure` rows**.
@@ -689,10 +691,20 @@ Report privately, **not** via public issues. Embargo SLA 90 days; ack within
 
 `cargo deny` (permissive-license allowlist, `yanked = "deny"`,
 `unknown-registry = "deny"`) and `cargo audit` run in CI. Release artifacts
-carry **SLSA-3 OIDC build-provenance attestations** via
-`actions/attest-build-provenance@v4` (SHA-pinned). Verify with
+carry **sigstore-backed in-toto build-provenance attestations** via
+`actions/attest-build-provenance@v4` (SHA-pinned). Every artifact is covered, and
+the attestation names the workflow, the commit and the runner that produced it, so
+a tarball claiming to be a release of this crate can be checked against a
+signature only a run of this repository's workflow can produce. Verify with
 `gh attestation verify --owner <org> <artifact>` or
 `cosign verify-blob-attestation`.
+
+That is **SLSA v1.0 Build Level 2**, not Level 3. L3 asks that the build run
+somewhere the provenance signing identity is not reachable from the build steps
+themselves; here the attest step sits inline in the same `build-artifacts` job
+that compiles, and that job restores a `Swatinem/rust-cache` shared with the rest
+of CI. Reaching L3 is a workflow change, not a code change — see
+[`docs/DEFERRED_WORK.md` §1](https://github.com/snaart/phantom_protocol/blob/main/docs/DEFERRED_WORK.md).
 
 ## Status & limitations
 

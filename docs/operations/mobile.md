@@ -372,8 +372,12 @@ every `send`/`recv` on it errors immediately. Use `connectPinned` /
 accessible to apps sharing the same team ID (iOS) or user ID (Android). Assess
 your threat model; clear tickets on detected compromise.
 
-**Reproducible builds.** Recommended for supply-chain hygiene. SLSA-3 provenance
-(Phase 7.4) covers Rust artifacts — integrate with your mobile CI/CD pipeline.
+**Reproducible builds.** Recommended for supply-chain hygiene. The release
+pipeline attaches a sigstore-backed in-toto build-provenance attestation to every
+Rust artifact (SLSA v1.0 Build L2; `gh attestation verify --owner <org>
+<artifact>`). It covers the tarballs `release.yml` builds, **not** the XCFramework
+or AAR you assemble from them, so attest your own mobile artifacts in your own
+pipeline rather than inheriting a claim from ours.
 
 **Signing key is server-side only.** The bytes baked into the app are the *public*
 `HybridVerifyingKey`. Never bundle a `HybridSigningKey` (private).

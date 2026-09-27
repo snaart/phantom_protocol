@@ -12,9 +12,11 @@ the four FFI bindings:
 
 **Publishing is intentionally manual.** None of the steps below are
 automated in CI — releasing a binding is a deliberate human action.
-SLSA-3 build-provenance attestation is wired up for the Rust crate
-(`.github/workflows/release.yml`); per-binding publish workflows are a
-follow-up beyond the scope of these configs.
+Build-provenance attestation is wired up for the Rust crate
+(`.github/workflows/release.yml` — sigstore-backed in-toto provenance, SLSA v1.0
+Build L2); per-binding publish workflows are a follow-up beyond the scope of these
+configs, so a wheel, XCFramework or AAR built from these files carries no
+attestation of its own.
 
 ---
 

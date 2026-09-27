@@ -33,8 +33,10 @@ add FMT_SMF / FMT_MSA families. This document does not cover the ND PP.
 - `tests/bindings/{swift,kotlin,c,python}` — the UniFFI-generated consumer
   FFI surfaces, treated as part of the TOE boundary for the purposes of
   interface testing.
-- CI pipeline artifacts: SLSA-3 build-provenance attestations produced by
-  `.github/workflows/release.yml` (actions/attest-build-provenance@v4.1.0).
+- CI pipeline artifacts: sigstore-backed in-toto build-provenance attestations
+  produced by `.github/workflows/release.yml`
+  (`actions/attest-build-provenance@v4.2.2`, SHA-pinned). SLSA v1.0 Build **L2** —
+  see the ALC_CMC.1 row in §4 for what that does and does not evidence.
 
 ### Out of Scope
 
@@ -302,7 +304,7 @@ the client's IP address protection. Phantom Protocol's position:
 | AGD_OPE.1 | Operational User Guidance | `docs/operations/deployment.md`, `docs/operations/kubernetes.md`, `docs/operations/mobile.md`, `docs/operations/wasm.md`, `docs/operations/docker.md`, `docs/operations/systemd.md`. | Helm chart at `docs/operations/helm/`. Grafana / Prometheus dashboards at `docs/observability/grafana/` and `docs/observability/prometheus/`. |
 | AGD_PRE.1 | Preparative Procedures | `docs/operations/deployment.md` — installation, configuration, network prerequisites. `docs/operations/perf-tuning.md` — tuning and validation steps. | Ensure the preparative guide is self-contained for the evaluated configuration (`std` build, default features). |
 | ALC_DVS.1 | Identification of Security Measures in the Development Environment | `docs/security/incident-response.md` — triage timeline, severity buckets, embargo / disclosure flow. `.github/workflows/` — CI gates enforced on every PR. | Lab will want a written development-security policy; `incident-response.md` covers the incident side but not the development-process side. |
-| ALC_CMC.1 | CM Capabilities | Git commit history on `main`. SLSA-3 build provenance: `.github/workflows/release.yml` (`actions/attest-build-provenance@v4.1.0`). Verify: `gh attestation verify --owner <org> <artifact>` or `cosign verify-blob-attestation`. | SLSA-3 attestation (Phase 7.4, commit `fb89465`) is strong supply-chain evidence. |
+| ALC_CMC.1 | CM Capabilities | Git commit history on `main`, plus the `v*.*.*` tags. Signed build provenance: `.github/workflows/release.yml` (`actions/attest-build-provenance@v4.2.2`, SHA-pinned) emits a sigstore-backed in-toto v1 statement per release tarball. Verify: `gh attestation verify --owner <org> <artifact>` or `cosign verify-blob-attestation`. | The attestation is **SLSA v1.0 Build L2**, not L3: it authenticates which workflow, commit and runner produced an artifact, which is what ALC_CMC.1 asks (unique reference + CM system). It does **not** evidence build isolation, because the attest step is inline in the job that compiles and that job restores a cache shared with the rest of CI — see `../DEFERRED_WORK.md` §1. Note also that the history before the 0.3.0 tag was rewritten (§4 note below), so a pre-0.3.0 commit id from an older document will not resolve. |
 | ALC_CMS.1 | CM Scope | All source files under `core/` tracked in git. `cargo deny check` (`deny.toml`) enforces license and yanked-crate policy on every CI run. | Dependency version pinning via `Cargo.lock`. |
 | ATE_FUN.1 | Functional Testing | `core/tests/security_invariants.rs` — 73 formal negative-security tests (always-on, not `#[ignore]`). `core/tests/property.rs` — proptest harness (AEAD round-trip, AAD-mismatch, replay window). `core/tests/cavp.rs` — 5 CAVP-style KAT vectors. `core/tests/tcp_integration.rs` — loopback end-to-end (run with `-- --ignored`). | Lab will execute the test suite independently. The 73 security invariant tests are the primary ATE_FUN evidence. |
 | ATE_COV.1 | Analysis of Coverage | `cargo llvm-cov` **line** coverage on stable (`--lcov --output-path lcov.info`). Coverage workflow: `.github/workflows/coverage.yml`; branch coverage is deliberately out of scope (it requires nightly's `-Z coverage-options=branch`, whose `llvm-cov export` crashes). | Line-coverage percentage for security-critical paths (crypto/, security/) should be documented in the ST; branch coverage must be argued separately. |
@@ -373,18 +375,23 @@ the client's IP address protection. Phantom Protocol's position:
    - Security Target (ST): expand this document into a formal ST per
      CC:2022 Part 2/3 requirements.
    - Developer Evidence: source tree + build instructions (`README.md`
-     §Quick start + `CONTRIBUTING.md`), CI logs, SLSA-3 attestation artifacts.
+     §Quick start + `CONTRIBUTING.md`), CI logs, build-provenance attestation
+     artifacts (`*.intoto.jsonl`, uploaded beside each release tarball).
    - Test Evidence: `core/tests/security_invariants.rs`, `core/tests/cavp.rs`,
      `core/tests/property.rs` outputs. The lab will likely run these
      independently.
    - Guidance Documents: `docs/operations/` suite (AGD evidence).
 
-4. **Supply-chain evidence.** SLSA-3 provenance attestations are generated
-   automatically on tag-triggered releases by `.github/workflows/release.yml`
-   (commit `fb89465`, Phase 7.4). Attestation verifiable via:
+4. **Supply-chain evidence.** Build-provenance attestations are generated
+   automatically on tag-triggered releases by the `build-artifacts` job in
+   `.github/workflows/release.yml`. Each is a sigstore-backed in-toto v1 SLSA
+   provenance statement — **SLSA v1.0 Build L2**. Verifiable via:
    `gh attestation verify --owner <org> <artifact>` or
    `cosign verify-blob-attestation`. Submit attestation artifacts alongside
-   the binary deliverable.
+   the binary deliverable, and state the level as L2: a lab that is handed an
+   L3 claim it can disprove from the workflow file spends the finding on
+   credibility rather than on the gap. What L3 would require is in
+   `../DEFERRED_WORK.md` §1.
 
 5. **Timeline.** End-to-end evaluation typically runs 6-12 months from lab
    engagement to NIAP validation decision. Resolving the gaps in §5

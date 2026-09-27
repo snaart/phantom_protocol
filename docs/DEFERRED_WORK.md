@@ -12,41 +12,71 @@ in [`protocol/PROTOCOL.md`](protocol/PROTOCOL.md).
 
 | Item | Status | Gated on |
 | --- | --- | --- |
-| Hermetic / reproducible builds (former SLSA v0.1 "L4") | SLSA v1.0 Build **L3** shipped (track top) | external build substrate |
+| SLSA Build **L3** + hermetic / reproducible builds | signed provenance shipped at Build **L2** | a reusable build workflow, then an external build substrate |
 | `no-std` PQ handshake (bare-metal) | framing-only ships | no-std crypto + runtime + QEMU test sub-project |
 | WASI **server-side** session | client `WasiLeg` ships | data-pump timer refactor + accept loop |
 | **ECN** congestion feedback | loss-feedback half shipped (#142) | ingress ECN readback + a wire field |
 
 ---
 
-## 1. Hermetic / reproducible builds (former SLSA v0.1 "L4")
+## 1. SLSA Build L3, then hermetic / reproducible builds
 
-**What ships today (L3 — the top of the SLSA v1.0 build track).** `release.yml`
-produces a sigstore-backed in-toto v1 SLSA build-provenance attestation via
-`actions/attest-build-provenance` (Phase 7.4). That gives non-falsifiable
-provenance tying each release artifact to the workflow, commit, and runner that
-built it — **SLSA Build Level 3**, on isolated GitHub-hosted ephemeral runners.
-SLSA **v1.0 has no Build L4**; L3 is the highest build level defined, so the
-provenance posture is already at the top of the current spec. Verify with
-`gh attestation verify --owner <org> <artifact>` or
-`cosign verify-blob-attestation`.
+**What ships today — signed provenance at Build L2.** `release.yml` produces a
+sigstore-backed in-toto v1 SLSA build-provenance attestation for every release
+tarball via `actions/attest-build-provenance`. The provenance names the workflow,
+the commit and the runner, it is signed by a Sigstore identity nobody outside a run
+of this repository's workflow can obtain, and it is verifiable by a consumer who has
+only the tarball:
 
-**Why the next step is deferred.** The capability beyond L3 — a **hermetic** build
-(all inputs declared and fetched ahead of time, no network during the build) on an
-isolated, reproducible build platform, with two-party review of every change to
-the build definition — was the SLSA **v0.1** "Level 4" notion (retired in v1.0,
-now folded into reproducible-builds + source/review tracks). GitHub-hosted runners
+```bash
+gh attestation verify --owner <org> phantom_protocol-<tag>-x86_64-unknown-linux-gnu.tar.gz
+# or, without gh:
+cosign verify-blob-attestation --bundle <bundle> <artifact>
+```
+
+Per GitHub's own documentation of the action, that posture is **SLSA v1.0 Build
+Level 2** — provenance exists, it is authentic, and it is produced by a hosted
+build service rather than asserted by the publisher. This file previously called it
+Level 3 and called Level 3 the top of the track, and both statements were wrong; the
+correction is recorded in `CHANGELOG.md`.
+
+**Why L3 is not reached, concretely.** Build L3 requires the provenance signing
+identity to be unavailable to the build steps it attests — on GitHub that means the
+compile-and-attest sequence lives in a **reusable workflow** that is the sole holder
+of that identity, so a change to a calling workflow cannot mint provenance for
+something the trusted one did not build. Two properties of `release.yml` stand
+between here and there:
+
+- The attest step is **inline in `build-artifacts`**, the same job that runs
+  `cargo build` and packages the tarball. The job holds `id-token: write` while
+  arbitrary build scripts from the dependency graph are executing in it.
+- That job restores a **`Swatinem/rust-cache`** keyed per target and shared with the
+  rest of CI, so a build input can come from a cache another workflow wrote. L3's
+  isolation requirement is about exactly this: one run must not be able to influence
+  another's.
+
+Neither is hard to fix and neither is a code change — it is a workflow refactor
+(lift build + package + attest into `.github/workflows/build-artifact.yml`, call it
+with `uses:`, and drop the cache restore from the release path so a release compiles
+from source every time). It is listed here rather than done because a release
+workflow is changed on a release, and this entry is the note that says which change.
+
+**Why hermeticity stays deferred after that.** Beyond L3 — a **hermetic** build (all
+inputs declared and fetched ahead of time, no network during the build) on an
+isolated, reproducible build platform, with two-party review of every change to the
+build definition — was the SLSA **v0.1** "Level 4" notion, retired in v1.0 and now
+folded into the reproducible-builds and source/review tracks. GitHub-hosted runners
 cannot *prove* that hermeticity and isolation without an external, dedicated build
 substrate (a reproducible-builds pipeline on a controlled builder, or a hermetic
-Bazel/Nix remote-exec environment). That substrate is an infrastructure
-procurement decision, not a code change.
+Bazel/Nix remote-exec environment). That substrate is an infrastructure procurement
+decision, not a code change.
 
 **What landing it would require.** A pinned, fully-vendored dependency set
 (offline `cargo` with a vendored registry); a reproducible toolchain pin
 (`rust-toolchain.toml` is in place); a hermetic builder (Nix flake or a Bazel
 remote-execution worker) that the provenance can attest as isolated; and the
 two-party-review control on the build definition. The code-side prerequisites
-(pinned toolchain, `deny.toml`, SLSA-3 provenance) are already in place.
+(pinned toolchain, `deny.toml`, signed build provenance) are already in place.
 
 ## 2. `no-std` post-quantum handshake on bare metal
 
@@ -161,5 +191,6 @@ shipped in #142.
   (a `WIRE_VERSION` bump is named above as a prerequisite for ECN).
 - [`../CHANGELOG.md`](../CHANGELOG.md) — shipped changes, including #142 (the
   loss-feedback half of the ECN item).
-- [`../.github/workflows/release.yml`](../.github/workflows/release.yml) — the SLSA
-  build-provenance pipeline referenced in §1.
+- [`../.github/workflows/release.yml`](../.github/workflows/release.yml) — the
+  build-provenance pipeline referenced in §1, including the inline attest step and
+  the shared cache restore that hold it at Build L2.

@@ -344,7 +344,8 @@ migration.
   `scripts/check_changelog_breaking_test.sh` for the gate's own cases.
 - `git tag` policy: `vX.Y.Z` on the commit that produced the corresponding
   `Cargo.toml` version; the tag-triggered release pipeline builds cross-target
-  artifacts with SLSA-3 build-provenance attestation.
+  artifacts and attaches a sigstore-backed in-toto build-provenance attestation to
+  each (SLSA v1.0 Build L2 — see `DEFERRED_WORK.md` §1 for what L3 would take).
 
 ---
 
