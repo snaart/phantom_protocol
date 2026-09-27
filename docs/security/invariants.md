@@ -25,8 +25,9 @@ Most of these are pinned by the always-on negative suite
 Three are pinned elsewhere, because they belong to builds that suite does not
 compile: Invariant 3 rides the off-by-default `mimicry` feature, and
 Invariants 10 and 11 are FIPS-build behaviour gated by the `fips-feature` CI
-job (Invariant 10's default-build half is also covered by the handshake unit
-tests). Two are pinned in part, and their entries say which part.
+job (Invariant 10's default-build half is covered by the handshake unit tests
+and, since 0.3.1, by three cases in that always-on suite). Two are pinned in
+part, and their entries say which part.
 
 | # | Invariant | Section |
 | --- | --- | --- |
@@ -77,14 +78,42 @@ other key.
 entry point above passes `Some`. Do not make the key optional at any of them
 without an equivalent caller-side check.
 
-**Caller obligation.** The `connect_pinned*` functions return once the socket is
-connected, before the handshake has run. `Ok` from them, and `Ok` from a `send()`
-that only queued, says nothing about the pin; a wrong key surfaces later through
-`await_ready()` / `last_error()`. Call `await_ready()` immediately after
-connecting.
+**Caller obligation.** `Ok` from a `connect_pinned*` function, and `Ok` from a
+`send()` that only queued, says nothing about the pin. Call `await_ready()`
+immediately after connecting: it is the call that resolves the handshake outcome
+and returns `CoreError::ServerIdentityMismatch` on a wrong key, and the same error
+is available afterwards from `last_error()` and from `send()` / `recv()` once the
+state is terminal.
+
+When these functions return relative to the handshake is not uniform, and 0.3.1
+changed it for three of them. `connect_pinned`, `connect_pinned_with_config`,
+`connect_pinned_with_resumption` and `connect_pinned_mimic` return as soon as the
+socket is open, before the handshake has run. The three PhantomUDP entry points do
+the same for a name that resolves to one address — every IP literal, and most real
+names — but for a name with several they walk the list, and each candidate but the
+last has its own handshake awaited inside the call, within a share of the ten-second
+client deadline, because nothing else can tell a datagram address with a server
+behind it from one with nothing behind it. So such a call may return a session that
+is already `Connected`, and it may return after a handshake has failed on an earlier
+address. Neither changes the obligation: `await_ready()` on the session that came
+back is still the only thing that answers about the pin, and it is cheap on a
+session that has already finished.
+
+**Do not let a candidate walk swallow a pin mismatch.** Which candidate produced a
+session is not a security question — every candidate's handshake checks the pin
+against the same key, so no address in the list can yield an authenticated session
+with the wrong one. What the walk decides is which failure the caller is told about,
+and the two reasons a candidate fails are not alike: a socket that cannot be bound,
+or a peer that never answers, says nothing about the name's other addresses, while a
+peer that answered and presented an identity that is not the pinned one has given a
+definitive answer about this attempt. Carrying on past the second replaces the typed
+`ServerIdentityMismatch` this invariant exists to deliver with whatever the last
+candidate reports — `Timeout`, for an address with nothing behind it — and a typed
+error that arrives as the wrong type is the string-matching problem in a new place.
 
 Enforced in: `core/src/api/session.rs` (`PhantomSession::connect_with_transport`,
-`SessionBuilder::connect`, `spawn_client`, the `connect_pinned*` functions),
+`SessionBuilder::connect`, `spawn_client`, the `connect_pinned*` functions,
+`connect_udp_trying_each_address`),
 `core/src/transport/handshake.rs` (`HandshakeClient::process_server_hello`, the
 `From<HandshakeError> for CoreError` mapping).
 
@@ -328,20 +357,61 @@ the full-size early-data tests in `tcp_integration` and `udp_integration`.
 `ClientHello.protocol_variant` carries the build's `PROTOCOL_VARIANT`
 (`phantom-default-1`, or `phantom-fips-1` under the `fips` feature) and is the
 leading field of the signed transcript. The server compares it first, before any
-KEM or signature work, and refuses a mismatch with
-`HandshakeError::ProtocolVariantMismatch`, ending the attempt without a session.
-A rewrite of the cleartext field in flight is caught by the client's signature
-check. A fips and a non-fips peer therefore never complete a handshake with each
-other. Do not drop the field, move it from the head of the transcript, or add a
-field ahead of it.
+KEM or signature work, and refuses a mismatch. A rewrite of the cleartext field in
+flight is caught by the client's signature check. A fips and a non-fips peer
+therefore never complete a handshake with each other. Do not drop the field, move
+it from the head of the transcript, or add a field ahead of it.
+
+**Since 0.3.1 the refusal is answered on the wire.** It used to be a
+`HandshakeResponse::Fail`, which the listener answers by closing without a reply, so
+the peer this check exists to inform learned nothing: over TCP a bare connection
+error, and over PhantomUDP — which has no close to observe — a client that
+retransmitted its hello until the handshake deadline and reported `Timeout`.
+`HandshakeServer::process_client_hello` now returns
+`HandshakeResponse::Reject(ServerReject::protocol_variant_mismatch())` under
+`REJECT_PROTOCOL_VARIANT = 2`, which both transports already put on the wire, and
+the client surfaces it as `CoreError::ProtocolRejected`; the operator-facing
+`HandshakeError::ProtocolVariantMismatch` is built by the listener from the hello it
+still holds.
+
+What this invariant asserts is unchanged — the variant is still the first field
+compared, still compared before any KEM or signature work, no session is produced,
+and the two builds still never interoperate. What is new is a step that emits an
+unauthenticated payload to an unauthenticated peer, which is the kind of step this
+document exists to hold, so:
+
+- **It is not an amplification primitive.** The reject body is six bytes
+  (`marker(4) ‖ code(1) ‖ supported_version(1)`), seven with the `ServerReply`
+  discriminant, answering a `ClientHello` of several kilobytes. Over PhantomUDP it
+  also does not reach an unvalidated source: `HandshakeServer::udp_admit` runs the
+  stateless-cookie round before `process_client_hello` is called at all, so a reply
+  only ever goes to an address that has echoed an IP-bound cookie.
+- **It discloses nothing a probe did not already have.** The body carries no variant
+  tag — the wire has no field for one, and a patch release may not add one — only
+  the code saying the variant was the problem and the `PROTOCOL_VERSION` this build
+  speaks. 0.3.0 already sent that same body to the same sources for a version
+  mismatch (`REJECT_UNSUPPORTED_VERSION = 1`), and a peer that reaches this branch
+  has already shown it holds a Phantom implementation built the other way.
+- **Code 1 keeps its meaning.** `ServerReject` keeps its three fields and its byte
+  layout, so an older capture still decodes and the frozen wire vectors pass
+  unregenerated. A new code is the extension point; a new field would be a wire
+  change.
 
 Enforced in: `core/src/transport/handshake.rs` (`PROTOCOL_VARIANT`,
-`HandshakeTranscript`, `HandshakeServer::process_client_hello`).
+`HandshakeTranscript`, `HandshakeServer::process_client_hello`,
+`ServerReject::protocol_variant_mismatch`, `REJECT_PROTOCOL_VARIANT`).
 
 Pinned by: `transport::handshake::tests::protocol_variant_mismatch_rejected`,
+`the_reject_codes_are_distinct_and_the_version_one_is_unchanged`,
 `handshake_succeeds_with_matching_protocol_variant` and
-`transcript_hash_wire_vector` in the default build; the `fips-feature` CI job
-runs the library suite under the fips variant.
+`transcript_hash_wire_vector`;
+`api::session::tests::client_describes_a_variant_reject_as_a_variant_reject`;
+`api::listener::tests::variant_mismatch_does_not_escalate_reputation`; and, in
+the always-on negative suite,
+`security_invariants::a_cross_variant_peer_is_answered_rather_than_left_to_time_out`,
+`a_cross_variant_refusal_reaches_the_client_as_a_typed_error` and
+`a_cross_variant_peer_over_udp_is_answered_rather_than_left_to_time_out`. The
+`fips-feature` CI job runs the library suite under the fips variant.
 
 ## 11. Under `fips`, the power-on self-test runs before any handshake
 
