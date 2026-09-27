@@ -977,8 +977,11 @@ async fn every_resolved_address_is_tried_until_one_answers() {
     use crate::crypto::hybrid_sign::HybridVerifyingKey;
 
     /// Enough for a loopback handshake many times over, so a candidate that does not answer
-    /// is the only reason an attempt can fail.
-    const BUDGET: Duration = Duration::from_millis(1500);
+    /// is the only reason an attempt can fail — and, split between the two candidates below,
+    /// still above the floor the share is held at, so this test goes on exercising the
+    /// division rather than the floor. `a_slow_but_working_first_address_is_not_abandoned`
+    /// covers the floor.
+    const BUDGET: Duration = Duration::from_secs(5);
 
     let listener = PhantomUdpListener::builder("127.0.0.1:0")
         .bind()
@@ -1085,4 +1088,335 @@ async fn every_resolved_address_is_tried_until_one_answers() {
     assert_eq!(session.connection_state(), ConnectionState::Connecting);
     drop(session);
     listener.shutdown();
+}
+
+/// A UDP relay that carries one client's datagrams to `upstream` and back, holding each of
+/// them for `hop` on the way.
+///
+/// It exists to make a **slow but working** address, which loopback otherwise cannot produce:
+/// every defect about per-candidate budgets is invisible at a microsecond round trip, because
+/// any budget at all is enough there. Strictly one client and one upstream.
+///
+/// Each direction is a reader and a writer over a queue, and the writer sleeps until each
+/// datagram's *own* arrival plus `hop` rather than sleeping `hop` per datagram in the reading
+/// loop. That distinction is the whole design: a `ClientHello` does not fit in one datagram
+/// (the ML-KEM encapsulation key alone is 1184 bytes against a 1200-byte path MTU), so it
+/// arrives as several fragments, and a delay taken inline in the reader would charge `hop`
+/// for each of them in turn — a three-fragment flight would cross in 1.2 s instead of 400 ms,
+/// which is a different path than the one being modelled and, as first written, one whose
+/// handshake fell outside the window this test needs. Sleeping to a per-datagram deadline
+/// makes the one-way delay exactly `hop` whatever the fragment count, and preserves arrival
+/// order for free: arrivals are ordered, so their deadlines are too.
+#[cfg(not(target_arch = "wasm32"))]
+async fn delaying_relay(
+    front: tokio::net::UdpSocket,
+    upstream: std::net::SocketAddr,
+    hop: Duration,
+) {
+    /// One datagram waiting to be forwarded, with the moment it arrived.
+    type Queued = (Instant, Vec<u8>);
+
+    let front = Arc::new(front);
+    let Ok(back) = tokio::net::UdpSocket::bind("127.0.0.1:0").await else {
+        return;
+    };
+    let back = Arc::new(back);
+    if back.connect(upstream).await.is_err() {
+        return;
+    }
+    // The client's address, learned from its first datagram. It always precedes anything
+    // coming back, so the downstream writer below never has to wait for it.
+    let (seen_tx, seen_rx) = watch::channel::<Option<std::net::SocketAddr>>(None);
+    let (upward_tx, mut upward_rx) = mpsc::unbounded_channel::<Queued>();
+    let (downward_tx, mut downward_rx) = mpsc::unbounded_channel::<Queued>();
+
+    let from_client = {
+        let front = front.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            while let Ok((n, from)) = front.recv_from(&mut buf).await {
+                seen_tx.send_replace(Some(from));
+                if upward_tx.send((Instant::now(), buf[..n].to_vec())).is_err() {
+                    return;
+                }
+            }
+        })
+    };
+    let to_upstream = {
+        let back = back.clone();
+        tokio::spawn(async move {
+            while let Some((arrived, bytes)) = upward_rx.recv().await {
+                tokio::time::sleep_until(arrived + hop).await;
+                if back.send(&bytes).await.is_err() {
+                    return;
+                }
+            }
+        })
+    };
+    let from_upstream = {
+        let back = back.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            while let Ok(n) = back.recv(&mut buf).await {
+                if downward_tx
+                    .send((Instant::now(), buf[..n].to_vec()))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+    };
+
+    while let Some((arrived, bytes)) = downward_rx.recv().await {
+        tokio::time::sleep_until(arrived + hop).await;
+        let to = *seen_rx.borrow();
+        let Some(to) = to else {
+            continue;
+        };
+        if front.send_to(&bytes, to).await.is_err() {
+            break;
+        }
+    }
+    from_client.abort();
+    to_upstream.abort();
+    from_upstream.abort();
+}
+
+/// A first address that is reachable but slow is not abandoned part-way through a handshake
+/// that was going to succeed.
+///
+/// **The defect.** The per-candidate share was `budget / n` with no floor, so a name with
+/// eight A/AAAA records — ordinary for a CDN or a multi-homed host — gave each candidate
+/// 1.25 s of the ten-second client handshake deadline, while a PhantomUDP handshake needs the
+/// cookie round plus hello/ServerHello: about 1.8 s on a 600 ms path. The first address was
+/// correct and answering, and the walk dropped it, working session and all.
+///
+/// **What a consumer sees.** `connect_pinned_udp` against a multi-homed name hands back
+/// whichever address happens to be last in the resolver's answer, on a path where 0.3.0
+/// connected to the first. If the last one is a black hole — which is the case the walk was
+/// written for — the connect fails outright.
+///
+/// **Why it comes back unnoticed.** Loopback. At a microsecond round trip every share is
+/// enough, so the whole in-tree end-to-end coverage of the walk passes with any divisor at
+/// all, and the arithmetic has no other output: a share that is too short is
+/// indistinguishable at the surface from an address that did not answer. The relay above is
+/// what makes the case reachable without a second host.
+///
+/// The two assertions are a pair and neither is enough alone. `spawned == 1` says the first
+/// candidate was the only one ever attempted, so it was not abandoned — that is the fix.
+/// `took > naive` says the handshake really did outlast the share the defect would have
+/// handed out, so the test is exercising the case and not passing because the handshake got
+/// fast.
+#[cfg(not(target_arch = "wasm32"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_but_working_first_address_is_not_abandoned() {
+    use crate::api::session::{
+        connect_udp_trying_each_address, CLIENT_HANDSHAKE_DEADLINE, MIN_CANDIDATE_HANDSHAKE_SHARE,
+    };
+    use crate::api::udp_listener::PhantomUdpListener;
+    use crate::crypto::hybrid_sign::HybridVerifyingKey;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// One-way delay the relay adds. A cookie-gated handshake is two flights, so it crosses
+    /// the relay four times and takes about 1.4 s.
+    ///
+    /// That has to land between the share the defect handed out (`naive`, asserted below) and
+    /// the floor, and the two margins are not symmetric in what threatens them. The lower one
+    /// cannot be crossed at all: the relay's sleeps can only overshoot, so the handshake is
+    /// never faster than `4 × HOP`. The upper one is what a loaded machine eats into, so the
+    /// address count below is chosen to leave it the larger of the two — 600 ms against
+    /// 400 ms.
+    const HOP: Duration = Duration::from_millis(350);
+    /// How many addresses the name has. Enough that the even division falls well under the
+    /// floor, which is also what buys the margin described above.
+    const ADDRESSES: usize = 10;
+
+    let listener = PhantomUdpListener::builder("127.0.0.1:0")
+        .bind()
+        .await
+        .expect("bind a PhantomUDP listener");
+    let live: std::net::SocketAddr = listener
+        .local_addr()
+        .parse()
+        .expect("the listener's address");
+    let pinned = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes())
+        .expect("the listener's verifying key");
+
+    let front = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind the relay's front socket");
+    let relay_addr = front.local_addr().expect("the relay's address");
+    let relay = tokio::spawn(delaying_relay(front, live, HOP));
+
+    // Bound sockets nobody reads, held for the test's life so the ports stay taken. They are
+    // here only to make the name an eight-address one; the walk must never reach them.
+    let mut holes = Vec::new();
+    let mut candidates = vec![relay_addr];
+    for _ in 1..ADDRESSES {
+        let hole = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind a black hole");
+        candidates.push(hole.local_addr().expect("the black hole's address"));
+        holes.push(hole);
+    }
+
+    let naive = CLIENT_HANDSHAKE_DEADLINE / ADDRESSES as u32;
+    assert!(
+        naive < MIN_CANDIDATE_HANDSHAKE_SHARE,
+        "this test needs an address count whose even share ({naive:?}) is under the floor \
+         ({MIN_CANDIDATE_HANDSHAKE_SHARE:?}), or it is not testing the floor"
+    );
+
+    let accepting = {
+        let listener = listener.clone();
+        tokio::spawn(async move { listener.accept().await })
+    };
+    let spawned = Arc::new(AtomicUsize::new(0));
+    let started = Instant::now();
+    let session =
+        connect_udp_trying_each_address("slow-first", &candidates, CLIENT_HANDSHAKE_DEADLINE, {
+            let pinned = pinned.clone();
+            let spawned = spawned.clone();
+            move |transport| {
+                spawned.fetch_add(1, Ordering::Relaxed);
+                PhantomSession::connect_with_transport("slow-first", transport, pinned.clone())
+            }
+        })
+        .await
+        .expect("the slow first address answers");
+    timeout(STEP, session.await_ready())
+        .await
+        .expect("await_ready returned")
+        .expect("the slow first address completed its handshake");
+    let took = started.elapsed();
+
+    assert_eq!(
+        spawned.load(Ordering::Relaxed),
+        1,
+        "the walk made {} attempts, so the slow first address was abandoned before its \
+         handshake finished",
+        spawned.load(Ordering::Relaxed)
+    );
+    assert!(
+        took > naive,
+        "the handshake finished in {took:?}, inside the {naive:?} share the unfloored \
+         division would have given it — so this run proves nothing about the floor. Raise \
+         HOP or ADDRESSES."
+    );
+
+    let accepted = timeout(STEP, accepting)
+        .await
+        .expect("the listener accepted")
+        .expect("accept task")
+        .expect("accept");
+    assert_eq!(
+        accepted.session().connection_state(),
+        ConnectionState::Connected
+    );
+
+    session.disconnect().await.expect("disconnect");
+    relay.abort();
+    listener.shutdown();
+    drop(holes);
+}
+
+/// An address that answers for the name and is not the pinned server is reported to the
+/// caller, and the walk stops there.
+///
+/// **The defect.** The walk recorded every candidate's `await_ready()` error into one slot and
+/// discarded it the moment a later candidate succeeded, so `CoreError::ServerIdentityMismatch`
+/// was treated exactly like "this address did not answer": a `log::debug!` line, and nothing
+/// returned.
+///
+/// **What a consumer sees.** An attacker who gets one extra address into the DNS answer for
+/// the server's name — an added AAAA record, a poisoned resolver, a hostile split-horizon
+/// zone — is contacted *first* on every `connect_pinned_udp*` and receives the client's whole
+/// `ClientHello`, and on `connect_pinned_udp_with_resumption` the sealed `early_data` blob as
+/// well. The client then reaches the genuine address, returns `Ok`, and `await_ready()`
+/// answers `Ok(())`. Confidentiality holds — the pin held and the blob stayed sealed — but
+/// nothing tells the caller that an impostor answered for this name, in the one path
+/// Invariant 1 exists to guarantee. At 0.3.0, with one address per name, the mismatch reached
+/// the caller.
+///
+/// **Why it comes back unnoticed.** Swallowing a refusal makes the walk *more* likely to
+/// reach a working address, so every functional test of it keeps passing — the only
+/// difference is an error that is never raised, and nothing that passes looks for one. It is
+/// also in the file `CONTRIBUTING.md` puts behind codeowner review, where the reviewer's
+/// attention is on the crypto rather than on which arm of a `match` drops a value.
+#[cfg(not(target_arch = "wasm32"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_impostor_answering_first_for_the_name_is_reported_and_stops_the_walk() {
+    use crate::api::session::{connect_udp_trying_each_address, CLIENT_HANDSHAKE_DEADLINE};
+    use crate::api::udp_listener::PhantomUdpListener;
+    use crate::crypto::hybrid_sign::HybridVerifyingKey;
+
+    let impostor = PhantomUdpListener::builder("127.0.0.1:0")
+        .bind()
+        .await
+        .expect("bind the impostor");
+    let genuine = PhantomUdpListener::builder("127.0.0.1:0")
+        .bind()
+        .await
+        .expect("bind the genuine listener");
+    let impostor_addr: std::net::SocketAddr = impostor
+        .local_addr()
+        .parse()
+        .expect("the impostor's address");
+    let genuine_addr: std::net::SocketAddr = genuine
+        .local_addr()
+        .parse()
+        .expect("the genuine listener's address");
+    // The caller pins the genuine server. The impostor holds a different identity — it is a
+    // whole listener of its own, so it answers a hello exactly as a real server does, and
+    // signs with the key it has.
+    let pinned = HybridVerifyingKey::from_bytes(&genuine.verifying_key_bytes())
+        .expect("the genuine verifying key");
+    assert_ne!(
+        impostor.verifying_key_bytes(),
+        genuine.verifying_key_bytes(),
+        "the two listeners have to hold different identities, or there is no impostor"
+    );
+
+    // Both listeners accept: the impostor must answer for the mismatch to be reachable at
+    // all, and the genuine one must be able to accept, so that its accepting nothing is a
+    // fact about the walk and not about the harness.
+    let impostor_accept = {
+        let impostor = impostor.clone();
+        tokio::spawn(async move { impostor.accept().await })
+    };
+    let genuine_accept = {
+        let genuine = genuine.clone();
+        tokio::spawn(async move { genuine.accept().await })
+    };
+
+    let err = connect_udp_trying_each_address(
+        "impostor-first",
+        &[impostor_addr, genuine_addr],
+        CLIENT_HANDSHAKE_DEADLINE,
+        {
+            let pinned = pinned.clone();
+            move |transport| {
+                PhantomSession::connect_with_transport("impostor-first", transport, pinned.clone())
+            }
+        },
+    )
+    .await
+    .expect_err("an address that answered as the wrong identity has to reach the caller");
+    assert!(
+        matches!(err, CoreError::ServerIdentityMismatch),
+        "the caller has to be told an impostor answered, as the typed variant it branches \
+         on; got {err:?}"
+    );
+
+    // And the walk stopped: the genuine address was never contacted, so the refusal ended
+    // the walk rather than merely being remembered while it carried on.
+    assert!(
+        timeout(QUIET, genuine_accept).await.is_err(),
+        "the walk went on to the genuine address after an impostor refused, so the refusal \
+         did not end it"
+    );
+    impostor_accept.abort();
+    impostor.shutdown();
+    genuine.shutdown();
 }

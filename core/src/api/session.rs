@@ -7424,8 +7424,171 @@ async fn resolve_all(addr: &str) -> Result<Vec<std::net::SocketAddr>, CoreError>
     Ok(candidates)
 }
 
+/// How many flights a PhantomUDP client handshake needs before a `Session` exists.
+///
+/// Two, and not one: the listener's stateless-cookie gate
+/// ([`udp_admit`](crate::transport::handshake::HandshakeServer::udp_admit)) answers a first
+/// `ClientHello` from an unproven source with a `HelloRetryRequest` carrying the cookie, and
+/// only the hello that comes back with it is answered with a `ServerHello`. Each flight is a
+/// round trip, so this is how many round trips a handshake that is going to succeed still
+/// has ahead of it at the moment [`connect_udp_trying_each_address`] starts waiting on a
+/// candidate.
+#[cfg(not(target_arch = "wasm32"))]
+const UDP_HANDSHAKE_FLIGHTS: u32 = 2;
+
+/// What a sender with no round-trip measurement of its own waits before treating a flight as
+/// lost.
+///
+/// One second: what RFC 6298 §2.1 asks of TCP before any RTT sample exists, and what RFC
+/// 9002 §6.2.2 arrives at for QUIC by a different route. The property that matters here is
+/// not the provenance, though — it is that this is the interval
+/// [`UdpClientTransport`](crate::api::udp_transport::UdpClientTransport)'s own handshake shim
+/// starts its retransmission schedule from, so it is this implementation's own statement of
+/// how long an answer may take before the answer counts as late. That constant is private to
+/// its module, so `the_candidate_share_floor_is_two_of_the_transports_first_intervals` in
+/// this file's test module holds the two to each other rather than a comment asking the next
+/// editor to.
+#[cfg(not(target_arch = "wasm32"))]
+const NO_SAMPLE_FLIGHT_RTO: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The least [`connect_udp_trying_each_address`] will give a candidate before abandoning it.
+///
+/// A share below this decides nothing. Both flights of the handshake are still outstanding
+/// when the wait starts, and until each of them has been outstanding for
+/// [`NO_SAMPLE_FLIGHT_RTO`] the transport underneath has not itself concluded anything about
+/// the path — so a shorter wait cannot distinguish a candidate that is not answering from
+/// one that is merely on a long path, and abandoning on it throws away working sessions. It
+/// is derived rather than chosen for that reason: the two factors are the number of round
+/// trips that have to happen and the length this implementation already treats as "late" for
+/// one of them.
+///
+/// The failure it exists to stop: a name with eight A/AAAA records — ordinary for a CDN or a
+/// multi-homed host — divided a ten-second budget into 1.25 s shares, while a handshake over
+/// a 600 ms path takes about 1.8 s. The correct, reachable first address was abandoned and
+/// the call handed back the last candidate instead.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) const MIN_CANDIDATE_HANDSHAKE_SHARE: std::time::Duration =
+    std::time::Duration::from_millis(
+        NO_SAMPLE_FLIGHT_RTO.as_millis() as u64 * UDP_HANDSHAKE_FLIGHTS as u64,
+    );
+
+/// The wait each candidate but the last is given, out of `budget`, when the name resolved to
+/// `count` addresses.
+///
+/// An even division, floored at [`MIN_CANDIDATE_HANDSHAKE_SHARE`] so that a wait means
+/// something, and then capped back at `budget`: when the caller's whole budget is smaller
+/// than one meaningful share there is no share that decides anything, and spending the
+/// budget on the first candidate is the most that can be done without overrunning the bound
+/// the caller set. Split out of the walk because it is the part carrying arithmetic, and
+/// arithmetic is worth checking without sockets.
+#[cfg(not(target_arch = "wasm32"))]
+fn candidate_share(budget: std::time::Duration, count: usize) -> std::time::Duration {
+    let even = budget
+        .checked_div(u32::try_from(count).unwrap_or(u32::MAX))
+        .unwrap_or(budget);
+    even.max(MIN_CANDIDATE_HANDSHAKE_SHARE).min(budget)
+}
+
+/// Whether `e` — the answer a candidate's [`await_ready`](PhantomSession::await_ready)
+/// gave — ends the address walk instead of moving it on to the next address.
+///
+/// The walk exists because a connected datagram socket cannot tell an address with a server
+/// behind it from an address with nothing, so only the handshake can. That makes every
+/// answer it gets one of two kinds, and treating them as one was the defect:
+///
+/// * **the path's answer** — nothing came back, the socket could not be used for this
+///   family, the reply did not parse, the session ended before it came up. Another address
+///   of the same name need not have that problem, and trying it is the whole point.
+/// * **the peer's answer** — something answered, and what it said was no. The caller has to
+///   hear that. One extra address in a name's DNS answer (an added AAAA record, a poisoned
+///   resolver, a hostile split-horizon zone) is contacted *first* on every
+///   `connect_pinned_udp*`, and receives the client's whole `ClientHello` — on the
+///   resumption entry point, its sealed `early_data` as well. The pin holds and the blob
+///   stays sealed, so nothing is disclosed; but the one signal that an impostor answered for
+///   this name is the error the pin check produces, and discarding it because a later
+///   address answered correctly leaves the caller with `Ok(())` and no way to know. That is
+///   the detection Invariant 1 exists to provide.
+///
+/// A third and much smaller class stops the walk for an unrelated reason: a failure that is
+/// this process's own — a configuration it refused, a power-on self-test it did not pass — is
+/// identical for every candidate, so going on can only reach the same error later.
+///
+/// Everything else continues, including the handful of internal failures that would also be
+/// identical for every candidate (a broken CSPRNG, a failed derivation). They are classified
+/// that way deliberately: none of them is reachable from this path, and mis-classifying a
+/// route-specific error as terminal breaks a connect that would have worked, while
+/// mis-classifying a process-wide one as continuable costs the walk and nothing else — the
+/// roster the walk ends with names what every candidate said.
+///
+/// The match is exhaustive rather than ending in `_ => false`, and that is the point: a
+/// variant added to [`CoreError`] later has to be classified here instead of joining the
+/// class that gets thrown away.
+#[cfg(not(target_arch = "wasm32"))]
+fn refusal_ends_the_walk(e: &CoreError) -> bool {
+    match e {
+        // The peer answered, and it is not the one the caller pinned — the variant this
+        // whole classification exists for. A name whose addresses hold *different*
+        // identities cannot be pinned to one key at all, and used to work only when the
+        // resolver happened to order the matching one after the others, so there is no
+        // working deployment this refuses.
+        CoreError::ServerIdentityMismatch => true,
+        // A Phantom server answered and refused this client: the protocol version or the
+        // build variant is wrong, and both are fixed at compile time. Every address of the
+        // service refuses identically, and the caller needs the typed variant to know that
+        // the fix is a different client and not a retry.
+        CoreError::ProtocolRejected(_) => true,
+        // The two builds cannot agree on a primitive — a statement about the pair of
+        // binaries rather than about the route between them.
+        CoreError::CipherSuiteUnavailable(_) => true,
+        // This process's own arguments were refused, and every candidate is handed the same
+        // ones. Validated before any I/O on these entry points, so what arrives here is
+        // never a value read off the wire.
+        CoreError::ConfigError(_) => true,
+        // This binary's power-on self-tests did not pass, so it has no business completing a
+        // handshake with anybody (Invariant 11).
+        #[cfg(feature = "fips")]
+        CoreError::FipsSelfTestFailure(_) => true,
+        // Nothing answered inside the share, or the socket could not be used, or the byte
+        // pipe broke: the cases the walk exists for.
+        CoreError::Timeout
+        | CoreError::NetworkError(_)
+        // The session ended before it came up, by this side's close or the peer's. There is
+        // nothing to hand back either way, and another address may hold a peer that stays.
+        | CoreError::ConnectionClosed
+        // Produced from values read off the wire as readily as from anything else, so what
+        // reaches here is this peer's bytes and says nothing about the next address.
+        | CoreError::SerializationError(_)
+        | CoreError::ValidationError(_)
+        | CoreError::CryptoError(_)
+        | CoreError::HandshakeError(_)
+        | CoreError::ReplayDetected(_)
+        // Not reachable from a client handshake at all: a stream and an unsupported
+        // operation both need a session first, and the remaining three are internal. See
+        // the note above on why the unreachable ones are classified this way round.
+        | CoreError::StreamError(_)
+        | CoreError::Unsupported(_)
+        | CoreError::KeyDerivationError
+        | CoreError::RngError(_)
+        | CoreError::InternalError(_) => false,
+    }
+}
+
+/// What each address the walk got as far as trying said, for the error it ends with and for
+/// the line it logs when a refusal cuts it short.
+#[cfg(not(target_arch = "wasm32"))]
+fn address_roster(tried: &[(std::net::SocketAddr, CoreError)]) -> String {
+    if tried.is_empty() {
+        return "no address was tried".to_string();
+    }
+    let each: Vec<String> = tried
+        .iter()
+        .map(|(server, e)| format!("{server}: {e}"))
+        .collect();
+    format!("{} address(es) tried — {}", tried.len(), each.join("; "))
+}
+
 /// Open a PhantomUDP session to `addr`, trying each address the name resolves to in turn
-/// until one of them answers.
+/// until one of them answers or one of them refuses.
 ///
 /// **Why this is not simply "take the first address".** It used to be, and the first address
 /// is whichever the resolver felt like putting first: `localhost` commonly resolves to `::1`
@@ -7437,9 +7600,30 @@ async fn resolve_all(addr: &str) -> Result<Vec<std::net::SocketAddr>, CoreError>
 /// out. The only thing that can tell the addresses apart is therefore the handshake itself.
 ///
 /// So each candidate but the last is given a share of `budget` — [`CLIENT_HANDSHAKE_DEADLINE`]
-/// at every call site — to complete its handshake, and the whole call stays inside that one
-/// deadline however many addresses the name has: n candidates get a share each, not the whole
-/// of it each.
+/// at every call site — to complete its handshake. The share is
+/// [`candidate_share`]: an even division of the budget, floored at
+/// [`MIN_CANDIDATE_HANDSHAKE_SHARE`] so a wait that decides nothing is never handed out.
+///
+/// **What that means for the total.** Below six addresses on the production budget the even
+/// division is at or above the floor, and the whole call stays inside `budget`. Above it the
+/// floor wins, and `floor × count` exceeds `budget`; the walk does not respond by shortening
+/// the shares, because shares that prove nothing are what the floor exists to prevent.
+/// Instead it stops waiting once `budget` has been spent and hands back the next candidate
+/// whose socket binds, unawaited — which bounds the whole call by `budget` plus one share and
+/// is the same contract a single-address name already has: `Ok` says a socket was opened and
+/// nothing more. A name with more addresses than the budget can pay for therefore has a tail
+/// the walk never reaches, and the caller's own
+/// [`await_ready`](PhantomSession::await_ready) is what tells it so.
+///
+/// **A refusal ends the walk.** An answer that came *from a peer* — a pinned-identity
+/// mismatch, a protocol rejection — is not an address that did not work, and is returned as
+/// itself; see [`refusal_ends_the_walk`] for the classification and for what discarding it
+/// costs. The typed variant is returned unchanged, because matching on it is the documented
+/// way a caller tells "update your pinned key" from "the network is down", so the address it
+/// came from and what the earlier candidates said go to `log::warn!` rather than into the
+/// error. Where the walk ends without any peer having answered, the error it returns carries
+/// the whole roster — every address tried and what each one said — because there the roster
+/// is the entire content of the answer.
 ///
 /// The last candidate is returned without waiting, and that is what keeps the contract these
 /// entry points document — that they return before the handshake, and `Ok` says nothing
@@ -7449,8 +7633,18 @@ async fn resolve_all(addr: &str) -> Result<Vec<std::net::SocketAddr>, CoreError>
 /// caller's own [`await_ready`](PhantomSession::await_ready) is the right place to learn the
 /// outcome, and waiting here would only delay the same answer.
 ///
-/// An abandoned attempt is dropped, which asks its background task to close; the task is
-/// bounded by its own handshake deadline in any case, and holds nothing but a socket.
+/// **An abandoned attempt is not cut short**, and this is deliberate rather than pending.
+/// Dropping the session raises its close request, but that request is read inside
+/// `run_data_pump`, and a session abandoned during its handshake never reaches the pump — so
+/// each abandoned candidate keeps its socket, its background task and its handshake
+/// retransmissions until its own [`CLIENT_HANDSHAKE_DEADLINE`] expires, which for an
+/// `n`-address name leaves up to `n − 1` of them alive at once. Making the close abandon a
+/// running handshake is not available: the same background task serves
+/// [`connect_with_transport`](PhantomSession::connect_with_transport), whose documented
+/// contract is that a close arriving during the handshake still pushes the writes queued
+/// ahead of it, and that contract needs the handshake to finish. What each abandoned attempt
+/// costs is bounded and known — one socket, one task, and the flight repeats of
+/// `HANDSHAKE_RETRANSMIT_BUDGET` sent into an address that is not answering.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn connect_udp_trying_each_address<F>(
     addr: &str,
@@ -7464,38 +7658,59 @@ where
     if candidates.is_empty() {
         return Err(CoreError::NetworkError(format!("no address for {}", addr)));
     }
-    let share = budget / candidates.len() as u32;
-    let mut last_error: Option<CoreError> = None;
+    let share = candidate_share(budget, candidates.len());
+    let started = std::time::Instant::now();
+    // What every candidate the walk tried said, in order. Kept rather than overwritten: a
+    // caller told only about the last one cannot tell "none of the four answered" from "the
+    // fourth was the only one tried".
+    let mut tried: Vec<(std::net::SocketAddr, CoreError)> = Vec::new();
     let last = candidates.len() - 1;
     for (i, server) in candidates.iter().enumerate() {
         let transport = match crate::api::udp_transport::UdpClientTransport::connect(*server).await
         {
             Ok(t) => t,
             Err(e) => {
-                last_error = Some(e);
+                tried.push((*server, e));
                 continue;
             }
         };
         let session = Arc::new(spawn(transport));
-        if i == last {
-            // Nothing left to fall back to — hand it over and let the caller ask.
+        // Nothing left to fall back to, or nothing left in the budget to buy a wait that
+        // would decide anything — hand it over and let the caller ask.
+        if i == last || started.elapsed() >= budget {
             return Ok(session);
         }
         let waited = session.await_ready();
         match tokio::time::timeout(share, waited).await {
             Ok(Ok(())) => return Ok(session),
-            Ok(Err(e)) => last_error = Some(e),
-            Err(_) => last_error = Some(CoreError::Timeout),
+            Ok(Err(e)) => {
+                if refusal_ends_the_walk(&e) {
+                    log::warn!(
+                        "PhantomSession: {server} answered for {addr} and refused the \
+                         connection ({e}); the remaining {} address(es) are not tried, \
+                         because a refusal is an answer and not an address that did not \
+                         work. Before it: {}",
+                        last - i,
+                        address_roster(&tried)
+                    );
+                    return Err(e);
+                }
+                tried.push((*server, e));
+            }
+            Err(_) => tried.push((*server, CoreError::Timeout)),
         }
         log::debug!(
-            "PhantomSession: {} did not answer as {server}; trying the next address",
-            addr
+            "PhantomSession: {addr} did not answer as {server}; trying the next address. So \
+             far: {}",
+            address_roster(&tried)
         );
     }
     // Every candidate but the last returns above, so reaching here means each of them failed
     // *before* a session existed — a socket that could not be bound to that family at all.
-    Err(last_error
-        .unwrap_or_else(|| CoreError::NetworkError(format!("no usable address for {}", addr))))
+    Err(CoreError::NetworkError(format!(
+        "no usable address for {addr}: {}",
+        address_roster(&tried)
+    )))
 }
 
 /// Connect to a server over **TCP**, pinning its identity to `pinned_key`.
@@ -7938,17 +8153,36 @@ pub async fn connect_pinned_with_resumption(
 /// consumers.
 ///
 /// `host` is resolved via the system resolver and **every** address it returns is tried, in
-/// the resolver's order, until one answers — like the TCP [`connect_pinned`], whose
-/// `TcpStream::connect` does the same. It matters more here than it looks: `localhost`
+/// the resolver's order, until one answers or one refuses — like the TCP [`connect_pinned`],
+/// whose `TcpStream::connect` does the same. It matters more here than it looks: `localhost`
 /// commonly resolves to `::1` before `127.0.0.1`, and a datagram socket "connected" to an
 /// address with nothing behind it reports no error at all, so taking only the first address
 /// meant a server listening on IPv4 was simply never reached. Only the handshake can tell
 /// the addresses apart, so each candidate but the last is given a share of the client
-/// handshake deadline to complete one; the whole call stays inside that single deadline
-/// however many addresses the name has, and the last candidate is handed back without
-/// waiting, which is why a one-address name — every IP literal among them — behaves exactly
-/// as it always did. Server-key pinning is mandatory (security invariant 1). Native-only,
-/// like [`connect_pinned`].
+/// handshake deadline to complete one, and the last is handed back without waiting — which
+/// is why a one-address name, every IP literal among them, behaves exactly as it always
+/// did. Two things about the walk are worth knowing before relying on it:
+///
+/// * **A refusal is returned, not walked past.** An address that *answers* and is not the
+///   pinned server ends the walk with [`CoreError::ServerIdentityMismatch`], and one that
+///   answers with a protocol rejection ends it with [`CoreError::ProtocolRejected`]. An
+///   extra address in a name's DNS answer — an added AAAA record, a poisoned resolver, a
+///   hostile split-horizon zone — is contacted first on every one of these calls and gets
+///   the whole `ClientHello`, so being told that something answered for this name and was
+///   not the server you pinned is the point of the pin. Where every address merely failed
+///   to answer, the returned [`CoreError::NetworkError`] names each one and what it said.
+///   A deployment whose addresses genuinely hold *different* identities has to pin per
+///   address; one key cannot be the right answer for all of them.
+/// * **The share has a floor**, so the call is not guaranteed to fit inside the single
+///   handshake deadline. A share shorter than a handshake decides nothing and abandons
+///   reachable addresses — a name with eight records divided a ten-second budget into
+///   1.25 s while a handshake on a 600 ms path takes about 1.8 s — so the share is floored
+///   at two seconds. Below six addresses that changes nothing. Above six the walk stops
+///   waiting once the deadline is spent and hands back the next candidate unawaited, which
+///   bounds the call by the deadline plus one share.
+///
+/// Server-key pinning is mandatory (security invariant 1). Native-only, like
+/// [`connect_pinned`].
 ///
 /// # Example
 ///
@@ -8093,7 +8327,12 @@ pub async fn connect_pinned_udp_with_config(
 /// does have a payload; a caller that resumes twice off one hint gets 1-RTT the second time.
 ///
 /// Like [`connect_pinned_udp`], every address the host resolves to is tried in the
-/// resolver's order, inside the one client handshake deadline. Native-only.
+/// resolver's order — including the two qualifications described there: an address that
+/// answers and refuses ends the walk with that refusal, and the per-address share has a
+/// floor, so a name with more than five addresses can take longer than the one client
+/// handshake deadline. On this entry point the first of those is the sharper of the two: the
+/// sealed `early_data` blob goes out in the first flight, so it reaches whatever answers
+/// first at the name, and the refusal is what tells the caller that happened. Native-only.
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg_attr(feature = "bindings", uniffi::export(async_runtime = "tokio"))]
 pub async fn connect_pinned_udp_with_resumption(
@@ -18259,5 +18498,186 @@ mod tests {
                 PER_PACKET_OVERHEAD
             );
         }
+    }
+
+    // ── The multi-address walk's arithmetic and its classification of answers ─────
+
+    /// The per-candidate share's floor is exactly two of the transport's own first
+    /// retransmission intervals.
+    ///
+    /// **The defect.** `share = budget / n` had no floor, so a name with eight A/AAAA records
+    /// — ordinary for a CDN or a multi-homed host — gave each candidate 1.25 s of a
+    /// ten-second budget while a PhantomUDP handshake over a 600 ms path needs its cookie
+    /// round plus hello/ServerHello, about 1.8 s. The first address was correct and reachable
+    /// and was abandoned anyway, working session and all, and the call handed back the last
+    /// candidate.
+    ///
+    /// **What a consumer sees.** `connect_pinned_udp` to a multi-homed name fails, or
+    /// succeeds against whichever address happens to be last, on a path that worked at 0.3.0.
+    ///
+    /// **Why it comes back unnoticed.** The floor is derived from a constant that lives in
+    /// another module and is private to it, so the derivation has to be restated here — and a
+    /// restated constant is one that drifts silently. Nothing about a shorter share looks
+    /// wrong; it shows up only as a connect that fails on a path nobody in CI has. This holds
+    /// the floor to the schedule the transport actually walks, so changing
+    /// `HANDSHAKE_INITIAL_RTO` without changing the floor breaks a test instead of a connect.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_candidate_share_floor_is_two_of_the_transports_first_intervals() {
+        let schedule = crate::api::udp_transport::handshake_retransmit_schedule();
+        let first = *schedule
+            .first()
+            .expect("the transport's retransmission schedule has at least one interval");
+        assert_eq!(
+            NO_SAMPLE_FLIGHT_RTO, first,
+            "the walk's idea of how long a flight may be outstanding before it counts as \
+             late ({NO_SAMPLE_FLIGHT_RTO:?}) has drifted from the interval the transport's \
+             handshake shim actually waits first ({first:?})"
+        );
+        assert_eq!(
+            MIN_CANDIDATE_HANDSHAKE_SHARE,
+            first * UDP_HANDSHAKE_FLIGHTS,
+            "the floor must be one of those intervals per handshake flight"
+        );
+    }
+
+    /// The share is an even division, floored, and then capped back at the caller's budget.
+    ///
+    /// **The defect.** See above: no floor. **What a consumer sees:** the same abandoned
+    /// connect. **Why it comes back unnoticed:** the arithmetic has no output of its own — a
+    /// share that is too short is indistinguishable from an address that did not answer, and
+    /// every end-to-end test of the walk uses loopback, where a handshake finishes in
+    /// milliseconds and any share at all is enough. This is the only place the three cases
+    /// are visible.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_candidate_share_is_floored_and_then_capped_at_the_budget() {
+        let budget = CLIENT_HANDSHAKE_DEADLINE;
+
+        // Few enough addresses that the even division is already meaningful: unchanged.
+        assert_eq!(candidate_share(budget, 1), budget);
+        assert_eq!(candidate_share(budget, 2), budget / 2);
+        assert_eq!(candidate_share(budget, 5), budget / 5);
+        assert!(
+            budget / 5 >= MIN_CANDIDATE_HANDSHAKE_SHARE,
+            "five addresses is the last count whose even share clears the floor on the \
+             production budget; if that stops being true the boundary below moves"
+        );
+
+        // Past that, the floor wins — this is the case the defect was in.
+        for count in 6..64usize {
+            assert_eq!(
+                candidate_share(budget, count),
+                MIN_CANDIDATE_HANDSHAKE_SHARE,
+                "{count} addresses got a share below the floor"
+            );
+        }
+
+        // A budget smaller than one meaningful share cannot be made to hold one, and
+        // overrunning the bound the caller set would be the worse answer: the first candidate
+        // gets the whole of it.
+        let tight = MIN_CANDIDATE_HANDSHAKE_SHARE / 4;
+        assert_eq!(candidate_share(tight, 2), tight);
+        assert_eq!(candidate_share(tight, 9), tight);
+
+        // A count of zero never reaches this from the walk, which returns first — but the
+        // division must not be what says so.
+        assert_eq!(candidate_share(budget, 0), budget);
+    }
+
+    /// An answer that came from a peer ends the walk; an answer that came from the path does
+    /// not.
+    ///
+    /// **The defect.** The walk recorded every `await_ready()` error into one `last_error`
+    /// slot and dropped it as soon as a later candidate answered, so
+    /// `CoreError::ServerIdentityMismatch` was handled exactly like "this address did not
+    /// answer" — a `log::debug!` line and nothing else.
+    ///
+    /// **What a consumer sees.** An attacker who gets one extra address into the DNS answer
+    /// for the server's name is contacted first on every `connect_pinned_udp*` and receives
+    /// the whole `ClientHello`, and on the resumption entry point the sealed `early_data`
+    /// blob; the client then reaches the genuine address, returns `Ok`, and `await_ready()`
+    /// answers `Ok(())`. Nothing ever tells the caller an impostor answered — in the one path
+    /// Invariant 1 exists to guarantee.
+    ///
+    /// **Why it comes back unnoticed.** Every functional test of the walk is about reaching a
+    /// working address, and all of them still pass when a refusal is swallowed: swallowing it
+    /// makes the walk *more* likely to find the working one. The only observable difference
+    /// is an error that is not raised, which no passing test notices. Pinned as a table over
+    /// the classification itself so that a variant moved from one class to the other has to
+    /// be moved here too.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_peers_refusal_ends_the_walk_and_a_paths_failure_does_not() {
+        for terminal in [
+            CoreError::ServerIdentityMismatch,
+            CoreError::ProtocolRejected("client speaks v5, server speaks v4".into()),
+            CoreError::CipherSuiteUnavailable("chacha20-poly1305".into()),
+            CoreError::ConfigError("no pinned key".into()),
+        ] {
+            assert!(
+                refusal_ends_the_walk(&terminal),
+                "{terminal:?} is an answer from a peer, or this process's own refusal — \
+                 treating it as an address that did not work is how the detection is lost"
+            );
+        }
+        for keep_walking in [
+            CoreError::Timeout,
+            CoreError::NetworkError("no route to host".into()),
+            CoreError::ConnectionClosed,
+            CoreError::SerializationError("truncated ServerHello".into()),
+            CoreError::ValidationError("bad field".into()),
+            CoreError::CryptoError("aead open failed".into()),
+            CoreError::HandshakeError("invalid server reply".into()),
+            CoreError::ReplayDetected("dup".into()),
+            CoreError::StreamError("no such stream".into()),
+            CoreError::Unsupported("migrate".into()),
+            CoreError::KeyDerivationError,
+            CoreError::RngError("no entropy".into()),
+            CoreError::InternalError("lock".into()),
+        ] {
+            assert!(
+                !refusal_ends_the_walk(&keep_walking),
+                "{keep_walking:?} says something about this address and nothing about the \
+                 next one — refusing to try the next one is what the walk exists to avoid"
+            );
+        }
+    }
+
+    /// The error a walk that reached the end of the list returns names every address it tried
+    /// and what each one said.
+    ///
+    /// **The defect.** The walk kept one `last_error` and returned that, so a name whose four
+    /// addresses failed for four different reasons reported one of them and dropped three.
+    ///
+    /// **What a consumer sees.** "Timeout" for a name where three of the four addresses were
+    /// refused outright by the kernel, with nothing to say which address the surviving error
+    /// even belonged to.
+    ///
+    /// **Why it comes back unnoticed.** The information is only missing, never wrong — the
+    /// call still fails, with a plausible error, and no assertion about a failing connect
+    /// looks at anything but the variant.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_roster_names_every_address_the_walk_tried() {
+        let first: std::net::SocketAddr = "127.0.0.1:1".parse().expect("addr");
+        let second: std::net::SocketAddr = "[::1]:2".parse().expect("addr");
+        let roster = address_roster(&[
+            (first, CoreError::Timeout),
+            (second, CoreError::NetworkError("address family".into())),
+        ]);
+        assert!(roster.contains("2 address(es)"), "got {roster}");
+        for expected in [
+            first.to_string(),
+            second.to_string(),
+            CoreError::Timeout.to_string(),
+            "address family".to_string(),
+        ] {
+            assert!(
+                roster.contains(&expected),
+                "the roster dropped {expected}: {roster}"
+            );
+        }
+        assert_eq!(address_roster(&[]), "no address was tried");
     }
 }
