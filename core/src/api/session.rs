@@ -1451,10 +1451,17 @@ impl PhantomSession {
         }
 
         let session_id = *crypto_session.id();
-        state.store(ConnectionState::Connected as u8, Ordering::Relaxed);
-        // Signal readiness — handshake succeeded. The watch fires once;
-        // late `await_ready()` callers see the already-resolved Connected value.
-        let _ = ready_tx.send(ConnectionState::Connected as u8);
+        // `Connected` unless the session has already ended, which it can have: the
+        // handshake is asynchronous, so a `disconnect()` — or dropping the handle — can
+        // land while it is still running, and that publishes `Closed` from the caller's
+        // own thread. Storing over it said the session was up when the caller had already
+        // closed it, and the readiness answer below, published from the state, would then
+        // have been `Ok(())` for a session that was over before it began.
+        publish_unless_ended(&state, ConnectionState::Connected);
+        // Signal readiness. The watch fires once; a late `await_ready()` caller sees the
+        // already-resolved value. Published from the state rather than as a literal
+        // `Connected`, for the same reason: what resolved has to be what happened.
+        let _ = ready_tx.send(state.load(Ordering::Relaxed));
         log::debug!("PhantomSession: fully connected to {}", peer);
 
         // Wrap the (post-handshake) transport so every data-plane send/recv is

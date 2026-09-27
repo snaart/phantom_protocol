@@ -550,6 +550,113 @@ async fn a_session_that_never_tried_is_not_reported_as_closed() {
     );
 }
 
+// ── A close that arrives while the handshake runs ────────────────────────────
+
+/// A close that lands while the handshake is still running is not walked back by the
+/// handshake finishing.
+///
+/// The handshake is asynchronous, so `disconnect()` — or dropping the handle — can happen
+/// while it is in flight, and it publishes `Closed` from the caller's own thread. The
+/// completion then stored `Connected` over it unconditionally and published that as the
+/// readiness answer, so `await_ready()` said `Ok(())` for a session the caller had already
+/// closed, and a poller saw it go live after being told to stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_during_the_handshake_is_not_walked_back() {
+    let server_hs = HandshakeServer::new().expect("HandshakeServer::new");
+    let pinned = server_hs.verifying_key().clone();
+    let (client_link, server_link, _cut) = Pipe::pair();
+    let client = Arc::new(PhantomSession::connect_with_transport(
+        "test-server:9000",
+        client_link,
+        pinned,
+    ));
+
+    // Take the hello and compose the reply WITHOUT sending it, so the handshake is provably
+    // still running when the close below lands.
+    let (reply, inner) = compose_reply_without_sending(&server_hs, &server_link).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        client.connection_state(),
+        ConnectionState::Connecting,
+        "precondition: the handshake has not finished"
+    );
+
+    client.disconnect().await.expect("disconnect");
+    assert_eq!(client.connection_state(), ConnectionState::Closed);
+
+    // Watch for the state going back up while the handshake completes behind us.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let poller = {
+        let client = client.clone();
+        let seen = seen.clone();
+        tokio::spawn(async move {
+            let until = Instant::now() + Duration::from_millis(600);
+            while Instant::now() < until {
+                seen.lock().await.push(client.connection_state());
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+    };
+    // Release the reply: the client's handshake now succeeds.
+    server_link
+        .send_bytes(&reply)
+        .await
+        .expect("send ServerHello");
+    poller.await.expect("poller task");
+
+    let ready = timeout(STEP, client.await_ready())
+        .await
+        .expect("await_ready returned")
+        .expect_err("a session closed before it came up is not ready");
+    assert!(
+        matches!(ready, CoreError::ConnectionClosed),
+        "the readiness answer has to be the close the caller asked for; got {ready:?}"
+    );
+    assert!(
+        client.last_error().await.is_none(),
+        "the caller's own close is not a failure"
+    );
+    let seen = seen.lock().await;
+    assert!(
+        !seen.contains(&ConnectionState::Connected),
+        "the session was published as Connected after the caller closed it: {seen:?}"
+    );
+    drop(inner);
+}
+
+/// Read the client's hello (answering the DoS gate's cookie retry, which *is* sent) and
+/// return the serialized `ServerHello` **unsent**, so the caller decides when the client's
+/// handshake completes.
+async fn compose_reply_without_sending(
+    server_hs: &HandshakeServer,
+    link: &Pipe,
+) -> (Vec<u8>, crate::transport::session::Session) {
+    let client_ip = "127.0.0.1".parse().expect("parse IP");
+    let mut bytes = link.recv_bytes().await.expect("recv ClientHello");
+    loop {
+        let hello = borsh::from_slice::<ClientHello>(&bytes).expect("deserialize ClientHello");
+        match server_hs.process_client_hello(&hello, 0, client_ip) {
+            HandshakeResponse::Retry(retry) => {
+                let wire = ServerReply::Retry(retry)
+                    .to_wire()
+                    .expect("serialize retry");
+                link.send_bytes(&wire).await.expect("send retry");
+                bytes = link.recv_bytes().await.expect("recv retry hello");
+            }
+            HandshakeResponse::Success(server_hello, session, _) => {
+                return (
+                    ServerReply::Hello(server_hello)
+                        .to_wire()
+                        .expect("serialize ServerHello"),
+                    session,
+                );
+            }
+            HandshakeResponse::Reject(r) => panic!("unexpected Reject: {r:?}"),
+            HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
+        }
+    }
+}
+
 // ── The concurrency cap ──────────────────────────────────────────────────────
 
 /// Past [`MAX_STREAMS`] open at once, `open_stream()` refuses, and the refusal costs
