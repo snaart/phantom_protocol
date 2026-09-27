@@ -2,7 +2,9 @@
 
 - **Date:** 2026-06-03
 - **Input:** [`docs/security/audit-report-2026-06-03.md`](audit-report-2026-06-03.md) — 33 confirmed + 8 disputed findings + the additional-surface gaps found outside the 13 review dimensions.
-- **Target:** `core/` @ `main` `5827909`. Crate is **v0.3.0 (pre-1.0)** — per project policy, deliberate breaking changes are acceptable when flagged in `CHANGELOG.md` and bundled into one coherent minor bump.
+- **Target:** `core/` @ `main` as it stood on 2026-06-03 — the commit id this line
+  used to give did not survive the pre-0.3.0 history rewrite
+  (`../policy/versioning.md` § 10, "Commit ids before 0.3.0"). Crate is **v0.3.0 (pre-1.0)** — per project policy, deliberate breaking changes are acceptable when flagged in `CHANGELOG.md` and bundled into one coherent minor bump.
 - **Scope:** every finding from **critical → info**, plus disputed items and the latent `networks/` gaps. Organized into **12 work-packages (WP1–WP12)** across **5 execution phases**, with a single coordinated wire bump.
 
 This plan is code-grounded: every change cites `file:line`. Read **§0 (cross-cutting rules)** first — it governs every fix.

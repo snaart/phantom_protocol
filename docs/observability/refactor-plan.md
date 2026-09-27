@@ -1,11 +1,15 @@
 # OpenTelemetry Refactor — Working Plan
 
 > **Status:** **shipped** (2026-05-19/20). All 20 atomic-commit rollout
-> steps landed on `feature/otel-observability` (commits `e59a1f1`..`5675ecc`
+> steps landed on `feature/otel-observability` (commits `568fea2`..`f9d35a1`
 > + this final sweep). This document remains the single source of truth for
-> the OpenTelemetry observability refactor — see §12 for the per-commit SHA
-> table and the tracked documentation in this directory for the canonical
-> summary.
+> the OpenTelemetry observability refactor — see §12 for the per-commit table
+> and the tracked documentation in this directory for the canonical summary.
+>
+> The ids in §12 were re-derived after the pre-0.3.0 history rewrite (see
+> `../policy/versioning.md` § 10, "Commit ids before 0.3.0"); the commit
+> **subjects** are what survived it, and `git log --grep` on a subject is the
+> lookup that cannot go stale again.
 
 **Start date:** 2026-05-19
 **Tracking:** the commit rollout in §12 records every step with the SHA it
@@ -617,26 +621,26 @@ Each row is one atomic commit. Each commit compiled and passed `cargo test
 
 | # | Step | Commit subject | Status | SHA |
 |---|------|---------------|--------|-----|
-| 1 | Doc plan committed | `docs(observability): OTel refactor working plan` | [x] | `e7290a7` |
-| 2 | Module scaffold + feature gate | `observability: scaffold module + ObservabilityConfig (no OTel deps yet)` | [x] | `e59a1f1` |
-| 3 | HotPathAtomics + per-leg arrays + CachePadded | `observability: lock-free HotPathAtomics with per-leg padding` | [x] | `02af467` |
-| 4 | Migrate recording sites from old TransportMetrics | `observability: migrate handshake/listener recording sites` | [x] | `f266415` |
-| 5 | Delete `transport/metrics.rs`, update cross-refs | `observability: remove legacy transport/metrics.rs` | [x] | `e49ad5d` |
-| 6 | Add `telemetry-otel` feature + opentelemetry/_sdk deps + ZST shim | `observability: feature-gate OTel deps + ZST no-op PhantomInstruments` | [x] | `085e735` |
-| 7 | PhantomInstruments + pre-interned attribute sets | `observability: PhantomInstruments + pre-interned attribute sets` | [x] | `327c641` |
-| 8 | Observable callbacks (with_callback) for hot atomics | `observability: bind ObservableCounter callbacks to HotPathAtomics` | [x] | `03c35fb` |
-| 9 | Handshake exponential Histogram + exemplars | `observability: Histogram for handshake.duration (exponential base-2)` | [x] | `36b06da` |
-| 10 | tracing-opentelemetry span integration | `observability: tracing-opentelemetry bridge + handshake/accept spans` | [x] | `bcaf13b` |
-| 11 | Server: telemetry init (OTLP gRPC + zstd + Delta) | `server: OTLP telemetry init (gRPC + zstd + Delta temporality)` | [x] | `a324e5f` |
-| 12 | Server: drop metrics_http.rs + hyper deps | `server: drop hand-rolled metrics_http.rs + hyper deps` | [x] | `527addf` |
-| 13 | Tests: observability suite (atomics, no-op, otel-integration, cardinality, exemplars) | `tests(observability): atomics, cardinality, exemplars, no-op fallback` | [x] | `623a572` |
-| 14 | Bench: hot-path overhead microbench | `bench(observability): hot-path record_send overhead microbench` | [x] | `c8563c6` |
-| 15 | Docs: README + metrics-catalog + otlp-setup + tracing-guide | `docs(observability): metrics catalog + OTLP setup + tracing guide` | [x] | `9f731a2` |
-| 16 | Docs: rewrite Grafana dashboards + Prometheus alerts under new naming | `docs(observability): rewrite Grafana dashboards + Prometheus alerts` | [x] | `d837fe8` |
-| 17 | examples/observability-demo crate with docker-compose stack | `examples: observability-demo (docker-compose: server + collector + grafana)` | [x] | `27721da` |
-| 18 | CHANGELOG + README Observability section | `docs: CHANGELOG + README Observability section for OTel pipeline` | [x] | `5822e6f` |
-| 19 | CI: add `cargo clippy --features telemetry-otel` job | `ci: clippy job for telemetry-otel feature` | [x] | `5675ecc` |
-| 20 | Final sweep: mark this document shipped | `docs(observability): Phase 8 — OTel observability shipped` | [x] | `9d07053` |
+| 1 | Doc plan committed | `docs(observability): OTel refactor working plan` | [x] | `ce078fb` |
+| 2 | Module scaffold + feature gate | `observability: scaffold module + ObservabilityConfig (no OTel deps yet)` | [x] | `568fea2` |
+| 3 | HotPathAtomics + per-leg arrays + CachePadded | `observability: lock-free HotPathAtomics with per-leg padding` | [x] | `ddb6244` |
+| 4 | Migrate recording sites from old TransportMetrics | `observability: migrate handshake/listener recording sites` | [x] | `33c5548` |
+| 5 | Delete `transport/metrics.rs`, update cross-refs | `observability: remove legacy transport/metrics.rs` | [x] | `8aa8ab8` |
+| 6 | Add `telemetry-otel` feature + opentelemetry/_sdk deps + ZST shim | `observability: feature-gate OTel deps + ZST no-op PhantomInstruments` | [x] | `b7d06ee` |
+| 7 | PhantomInstruments + pre-interned attribute sets | `observability: PhantomInstruments + pre-interned attribute sets` | [x] | `deb9a4d` |
+| 8 | Observable callbacks (with_callback) for hot atomics | `observability: bind ObservableCounter callbacks to HotPathAtomics` | [x] | `836daf2` |
+| 9 | Handshake exponential Histogram + exemplars | `observability: Histogram for handshake.duration (exponential base-2)` | [x] | `9475a13` |
+| 10 | tracing-opentelemetry span integration | `observability: tracing-opentelemetry bridge + rekey/path_validation spans + tracing-guide` | [x] | `40d7d3b` |
+| 11 | Server: telemetry init (OTLP gRPC + zstd + Delta) | `server: OTLP/gRPC telemetry init (metrics + traces + tracing bridge)` | [x] | `8bce6d6` |
+| 12 | Server: drop metrics_http.rs + hyper deps | `server: drop hand-rolled metrics_http.rs + hyper deps` | [x] | `30d5c40` |
+| 13 | Tests: observability suite (atomics, no-op, otel-integration, cardinality, exemplars) | `tests(observability): atomics, no-op fallback, OTel-on labeled events` | [x] | `1a1b285` |
+| 14 | Bench: hot-path overhead microbench | `bench(observability): hot-path record_send overhead — 2.5 ns/call on M1` | [x] | `80d724e` |
+| 15 | Docs: README + metrics-catalog + otlp-setup + tracing-guide | `docs(observability): README + metrics catalog + OTLP setup recipes` | [x] | `90296bf` |
+| 16 | Docs: rewrite Grafana dashboards + Prometheus alerts under new naming | `docs(observability): rewrite Grafana dashboard + Prometheus alerts under OTel names` | [x] | `7082476` |
+| 17 | examples/observability-demo crate with docker-compose stack | `examples: observability-demo crate with OTel Collector + Prometheus + Tempo + Grafana stack` | [x] | `60f2cf9` |
+| 18 | CHANGELOG + README Observability section | `docs: CHANGELOG + README Observability sections for OTel pipeline` | [x] | `9813c26` |
+| 19 | CI: add `cargo clippy --features telemetry-otel` job | `ci: clippy + test job for telemetry-otel feature` | [x] | `f9d35a1` |
+| 20 | Final sweep: mark this document shipped | `docs(observability): Phase 8 — OTel observability shipped` | [x] | `68d1db7` |
 
 ### Post-review amendments
 

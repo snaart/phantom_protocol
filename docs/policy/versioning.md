@@ -394,6 +394,27 @@ migration.
   artifacts and attaches a sigstore-backed in-toto build-provenance attestation to
   each (SLSA v1.0 Build L2 — see `DEFERRED_WORK.md` §1 for what L3 would take).
 
+### Commit ids before 0.3.0
+
+**The history up to and including the `v0.3.0` tag was rewritten, so every commit
+id minted before that tag changed.** A seven-character hash copied out of an older
+document, an old branch name, a stale PR comment or a local clone will not resolve
+against this repository; `git cat-file -t <sha>` answering `fatal: Not a valid
+object name` means the object never existed under that name here, not that the work
+is missing. The `v0.1.0`, `v0.1.1`, `v0.2.0`, `v0.2.1`, `v0.2.2` and `v0.3.0` tags
+were re-pointed at the rewritten commits and are the durable handles for those
+releases.
+
+What survived the rewrite is the commit **subjects**, so the reliable lookup for
+an old citation is `git log --all --grep '<subject>' -F` rather than the hash. The
+documents that carried pre-0.3.0 ids — `../compliance/fips-readiness.md`,
+`../observability/refactor-plan.md`, `../operations/{mobile,wasi}.md`,
+`../compliance/cc-pp-mapping.md` and the three `../security/audit-report-*.md`
+files — were re-pointed that way in 0.3.1; where a citation could not be resolved
+to one commit it was replaced with a path, a tag or a date, which is why most of
+them now name a file beside (or instead of) a hash. Prefer that form in new text:
+a path is checkable by opening it and survives the next rewrite.
+
 ---
 
 ## 11. Future evolution of this document

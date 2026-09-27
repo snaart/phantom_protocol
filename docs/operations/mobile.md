@@ -100,7 +100,8 @@ let package = Package(
 ```
 
 **Using `PhantomSession` from Swift.** The UniFFI surface exposes
-`connectPinned(host:port:pinnedKey:)` (landed in commit `bfbf808`) which
+`connectPinned(host:port:pinnedKey:)` (`d5b0a56`,
+`core/src/api/session.rs`) which
 internally opens a `TcpSessionTransport`, pins via `HybridVerifyingKey::
 from_bytes`, and delegates to `PhantomSession::connect_with_transport`
 (Security Invariant 1 enforced unconditionally). Use it directly:
@@ -197,7 +198,7 @@ dependencies {
 ```
 
 **Using `PhantomSession` from Kotlin.** `connectPinned` is on the UniFFI
-surface as of `bfbf808` — call it directly:
+surface (`d5b0a56`) — call it directly:
 
 ```kotlin
 import uniffi.phantom_protocol.*
@@ -355,9 +356,9 @@ planning. (`perf-tuning.md` covers server-side throughput, not per-session footp
 
 ## Security caveats
 
-**Pinned-connect shim (LANDED).** Commit `bfbf808` adds
+**Pinned-connect shim (LANDED).** `core/src/api/session.rs` exports
 `#[uniffi::export] pub async fn connect_pinned(host, port, pinned_key)
--> Result<Arc<PhantomSession>, CoreError>` to `core/src/api/session.rs`.
+-> Result<Arc<PhantomSession>, CoreError>` (added in `d5b0a56`).
 Internally: parses `pinned_key: Vec<u8>` into a `HybridVerifyingKey`,
 opens a `TcpSessionTransport` via `tokio::net::TcpStream::connect`, and
 delegates to `PhantomSession::connect_with_transport` — Security

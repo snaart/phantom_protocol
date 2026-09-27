@@ -1,7 +1,10 @@
 # Phantom Protocol — Security Audit Report
 
 - **Date:** 2026-06-11
-- **Target:** `phantom_protocol` library (`core/`), at `main` @ `6a7586f` (after connection migration + liveness landed).
+- **Target:** `phantom_protocol` library (`core/`), at `main` as it stood on
+  2026-06-11, after connection migration + liveness landed. The commit id this
+  line used to give did not survive the pre-0.3.0 history rewrite
+  (`../policy/versioning.md` § 10, "Commit ids before 0.3.0").
 - **Scope:** ~29,000 LoC across crypto, handshake, session/AEAD, the per-direction packet-number rework, the **new** PhantomUDP transport / demux, connection migration + path validation, liveness, SACK/reliability, wire codec, API/FFI, `unsafe`, DoS/concurrency, ICMP/middlebox handling, traffic-analysis/metadata, forward secrecy, timing, supply chain.
 - **Method:** source review organised by **22 dimensions** (14 core + 8 added: ICMP, middlebox, state-confusion, fingerprinting, metadata, key-rotation, forward-secrecy, timing), followed by a **two-check verification** of the deduplicated HIGH/MEDIUM set: a faithful re-read of the cited code and an exploitability check, both done against the actual code. Prior findings re-verified against current source.
 - **Predecessor:** builds on `docs/security/audit-report-2026-06-03.md` (1 Critical + 4 High). This audit verifies those fixes and audits the large post-2026-06-03 surface (PhantomUDP / migration / liveness / SACK / per-direction PN) that did not exist then.

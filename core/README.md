@@ -884,10 +884,12 @@ of CI. Reaching L3 is a workflow change, not a code change — see
   the state machine rather than its constant-timeness, which is an audit
   (`docs/compliance/constant-time-audit.md`) and not a measurement. Where only
   part of an invariant is pinned, the tests say so.
-  Plus the proptest, fuzz, wire-vector, runtime-integration, and CAVP suites,
-  683 library unit tests, and `#[ignore]`-gated loopback integration suites
-  (TCP, UDP — including injected loss/reorder via the fault transport — WASI,
-  TLS-mimicry). 0 workspace warnings, 0 clippy warnings. **Note:** broad test
+  Plus the proptest, fuzz, wire-vector, runtime-integration, and CAVP suites, the
+  library's own unit tests — `cargo test --manifest-path core/Cargo.toml --lib`
+  prints how many, which is the form this claim takes now because the count it
+  used to name had been wrong by 65 for a release — and `#[ignore]`-gated loopback
+  integration suites (TCP, UDP — including injected loss/reorder via the fault
+  transport — WASI, TLS-mimicry). 0 workspace warnings, 0 clippy warnings. **Note:** broad test
   coverage, a fault-injection rig, and a WAN measurement campaign are *not* a
   substitute for an external security audit.
 - **Broad feature coverage across the planned phases, but not production-ready.**
