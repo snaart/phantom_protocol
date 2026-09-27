@@ -12,13 +12,13 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 **A patch release, and a wire-compatible one.** `WIRE_VERSION` stays 8 and
 `PROTOCOL_VERSION` stays 5, so a 0.3.1 peer and a 0.3.0 peer complete a handshake and
-carry data in both directions, and no AEAD plaintext or header layout moved. Two things
-qualify that, and both have entries of their own below. `PhantomStream` stopped
-implementing `std::panic::UnwindSafe`: no item was removed and no signature changed, but
-that is a Rust API break and it is this release's only one (**Changed**). And a mixed
-pair has one behavioural limit — a 0.3.0 peer counts concurrent streams differently and
-will take 255 of them where a 0.3.1 peer takes 256 (**Fixed**, "The receive-side stream
-cap counts the streams the peer has open"). What did change is behaviour that
+carry data in both directions, and no AEAD plaintext or header layout moved. No item was
+removed, no signature changed, and no auto trait went away, so there is no Rust API break
+here and nothing a consumer has to change to take the upgrade. One thing qualifies that,
+and it has an entry of its own below: a mixed pair has a behavioural limit — a 0.3.0 peer
+counts concurrent streams differently and will take 255 of them where a 0.3.1 peer takes
+256 (**Fixed**, "The receive-side stream cap counts the streams the peer has open"). What
+did change is behaviour that
 contradicted its own documentation — a reader parked forever on a stream the session had
 already ended, a `supports_migration()` that answered for a method the caller could not
 reach, a ticket cache configured to hold nothing that held one — plus the release
@@ -37,8 +37,10 @@ neither can a script nobody invokes.
 exported item's doc comment into its checksum, and eleven of those checksums move here:
 `connect_pinned_udp`, `connect_pinned_udp_with_resumption` and
 `connect_pinned_with_resumption`; `PhantomSession::send`, `recv`, `open_stream`,
-`await_ready`, `migrate` and `supports_migration`; and `PhantomStream::recv`. So the
-generated Python, Swift and Kotlin files in this release differ from 0.3.0's.
+`await_ready`, `migrate` and `supports_migration`; and `PhantomStream::recv` and
+`set_priority`. No exported item is added or removed, so the eleven are the whole of the
+difference. So the generated Python, Swift and Kotlin files in this release differ from
+0.3.0's.
 `UNIFFI_CONTRACT_VERSION` is unchanged at 30, which means the coarse gate passes and a
 stale binding fails at import time in the consumer's process instead. The regenerated
 files ship in `tests/bindings/`. The `SessionBuilder` rustdoc is corrected too and is
@@ -118,6 +120,20 @@ Pointers only: each item is set out in full in the entry named.
   refused for about fifteen seconds, because each report cost the send loop a walk over
   every stream the session held.
 
+  Doing it on the spot means the handle carries a private field holding the session's stream
+  bookkeeping, and that bookkeeping reaches a `DashMap`, which is not `RefUnwindSafe`. An
+  auto trait is derived from every field, so that field silently took
+  `std::panic::UnwindSafe` off `PhantomStream` — a break a compiler stops a consumer over,
+  invisible in every signature, in a release that has no other. It is asserted back, with
+  the argument for why it holds written beside the impl: one operation on that bookkeeping
+  changes anything, and it is a parity test, two map removals and an atomic decrement, none
+  of which can panic or await, so no unwind can carry a reference to a half-applied change.
+  `std::panic::RefUnwindSafe` is deliberately not asserted — `PhantomStream` never had it.
+  A `--lib` test moves a stream into a generic function bounded on `UnwindSafe`, so a future
+  field that takes the trait away again fails a required check rather than
+  `cargo semver-checks`, which runs only on the release path and under
+  `continue-on-error`.
+
 - **An orderly close and a broken connection are told apart at the surface.** A session that
   ended in the orderly way — this side's `disconnect()` or the peer's — reports
   `ConnectionState::Closed`, `last_error() == None`, and `CoreError::ConnectionClosed` from
@@ -132,9 +148,32 @@ Pointers only: each item is set out in full in the entry named.
   likewise no longer reported as an orderly departure, and an end already reached is no
   longer overwritten by the pump's teardown.
 
+- **`PhantomStream::set_priority` reports an ended session as
+  `CoreError::ConnectionClosed`**, which is what `send_reliable`, `send_unreliable`,
+  `disconnect` and `recv` answer, instead of `CoreError::NetworkError("Session closed")`. It
+  was the one of the type's five calls left behind when the others were retyped, and three
+  of four is worse for a caller than either answer applied consistently would be: the single
+  arm that has to be written as a string comparison is the one nobody writes, so an orderly
+  end arrived through it as a network fault. It is still not refused during the peer's
+  draining window, unlike the three that carry a payload — returning `Ok` for bytes the pump
+  will discard is what that refusal exists to stop, and a priority is not a payload.
+
 - **`disconnect()` during the handshake is no longer walked back by the handshake
   completing**, so `await_ready()` answers `CoreError::ConnectionClosed` for a session the
-  caller had already closed instead of `Ok(())` or a generic error.
+  caller had already closed instead of `Ok(())` or a generic error. **A handshake that then
+  *fails* no longer overwrites that close either** — the failing exit is the twin of the
+  succeeding one and had the same defect, which the first fix's covering test did not reach
+  because it drove only the arm where the reply arrives. A session the caller had closed
+  itself reported `ConnectionState::Failed` with
+  `last_error() == Some(NetworkError("the far end vanished"))`: a cause recorded against an
+  event that happened after the caller was finished, for a close the call had already
+  reported as carried out, and the exact opposite of the orderly end the entry above
+  advertises. It now reports `Closed` with `last_error() == None`. Both exits go through one
+  publisher that decides the state and the cause together — the cause is stored first, so a
+  caller polling the state and then `last_error()` never sees a `Failed` with nothing
+  recorded against it, and it is taken back out when an end is already published — and the
+  readiness answer is read back out of the state instead of being asserted as a literal
+  `Failed`. The FIPS power-on-self-test exit shared the shape and is covered with them.
 
 - **`connect_pinned_udp`, `connect_pinned_udp_with_config` and
   `connect_pinned_udp_with_resumption` try every address the host resolves to**, in the
@@ -142,9 +181,46 @@ Pointers only: each item is set out in full in the entry named.
   `127.0.0.1` — plain `localhost` on many machines — failed with `Timeout` against a server
   listening on IPv4, where the TCP helper on the same name connects: only the handshake can
   tell UDP candidates apart, because "connecting" a datagram socket succeeds against an
-  address with nothing behind it. The whole call stays inside the existing client handshake
-  deadline rather than multiplying it by the address count, and a name with one address —
-  every IP literal among them — still returns before the handshake as documented.
+  address with nothing behind it. A name with one address — every IP literal among them —
+  still returns before the handshake as documented.
+
+  **A refusal from an address that answered ends the walk and is returned as itself.** As
+  first written the walk recorded each candidate's failure into one slot and dropped it the
+  moment a later candidate answered, so `CoreError::ServerIdentityMismatch` was handled
+  exactly like "this address timed out": a debug line, and nothing returned. One extra
+  address in a name's DNS answer — an added AAAA record, a poisoned resolver, a hostile
+  split-horizon zone — is contacted *first* on every one of these calls and receives the
+  whole `ClientHello`, and on the resumption entry point the sealed `early_data` blob; the
+  client then reached the genuine address and `await_ready()` answered `Ok(())`. The pin
+  held and the blob stayed sealed, so nothing was disclosed, but the one signal that an
+  impostor answered for this name reached nobody — in the path Security Invariant 1 exists
+  to provide it, and it had reached the caller when the name had one address. An answer that
+  came from a peer (`ServerIdentityMismatch`, `ProtocolRejected`, a cipher suite the two
+  builds cannot agree on) now ends the walk and is returned unchanged, because matching on
+  the typed variant is how a caller tells "update your pinned key" from "the network is
+  down"; a failure that came from the path still moves on to the next address. The
+  classification is an exhaustive match, so a `CoreError` variant added later has to be
+  placed rather than joining the discarded class by default. The refusing address and what
+  the earlier candidates said go to `log::warn!` rather than into the error, since these
+  variants carry no payload and must stay matchable; where no address answered at all, the
+  returned `CoreError::NetworkError` names every address tried and what each one said, which
+  there is the whole content of the answer. A name whose addresses genuinely hold different
+  identities no longer connects through a later one — pin per address for that deployment.
+
+  **The per-address share of the handshake deadline has a floor of 2 s**, derived as one
+  flight RTO per handshake flight rather than chosen. An even division gave a name with
+  eight A/AAAA records — ordinary for a CDN or a multi-homed host — 1.25 s each, and a
+  PhantomUDP handshake needs its cookie round plus hello and `ServerHello`, about 1.8 s on a
+  600 ms path: the correct, reachable first address was abandoned mid-handshake, working
+  session and all, and the call handed back the last candidate. **Consequence for the
+  total:** at five addresses or fewer the even division is at or above the floor and the
+  whole call stays inside the 10 s deadline, as 0.3.1's first draft of this entry said it
+  always would. At six or more the floor wins, and rather than hand out shares that decide
+  nothing the walk stops waiting once the deadline is spent and hands back the next
+  candidate unawaited — bounding the call by the deadline plus one share, 12 s, and giving
+  such a name a tail of addresses the walk never reaches. That is the contract a
+  single-address name always had: `Ok` says a socket was opened and nothing more, and
+  `await_ready()` is what says who answered.
 
 - **An accepted session reported a migration it could not perform, and accepted the
   request.** `PhantomSession::supports_migration()` and `migrate()` both read one flag taken
@@ -428,21 +504,6 @@ Pointers only: each item is set out in full in the entry named.
 
 ### Changed
 
-- **`PhantomStream` no longer implements `std::panic::UnwindSafe`.** This is the release's
-  only Rust API break. It is invisible in a signature and it is the one thing here a
-  compiler can stop a consumer over, so it is written down rather than left to be met. The
-  handle gained a private field carrying the session's own stream bookkeeping — what lets a
-  stream nothing was ever written on retire itself instead of reporting to the data pump
-  (see **Fixed**) — and that bookkeeping holds an `Arc<StreamDemultiplexer>`, whose
-  `DashMap` is not `RefUnwindSafe`, so the auto trait stops holding for the handle in front
-  of it. A caller that passes a `PhantomStream`, or anything containing one, into
-  `std::panic::catch_unwind` now needs `std::panic::AssertUnwindSafe` around it, which is
-  what a caller holding a `PhantomSession` has always needed: that handle has never been
-  `UnwindSafe`, so an application that already carries a session across a `catch_unwind`
-  boundary is unaffected. Restoring the impl was the alternative and would mean asserting
-  unwind safety over the session's tables from inside the stream handle — a wider claim
-  than the fix needs, and not one to make in a patch release.
-
 - **Seven dependencies the crate never referenced no longer reach a consumer's build, and
   `tokio` is asked for four fewer features.** The `std` feature carried `tokio-util`,
   `async-trait`, `env_logger`, `argon2`, `base64`, `once_cell` and `bitflags`, and no source
@@ -573,6 +634,19 @@ Pointers only: each item is set out in full in the entry named.
   the two versions; both now say it, and the protocol section states the 255 a sender
   should keep to against a peer whose build it does not know, together with what a second
   implementation should count.
+
+- **The address walk's documentation no longer says an abandoned attempt asks its background
+  task to close.** It does not. Dropping the session raises the close request, but that
+  request is read inside `run_data_pump`, which a session abandoned during its handshake
+  never reaches — so each abandoned candidate keeps its socket, its background task and its
+  handshake retransmissions until its own 10 s deadline expires, leaving up to `n − 1` of
+  them alive at once for an `n`-address name. Cutting a running handshake short is not
+  available here: the same background task serves
+  `PhantomSession::connect_with_transport`, whose documented contract is that a close
+  arriving during the handshake still pushes the writes queued ahead of it, and that needs
+  the handshake to finish. So the documentation states what happens, what it costs — one
+  socket, one task, and the flight repeats of the handshake retransmit budget sent to an
+  address that is not answering — and why it is deliberate rather than pending.
 
 - **`docs/policy/versioning.md` § 2 says how the semver report decides what to check.** The
   release type is derived from the version step rather than fixed, and the section that

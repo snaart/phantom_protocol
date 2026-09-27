@@ -119,6 +119,8 @@ Enforced in: `core/src/api/session.rs` (`PhantomSession::connect_with_transport`
 
 Pinned by: `security_invariants::server_identity_mismatch_aborts_handshake`;
 `api::session::tests::session_builder_missing_pinned_key_errors`;
+`api::session_end_tests::an_impostor_answering_first_for_the_name_is_reported_and_stops_the_walk`
+(the candidate-walk rule above, over two live loopback servers);
 `tcp_integration::tcp_integration_wrong_pinned_key_rejected` and the pinned
 round-trips in `tcp_integration` / `udp_integration`.
 
