@@ -8,7 +8,7 @@ includedir=${prefix}/include
 Name: phantom_protocol
 Description: Phantom Protocol — post-quantum-secure L4/L6 transport (C FFI)
 URL: https://github.com/SNAcorp/phantom-protocol
-Version: 0.3.0
+Version: 0.3.1
 Cflags: -I${includedir}
 # The macOS dylib's install name is `@rpath/libphantom_protocol.dylib`, which the loader
 # resolves against the consumer's own `-rpath` entries. Without one it finds nothing and

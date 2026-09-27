@@ -158,7 +158,7 @@ apply — please read before committing to a C-side integration:
    discriminant (15 = ServerIdentityMismatch, 16 = ProtocolRejected,
    17 = Unsupported).
 3. **Stale on UniFFI bump.** Contract version 30 (UniFFI 0.32) is current
-   as of phantom_protocol 0.3.0. If you upgrade UniFFI, re-run
+   as of phantom_protocol 0.3.1. If you upgrade UniFFI, re-run
    `tests/bindings/generate_c.sh` and reconcile changes.
 4. **Integer-typed futures.** Only the `_u64`, `_rust_buffer`,
    `_void`, and `_u8` variants of the future-poll family are declared

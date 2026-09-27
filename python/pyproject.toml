@@ -29,7 +29,7 @@ build-backend = "maturin"
 name = "phantom-protocol"
 # Version is read from core/Cargo.toml by maturin; keep in sync manually if
 # overriding here. Remove the line below to have maturin derive it from Cargo.
-version = "0.3.0"
+version = "0.3.1"
 description = "Post-quantum-secure L4/L6 transport SDK (Python binding)"
 readme = "../README.md"
 requires-python = ">=3.8"
