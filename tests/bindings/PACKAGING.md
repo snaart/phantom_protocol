@@ -38,9 +38,10 @@ wheel. The result is installable with a plain `pip install`.
 # Prerequisites
 pip install "maturin>=1.6,<2.0"
 
-# Build a wheel for the current platform (from the repo root):
+# Build a wheel for the current platform. `python/pyproject.toml` already points
+# maturin at ../core/Cargo.toml and enables the bindings feature, so no flags:
 cd python
-maturin build --release --manifest-path ../core/Cargo.toml --features bindings --out ../target/wheels
+maturin build --release --out ../target/wheels
 
 # Install it (no extra steps — cdylib is inside the wheel):
 pip install --no-index --find-links ../target/wheels phantom-protocol
@@ -48,9 +49,20 @@ pip install --no-index --find-links ../target/wheels phantom-protocol
 # Verify:
 python -c "import phantom_protocol; print('ok')"
 
+# Or do all of the above in a throwaway venv, including a loopback round-trip
+# through the installed package:
+./verify_wheel.sh
+
 # Publish to PyPI (manual — needs MATURIN_PYPI_TOKEN):
-maturin publish --manifest-path ../core/Cargo.toml
+maturin publish
 ```
+
+maturin's uniffi mode generates a whole PACKAGE named after the crate, so
+`python/pyproject.toml` deliberately sets no `python-source`: a hand-written
+`python/phantom_protocol/` of the same name made maturin nest the generated
+package inside it, and `import phantom_protocol` then failed with
+`cannot import name '__all__' from 'phantom_protocol.phantom_protocol'`. Run
+`verify_wheel.sh` after touching that file — a broken wheel builds silently.
 
 For a real multi-platform PyPI release (manylinux, macOS, Windows) wrap
 the build with **`cibuildwheel`** targeting the `python/pyproject.toml`. A
