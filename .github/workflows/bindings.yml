@@ -130,3 +130,20 @@ jobs:
              -L target/release -lphantom_protocol \
              -o /tmp/phantom_c_smoke
           LD_LIBRARY_PATH=target/release /tmp/phantom_c_smoke
+      - name: The C helpers refuse a mispinned server
+        # `consumer_smoke.c` above proves the C surface links and a session can
+        # be driven over it. It does not connect to a server carrying the wrong
+        # pinned key, which is the case the blocking helpers got wrong: the
+        # exported `connect_pinned` future resolves when the SOCKET connects,
+        # and the handshake — with it the pin check Security Invariant 1 exists
+        # to make — runs afterwards, so a mispinned connect used to hand back an
+        # ordinary-looking session handle and report nothing. `pinning_smoke.c`
+        # drives four connects (right key, wrong key, malformed key, dead port)
+        # and requires each to be distinguishable.
+        #
+        # This ran nowhere until now: the test shipped with the fix and no
+        # workflow or hook named it, so reverting `phantom_helpers.h` would have
+        # been green in every job. The cdylib is already built by the step
+        # above, so the script's own `cargo build` is a no-op and this costs the
+        # compile and a handful of loopback handshakes.
+        run: tests/bindings/c/run_c_pinning_test.sh

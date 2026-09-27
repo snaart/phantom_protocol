@@ -114,6 +114,30 @@ repos:
         files: ^tests/bindings/swift/(check_xcframework\.sh|check_xcframework_test\.sh|Package\.swift|build-xcframework\.sh)$
         pass_filenames: false
 
+      - id: check-gate-wiring
+        name: every check under scripts/ and tests/ is invoked by something
+        # A check nobody runs is indistinguishable from one that always passes,
+        # and the diff that adds it looks complete. `run_c_pinning_test.sh` — the
+        # regression test for a pinned-identity defect in the blocking C helpers
+        # — was in no workflow and no hook, so reverting the fix would have been
+        # green. Pure text over the workflows, the hooks and the runners
+        # themselves, so it belongs here as well as in CI. The C test it caught
+        # does NOT run here: it needs a release build of the cdylib, which is
+        # minutes, and heavy checks stay in CI.
+        entry: scripts/check_gate_wiring.py
+        language: system
+        files: ^(\.github/workflows/.*\.yml|\.pre-commit-config\.yaml|scripts/.*|tests/.*)$
+        pass_filenames: false
+
+      - id: check-gate-wiring-cases
+        name: the gate-wiring check reports each way the wiring can go missing
+        # Fabricates its own trees in a temp directory and needs nothing built,
+        # so the cases can run beside the check they are for.
+        entry: scripts/check_gate_wiring_test.py
+        language: system
+        files: ^scripts/check_gate_wiring(_test)?\.py$
+        pass_filenames: false
+
       # ── Landing page and license text that ship inside the crate ──────
       - id: sync-readme
         name: core/README.md and core/LICENSE mirror the root copies

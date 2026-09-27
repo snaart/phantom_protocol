@@ -87,6 +87,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # Every runner under scripts/ and tests/ has to be named by a workflow, a
+      # hook, or a script that runs. `tests/bindings/c/run_c_pinning_test.sh`
+      # shipped with this release as the regression test for a pinned-identity
+      # defect in the blocking C helpers and was invoked by nothing, so
+      # reverting the fix would have been green everywhere — which is the one
+      # failure mode a check cannot report about itself. Pure text, a few tens of
+      # milliseconds, and it lives here because this is the required context
+      # where the cheap gates with no job of their own belong. Its own cases
+      # first, for the reason the memory-arithmetic job gives.
+      - run: scripts/check_gate_wiring_test.py
+      - run: scripts/check_gate_wiring.py
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
