@@ -91,6 +91,20 @@ jobs:
         uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2
         with:
           tool: cargo-semver-checks@0.50.0
+      # No `--release-type` argument. The script reads the release type out of the
+      # tree — `core/Cargo.toml`'s version against the newest release heading below
+      # it in `CHANGELOG.md` — because a type written here is a type that stays
+      # behind when the version moves, which is what happened: every run said
+      # "assume minor change", so the report for a patch release described a minor
+      # one and skipped the 27 minor-severity lints a patch release must also pass.
+      # The script then checks the type it used against the step the tool says it
+      # compared, and fails if the type permitted more, so a wrong argument or a
+      # baseline that moved mid-window is red rather than quiet.
+      #
+      # The tag path needs no different argument, and passes none: this job is
+      # `if: github.event_name == 'pull_request'`, so a tag push runs no comparison
+      # at all. The pull request that bumps the version is the one run that sees the
+      # exact step.
       - name: Compare the public API against the published release
         run: scripts/semver_report.sh "${GITHUB_WORKSPACE}/semver-report.txt"
       # `always()` on both of the next two steps: a report is most worth having

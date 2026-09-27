@@ -46,6 +46,20 @@ each reported symbol, and its owner, to appear there. The report itself is attac
 to every pull-request run as the `semver-checks-report` artifact and printed to the
 job summary.
 
+Which lints run is decided by the release type, and that is read out of the tree
+rather than written into the workflow: `scripts/semver_report.sh` compares
+`core/Cargo.toml`'s version against the newest release heading below it in
+`CHANGELOG.md`, so `0.3.0 → 0.3.1` is checked as the patch release this section
+defines as "bugfix / docs only" and `0.3.1 → 0.4.0` as the minor one it lets break.
+It matters because the narrower type skips lints rather than relabelling findings: a
+`minor` run of this crate performs 196 checks where a `patch` run performs 223. Until
+0.3.1 the type was the fixed word `minor`, which was the right assumption before a
+version had been bumped and the wrong one after, and the script now also refuses to
+report at all if the type it used permitted more than the step the tool says it
+compared. Inside an open window, where the manifest version is still the published
+one and there is no step to read, it assumes `patch` — the strictest — because the
+work may ship in either kind of release.
+
 The comparison covers default features plus `telemetry-otel`, `mimicry` and
 `embedded` — the largest set of this crate's features that builds together on one
 host, and the same set docs.rs uses. `fips`, `wasi-leg` and `no-std` are compared
