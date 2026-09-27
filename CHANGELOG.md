@@ -11,30 +11,39 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 ## [0.3.1] - 2026-09-27
 
 **A patch release, and a wire-compatible one.** `WIRE_VERSION` stays 8 and
-`PROTOCOL_VERSION` stays 5, so a 0.3.1 peer and a 0.3.0 peer interoperate in both
-directions. No public item was removed, no signature changed, and no AEAD plaintext or
-header layout moved. What did change is behaviour that contradicted its own
-documentation — a reader parked forever on a stream the session had already ended, a
-`supports_migration()` that answered for a method the caller could not reach, a ticket
-cache configured to hold nothing that held one — plus the release artifacts themselves,
-which in 0.3.0 were published in a state no consumer could use.
+`PROTOCOL_VERSION` stays 5, so a 0.3.1 peer and a 0.3.0 peer complete a handshake and
+carry data in both directions, and no AEAD plaintext or header layout moved. Two things
+qualify that, and both have entries of their own below. `PhantomStream` stopped
+implementing `std::panic::UnwindSafe`: no item was removed and no signature changed, but
+that is a Rust API break and it is this release's only one (**Changed**). And a mixed
+pair has one behavioural limit — a 0.3.0 peer counts concurrent streams differently and
+will take 255 of them where a 0.3.1 peer takes 256 (**Fixed**, "The receive-side stream
+cap counts the streams the peer has open"). What did change is behaviour that
+contradicted its own documentation — a reader parked forever on a stream the session had
+already ended, a `supports_migration()` that answered for a method the caller could not
+reach, a ticket cache configured to hold nothing that held one — plus the release
+artifacts themselves, which in 0.3.0 were published in a state no consumer could use.
 
 **Almost everything here was found by using the published crate rather than by reading
 it.** Every defect below was green in CI at the 0.3.0 tag. The artifact ones were found
 by downloading the tarball; the API ones by writing a project that depends on the
 crates.io release and then doing ordinary things with it — open a stream, read from it,
-close the session, resolve `localhost`. That is the reason this release also adds two
-gates over the release path and one over the Swift packaging: a release cannot be its own
-regression test, and neither can a packaging script nobody runs.
+close the session, resolve `localhost`. That is the reason this release also adds checks
+over the release path, the Swift packaging and the Python wheel — and says under **Added**
+which of them a workflow runs, because a release cannot be its own regression test and
+neither can a script nobody invokes.
 
 **Regenerate the language bindings rather than relinking them.** `uniffi` 0.32 folds each
-exported item's doc comment into its checksum, and several rustdoc comments on exported
-items are corrected here — `PhantomSession::supports_migration`, `migrate`, the
-two `*_with_resumption` free functions and the `SessionBuilder` docs among them —
-so the generated Python, Swift and Kotlin files in this
-release differ from 0.3.0's. `UNIFFI_CONTRACT_VERSION` is unchanged at 30, which means the
-coarse gate passes and a stale binding fails at import time in the consumer's process
-instead. The regenerated files ship in `tests/bindings/`.
+exported item's doc comment into its checksum, and eleven of those checksums move here:
+`connect_pinned_udp`, `connect_pinned_udp_with_resumption` and
+`connect_pinned_with_resumption`; `PhantomSession::send`, `recv`, `open_stream`,
+`await_ready`, `migrate` and `supports_migration`; and `PhantomStream::recv`. So the
+generated Python, Swift and Kotlin files in this release differ from 0.3.0's.
+`UNIFFI_CONTRACT_VERSION` is unchanged at 30, which means the coarse gate passes and a
+stale binding fails at import time in the consumer's process instead. The regenerated
+files ship in `tests/bindings/`. The `SessionBuilder` rustdoc is corrected too and is
+deliberately not in that list: the builders are Rust-only, so no checksum exists for them
+to move.
 
 ### Security
 
@@ -88,6 +97,20 @@ Pointers only: each item is set out in full in the entry named.
   charged against the peer's allowance, so the last stream each side was allowed to open was
   one the other would not take.
 
+  **Against a 0.3.0 peer, keep to 255 concurrent streams.** This is the one place where a
+  0.3.1 and a 0.3.0 peer do not agree, and nothing on the wire carries the disagreement: a
+  0.3.0 receiver compares the whole table, which already holds the reserved
+  raw-application stream, so it admits 255 peer streams — and one fewer for each stream it
+  has opened itself — and refuses the 256th. It refuses it the way this cap has always
+  refused: the stream-creating segment is dropped unrecorded, so it is not acknowledged
+  either, the sender retransmits into silence, and the sender's liveness sweep reads that
+  silence as a dead path and ends the whole session a few seconds later, healthy streams
+  included. That is the failure the first two entries above describe, arriving from the
+  other end of a mixed pair, and neither side can detect the other's rule to work around
+  it. The reverse pair fails the same way for the opposite reason: a 0.3.0 client has no
+  local cap at all — its `open_stream()` only ever fails when stream ids run out — so it
+  will go past 256, and the 257th is the one a 0.3.1 server refuses.
+
 - **Letting go of a stream nothing was ever written on retires it on the spot** instead of
   reporting it to the data pump, and a burst of released handles is taken in one pass rather
   than one apiece. Releasing four times the handles cost 21.7 times the time — 1 000 took
@@ -99,11 +122,15 @@ Pointers only: each item is set out in full in the entry named.
   ended in the orderly way — this side's `disconnect()` or the peer's — reports
   `ConnectionState::Closed`, `last_error() == None`, and `CoreError::ConnectionClosed` from
   `send()`, `recv()` and `await_ready()`; one whose transport ended without a close reports
-  `ConnectionState::Dead` and the cause it failed with. The two were byte-for-byte
-  identical, down to the message, though they call for opposite reactions. A session torn
-  down because the peer ignored the receive window is likewise no longer reported as an
-  orderly departure, and an end already reached is no longer overwritten by the pump's
-  teardown.
+  `ConnectionState::Dead` and the cause it failed with. Through `recv()` and
+  `await_ready()` the two used to be one answer to the byte — `NetworkError("Session
+  closed")` and `NetworkError("session failed")` respectively, whichever way the session had
+  ended — and through `send()` they differed only by the state name formatted into a message
+  (`Cannot send in state Closed` against `… Dead`), which is a difference a caller can act on
+  only by matching on a string. They call for opposite reactions: take the result and stop,
+  against reconnect. A session torn down because the peer ignored the receive window is
+  likewise no longer reported as an orderly departure, and an end already reached is no
+  longer overwritten by the pump's teardown.
 
 - **`disconnect()` during the handshake is no longer walked back by the handshake
   completing**, so `await_ready()` answers `CoreError::ConnectionClosed` for a session the
@@ -295,6 +322,32 @@ Pointers only: each item is set out in full in the entry named.
   include it, so the bundle did not build what it documented. The version is read out of
   `core/Cargo.toml`, a bundle that cannot be named is not built, and both headers ship.
 
+- **The semver gate reports the release actually being cut.** `scripts/semver_report.sh`
+  passed `--release-type minor` as a literal — the right assumption before a version had been
+  bumped and the wrong one after, so the report for this patch release said "assume minor
+  change" on the one line a reader checks to learn what was compared. That word also decides
+  which lints run at all: of cargo-semver-checks' 253 lints a `minor` run performs the 196
+  major-severity ones, while a `patch` run performs 223, the extra 27 being minor-severity
+  checks for changes a minor bump would excuse and `docs/policy/versioning.md` § 2 says a
+  patch release must not make. The type is now read out of the tree — `core/Cargo.toml`'s
+  version against the newest release heading below it in `CHANGELOG.md`, falling back to the
+  strictest when there is no step to read — the report's first line records it and where it
+  came from, and after the run the script re-derives the step from the tool's own
+  `Checking … vB -> vC` line and fails if the type it ran with permitted more than that step.
+  So a wrong argument, or a baseline that moved because a release was published mid-window,
+  is a red check rather than a quieter report. Eleven new stubbed-cargo cases pin each of
+  those, the suite asserts its own case count, and it runs as a pre-commit hook when the
+  script or the cases change.
+
+- **The changelog gate read a baseline only from a cold run.** `check_changelog_breaking.py`
+  took the compared-against version from the `Building … (baseline)` line, which a run whose
+  baseline rustdoc is already built never prints — it prints `Parsing … (baseline, cached)`.
+  With no baseline read, the gate falls back to `[Unreleased]` alone, so a *cut* release
+  whose notes are complete under `## [0.3.1]` was reported as having written nothing down,
+  depending on whether the runner's cache happened to be warm. That is the same failure the
+  baseline comparison was added to prevent, arriving by the back door; both spellings are
+  read now, and a case pins the cached one.
+
 - **The WASI integration job installs the wasmtime version the tree names.** The step read
   `curl -sSf https://wasmtime.dev/install.sh | bash` beneath the words "Pinned via the
   official installer script"; without `--version` that installer resolves the GitHub
@@ -354,12 +407,15 @@ Pointers only: each item is set out in full in the entry named.
   one a reader copies, now ends with `await_ready()`, and the two sentences that said
   `.connect().await` performs the handshake say what it actually does.
 
-- **Forty-five commit ids cited across `docs/` no longer resolved.** The history up to the
-  `v0.3.0` tag was rewritten and nothing recorded it, so the two 2026-06 audit reports, the
-  remediation plan, the 20-row rollout table in `docs/observability/refactor-plan.md`, the
-  FIPS inventory in `docs/compliance/fips-readiness.md`,
-  `docs/operations/{mobile,wasi}.md`, `docs/security/panic-sites.md` and the ALC_CMC.1
-  evidence row all pointed at objects this repository does not contain. Commit *subjects*
+- **Forty-six commit ids cited across `docs/` no longer resolved** — 37 distinct ids across
+  nine documents, counted as citations because several of them are cited more than once. The
+  history up to the `v0.3.0` tag was rewritten and nothing recorded it, so the two 2026-06
+  audit reports, the remediation plan, the 20-row rollout table in
+  `docs/observability/refactor-plan.md`, the FIPS inventory in
+  `docs/compliance/fips-readiness.md`, `docs/operations/{mobile,wasi}.md`,
+  `docs/security/panic-sites.md` and the ALC_CMC.1 evidence row in
+  `docs/compliance/cc-pp-mapping.md` all pointed at objects this repository does not
+  contain. Commit *subjects*
   survived the rewrite, so most were re-derived with `git log --all --grep`; the rest were
   replaced with a path, a tag or a date. Each re-pointed citation now names the implementing
   file as well. `docs/policy/versioning.md` § 10 gains "Commit ids before 0.3.0", which
@@ -371,6 +427,21 @@ Pointers only: each item is set out in full in the entry named.
   go stale again.
 
 ### Changed
+
+- **`PhantomStream` no longer implements `std::panic::UnwindSafe`.** This is the release's
+  only Rust API break. It is invisible in a signature and it is the one thing here a
+  compiler can stop a consumer over, so it is written down rather than left to be met. The
+  handle gained a private field carrying the session's own stream bookkeeping — what lets a
+  stream nothing was ever written on retire itself instead of reporting to the data pump
+  (see **Fixed**) — and that bookkeeping holds an `Arc<StreamDemultiplexer>`, whose
+  `DashMap` is not `RefUnwindSafe`, so the auto trait stops holding for the handle in front
+  of it. A caller that passes a `PhantomStream`, or anything containing one, into
+  `std::panic::catch_unwind` now needs `std::panic::AssertUnwindSafe` around it, which is
+  what a caller holding a `PhantomSession` has always needed: that handle has never been
+  `UnwindSafe`, so an application that already carries a session across a `catch_unwind`
+  boundary is unaffected. Restoring the impl was the alternative and would mean asserting
+  unwind safety over the session's tables from inside the stream handle — a wider claim
+  than the fix needs, and not one to make in a patch release.
 
 - **Seven dependencies the crate never referenced no longer reach a consumer's build, and
   `tokio` is asked for four fewer features.** The `std` feature carried `tokio-util`,
@@ -386,8 +457,34 @@ Pointers only: each item is set out in full in the entry named.
   tests, its benches or its examples — an embedder that needs them asks tokio for them
   itself, as the reference server already does for its SIGTERM drain. A default consumer
   build goes from 164 crates to 135, among them `regex`, `jiff`, `blake2`, `password-hash`,
-  `signal-hook-registry` and the whole `anstream`/`anstyle` colour stack. No public item
-  changed; this is a dependency-graph change only.
+  `signal-hook-registry` and the whole `anstream`/`anstyle` colour stack.
+
+  **Dropping the four `tokio` features can break a consumer's build, and no tool here
+  reports it.** Cargo unifies features across the whole dependency graph, so a consumer
+  that declares `tokio` itself has been compiling against the union of the features it
+  asked for and the ones asked for here. A consumer whose own manifest says
+  `features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"]`, and whose
+  code calls `tokio::signal::ctrl_c()`, `tokio::io::stdin()`, `tokio::fs::read` or
+  `tokio::process::Command`, compiled against 0.3.0 for no reason of its own and stops
+  compiling on `cargo update -p phantom-protocol`. That is checked rather than reasoned
+  about, for all four. The break is loud and self-describing — rustc names the feature
+  ("the item is gated behind the `signal` feature") — and the fix is one line in the
+  consumer's own manifest: ask tokio for the features you use. Nothing in the tool chain
+  would have warned first: the public API is byte-identical, so `cargo-semver-checks`
+  reports nothing, because a dependency's feature set is not part of the surface it
+  compares.
+
+  **The seven removed crates reach a consumer by the same route and much more narrowly.**
+  Rust will not let code name a crate its own manifest does not declare, so nobody was
+  using them *through* this one; what a consumer could be relying on is the unification
+  again. This crate asked for `tokio-util` with default features plus `codec`, for
+  `argon2`, `once_cell`, `bitflags` and `env_logger` with their default features, for
+  `base64` with `alloc` only, and for `async-trait`, which has no features — so a consumer
+  that declares one of those itself with fewer features was being handed ours and now gets
+  only its own. `time` is in the same position: it is still a dependency, but only under
+  `mimicry`, which is off by default. The remedy is the same line in the same place, and
+  it is worth applying deliberately rather than waiting to find out, because the missing
+  item can be one an `#[cfg(feature)]` in that crate hides rather than one it names.
 
 ### Added
 
@@ -407,13 +504,24 @@ Pointers only: each item is set out in full in the entry named.
   the library to the bindings generator, checking what was written rather than the exit code,
   since `uniffi-bindgen` succeeds while finding nothing.
 
-- **A standing check over the Swift XCFramework, and one over the Python wheel.**
-  `tests/bindings/swift/check_xcframework.sh` asserts the per-slice header names, that no
-  framework was copied inside the framework, and that there is one slice per platform
-  `Package.swift` declares; `check_xcframework_test.sh` breaks it eight ways to prove it
-  fires. `python/verify_wheel.sh` builds a wheel, installs it into a throwaway venv and
-  imports and exercises it, which is the only thing that catches an import that the build
-  itself reports as a success.
+- **A shape check over the Swift XCFramework, and a build-and-import check over the Python
+  wheel.** `tests/bindings/swift/check_xcframework.sh` asserts the per-slice header names,
+  that no framework was copied inside the framework, and that there is one slice per
+  platform `Package.swift` declares; `check_xcframework_test.sh` breaks it eight ways to
+  prove it fires, and asserts its own case count, so an early exit in it cannot read as a
+  clean sweep. `python/verify_wheel.sh` builds a wheel, installs it into a throwaway
+  virtualenv and imports and exercises it, which is the only thing that catches an import
+  the build itself reports as a success.
+
+  **Where each of those actually runs, since a check nothing invokes is a script.** The
+  mutation cases need nothing but a temporary directory, so they are a pre-commit hook now,
+  firing on the four Swift packaging files. The other two need an artifact to look at — a
+  built framework, a built wheel — and belong in `bindings.yml`'s `swift` job, after
+  `build-xcframework.sh`, and in `release.yml`'s `build-python-wheel` job; adding those two
+  steps, and the branch-protection contexts that make them count, is a maintainer action
+  this release does not take. Until then they are run by hand from the flow in
+  `tests/bindings/PACKAGING.md`. The release-artifact gate above is the only new CI job
+  here.
 
 - **Typed EOF on `PhantomStream::recv` is now documented where a reader looks for it.**
   `docs/protocol/PROTOCOL.md` § 4.5 names `Ok(None)` (clean in-order `FIN`, half-closed)
@@ -442,6 +550,34 @@ Pointers only: each item is set out in full in the entry named.
   recorded. `scripts/check_changelog_breaking.py` passed over it because the symbol *is*
   named in that section — as a trailing sentence inside a bullet about an unrelated removal
   — which is the floor that gate sets and not a review.
+
+- **`docs/security/invariants.md` describes the two invariants this release moved.**
+  Invariant 10 said a variant mismatch ends the attempt without a session, which is still
+  true and no longer the whole of it: the server answers on the wire first, under a new
+  reject code, and a new unauthenticated payload sent to an unauthenticated peer belongs in
+  the security record rather than only in these notes. The entry now states it, with why it
+  is not an amplification primitive (a seven-byte reply behind the stateless-cookie round,
+  which runs first) and why it discloses nothing a probe did not have (0.3.0 already sent
+  the same body for a version mismatch). Invariant 1's caller obligation said the
+  `connect_pinned*` functions return before the handshake has run, which stopped being true
+  of the three UDP ones on a multi-address name; it now says which functions return when,
+  and adds the rule a candidate walk has to keep — that a pinned-identity mismatch is an
+  answer about this attempt and not a reason to try the next address, because a walk that
+  carries on past it replaces a typed `ServerIdentityMismatch` with whatever the last
+  candidate reports.
+
+- **The stream cap is documented as the peer's count, and as a mixed-version limit.**
+  `docs/protocol/PROTOCOL.md` § 4.4 and the DoS-bound table in
+  `docs/security/threat-model.md` said `MAX_STREAMS` bounds concurrent receive streams
+  without saying which streams are counted, which is the whole of the difference between
+  the two versions; both now say it, and the protocol section states the 255 a sender
+  should keep to against a peer whose build it does not know, together with what a second
+  implementation should count.
+
+- **`docs/policy/versioning.md` § 2 says how the semver report decides what to check.** The
+  release type is derived from the version step rather than fixed, and the section that
+  presents `cargo-semver-checks` as the guardrail for the record is where a reader finds out
+  that a narrower type skips lints rather than relabelling findings.
 
 - **`PhantomConfig::write_stall_timeout`'s one-second floor is documented as belonging to
   the field rather than to the deadline.** The field said the deadline must be at least a
