@@ -912,6 +912,40 @@ impl StreamRegistry {
     }
 }
 
+/// Keeps [`PhantomStream`](crate::api::stream::PhantomStream) usable across a
+/// [`catch_unwind`](std::panic::catch_unwind) boundary.
+///
+/// `DashMap` is `!RefUnwindSafe` — it holds an `UnsafeCell<RawTable<…>>` — so the moment this
+/// registry was added to [`StreamLink`], a handle a consumer could previously move into
+/// `catch_unwind` needed an `AssertUnwindSafe` wrapper it had never needed before. Nothing
+/// about the type had actually become fragile; the auto trait simply stopped being derived,
+/// and `cargo semver-checks` reports that as a major break for a patch release. This asserts
+/// what was true all along, rather than leaving a consumer to assert it.
+///
+/// **Why it is true.** The claim an `UnwindSafe` impl makes is that a value carried out of a
+/// panic cannot then be used to observe state the panic left half-changed. The invariant
+/// that could be half-changed here is the agreement between the three handles — a stream in
+/// the table, a route in the demultiplexer, and a unit on the active-streams gauge. Exactly
+/// one operation on this type changes any of them, [`Self::retire_untouched_local`], and it
+/// is a parity test on an integer, one atomic load, one map removal, one atomic decrement,
+/// one map removal and a trailing log line. Not one of those steps can panic and none of
+/// them awaits, so there is no way to be part-way through the sequence while an unwind is in
+/// progress: an unwind does not interrupt running code, it propagates out of a panic, and
+/// there is no panic here to propagate out of. The `log::debug!` is the one call that can
+/// reach code this crate did not write, and it runs after the sequence has finished.
+///
+/// The maps' own locks do not change the answer either. They are `parking_lot` locks, which
+/// do not poison, and a guard released by an unwind leaves its shard structurally intact; no
+/// caller code runs while one is held, because the keys are `u32` and the removed values are
+/// dropped by the caller after the guard has gone (`Stream`'s own `Drop` is one saturating
+/// subtraction and one atomic add).
+///
+/// This is the whole claim, and deliberately no more: [`std::panic::RefUnwindSafe`] is not
+/// asserted, because nothing needs it — `PhantomStream` was never `RefUnwindSafe`, having a
+/// `tokio::sync::Mutex` of its own — and an impl nothing needs is an obligation nobody
+/// checks.
+impl std::panic::UnwindSafe for StreamRegistry {}
+
 /// A registry belonging to no session: its tables are empty, so nothing is ever retired
 /// through it and a handle built on it always reports its drop to (an absent) pump. For
 /// tests that build a stream handle by hand.

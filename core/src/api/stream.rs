@@ -241,6 +241,23 @@ impl PhantomStream {
     /// The request does not wait behind writes queued on the session, so it
     /// applies to whatever the stream holds at that pass — writes made before
     /// this call included, even if they are still waiting for room.
+    ///
+    /// Returns [`CoreError::ConnectionClosed`] when the session is over, which is the same
+    /// answer [`send_reliable`](Self::send_reliable), [`send_unreliable`](Self::send_unreliable)
+    /// and [`disconnect`](Self::disconnect) give. It used to be a
+    /// `NetworkError("Session closed")` here alone, so three of this type's four outbound
+    /// calls reported an ended session as a typed close and the fourth reported it as a
+    /// network fault — which is worse for a caller matching on the error than either answer
+    /// consistently would be: the one arm that has to be written as a string comparison is
+    /// the one nobody writes, and a session that ended in the orderly way was reported as a
+    /// failure.
+    ///
+    /// Unlike the three of them it is not refused while the session is
+    /// [`Draining`](crate::api::session::ConnectionState::Draining). Those carry a payload
+    /// the pump would throw away, and returning `Ok` for bytes that never reach the wire is
+    /// the defect that refusal exists to stop; a priority is not a payload — it is applied
+    /// to the stream's own scheduling for as long as the stream still has one, and asks
+    /// nothing of the peer.
     pub async fn set_priority(&self, priority: u32) -> Result<(), CoreError> {
         self.link
             .control
@@ -249,7 +266,7 @@ impl PhantomStream {
                 priority,
             })
             .await
-            .map_err(|_| CoreError::NetworkError("Session closed".into()))
+            .map_err(|_| CoreError::ConnectionClosed)
     }
 
     /// Close this side of the stream; the peer will see EOF on its read half,
@@ -490,5 +507,105 @@ mod tests {
             "second recv after Close must return Ok(None), got {:?}",
             second
         );
+    }
+    /// Every outbound call on a stream reports an ended session the same way, as
+    /// [`CoreError::ConnectionClosed`].
+    ///
+    /// **The defect.** `send_reliable`, `send_unreliable` and `disconnect` were retyped to
+    /// the typed close and `set_priority` was left behind, still answering
+    /// `NetworkError("Session closed")`.
+    ///
+    /// **What a consumer sees.** Three of this type's four outbound calls report an ended
+    /// session as a typed close and the fourth reports it as a network fault. A caller
+    /// matching on the error either misses the fourth — a `match` arm nobody writes, because
+    /// writing it means comparing a string — or has to handle both shapes for one event; and
+    /// a session that ended in the orderly way is described as something going wrong. Three
+    /// of four is worse for them than either answer applied consistently.
+    ///
+    /// **Why it comes back unnoticed.** Nothing fails: the call still returns `Err`, the
+    /// stream is still gone, and the difference is only in what the error *is*. It is also
+    /// the one of the four with no payload, so it has no test of its own about where its
+    /// bytes went, and it was retyped by a change whose subject was the other three. Driven
+    /// by dropping the receiving half of each channel, which is what a torn-down pump leaves
+    /// behind.
+    #[tokio::test]
+    async fn every_outbound_call_reports_an_ended_session_as_a_typed_close() {
+        let (stream_msg_tx, stream_msg_rx) = mpsc::channel::<StreamMessage>(8);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(16);
+        let (control_tx, control_rx) = mpsc::channel(1);
+        let (released, _released_rx) = mpsc::unbounded_channel();
+        let handle = StreamHandle {
+            stream_id: 3,
+            rx: stream_msg_rx,
+        };
+        let ps = PhantomStream::new(
+            handle,
+            StreamLink {
+                commands: cmd_tx,
+                control: control_tx,
+                released,
+                registry: crate::api::session::detached_stream_registry(),
+            },
+            Arc::new(AtomicU8::new(ConnectionState::Connected as u8)),
+        );
+
+        // The healthy case first, or the assertions below are satisfied by channels that
+        // never worked.
+        ps.set_priority(7).await.expect("a live session takes it");
+        ps.send_reliable(b"live".to_vec())
+            .await
+            .expect("a live session takes it");
+
+        // What a pump that has exited leaves behind: nobody holding the receiving end.
+        drop(cmd_rx);
+        drop(control_rx);
+        drop(stream_msg_tx);
+
+        for (what, answer) in [
+            ("set_priority", ps.set_priority(1).await),
+            ("send_reliable", ps.send_reliable(b"gone".to_vec()).await),
+            (
+                "send_unreliable",
+                ps.send_unreliable(b"gone".to_vec()).await,
+            ),
+            ("disconnect", ps.disconnect().await),
+        ] {
+            assert!(
+                matches!(answer, Err(CoreError::ConnectionClosed)),
+                "{what}() on an ended session must answer the typed close every one of its \
+                 siblings answers; got {answer:?}"
+            );
+        }
+        // And the read half agrees, so all five of the type's calls name the same event the
+        // same way.
+        assert!(matches!(ps.recv().await, Err(CoreError::ConnectionClosed)));
+    }
+
+    /// A `PhantomStream` can still be moved across a
+    /// [`catch_unwind`](std::panic::catch_unwind) boundary without an
+    /// `AssertUnwindSafe` wrapper.
+    ///
+    /// **The defect.** The stream handle gained a `StreamRegistry`, which holds
+    /// `Arc<DashMap<..>>`, and `DashMap` is `!RefUnwindSafe` — so `PhantomStream` silently
+    /// stopped implementing `UnwindSafe`. `cargo semver-checks --release-type patch` reports
+    /// that as a major-level break, which it is: nothing about the type became fragile, but
+    /// an auto trait stopped being derived.
+    ///
+    /// **What a consumer sees.** Code that compiled at 0.3.0 —
+    /// `catch_unwind(move || { let _ = stream; })`, or any generic function with an
+    /// `UnwindSafe` bound — stops compiling on a patch upgrade, and the fix at their end is
+    /// an `AssertUnwindSafe` they have to reason about.
+    ///
+    /// **Why it comes back unnoticed.** An auto trait is not written down anywhere, so
+    /// nothing in this crate mentions it and no amount of reading the diff shows it going
+    /// away; it is implied by every field, and one field of one private struct is enough to
+    /// remove it. `cargo semver-checks` catches it, and does not run in `ci.yml` at all — it
+    /// runs in `release.yml` under `continue-on-error: true`. This is the check that fails in
+    /// the suite that is a required context.
+    #[test]
+    fn a_phantom_stream_can_cross_a_catch_unwind_boundary() {
+        fn moved_into_catch_unwind<T: std::panic::UnwindSafe>(_: T) {}
+        let (ps, _tx, _cmd) = make_stream(3, 1);
+        moved_into_catch_unwind(ps);
     }
 }
