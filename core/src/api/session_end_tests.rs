@@ -958,3 +958,135 @@ async fn a_burst_of_released_streams_is_not_a_pass_each() {
     client.disconnect().await.expect("disconnect");
     drop(server);
 }
+
+// ── Every resolved address is tried ──────────────────────────────────────────
+
+/// A name that resolves to a black hole before it resolves to the server still connects.
+///
+/// The resolver's order is not a statement about what is reachable: `localhost` commonly
+/// resolves to `::1` ahead of `127.0.0.1`, and a server listening only on IPv4 was then never
+/// reached, because only the first address was ever used. Nothing reported it either — the
+/// TCP helper works on the same name, since `TcpStream::connect` walks the list, while
+/// "connecting" a datagram socket only records where to send and succeeds against an address
+/// with nothing behind it. The failure surfaced much later as a handshake that timed out.
+///
+/// The budget here is the one knob the production entry points hand over: the whole call is
+/// bounded by it, divided between the candidates, rather than each candidate getting the
+/// whole of it.
+#[cfg(not(target_arch = "wasm32"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_resolved_address_is_tried_until_one_answers() {
+    use crate::api::session::connect_udp_trying_each_address;
+    use crate::api::udp_listener::PhantomUdpListener;
+    use crate::crypto::hybrid_sign::HybridVerifyingKey;
+
+    /// Enough for a loopback handshake many times over, so a candidate that does not answer
+    /// is the only reason an attempt can fail.
+    const BUDGET: Duration = Duration::from_millis(1500);
+
+    let listener = PhantomUdpListener::builder("127.0.0.1:0")
+        .bind()
+        .await
+        .expect("bind a PhantomUDP listener");
+    let live: std::net::SocketAddr = listener
+        .local_addr()
+        .parse()
+        .expect("the listener's address");
+    let pinned = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes())
+        .expect("the listener's verifying key");
+
+    // A bound socket nobody reads: datagrams reach it and nothing ever comes back, which is
+    // exactly what an address in the wrong family looks like from a connected UDP socket.
+    let hole = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind a black hole");
+    let hole_addr = hole.local_addr().expect("the black hole's address");
+
+    // The black hole first. The live address is reached only if the list is walked.
+    let accepting = {
+        let listener = listener.clone();
+        tokio::spawn(async move { listener.accept().await })
+    };
+    let session = {
+        let pinned = pinned.clone();
+        connect_udp_trying_each_address(
+            "black-hole-first",
+            &[hole_addr, live],
+            BUDGET,
+            move |transport| {
+                PhantomSession::connect_with_transport(
+                    "black-hole-first",
+                    transport,
+                    pinned.clone(),
+                )
+            },
+        )
+        .await
+        .expect("one of the two addresses answers")
+    };
+    timeout(STEP, session.await_ready())
+        .await
+        .expect("await_ready returned")
+        .expect("the live address answered");
+    let accepted = timeout(STEP, accepting)
+        .await
+        .expect("the listener accepted")
+        .expect("accept task")
+        .expect("accept");
+    assert_eq!(
+        accepted.session().connection_state(),
+        ConnectionState::Connected
+    );
+    session.disconnect().await.expect("disconnect");
+
+    // The live address first: taken on the first attempt, with no wasted share.
+    let accepting = {
+        let listener = listener.clone();
+        tokio::spawn(async move { listener.accept().await })
+    };
+    let started = Instant::now();
+    let session = {
+        let pinned = pinned.clone();
+        connect_udp_trying_each_address(
+            "live-first",
+            &[live, hole_addr],
+            BUDGET,
+            move |transport| {
+                PhantomSession::connect_with_transport("live-first", transport, pinned.clone())
+            },
+        )
+        .await
+        .expect("the first address answers")
+    };
+    timeout(STEP, session.await_ready())
+        .await
+        .expect("await_ready returned")
+        .expect("the live address answered");
+    assert!(
+        started.elapsed() < BUDGET,
+        "a first address that answers must not cost a whole share; took {:?}",
+        started.elapsed()
+    );
+    let _ = timeout(STEP, accepting)
+        .await
+        .expect("the listener accepted");
+    session.disconnect().await.expect("disconnect");
+
+    // One address, which happens to be a black hole: handed back without waiting, exactly as
+    // these entry points document — `Ok` here says a socket was bound and nothing more.
+    let started = Instant::now();
+    let session =
+        connect_udp_trying_each_address("hole-only", &[hole_addr], BUDGET, move |transport| {
+            PhantomSession::connect_with_transport("hole-only", transport, pinned.clone())
+        })
+        .await
+        .expect("a single address is handed back unawaited");
+    assert!(
+        started.elapsed() < BUDGET,
+        "the only candidate must be returned without waiting on its handshake; took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(session.connection_state(), ConnectionState::Connecting);
+    drop(session);
+    listener.shutdown();
+}

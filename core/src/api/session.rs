@@ -7296,6 +7296,94 @@ impl Drop for PhantomSession {
 
 // ─── Pinned-Connect Shim (Phase 7.2 mobile bridge) ──────────────────────────
 
+/// Every address `addr` resolves to, in the order the resolver gave them, or a typed error
+/// when the name resolves to nothing at all.
+#[cfg(not(target_arch = "wasm32"))]
+async fn resolve_all(addr: &str) -> Result<Vec<std::net::SocketAddr>, CoreError> {
+    let candidates: Vec<std::net::SocketAddr> = tokio::net::lookup_host(addr)
+        .await
+        .map_err(|e| CoreError::NetworkError(format!("resolve {}: {}", addr, e)))?
+        .collect();
+    if candidates.is_empty() {
+        return Err(CoreError::NetworkError(format!("no address for {}", addr)));
+    }
+    Ok(candidates)
+}
+
+/// Open a PhantomUDP session to `addr`, trying each address the name resolves to in turn
+/// until one of them answers.
+///
+/// **Why this is not simply "take the first address".** It used to be, and the first address
+/// is whichever the resolver felt like putting first: `localhost` commonly resolves to `::1`
+/// ahead of `127.0.0.1`, and a server listening only on IPv4 is then never reached. On TCP
+/// the same name works, because `TcpStream::connect` walks the list — a connect to a port
+/// nothing is listening on is refused, and it moves on. A datagram socket has no such
+/// answer: "connecting" one only records where to send, so it succeeds against an address
+/// with nothing behind it, and the failure surfaces much later as a handshake that timed
+/// out. The only thing that can tell the addresses apart is therefore the handshake itself.
+///
+/// So each candidate but the last is given a share of `budget` — [`CLIENT_HANDSHAKE_DEADLINE`]
+/// at every call site — to complete its handshake, and the whole call stays inside that one
+/// deadline however many addresses the name has: n candidates get a share each, not the whole
+/// of it each.
+///
+/// The last candidate is returned without waiting, and that is what keeps the contract these
+/// entry points document — that they return before the handshake, and `Ok` says nothing
+/// about the peer's identity — exactly as it was for a name with one address, which is every
+/// literal address and the overwhelming majority of real ones. There is also nothing to be
+/// gained by waiting on the last one: there is no candidate left to fall back to, so the
+/// caller's own [`await_ready`](PhantomSession::await_ready) is the right place to learn the
+/// outcome, and waiting here would only delay the same answer.
+///
+/// An abandoned attempt is dropped, which asks its background task to close; the task is
+/// bounded by its own handshake deadline in any case, and holds nothing but a socket.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn connect_udp_trying_each_address<F>(
+    addr: &str,
+    candidates: &[std::net::SocketAddr],
+    budget: std::time::Duration,
+    mut spawn: F,
+) -> Result<Arc<PhantomSession>, CoreError>
+where
+    F: FnMut(crate::api::udp_transport::UdpClientTransport) -> PhantomSession,
+{
+    if candidates.is_empty() {
+        return Err(CoreError::NetworkError(format!("no address for {}", addr)));
+    }
+    let share = budget / candidates.len() as u32;
+    let mut last_error: Option<CoreError> = None;
+    let last = candidates.len() - 1;
+    for (i, server) in candidates.iter().enumerate() {
+        let transport = match crate::api::udp_transport::UdpClientTransport::connect(*server).await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                last_error = Some(e);
+                continue;
+            }
+        };
+        let session = Arc::new(spawn(transport));
+        if i == last {
+            // Nothing left to fall back to — hand it over and let the caller ask.
+            return Ok(session);
+        }
+        let waited = session.await_ready();
+        match tokio::time::timeout(share, waited).await {
+            Ok(Ok(())) => return Ok(session),
+            Ok(Err(e)) => last_error = Some(e),
+            Err(_) => last_error = Some(CoreError::Timeout),
+        }
+        log::debug!(
+            "PhantomSession: {} did not answer as {server}; trying the next address",
+            addr
+        );
+    }
+    // Every candidate but the last returns above, so reaching here means each of them failed
+    // *before* a session existed — a socket that could not be bound to that family at all.
+    Err(last_error
+        .unwrap_or_else(|| CoreError::NetworkError(format!("no usable address for {}", addr))))
+}
+
 /// Connect to a server over **TCP**, pinning its identity to `pinned_key`.
 ///
 /// # ⚠ Returns before the handshake — `Ok` here does not mean the pin matched
@@ -7708,7 +7796,10 @@ pub async fn connect_pinned_with_resumption(
 /// datagram socket, involves no exchange with the peer at all. The handshake and
 /// the check that the server holds `pinned_key` run on the background task,
 /// while the session reports [`ConnectionState::Connecting`] and
-/// [`send`](PhantomSession::send) queues bytes rather than refusing them.
+/// [`send`](PhantomSession::send) queues bytes rather than refusing them. (The one
+/// exception is a `host` that resolves to more than one address: telling those apart
+/// takes a handshake, so the candidates before the last one are tried and awaited — see
+/// below.)
 ///
 /// **Call [`await_ready`](PhantomSession::await_ready) before treating the
 /// session as authenticated**; it surfaces
@@ -7723,12 +7814,18 @@ pub async fn connect_pinned_with_resumption(
 /// path validation, and passive NAT-rebind recovery are all live for FFI
 /// consumers.
 ///
-/// `host` is resolved via the system resolver; the **first** returned address is
-/// used. Unlike the TCP [`connect_pinned`] (whose `TcpStream::connect` tries every
-/// resolved address in turn), this does **not** fall back to subsequent addresses
-/// if the first is unreachable — pass an IP literal or a single-family host when
-/// that matters. Server-key pinning is mandatory (security invariant 1).
-/// Native-only, like [`connect_pinned`].
+/// `host` is resolved via the system resolver and **every** address it returns is tried, in
+/// the resolver's order, until one answers — like the TCP [`connect_pinned`], whose
+/// `TcpStream::connect` does the same. It matters more here than it looks: `localhost`
+/// commonly resolves to `::1` before `127.0.0.1`, and a datagram socket "connected" to an
+/// address with nothing behind it reports no error at all, so taking only the first address
+/// meant a server listening on IPv4 was simply never reached. Only the handshake can tell
+/// the addresses apart, so each candidate but the last is given a share of the client
+/// handshake deadline to complete one; the whole call stays inside that single deadline
+/// however many addresses the name has, and the last candidate is handed back without
+/// waiting, which is why a one-address name — every IP literal among them — behaves exactly
+/// as it always did. Server-key pinning is mandatory (security invariant 1). Native-only,
+/// like [`connect_pinned`].
 ///
 /// # Example
 ///
@@ -7765,15 +7862,11 @@ pub async fn connect_pinned_udp(
         .map_err(|e| CoreError::CryptoError(format!("invalid pinned key: {}", e)))?;
 
     let addr = format!("{}:{}", host, port);
-    let server: std::net::SocketAddr = tokio::net::lookup_host(&addr)
-        .await
-        .map_err(|e| CoreError::NetworkError(format!("resolve {}: {}", addr, e)))?
-        .next()
-        .ok_or_else(|| CoreError::NetworkError(format!("no address for {}", addr)))?;
-
-    let transport = crate::api::udp_transport::UdpClientTransport::connect(server).await?;
-    let session = PhantomSession::connect_with_transport(&addr, transport, expected_server_key);
-    Ok(Arc::new(session))
+    let candidates = resolve_all(&addr).await?;
+    connect_udp_trying_each_address(&addr, &candidates, CLIENT_HANDSHAKE_DEADLINE, |transport| {
+        PhantomSession::connect_with_transport(&addr, transport, expected_server_key.clone())
+    })
+    .await
 }
 
 /// Like [`connect_pinned_udp`] but also applies [`PhantomConfig`](crate::config::PhantomConfig)
@@ -7813,22 +7906,19 @@ pub async fn connect_pinned_udp_with_config(
     let expected_server_key = HybridVerifyingKey::from_bytes(&pinned_key)
         .map_err(|e| CoreError::CryptoError(format!("invalid pinned key: {}", e)))?;
     let addr = format!("{}:{}", host, port);
-    let server: std::net::SocketAddr = tokio::net::lookup_host(&addr)
-        .await
-        .map_err(|e| CoreError::NetworkError(format!("resolve {}: {}", addr, e)))?
-        .next()
-        .ok_or_else(|| CoreError::NetworkError(format!("no address for {}", addr)))?;
-    let transport = crate::api::udp_transport::UdpClientTransport::connect(server).await?;
     let liveness = config.liveness();
-    let session = PhantomSession::spawn_client(
-        &addr,
-        transport,
-        expected_server_key,
-        Arc::new(TokioRuntime),
-        None,
-        Some(liveness),
-    );
-    Ok(Arc::new(session))
+    let candidates = resolve_all(&addr).await?;
+    connect_udp_trying_each_address(&addr, &candidates, CLIENT_HANDSHAKE_DEADLINE, |transport| {
+        PhantomSession::spawn_client(
+            &addr,
+            transport,
+            expected_server_key.clone(),
+            Arc::new(TokioRuntime),
+            None,
+            Some(liveness),
+        )
+    })
+    .await
 }
 
 /// 0-RTT resumption analogue of [`connect_pinned_udp`] — the UDP sibling of
@@ -7909,25 +7999,21 @@ pub async fn connect_pinned_udp_with_resumption(
     }
 
     let addr = format!("{}:{}", host, port);
-    let server: std::net::SocketAddr = tokio::net::lookup_host(&addr)
-        .await
-        .map_err(|e| CoreError::NetworkError(format!("resolve {}: {}", addr, e)))?
-        .next()
-        .ok_or_else(|| CoreError::NetworkError(format!("no address for {}", addr)))?;
-
-    let transport = crate::api::udp_transport::UdpClientTransport::connect(server).await?;
     // All validation (key pin, hint size, early-data cap) is done above.
     // Delegates directly to `spawn_client` to keep 0-RTT one-shot /
     // best-effort (security invariant 9).
-    let session = PhantomSession::spawn_client(
-        &addr,
-        transport,
-        expected_server_key,
-        Arc::new(TokioRuntime),
-        Some((session_id, resumption_secret, early_data)),
-        None,
-    );
-    Ok(Arc::new(session))
+    let candidates = resolve_all(&addr).await?;
+    connect_udp_trying_each_address(&addr, &candidates, CLIENT_HANDSHAKE_DEADLINE, |transport| {
+        PhantomSession::spawn_client(
+            &addr,
+            transport,
+            expected_server_key.clone(),
+            Arc::new(TokioRuntime),
+            Some((session_id, resumption_secret, early_data.clone())),
+            None,
+        )
+    })
+    .await
 }
 
 // ─── SessionBuilder ─────────────────────────────────────────────────────────
