@@ -400,3 +400,122 @@ async fn a_failed_handshake_releases_the_streams_opened_while_it_ran() {
     );
     drop(ours);
 }
+
+// ── The concurrency cap ──────────────────────────────────────────────────────
+
+/// Past [`MAX_STREAMS`] open at once, `open_stream()` refuses, and the refusal costs
+/// nothing: no id spent out of a space that never reuses one, no route left behind, and the
+/// next stream opened after one closes gets the id it would have got anyway.
+///
+/// Refusing at all is the fix. The peer holds the same limit on how many streams it will
+/// take from us and enforces it *silently* — the segment that would open the stream is
+/// never acknowledged — so the stream past the limit did not fail, it stalled with data
+/// outstanding, and inbound silence with data in flight is what the liveness sweep reads as
+/// a dead path. `open_stream()` returned `Ok`, `send_reliable()` returned `Ok`, nothing
+/// reported the limit, and a few seconds later the whole session was gone.
+///
+/// Driven against an inert session, with no pump and no peer, because the cap is this
+/// side's own arithmetic and nothing here should depend on a round trip.
+#[tokio::test]
+async fn open_stream_refuses_past_the_cap_without_spending_an_id() {
+    let session = PhantomSession::connect("inert:0".into());
+
+    let mut held = Vec::with_capacity(MAX_STREAMS);
+    for i in 0..MAX_STREAMS {
+        held.push(
+            session
+                .open_stream()
+                .unwrap_or_else(|e| panic!("stream {i} of {MAX_STREAMS} was refused: {e:?}")),
+        );
+    }
+    let last_id = held.last().expect("MAX_STREAMS is not zero").stream_id();
+    assert_eq!(session.demux().active_stream_count(), MAX_STREAMS);
+
+    for attempt in 0..3 {
+        match session.open_stream() {
+            Err(CoreError::StreamError(_)) => {}
+            Err(other) => panic!("attempt {attempt}: refused with {other:?}"),
+            Ok(extra) => panic!(
+                "attempt {attempt}: handed out stream {} past the cap of {MAX_STREAMS}",
+                extra.stream_id()
+            ),
+        }
+        assert_eq!(
+            session.demux().active_stream_count(),
+            MAX_STREAMS,
+            "attempt {attempt}: a refused open left a route behind"
+        );
+    }
+
+    // One stream goes; the next one opens, and its id is the very next of this side's
+    // parity — so none of the three refusals above spent one.
+    held.pop();
+    assert_eq!(session.demux().active_stream_count(), MAX_STREAMS - 1);
+    let next = session.open_stream().expect("a slot has freed");
+    assert_eq!(
+        next.stream_id(),
+        last_id + 2,
+        "a refused open must not advance the id allocator"
+    );
+}
+
+/// Every one of the [`MAX_STREAMS`] streams this side may open is surfaced by the peer.
+///
+/// The two halves of the limit have to agree, or the last stream this side is allowed to
+/// open is one the peer will not take — which is the stall the refusal above exists to
+/// avoid, and it was reachable: the peer charged its own reserved raw-application stream
+/// against the peer's allowance, so it took `MAX_STREAMS - 1` and silently refused the
+/// last.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_peer_takes_every_stream_the_cap_allows() {
+    let (client, server, _cut) = establish().await;
+
+    // Accept concurrently: the incoming-stream channel is bounded, and a handle that finds
+    // it full is dropped rather than held for an application that is not asking.
+    let collector = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            let mut taken: Vec<Arc<PhantomStream>> = Vec::with_capacity(MAX_STREAMS);
+            while taken.len() < MAX_STREAMS {
+                match timeout(STEP, server.accept_stream()).await {
+                    Ok(Ok(stream)) => taken.push(stream),
+                    _ => break,
+                }
+            }
+            taken
+        })
+    };
+
+    let mut ours = Vec::with_capacity(MAX_STREAMS);
+    for i in 0..MAX_STREAMS {
+        let stream = client
+            .open_stream()
+            .unwrap_or_else(|e| panic!("stream {i} of {MAX_STREAMS} was refused: {e:?}"));
+        stream
+            .send_reliable(vec![0xA5])
+            .await
+            .expect("send on a fresh stream");
+        ours.push(stream);
+    }
+
+    let taken = timeout(Duration::from_secs(60), collector)
+        .await
+        .expect("the collector finished")
+        .expect("collector task");
+    assert_eq!(
+        taken.len(),
+        MAX_STREAMS,
+        "the peer surfaced {} of the {MAX_STREAMS} streams the cap allows this side to open",
+        taken.len()
+    );
+    // And the session is healthy afterwards: nothing was left stalling it.
+    assert_eq!(client.connection_state(), ConnectionState::Connected);
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(client.connection_state(), ConnectionState::Connected);
+    assert!(client.last_error().await.is_none());
+
+    drop(taken);
+    drop(ours);
+    client.disconnect().await.expect("disconnect");
+    drop(client);
+}

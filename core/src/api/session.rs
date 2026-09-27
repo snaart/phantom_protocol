@@ -23,7 +23,7 @@
 //!
 //! | bound | what it limits | enforced by |
 //! | --- | --- | --- |
-//! | [`MAX_STREAMS`] | concurrent receive streams | `handle_packet` refuses the stream-creating segment past the cap; unrecorded, so it is not SACKed either |
+//! | [`MAX_STREAMS`] | streams the peer has open at once | `handle_packet` refuses the stream-creating segment past the cap; unrecorded, so it is not SACKed either |
 //! | [`MAX_RECV_FRAME`] | one inbound frame, hence one queued item | the pump's reader drops the frame before decrypting it |
 //! | [`MAX_RECV_REORDER`](crate::transport::stream::MAX_RECV_REORDER) entries and `Stream::recv_reorder_byte_limit` | one stream's out-of-order backlog | `Stream::accept_in_order` refuses the segment; the sender retransmits |
 //! | [`SESSION_RECV_WINDOW_GROWTH_BUDGET`](crate::transport::stream::SESSION_RECV_WINDOW_GROWTH_BUDGET) | window growth across all streams of a session | `SharedRecvTuning` hands growth out of one allowance |
@@ -42,6 +42,14 @@
 //! will admit, not an allocation and not a gate — nothing on the receive path
 //! refuses in-order data for exceeding it — so it constrains a compliant sender
 //! and no one else.
+//!
+//! The first row bounds what the *peer* opens, which is what this section is about,
+//! and this side's own [`PhantomSession::open_stream`] is bounded by the same
+//! figure separately — so the session's stream table holds at most
+//! `2 × MAX_STREAMS + 1` entries, the two caps plus the reserved raw-application
+//! stream, and every per-stream row below is multiplied by that rather than by
+//! `MAX_STREAMS` alone. The two halves are counted apart because they are reached
+//! apart: the peer's by the receive path, this side's before an id is allocated.
 //!
 //! Three of the rows above are also qualified, and the qualifications matter.
 //! The reorder bounds cover the *out-of-order* arm only; a segment arriving in
@@ -935,8 +943,10 @@ impl PhantomSession {
         // Client sessions have no listener, so they own their observability
         // instance (its `snapshot()` reflects just this connection).
         let observability = Observability::new(ObservabilityConfig::default());
-        // Balanced active-streams gauge, shared with the pump (see StreamGauge).
-        let stream_gauge = StreamGauge::new(observability.clone());
+        // Balanced active-streams gauge, shared with the pump (see StreamGauge). Client
+        // role: this side allocates the odd stream ids, so those are the ones its own
+        // MAX_STREAMS limit counts.
+        let stream_gauge = StreamGauge::new(observability.clone(), true);
         // One receive-window growth budget for the whole connection. It is created here
         // rather than on the negotiated `Session`, which does not exist yet: `open_stream()`
         // is reachable before the handshake completes, and a stream built with a budget of
@@ -1083,7 +1093,7 @@ impl PhantomSession {
         // Note the observability handle here is the *listener's* aggregate, so
         // the gauge it feeds is "streams open across every accepted session" —
         // which is why the per-session drain below has to be exact.
-        let stream_gauge = StreamGauge::new(observability.clone());
+        let stream_gauge = StreamGauge::new(observability.clone(), false);
         // One receive-window growth budget for the whole connection: this handle, and only
         // this handle, is what every stream of the session is built from.
         let recv_tuning = Arc::new(SharedRecvTuning::default());
@@ -1596,39 +1606,110 @@ const RAW_APP_STREAM_ID: u32 = 1;
 ///   peer-initiated stream concurrently with the pump's drain.
 /// - [`Self::closed`] never decrements below zero, so a removal racing a drain
 ///   cannot push the gauge negative.
+/// - The count is kept per side — streams this end opened and streams the peer opened —
+///   because each side has its own [`MAX_STREAMS`] limit and the two are enforced in
+///   different places: [`PhantomSession::open_stream`] asks this type before it allocates
+///   an id, and the receive path asks it before it auto-creates a stream for an id the peer
+///   has sent on. The split is derived from the id's parity, which is fixed for the life of
+///   the session by the role, so it needs no separate bookkeeping.
 #[derive(Debug)]
 pub(crate) struct StreamGauge {
-    /// User-visible streams currently reported open by this session.
-    open: AtomicI64,
+    /// User-visible streams *this side* opened that are still in the session's table.
+    local_open: AtomicI64,
+    /// User-visible streams *the peer* opened that are still in the session's table.
+    peer_open: AtomicI64,
+    /// `stream_id % 2` for the ids this side allocates — 1 for a client (odd ids), 0 for a
+    /// server (even ids). Mirrors `StreamDemultiplexer::is_local_stream_id`.
+    local_parity: u32,
     observability: Arc<Observability>,
 }
 
 impl StreamGauge {
-    fn new(observability: Arc<Observability>) -> Arc<Self> {
+    /// `is_client` fixes which parity this side allocates from, exactly as it does for
+    /// [`StreamDemultiplexer::new_with_role`]: a client's ids are odd, a server's even.
+    fn new(observability: Arc<Observability>, is_client: bool) -> Arc<Self> {
         Arc::new(Self {
-            open: AtomicI64::new(0),
+            local_open: AtomicI64::new(0),
+            peer_open: AtomicI64::new(0),
+            local_parity: u32::from(is_client),
             observability,
+        })
+    }
+
+    /// Whether `stream_id` is one this side allocates. The reserved ids 0 and 1 belong to
+    /// neither side and are not counted at all.
+    fn is_local(&self, stream_id: u32) -> bool {
+        stream_id % 2 == self.local_parity
+    }
+
+    /// The side `stream_id` belongs to, or `None` for the reserved internal ids.
+    fn side(&self, stream_id: u32) -> Option<&AtomicI64> {
+        if stream_id <= RAW_APP_STREAM_ID {
+            return None;
+        }
+        Some(if self.is_local(stream_id) {
+            &self.local_open
+        } else {
+            &self.peer_open
         })
     }
 
     /// Count a newly-opened user-visible stream. No-op for the internal ids.
     fn opened(&self, stream_id: u32) {
-        if stream_id <= RAW_APP_STREAM_ID {
+        let Some(side) = self.side(stream_id) else {
             return;
-        }
-        self.open.fetch_add(1, Ordering::AcqRel);
+        };
+        side.fetch_add(1, Ordering::AcqRel);
         self.observability.stream_opened();
+    }
+
+    /// Take one of this side's [`MAX_STREAMS`] slots for a stream it is about to open, or
+    /// report that they are all taken.
+    ///
+    /// The check and the claim are one atomic step, so two callers racing cannot both be
+    /// told they had the last slot. A `false` return has counted nothing: the caller has
+    /// not allocated an id yet, so a refusal leaves no trace at all — no id spent, no route
+    /// registered, no gauge to unwind.
+    fn try_open_local(&self) -> bool {
+        let taken = self
+            .local_open
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                (v < MAX_STREAMS as i64).then_some(v + 1)
+            })
+            .is_ok();
+        if taken {
+            self.observability.stream_opened();
+        }
+        taken
+    }
+
+    /// Hand back a slot [`Self::try_open_local`] took, for a stream that in the end was not
+    /// opened — the id space ran out between the claim and the allocation.
+    fn undo_open_local(&self) {
+        if self
+            .local_open
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                (v > 0).then_some(v - 1)
+            })
+            .is_ok()
+        {
+            self.observability.stream_closed();
+        }
+    }
+
+    /// How many streams the peer currently has open on this session.
+    fn peer_open(&self) -> usize {
+        self.peer_open.load(Ordering::Acquire).max(0) as usize
     }
 
     /// Retire a stream previously counted by [`Self::opened`]. No-op for the
     /// internal ids and for a stream this session never counted (or already
     /// retired via [`Self::drain`]).
     fn closed(&self, stream_id: u32) {
-        if stream_id <= RAW_APP_STREAM_ID {
+        let Some(side) = self.side(stream_id) else {
             return;
-        }
-        if self
-            .open
+        };
+        if side
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
                 (v > 0).then_some(v - 1)
             })
@@ -1640,7 +1721,8 @@ impl StreamGauge {
 
     /// Retire every stream still counted (session teardown). Idempotent.
     fn drain(&self) {
-        let still_open = self.open.swap(0, Ordering::AcqRel);
+        let still_open =
+            self.local_open.swap(0, Ordering::AcqRel) + self.peer_open.swap(0, Ordering::AcqRel);
         for _ in 0..still_open {
             self.observability.stream_closed();
         }
@@ -4905,18 +4987,37 @@ async fn send_path_validation<T: SessionTransport>(
     true
 }
 
-/// Hard cap on concurrent receive streams a peer can open on one session (H-3).
+/// Hard cap on how many streams **each side** may have open at once on one session (H-3).
 ///
-/// The recv path auto-creates a `Stream` for any of the 2^32 `stream_id`s; without a cap a
-/// peer can spray distinct ids to explode the stream table. Enforced in `handle_packet`,
-/// on the arm that would create the stream: past the cap the segment is refused, and being
-/// unrecorded it is not SACKed either, so the sender retransmits rather than believing the
-/// stream exists. Sized well above QUIC's ~100-stream default so real multiplexing is
-/// unaffected.
+/// Counted per side, and per side is what makes the two halves agree. The receive path
+/// auto-creates a `Stream` for any of the 2^32 `stream_id`s, so without a cap a peer can
+/// spray distinct ids to explode the stream table; and this side can do the same to the
+/// peer, one [`PhantomSession::open_stream`] at a time.
 ///
-/// It is a multiplier on several of the per-stream bounds below, so raising it raises what
-/// one session can be made to hold — see the receive-memory section in this module's
+/// - **The peer's half** is enforced in `handle_packet`, on the arm that would create the
+///   stream: past the cap the segment is refused, and being unrecorded it is not SACKed
+///   either, so the sender retransmits rather than believing the stream exists.
+/// - **This side's half** is enforced in [`PhantomSession::open_stream`], which refuses
+///   with [`CoreError::StreamError`] rather than handing back a stream the peer has no room
+///   for. That refusal is the whole reason the local half exists: the peer's refusal is
+///   *silent* — a segment nobody acknowledges — so a stream opened past the peer's cap
+///   stalls with data outstanding, and inbound silence with data in flight is exactly what
+///   the liveness sweep reads as a dead path. One stream too many used to end the whole
+///   session, and every healthy stream on it, a few seconds later.
+///
+/// Sized well above QUIC's ~100-stream default so real multiplexing is unaffected. The
+/// session's stream table therefore holds at most `2 × MAX_STREAMS + 1` entries — each
+/// side's cap, plus the reserved raw-app stream the pump creates — and the cap is a
+/// multiplier on several of the per-stream bounds below, so raising it raises what one
+/// session can be made to hold. See the receive-memory section in this module's
 /// documentation for which of them it multiplies.
+///
+/// **What it does not promise.** The two caps are local, so they cannot see each other: if
+/// *both* ends open close to `MAX_STREAMS` streams, each end's table has its own streams in
+/// it as well as the peer's, and the peer's cap can still be reached by a stream this side
+/// was allowed to open. Refusing locally removes the case a single side can cause on its
+/// own — which is the one an application reaches by accident — and leaves the symmetric one,
+/// where both ends are deliberately at their limit, behaving as it did.
 pub const MAX_STREAMS: usize = 256;
 
 /// Ceiling on the app-delivery backlog one session may hold, in bytes.
@@ -5749,10 +5850,16 @@ async fn handle_packet<T: SessionTransport>(
                         return;
                     }
                 }
-                if streams_recv.len() >= MAX_STREAMS {
+                // The peer's own streams are what this counts, not the table's size: the
+                // table also holds this side's streams and the reserved raw-app stream,
+                // and charging those against the peer's allowance made the limit a
+                // different number depending on how many streams this side happened to
+                // have open — so the peer could be refused its 256th stream, silently,
+                // while `MAX_STREAMS` said it was owed one.
+                if scratch.stream_gauge.peer_open() >= MAX_STREAMS {
                     log::warn!(
                         "PhantomSession: refusing new receive stream {stream_id}: \
-                         MAX_STREAMS ({MAX_STREAMS}) reached"
+                         MAX_STREAMS ({MAX_STREAMS}) already open from this peer"
                     );
                     return;
                 }
@@ -6263,7 +6370,9 @@ impl PhantomSession {
             // Inert constructor has no transport; migration is not possible.
             migration_capable: false,
             // Inert constructor: no pump, so only `Drop` ever drains this.
-            stream_gauge: StreamGauge::new(observability.clone()),
+            // Server parity, matching the `StreamDemultiplexer::new` above; nothing is ever
+            // opened on this session, so which it is only has to be consistent.
+            stream_gauge: StreamGauge::new(observability.clone(), false),
             observability,
             recv_tuning: Arc::new(SharedRecvTuning::default()),
         })
@@ -6278,17 +6387,44 @@ impl PhantomSession {
     ///
     /// # Errors
     ///
-    /// [`CoreError::StreamError`] once this side has opened 32 767 streams in the
-    /// session. A stream id travels in a 16-bit header field and each side allocates
-    /// from its own half of that space, never reusing an id — even one whose stream
-    /// has long since closed, because the peer may still be holding it or the record
-    /// that it closed, and would fold a new stream's bytes into it. Nothing is opened
-    /// and the session is otherwise unaffected: streams already open carry on, and
-    /// `accept_stream()` still takes the peer's. The limit counts every stream opened,
-    /// not the ones open at once, so a long-lived session that opens a stream per
-    /// request reaches it; open a new session to continue.
+    /// [`CoreError::StreamError`], for either of two limits, with nothing opened and the
+    /// session otherwise unaffected in both cases: streams already open carry on, and
+    /// `accept_stream()` still takes the peer's.
+    ///
+    /// - **[`MAX_STREAMS`] already open on this side.** The peer holds the same limit on
+    ///   how many streams it will accept from us, and it enforces it *silently* — the
+    ///   segment that would open the stream is simply never acknowledged. So a stream
+    ///   handed out past the limit would not fail; it would sit with data outstanding
+    ///   that nothing can retire, and inbound silence with data in flight is what the
+    ///   liveness sweep reads as a dead path. Refusing here is the difference between one
+    ///   stream reporting a limit and the whole session dying a few seconds later. Retry
+    ///   once a stream has closed: the limit counts streams open *at once*, and a stream
+    ///   leaves the count when its close is acknowledged, or immediately if it was let go
+    ///   of without ever having been written on.
+    /// - **32 767 streams opened over the session's life.** A stream id travels in a
+    ///   16-bit header field and each side allocates from its own half of that space,
+    ///   never reusing an id — even one whose stream has long since closed, because the
+    ///   peer may still be holding it or the record that it closed, and would fold a new
+    ///   stream's bytes into it. This limit counts every stream ever opened, so a
+    ///   long-lived session that opens a stream per request reaches it; open a new session
+    ///   to continue.
     pub fn open_stream(&self) -> Result<Arc<crate::api::stream::PhantomStream>, CoreError> {
-        let handle = self.demux.open_stream(STREAM_RECV_CHANNEL_DEPTH)?;
+        // Claimed before an id is allocated, so a refusal leaves nothing behind: no id
+        // spent out of a space that never reuses one, and no half-registered route in the
+        // demultiplexer for a stream that does not exist.
+        if !self.stream_gauge.try_open_local() {
+            return Err(CoreError::StreamError(format!(
+                "this session already has the {MAX_STREAMS} streams it may have open at \
+                 once; close one before opening another"
+            )));
+        }
+        let handle = match self.demux.open_stream(STREAM_RECV_CHANNEL_DEPTH) {
+            Ok(handle) => handle,
+            Err(e) => {
+                self.stream_gauge.undo_open_local();
+                return Err(e);
+            }
+        };
         let stream_id = handle.stream_id;
 
         let transport_stream = Arc::new(Stream::with_recv_tuning(
@@ -6296,14 +6432,14 @@ impl PhantomSession {
             self.recv_tuning.clone(),
         ));
         self.streams.insert(stream_id, transport_stream);
-        // Count the stream on the active-streams gauge. The matching retire is
-        // `retire_stream`, once both halves are closed; `retire_released_stream`,
+        // The stream is already counted on the active-streams gauge — the claim above is
+        // what counted it, so that the limit is checked and taken in one step. The matching
+        // retire is `retire_stream`, once both halves are closed; `retire_released_stream`,
         // once the handle has been dropped and this side's half is closed (at once,
         // for a stream dropped before a reliable byte was written on it); the
         // offset-exhaustion fallback in `flush_deferred_sends`; or — for a stream
         // still open when the session ends (including one opened after the pump
         // already exited) — the drain in `Drop for PhantomSession` / at pump exit.
-        self.stream_gauge.opened(stream_id);
 
         Ok(Arc::new(crate::api::stream::PhantomStream::new(
             handle,
@@ -7819,7 +7955,7 @@ mod tests {
     fn test_recv_scratch(obs: &Arc<Observability>, ack_capacity: usize) -> RecvScratch {
         RecvScratch::new(
             ack_capacity,
-            StreamGauge::new(obs.clone()),
+            StreamGauge::new(obs.clone(), false),
             Arc::new(PathChallenges::default()),
             Arc::new(SharedRecvTuning::default()),
         )
@@ -9872,7 +10008,7 @@ mod tests {
         let connection_budget = Arc::new(SharedRecvTuning::default());
         let mut scratch = RecvScratch::new(
             256,
-            StreamGauge::new(obs.clone()),
+            StreamGauge::new(obs.clone(), false),
             Arc::new(PathChallenges::default()),
             connection_budget.clone(),
         );
@@ -16816,7 +16952,7 @@ mod tests {
     #[test]
     fn stream_gauge_is_balanced_and_never_negative() {
         let obs = Observability::new(ObservabilityConfig::default());
-        let gauge = StreamGauge::new(obs.clone());
+        let gauge = StreamGauge::new(obs.clone(), true);
 
         // Internal ids (0 = control, 1 = raw-app) are not user streams.
         gauge.opened(0);
