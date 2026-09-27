@@ -22,10 +22,12 @@ Which section is not constrained: a removal belongs under `### Removed` and a
 signature change under `### Changed`, and forcing every name into one heading
 would trade an accurate record for a tidy one.
 
-Scope note: the report is generated with `--release-type minor`, so it lists the
-lints that require a *major* bump — the breaking set. Purely additive changes
-are permitted by that release type, are not reported, and are therefore not
-gated here.
+Scope note: which lints ran is decided by the `--release-type` the report was
+produced with, which `scripts/semver_report.sh` derives from the version step in
+the tree (patch for `0.3.0 -> 0.3.1`, minor for `0.3.1 -> 0.4.0`). This gate reads
+whatever that run reported and requires all of it to be written down; it does not
+decide what counts as breaking. The report's first line records the release type,
+so a report that was produced for a more permissive release says so.
 
 Usage:
     scripts/check_changelog_breaking.py --report semver-report.txt
@@ -189,11 +191,22 @@ def parse_report(text: str) -> list[tuple[str, str]]:
 def baseline_version(report: str) -> str | None:
     """The version `cargo-semver-checks` compared against, read from its report.
 
-    The tool prints `Building <crate> vX.Y.Z (baseline)` before it starts, so
-    the report says which published release the findings are relative to. That
-    is the only thing that decides which changelog sections may satisfy them.
+    The tool names the baseline release before it starts, so the report says which
+    published release the findings are relative to. That is the only thing that
+    decides which changelog sections may satisfy them.
+
+    It names it on either of two lines, and both have to be read. A cold run
+    prints `Building <crate> vX.Y.Z (baseline)`; a run whose baseline rustdoc is
+    already in the target directory skips that step and prints only `Parsing
+    <crate> vX.Y.Z (baseline, cached)`. Reading only the first meant a cached
+    baseline looked like no baseline at all, which falls back to `[Unreleased]`
+    only — so a cut release's complete notes were reported as unwritten depending
+    on whether the runner's cache happened to be warm. That is the same failure
+    [`sections_newer_than_baseline`] exists to prevent, arriving by the back door.
     """
-    match = re.search(r"^\s*Building \S+ v(\S+) \(baseline\)", report, re.M)
+    match = re.search(
+        r"^\s*(?:Building|Parsing)\s+\S+\s+v(\S+)\s+\(baseline", report, re.M
+    )
     return match.group(1) if match else None
 
 

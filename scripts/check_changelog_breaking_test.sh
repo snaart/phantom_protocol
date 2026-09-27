@@ -74,6 +74,24 @@ write_report_with_baseline() {
     rm -f "${body}"
 }
 
+# The same report as `write_report_with_baseline`, but naming its baseline the way
+# a run whose baseline rustdoc was already built names it. A cold run prints a
+# `Building … (baseline)` line; a warm one skips that step entirely and says only
+# `Parsing … (baseline, cached)`. Both are completed comparisons and both state the
+# baseline, so the gate has to read either — a warm cache is not a reason to read a
+# different set of changelog sections.
+write_report_with_cached_baseline() {
+    local body
+    body="$(mktemp)"
+    write_report "${body}"
+    {
+        echo "     Parsing phantom-protocol v0.2.2 (baseline, cached)"
+        echo "      Parsed [   0.035s] (baseline)"
+        cat "${body}"
+    } > "$1"
+    rm -f "${body}"
+}
+
 write_report() {
     cat > "$1" <<'REPORT'
     Checking phantom-protocol v0.2.2 -> v0.2.2 (assume minor change)
@@ -733,6 +751,46 @@ LOG
     rm -rf "${dir}"
 }
 
+# Pins the defect that the warm-cache wording caused: with the baseline unread, the
+# gate falls back to `[Unreleased]` alone and reports a *cut* release's complete
+# notes as unwritten. A consumer never sees that; the release engineer sees a red
+# gate on a changelog that is right, at the moment the notes are finished, and the
+# quickest way past it is to stop believing the gate. Without this case the
+# regression is invisible locally and on CI alike, because which line the tool
+# prints depends on whether the runner's target directory was restored from cache
+# and nothing in this repository chooses that.
+case_a_cached_baseline_is_still_a_baseline() {
+    local dir
+    dir="$(mktemp -d)"
+    write_report_with_cached_baseline "${dir}/report.txt"
+    cat > "${dir}/CHANGELOG.md" <<'LOG'
+# Changelog
+
+## [Unreleased]
+
+## [0.3.0] - 2026-09-07
+
+### Changed
+
+- `BandwidthSnapshot` gained `delivered_time`; construct it with the new field.
+- `PhantomConfig` lost `auto_fallback`; drop it from struct literals.
+- `Stream::local_recv_window` is now `advertised_recv_window`; rename the call.
+
+## [0.2.2] - 2026-06-22
+
+### Changed
+
+- Something already shipped.
+LOG
+    run_gate "${dir}/report.txt" "${dir}/CHANGELOG.md"
+    if [ "${RC}" -eq 0 ]; then
+        pass "a baseline named on the cached Parsing line is read like any other"
+    else
+        fail "a cached baseline was read as no baseline, so a cut release's notes were rejected: ${OUT}"
+    fi
+    rm -rf "${dir}"
+}
+
 case_complete_record_is_accepted
 case_missing_symbol_is_rejected
 case_owner_must_be_named_too
@@ -746,6 +804,7 @@ case_unreadable_entry_is_an_error
 case_older_section_does_not_count
 case_a_named_release_above_the_baseline_counts
 case_a_named_release_at_or_below_the_baseline_does_not_count
+case_a_cached_baseline_is_still_a_baseline
 case_duplicate_heading_in_unreleased_is_rejected
 case_a_heading_repeated_under_a_different_release_is_not_a_duplicate
 case_every_duplicated_heading_is_reported_with_its_lines
