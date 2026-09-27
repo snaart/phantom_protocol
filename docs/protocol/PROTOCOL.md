@@ -1410,6 +1410,28 @@ it. Against the timer-driven alternative of § 12.4 — over two minutes for the
 and for a server's demux routes no reclaim at all until traffic happens to trigger one
 — either bound is the same order of magnitude of improvement.
 
+**On an ordered byte-pipe transport the window is not needed and is not taken.** Every
+sentence above is about a datagram transport, where the `CLOSE` and the data behind it
+are separate messages the path may reorder. Over a byte pipe — TCP, a WebSocket, a WASI
+socket, a UART — the transport itself guarantees in-order delivery, so the close cannot
+overtake anything: by the time it is parsed, every byte the sender wrote before it has
+already been handed over. There is nothing left to drain, and the peer's own end-of-stream
+arrives immediately behind the frame, which is a stronger signal than the frame is. A
+receiver on such a transport may therefore conclude at once, and this implementation does:
+it publishes `Draining` and then tears down on the read side's end-of-stream, typically
+tens of microseconds later, rather than holding the floor. The floor is a property of the
+displacement it exists to absorb, and on an ordered transport that displacement is zero.
+
+Two consequences worth stating, because both have been read the wrong way. An
+implementation that *does* hold the full window on a byte pipe is conformant — it waits
+for something that cannot arrive, which costs a bounded delay and loses nothing. And
+`ConnectionState::Draining` is not a state an application can poll for on a byte-pipe
+session: a consumer sampling `connection_state()` even every millisecond will see
+`Connected` and then `Closed`. Code that must react to a peer's departure should read the
+error from `recv()` — `CoreError::ConnectionClosed` for an orderly one — rather than watch
+for a state that on three of this implementation's five transports is transient by
+construction.
+
 **If it is lost entirely**, nothing breaks and nothing is retried: the receiver falls
 back to concluding the same thing from silence, on the liveness timer of § 12.4,
 exactly as it did before v8. That is the whole compatibility story of the frame — it

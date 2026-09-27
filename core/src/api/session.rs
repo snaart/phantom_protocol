@@ -7833,6 +7833,15 @@ async fn connect_mimic(
 /// the default liveness settings and the thirty-second write deadline of
 /// [`connect_pinned`].
 ///
+/// **A resume consumes the ticket, whether or not `early_data` is empty.** The ticket is
+/// one-shot (security invariant 9), and the server consumes it the moment the resumption
+/// binder verifies — before it looks at whether a sealed blob came with it. Resuming with an
+/// empty `early_data` therefore spends the ticket to buy only the cookie / proof-of-work
+/// bypass, and [`PhantomSession::early_data_accepted`] answers `None`, which is correct
+/// ("no early-data on this connect") and easy to read as "nothing was spent". A caller with
+/// nothing to send yet should connect without the hint and keep it for the connect that
+/// does have a payload; a caller that resumes twice off one hint gets 1-RTT the second time.
+///
 /// Native-only, like [`connect_pinned`]: `TcpSessionTransport` lives
 /// behind `cfg(not(target_arch = "wasm32"))`.
 #[cfg(not(target_arch = "wasm32"))]
@@ -8073,8 +8082,18 @@ pub async fn connect_pinned_udp_with_config(
 /// rejected before the UDP socket is bound. Acceptance is best-effort (security
 /// invariant 9): an unknown/stale ticket completes 1-RTT and the caller checks
 /// [`PhantomSession::early_data_accepted`] and re-sends when it is not `Some(true)`.
-/// Like [`connect_pinned_udp`], the first resolved address is used with no fallback.
-/// Native-only.
+///
+/// **A resume consumes the ticket, whether or not `early_data` is empty.** The ticket is
+/// one-shot (security invariant 9), and the server consumes it the moment the resumption
+/// binder verifies — before it looks at whether a sealed blob came with it. Resuming with an
+/// empty `early_data` therefore spends the ticket to buy only the cookie / proof-of-work
+/// bypass, and [`PhantomSession::early_data_accepted`] answers `None`, which is correct
+/// ("no early-data on this connect") and easy to read as "nothing was spent". A caller with
+/// nothing to send yet should connect without the hint and keep it for the connect that
+/// does have a payload; a caller that resumes twice off one hint gets 1-RTT the second time.
+///
+/// Like [`connect_pinned_udp`], every address the host resolves to is tried in the
+/// resolver's order, inside the one client handshake deadline. Native-only.
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg_attr(feature = "bindings", uniffi::export(async_runtime = "tokio"))]
 pub async fn connect_pinned_udp_with_resumption(
@@ -8178,6 +8197,13 @@ impl<T> SessionBuilder<T> {
     /// Both values behind the hint — `hint.session_id()` and
     /// `hint.resumption_secret()` — must be exactly 32 bytes; oversized
     /// `early_data` (> [`EARLY_DATA_MAX_LEN`]) is rejected at `.connect()` time.
+    ///
+    /// The hint is spent either way: the ticket is one-shot and the server consumes it
+    /// when the resumption binder verifies, before it looks for a sealed blob. Attaching a
+    /// hint with an empty `early_data` therefore buys only the cookie / proof-of-work
+    /// bypass and leaves nothing for the next connect, while
+    /// [`PhantomSession::early_data_accepted`] reads `None` — correct, and easy to mistake
+    /// for "the ticket is still good". Keep the hint until there is a payload to send.
     pub fn resumption(mut self, hint: Arc<ResumptionHint>, early_data: Vec<u8>) -> Self {
         // Stored raw; the exact-32-byte length is validated at `.connect()` time
         // (matching the strict FFI `connect_pinned_*_with_resumption` path), so a

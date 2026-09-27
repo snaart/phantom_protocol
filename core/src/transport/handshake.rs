@@ -2289,6 +2289,74 @@ mod tests {
         }
     }
 
+    /// A resume that carries **no** early data still consumes the ticket, and the entry
+    /// points say so.
+    ///
+    /// The one-shot rule is decided the moment the resumption binder verifies, before the
+    /// server looks for a sealed blob, so a resume with an empty `early_data` spends the
+    /// ticket to buy only the cookie / proof-of-work bypass. That is a deliberate choice and
+    /// not an oversight — a hello that names a ticket has already used it, and making the
+    /// consumption conditional on a payload would let the same ticket buy the bypass as
+    /// often as its holder liked — but it is easy to read the other way, because
+    /// `early_data_accepted()` answers `None` for such a connect, which is correct ("no
+    /// early-data on this connect") and looks like "nothing was spent". The rustdoc on
+    /// `connect_pinned_with_resumption`, `connect_pinned_udp_with_resumption` and
+    /// `SessionBuilder::resumption` states the cost; this pins the behaviour those sentences
+    /// describe, so the two cannot drift apart.
+    #[tokio::test]
+    async fn a_resume_without_early_data_still_spends_the_ticket() {
+        let server = HandshakeServer::new().expect("HandshakeServer::new");
+        let client_ip = "127.0.0.1".parse().unwrap();
+
+        // One full handshake to mint a ticket.
+        let first = HandshakeClient::new().unwrap();
+        let first_hello = first.create_client_hello();
+        let cookie = match server.process_client_hello(&first_hello, 0, client_ip) {
+            HandshakeResponse::Retry(r) => r.cookie.unwrap(),
+            other => panic!("expected retry, got {other:?}"),
+        };
+        let mut with_cookie = first_hello.clone();
+        with_cookie.cookie = Some(cookie);
+        let first_session = match server.process_client_hello(&with_cookie, 0, client_ip) {
+            HandshakeResponse::Success(_, s, _) => s,
+            other => panic!("expected success, got {other:?}"),
+        };
+        let (rid, secret) = first_session.resumption_hint().unwrap();
+
+        // A resume with no sealed blob: it resumes (the cookie gate is bypassed, which is
+        // what it bought) and it reports no 0-RTT, because none was offered.
+        let second = HandshakeClient::new().unwrap();
+        let empty_resume = second.create_client_hello_with_resume(rid, &secret, None);
+        assert!(empty_resume.early_data.is_none());
+        match server.process_client_hello(&empty_resume, 0, client_ip) {
+            HandshakeResponse::Success(h, _, early) => {
+                assert!(!h.early_data_accepted, "nothing was offered to accept");
+                assert!(early.is_none(), "no early-data plaintext to deliver");
+            }
+            other => panic!("the resume should have bypassed the cookie gate, got {other:?}"),
+        }
+
+        // The ticket is gone, so a later resume off the same hint — this one carrying a
+        // payload — gets a 1-RTT handshake and no 0-RTT.
+        let third = HandshakeClient::new().unwrap();
+        let payload = b"the-request-that-matters";
+        let real_resume =
+            third.create_client_hello_with_resume(rid, &secret, Some(payload.as_slice()));
+        assert!(real_resume.early_data.is_some());
+        match server.process_client_hello(&real_resume, 0, client_ip) {
+            // The ticket is unknown now, so the id buys no bypass either and the server
+            // answers with the ordinary cookie retry.
+            HandshakeResponse::Retry(_) => {}
+            HandshakeResponse::Success(h, _, early) => {
+                assert!(
+                    !h.early_data_accepted && early.is_none(),
+                    "a spent ticket must not serve 0-RTT a second time"
+                );
+            }
+            other => panic!("expected a 1-RTT fallback, got {other:?}"),
+        }
+    }
+
     /// Phase 4.1 — unknown `resume_session_id` does NOT bypass cookie.
     /// The server simply ignores the unknown id and falls through to
     /// the normal cookie/PoW path.
