@@ -49,6 +49,23 @@ for ext in dylib so dll; do
     [ -f "${src}" ] && cp "${src}" "${STAGE}/${BUNDLE}/lib/"
 done
 
+# A Mach-O library records the path it expects to be found at, and rustc writes
+# the absolute path of this build tree into it. Shipped unchanged, the first
+# consumer that links the bundle dies at launch with `dyld: Library not loaded`
+# naming a directory on the machine that built it. `@rpath` makes the name
+# relative to the consumer's own `-rpath`, which is what a redistributable dylib
+# carries. `install_name_tool` re-signs the ad-hoc signature it invalidates;
+# `otool -D` is the proof, and a bundle that fails it must not be produced.
+STAGED_DYLIB="${STAGE}/${BUNDLE}/lib/libphantom_protocol.dylib"
+if [ -f "${STAGED_DYLIB}" ]; then
+    install_name_tool -id @rpath/libphantom_protocol.dylib "${STAGED_DYLIB}"
+    got="$(otool -D "${STAGED_DYLIB}" | tail -n 1)"
+    if [ "${got}" != "@rpath/libphantom_protocol.dylib" ]; then
+        echo "install name is '${got}', expected '@rpath/libphantom_protocol.dylib'" >&2
+        exit 1
+    fi
+fi
+
 sed "s|@PREFIX@|${PREFIX}|g" "${SCRIPT_DIR}/phantom_protocol.pc.in" \
     > "${STAGE}/${BUNDLE}/lib/pkgconfig/phantom_protocol.pc"
 

@@ -214,6 +214,28 @@ jobs:
             cp "${LIBDIR}/libphantom_protocol.so" "dist/${NAME}/"
           else
             cp "${LIBDIR}/libphantom_protocol.dylib" "dist/${NAME}/"
+            # A Mach-O library records the path it expects to be found at, and
+            # rustc writes the absolute path of the build directory into it —
+            # `/Users/runner/work/.../target/.../deps/libphantom_protocol.dylib`,
+            # a directory that exists on no machine but the runner. Every
+            # consumer that links the shipped library then dies at launch with
+            # `dyld: Library not loaded`, before `main`, and the failure names
+            # the runner's path rather than anything the consumer can act on.
+            # 0.3.0 shipped both macOS rows that way. `@rpath` makes the name
+            # relative to whatever the consumer's own `-rpath` says, which is
+            # what a redistributable dylib is supposed to carry.
+            #
+            # This rewrites the copy in the staging directory, so the build tree
+            # is left alone. `install_name_tool` invalidates the ad-hoc
+            # signature arm64 macOS requires and re-signs the file itself; the
+            # check below is what proves the result still loads.
+            install_name_tool -id @rpath/libphantom_protocol.dylib \
+              "dist/${NAME}/libphantom_protocol.dylib"
+            got="$(otool -D "dist/${NAME}/libphantom_protocol.dylib" | tail -n 1)"
+            if [ "${got}" != "@rpath/libphantom_protocol.dylib" ]; then
+              echo "install name is '${got}', expected '@rpath/libphantom_protocol.dylib'" >&2
+              exit 1
+            fi
           fi
           # The license text is not optional either: Apache-2.0 §4(a) requires
           # every redistribution, binaries included, to carry a copy, so a
