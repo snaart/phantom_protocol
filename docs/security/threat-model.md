@@ -259,7 +259,7 @@ compliant peer and nobody else.
 
 | link | bound | enforced by | enforced? |
 | --- | --- | --- | --- |
-| streams | `MAX_STREAMS` = 256 | `handle_packet` refuses the segment that would create the 257th; unrecorded, so it is not SACKed either | **yes** |
+| streams | `MAX_STREAMS` = 256 **the peer holds open** (this side's own streams and the reserved raw-application stream share the table, not the allowance) | `handle_packet` refuses the segment that would create the peer's 257th; unrecorded, so it is not SACKed either | **yes** |
 | inbound frame | `MAX_RECV_FRAME` = 1335 B, i.e. `MAX_RECV_PAYLOAD` = 1304 B of plaintext | the pump's reader drops a larger frame before decrypting it | **yes** |
 | advertised window | `MAX_RECV_WINDOW` = 1 MiB per stream | *nothing* — the receive path admits in-order data without consulting it | **no — observed** |
 | window growth | one session-wide `SESSION_RECV_WINDOW_GROWTH_BUDGET` = 8 MiB over the 64 KiB every stream starts with | `SharedRecvTuning` draws every doubling from the one allowance | **yes** |

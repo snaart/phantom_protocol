@@ -595,9 +595,24 @@ an id its peer has since dropped is acknowledged and discarded. Get this wrong
 and every byte-level vector in `INTEROP.md` still passes.
 
 Concurrent *receive* streams are capped at `MAX_STREAMS = 256` per session
-(`api/session.rs`); a reliable segment naming a new id past that cap is refused
-rather than admitted, and — being unrecorded — is not acknowledged, so the peer
-retransmits and that stream stalls instead of the table growing without bound.
+(`api/session.rs`), counted over the streams **the peer** holds open: this side's
+own streams and the reserved raw-application stream live in the same table but not
+in the same allowance, so a peer may open the number this paragraph names. A
+reliable segment naming a new id past the cap is refused rather than admitted, and
+— being unrecorded — is not acknowledged, so the peer retransmits and that stream
+stalls instead of the table growing without bound.
+
+**A peer that counts differently is handed that stall, and this implementation
+counted differently until 0.3.1.** Before then the whole table was compared against
+the cap, so a 0.3.0 receiver admits 255 peer streams — one fewer for every stream it
+has opened itself — and refuses the 256th. The refusal is silent by the rule above,
+the segment stays outstanding, and the sender's liveness sweep reads the silence as a
+dead path and ends the session seconds later, taking every healthy stream on it.
+Nothing on the wire states which rule a peer applies and there is no field in which
+to ask, so a sender that does not know its peer's build should keep to **255**
+concurrent streams. A second implementation should count the peer's streams alone:
+it is the only rule under which the number named here is the number a peer may
+actually use.
 
 ### 4.5 AEAD-plaintext payload codecs (SACK / reliable frame / COALESCED / WINDOW_UPDATE)
 
