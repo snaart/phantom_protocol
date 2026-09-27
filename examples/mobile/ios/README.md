@@ -38,7 +38,8 @@ examples/mobile/ios/
 You need a macOS host with Xcode and the iOS Rust targets:
 
 ```sh
-rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios \
+                  aarch64-apple-darwin x86_64-apple-darwin
 ```
 
 > **Note:** `core/Cargo.toml` declares `crate-type = ["lib", "cdylib"]`, so a
@@ -50,38 +51,67 @@ rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 > and a `#[global_allocator]` from the library and breaks the bare-metal
 > `thumbv7em-none-eabihf` build. `build-xcframework.sh` already does this.
 
-The repository ships a ready-made script that compiles the three iOS slices,
-`lipo`s the simulator slices together, and assembles the XCFramework with the
-UniFFI C headers bundled:
+The repository ships a ready-made script that compiles the slices, `lipo`s the
+multi-architecture ones together, stages the UniFFI C header and modulemap, and
+assembles the XCFramework:
 
 ```sh
 # from the repository root
 ./tests/bindings/swift/build-xcframework.sh
+
+# Compile the generated binding against the result (macOS host)
+swift build --package-path tests/bindings/swift
 ```
 
 Equivalently, by hand:
 
 ```sh
-# Device (arm64), Apple-silicon simulator, Intel simulator.
+# Device (arm64), Apple-silicon simulator, Intel simulator, and the two macOS
+# architectures — `Package.swift` declares .iOS and .macOS, and a declared
+# platform without a slice resolves fine and then fails to link.
 # `cargo rustc --crate-type staticlib` is what produces the .a — see the note above.
-cargo rustc --release --target aarch64-apple-ios     --manifest-path core/Cargo.toml --crate-type staticlib
-cargo rustc --release --target aarch64-apple-ios-sim --manifest-path core/Cargo.toml --crate-type staticlib
-cargo rustc --release --target x86_64-apple-ios      --manifest-path core/Cargo.toml --crate-type staticlib
+for triple in aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios \
+              aarch64-apple-darwin x86_64-apple-darwin; do
+    cargo rustc --release --target "$triple" --manifest-path core/Cargo.toml --crate-type staticlib
+done
 
-# Merge the two simulator slices into one fat library
-mkdir -p target/universal-ios-sim/release
+# Merge the multi-architecture slices into fat libraries
+mkdir -p target/universal-ios-sim/release target/universal-macos/release
 lipo -create \
     target/aarch64-apple-ios-sim/release/libphantom_protocol.a \
     target/x86_64-apple-ios/release/libphantom_protocol.a \
     -output target/universal-ios-sim/release/libphantom_protocol.a
+lipo -create \
+    target/aarch64-apple-darwin/release/libphantom_protocol.a \
+    target/x86_64-apple-darwin/release/libphantom_protocol.a \
+    -output target/universal-macos/release/libphantom_protocol.a
 
-# Assemble the XCFramework (the -headers dir carries the UniFFI .h + .modulemap)
+# Stage the headers. The directory handed to -headers is copied WHOLESALE into
+# every slice, so it must hold exactly the FFI header and the modulemap — and the
+# modulemap must be named module.modulemap, which is the only name clang looks
+# for. Passing tests/bindings/swift/ instead fails twice over: the output lands
+# in that same directory, so xcodebuild copies its own half-written framework
+# into itself and dies with `the file name "ios-arm64" is invalid`; and the
+# modulemap arrives under its generated name, so `canImport(phantom_protocolFFI)`
+# is false and the build fails on `cannot find type 'RustBuffer' in scope`.
+rm -rf target/xcframework-headers && mkdir -p target/xcframework-headers
+cp tests/bindings/swift/phantom_protocolFFI.h target/xcframework-headers/
+cp tests/bindings/swift/phantom_protocolFFI.modulemap \
+   target/xcframework-headers/module.modulemap
+
+# Assemble the XCFramework
 xcodebuild -create-xcframework \
     -library target/aarch64-apple-ios/release/libphantom_protocol.a \
-        -headers tests/bindings/swift/ \
+        -headers target/xcframework-headers \
     -library target/universal-ios-sim/release/libphantom_protocol.a \
-        -headers tests/bindings/swift/ \
+        -headers target/xcframework-headers \
+    -library target/universal-macos/release/libphantom_protocol.a \
+        -headers target/xcframework-headers \
     -output tests/bindings/swift/PhantomProtocol.xcframework
+
+# Check the result before shipping it: the gate catches a misnamed modulemap, a
+# stray file in Headers and a declared platform with no slice.
+./tests/bindings/swift/check_xcframework.sh
 ```
 
 Then place it where this sample's `Package.swift` expects it:

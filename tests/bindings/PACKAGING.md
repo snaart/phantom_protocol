@@ -81,11 +81,23 @@ Use this flow only for local testing or the `bindings/drift` CI job.
 
 ```sh
 cd tests/bindings/swift
-rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios \
+                  aarch64-apple-darwin x86_64-apple-darwin
 ./build-xcframework.sh         # produces PhantomProtocol.xcframework
+./check_xcframework.sh         # header names + one slice per declared platform
+swift build                    # the generated binding, compiled against it
 # Then commit a tag and host the XCFramework on a GitHub Release;
 # update Package.swift's `.binaryTarget(url:checksum:)` to point at it.
 ```
+
+The framework carries three platform slices — iOS device, iOS simulator and
+macOS — because `Package.swift` declares `.iOS` and `.macOS`. A declared platform
+with no slice resolves fine and then fails to link, which is why
+`check_xcframework.sh` compares the two lists. It also checks that the modulemap
+inside the framework is named `module.modulemap`: under its generated name
+(`phantom_protocolFFI.modulemap`) clang exports no module, so the generated
+Swift's `canImport(phantom_protocolFFI)` is false and compilation dies on
+`cannot find type 'RustBuffer' in scope` with a framework that looks fine.
 
 A *published* SwiftPM package needs a binary target hosted at a stable
 URL with a SHA-256 checksum; the in-tree `Package.swift` declares a
