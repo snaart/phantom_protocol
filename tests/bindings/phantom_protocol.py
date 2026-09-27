@@ -527,15 +527,15 @@ def _uniffi_check_contract_api_version(lib):
 def _uniffi_check_api_checksums(lib):
     if lib.uniffi_phantom_protocol_checksum_func_connect_pinned() != 13736:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp() != 56169:
+    if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp() != 30504:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_config() != 35502:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption() != 52312:
+    if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption() != 52362:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_config() != 36966:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 56380:
+    if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 43340:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_func_generate_signing_key() != 39294:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -571,7 +571,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_accept_stream() != 18738:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_await_ready() != 29445:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_await_ready() != 43401:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_connection_state() != 5175:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -589,23 +589,23 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_metrics_snapshot() != 13889:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_migrate() != 13926:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_migrate() != 52007:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_open_stream() != 61871:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_open_stream() != 16360:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_peer_addr() != 8519:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_queued_count() != 33659:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_recv() != 6660:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_recv() != 33455:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_resumption_hint() != 62628:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_send() != 6054:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_send() != 52397:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 13691:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_supports_migration() != 35412:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_supports_migration() != 24184:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping() != 8496:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -613,7 +613,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 57646:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomstream_recv() != 45283:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomstream_recv() != 11746:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_reliable() != 35264:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -2798,10 +2798,22 @@ class PhantomStreamProtocol(typing.Protocol):
         Returns:
         - `Ok(Some(bytes))` — a data payload arrived.
         - `Ok(None)` — the peer sent a clean FIN; the stream is half-closed
-        for reading. No more data will arrive on this stream.
-        - `Err(CoreError::ConnectionClosed)` — the underlying session ended
-        (the mpsc channel was dropped) before a clean EOF was signalled.
-        This indicates an abnormal termination rather than a graceful close.
+        for reading. No more data will arrive on this stream. Exactly once: a further
+        call on a stream whose FIN has already been reported gets the `Err` below.
+        - `Err(CoreError::ConnectionClosed)` — the session ended before a FIN arrived on
+        this stream.
+
+        **The session ending is an `Err` here, not `Ok(None)`, even when it ended in the
+        orderly way.** `Ok(None)` is a statement about *this stream*: the peer closed its
+        writing half, so everything it meant to send has been read. The end of the session
+        says nothing of the kind — the peer may have been half-way through writing on this
+        stream — so reporting it as a clean end of stream would tell the caller it had
+        everything when the truth is that nobody can now say. The distinction survives in
+        both directions: a stream whose FIN did arrive reports `Ok(None)` first and the
+        error only afterwards, so a reader that reads to EOF never sees the error at all.
+
+        Either way the call resolves. Whatever was already delivered into this stream is
+        handed over first, in order, and the end is reported after it.
 """
         raise NotImplementedError
     async def send_reliable(self, data: bytes) -> None:
@@ -2970,10 +2982,22 @@ class PhantomStream(PhantomStreamProtocol):
         Returns:
         - `Ok(Some(bytes))` — a data payload arrived.
         - `Ok(None)` — the peer sent a clean FIN; the stream is half-closed
-        for reading. No more data will arrive on this stream.
-        - `Err(CoreError::ConnectionClosed)` — the underlying session ended
-        (the mpsc channel was dropped) before a clean EOF was signalled.
-        This indicates an abnormal termination rather than a graceful close.
+        for reading. No more data will arrive on this stream. Exactly once: a further
+        call on a stream whose FIN has already been reported gets the `Err` below.
+        - `Err(CoreError::ConnectionClosed)` — the session ended before a FIN arrived on
+        this stream.
+
+        **The session ending is an `Err` here, not `Ok(None)`, even when it ended in the
+        orderly way.** `Ok(None)` is a statement about *this stream*: the peer closed its
+        writing half, so everything it meant to send has been read. The end of the session
+        says nothing of the kind — the peer may have been half-way through writing on this
+        stream — so reporting it as a clean end of stream would tell the caller it had
+        everything when the truth is that nobody can now say. The distinction survives in
+        both directions: a stream whose FIN did arrive reports `Ok(None)` first and the
+        error only afterwards, so a reader that reads to EOF never sees the error at all.
+
+        Either way the call resolves. Whatever was already delivered into this stream is
+        handed over first, in order, and the end is reported after it.
 """
         _uniffi_lowered_args = (
             self._uniffi_clone_handle(),
@@ -3551,6 +3575,11 @@ class PhantomSessionProtocol(typing.Protocol):
         captured terminal error on failure. This is the preferred alternative
         to polling `connection_state()` in a loop.
 
+        A session that is over rather than failed — closed by this side or by the peer, with
+        nothing recorded against it — answers [`CoreError::ConnectionClosed`]. It is not
+        ready and never will be, but nothing went wrong, and
+        [`last_error`](Self::last_error) still reports `None`.
+
         Because the readiness signal is carried on a `watch` channel, a call
         made *after* the handshake has already resolved (either direction)
         returns immediately — there is no lost-notification race.
@@ -3728,6 +3757,12 @@ class PhantomSessionProtocol(typing.Protocol):
         or Embedded session returns [`CoreError::Unsupported`]. Check
         [`supports_migration`](Self::supports_migration) first, or use
         `connect_pinned_udp` to ensure UDP backing.
+
+        **This is the client's entry point only.** A session handed back by a listener is
+        the server end of a PhantomUDP connection, and although its transport does migrate,
+        it does so through [`migrate_server`](Self::migrate_server) — calling `migrate()`
+        there returns [`CoreError::Unsupported`] rather than accepting a request the pump
+        would discard.
 """
         raise NotImplementedError
     def open_stream(self, ) -> PhantomStream:
@@ -3741,15 +3776,27 @@ class PhantomSessionProtocol(typing.Protocol):
 
         # Errors
 
-        [`CoreError::StreamError`] once this side has opened 32 767 streams in the
-        session. A stream id travels in a 16-bit header field and each side allocates
-        from its own half of that space, never reusing an id — even one whose stream
-        has long since closed, because the peer may still be holding it or the record
-        that it closed, and would fold a new stream's bytes into it. Nothing is opened
-        and the session is otherwise unaffected: streams already open carry on, and
-        `accept_stream()` still takes the peer's. The limit counts every stream opened,
-        not the ones open at once, so a long-lived session that opens a stream per
-        request reaches it; open a new session to continue.
+        [`CoreError::StreamError`], for either of two limits, with nothing opened and the
+        session otherwise unaffected in both cases: streams already open carry on, and
+        `accept_stream()` still takes the peer's.
+
+        - **[`MAX_STREAMS`] already open on this side.** The peer holds the same limit on
+        how many streams it will accept from us, and it enforces it *silently* — the
+        segment that would open the stream is simply never acknowledged. So a stream
+        handed out past the limit would not fail; it would sit with data outstanding
+        that nothing can retire, and inbound silence with data in flight is what the
+        liveness sweep reads as a dead path. Refusing here is the difference between one
+        stream reporting a limit and the whole session dying a few seconds later. Retry
+        once a stream has closed: the limit counts streams open *at once*, and a stream
+        leaves the count when its close is acknowledged, or immediately if it was let go
+        of without ever having been written on.
+        - **32 767 streams opened over the session's life.** A stream id travels in a
+        16-bit header field and each side allocates from its own half of that space,
+        never reusing an id — even one whose stream has long since closed, because the
+        peer may still be holding it or the record that it closed, and would fold a new
+        stream's bytes into it. This limit counts every stream ever opened, so a
+        long-lived session that opens a stream per request reaches it; open a new session
+        to continue.
 """
         raise NotImplementedError
     def peer_addr(self, ) -> str:
@@ -3778,9 +3825,17 @@ class PhantomSessionProtocol(typing.Protocol):
         refcount the Vec is moved out of the underlying buffer, otherwise
         `Bytes::to_vec` copies.
 
-        When the session is `Failed` or `Dead` and the recv channel has been
-        dropped, returns the captured terminal error (if any) rather than the
-        generic `"Session closed"` message.
+        # The end of the session
+
+        Once the session is over and everything it delivered has been read, this returns
+        [`CoreError::ConnectionClosed`] for an orderly end — this side's own
+        [`disconnect`](Self::disconnect), or the peer's — and the captured terminal cause
+        for any other: [`CoreError::Timeout`] for a path the transport gave up on, whatever
+        the handshake failed with, and so on. So the two cases a reader has to tell apart —
+        "the peer is finished, take the result" and "the connection broke, retry" — differ
+        in the value returned rather than only in a message, and agree with
+        [`connection_state`](Self::connection_state) (`Closed` against `Dead`) and with
+        [`last_error`](Self::last_error) (`None` against the cause).
 """
         raise NotImplementedError
     async def resumption_hint(self, ) -> typing.Optional[ResumptionHint]:
@@ -3812,7 +3867,12 @@ class PhantomSessionProtocol(typing.Protocol):
         - If the session is `Failed` or `Dead`: returns the captured terminal
         error (from the handshake or the data pump) so the caller gets the
         *specific* cause (e.g. [`CoreError::ServerIdentityMismatch`]) rather
-        than the generic `"Cannot send in state Failed"` message.
+        than a generic message.
+        - If the session is `Closed`: returns [`CoreError::ConnectionClosed`]. That is the
+        whole answer — a session closed in the orderly way, by this side or by the peer,
+        has no cause to report and [`last_error`](Self::last_error) stays `None`. It is
+        how a caller tells an orderly end from a failed one: this error with no cause
+        behind it is the first, a cause is the second.
 
         # ⚠ This is a byte stream, not a message channel
 
@@ -3857,13 +3917,18 @@ class PhantomSessionProtocol(typing.Protocol):
         raise NotImplementedError
     def supports_migration(self, ) -> bool:
         """
-        Whether this session's transport supports seamless connection migration
-        (i.e., [`migrate`](Self::migrate) will succeed for UDP sessions).
+        Whether [`migrate`](Self::migrate) can move this session.
 
-        Returns `true` only when the session is backed by `UdpClientTransport`.
-        On TCP, WebSocket, WASI, or Embedded sessions, [`migrate`](Self::migrate)
-        returns [`CoreError::Unsupported`] — use reconnection with 0-RTT resumption
-        instead.
+        Returns `true` only for a **client** session backed by `UdpClientTransport`. On TCP,
+        WebSocket, WASI or Embedded sessions, and on a session accepted by a listener,
+        [`migrate`](Self::migrate) returns [`CoreError::Unsupported`] — use reconnection
+        with 0-RTT resumption instead.
+
+        An accepted PhantomUDP session answers `false` here even though its transport does
+        migrate: the server side moves through the Rust-only
+        [`migrate_server`](Self::migrate_server), and `migrate` is refused there so that the
+        FFI-exported client operation cannot move a server. Answering `true` would name a
+        capability nothing the caller of this method can reach.
 """
         raise NotImplementedError
     async def traffic_shaping(self, ) -> typing.Optional[TrafficShapingConfig]:
@@ -4063,6 +4128,11 @@ class PhantomSession(PhantomSessionProtocol):
         Returns `Ok(())` on successful connection, or `Err(cause)` with the
         captured terminal error on failure. This is the preferred alternative
         to polling `connection_state()` in a loop.
+
+        A session that is over rather than failed — closed by this side or by the peer, with
+        nothing recorded against it — answers [`CoreError::ConnectionClosed`]. It is not
+        ready and never will be, but nothing went wrong, and
+        [`last_error`](Self::last_error) still reports `None`.
 
         Because the readiness signal is carried on a `watch` channel, a call
         made *after* the handshake has already resolved (either direction)
@@ -4341,6 +4411,12 @@ class PhantomSession(PhantomSessionProtocol):
         or Embedded session returns [`CoreError::Unsupported`]. Check
         [`supports_migration`](Self::supports_migration) first, or use
         `connect_pinned_udp` to ensure UDP backing.
+
+        **This is the client's entry point only.** A session handed back by a listener is
+        the server end of a PhantomUDP connection, and although its transport does migrate,
+        it does so through [`migrate_server`](Self::migrate_server) — calling `migrate()`
+        there returns [`CoreError::Unsupported`] rather than accepting a request the pump
+        would discard.
 """
         
         _UniffiFfiConverterString.check_lower(local_addr)
@@ -4369,15 +4445,27 @@ class PhantomSession(PhantomSessionProtocol):
 
         # Errors
 
-        [`CoreError::StreamError`] once this side has opened 32 767 streams in the
-        session. A stream id travels in a 16-bit header field and each side allocates
-        from its own half of that space, never reusing an id — even one whose stream
-        has long since closed, because the peer may still be holding it or the record
-        that it closed, and would fold a new stream's bytes into it. Nothing is opened
-        and the session is otherwise unaffected: streams already open carry on, and
-        `accept_stream()` still takes the peer's. The limit counts every stream opened,
-        not the ones open at once, so a long-lived session that opens a stream per
-        request reaches it; open a new session to continue.
+        [`CoreError::StreamError`], for either of two limits, with nothing opened and the
+        session otherwise unaffected in both cases: streams already open carry on, and
+        `accept_stream()` still takes the peer's.
+
+        - **[`MAX_STREAMS`] already open on this side.** The peer holds the same limit on
+        how many streams it will accept from us, and it enforces it *silently* — the
+        segment that would open the stream is simply never acknowledged. So a stream
+        handed out past the limit would not fail; it would sit with data outstanding
+        that nothing can retire, and inbound silence with data in flight is what the
+        liveness sweep reads as a dead path. Refusing here is the difference between one
+        stream reporting a limit and the whole session dying a few seconds later. Retry
+        once a stream has closed: the limit counts streams open *at once*, and a stream
+        leaves the count when its close is acknowledged, or immediately if it was let go
+        of without ever having been written on.
+        - **32 767 streams opened over the session's life.** A stream id travels in a
+        16-bit header field and each side allocates from its own half of that space,
+        never reusing an id — even one whose stream has long since closed, because the
+        peer may still be holding it or the record that it closed, and would fold a new
+        stream's bytes into it. This limit counts every stream ever opened, so a
+        long-lived session that opens a stream per request reaches it; open a new session
+        to continue.
 """
         _uniffi_lowered_args = (
             self._uniffi_clone_handle(),
@@ -4438,9 +4526,17 @@ class PhantomSession(PhantomSessionProtocol):
         refcount the Vec is moved out of the underlying buffer, otherwise
         `Bytes::to_vec` copies.
 
-        When the session is `Failed` or `Dead` and the recv channel has been
-        dropped, returns the captured terminal error (if any) rather than the
-        generic `"Session closed"` message.
+        # The end of the session
+
+        Once the session is over and everything it delivered has been read, this returns
+        [`CoreError::ConnectionClosed`] for an orderly end — this side's own
+        [`disconnect`](Self::disconnect), or the peer's — and the captured terminal cause
+        for any other: [`CoreError::Timeout`] for a path the transport gave up on, whatever
+        the handshake failed with, and so on. So the two cases a reader has to tell apart —
+        "the peer is finished, take the result" and "the connection broke, retry" — differ
+        in the value returned rather than only in a message, and agree with
+        [`connection_state`](Self::connection_state) (`Closed` against `Dead`) and with
+        [`last_error`](Self::last_error) (`None` against the cause).
 """
         _uniffi_lowered_args = (
             self._uniffi_clone_handle(),
@@ -4496,7 +4592,12 @@ class PhantomSession(PhantomSessionProtocol):
         - If the session is `Failed` or `Dead`: returns the captured terminal
         error (from the handshake or the data pump) so the caller gets the
         *specific* cause (e.g. [`CoreError::ServerIdentityMismatch`]) rather
-        than the generic `"Cannot send in state Failed"` message.
+        than a generic message.
+        - If the session is `Closed`: returns [`CoreError::ConnectionClosed`]. That is the
+        whole answer — a session closed in the orderly way, by this side or by the peer,
+        has no cause to report and [`last_error`](Self::last_error) stays `None`. It is
+        how a caller tells an orderly end from a failed one: this error with no cause
+        behind it is the first, a cause is the second.
 
         # ⚠ This is a byte stream, not a message channel
 
@@ -4571,13 +4672,18 @@ class PhantomSession(PhantomSessionProtocol):
         )
     def supports_migration(self, ) -> bool:
         """
-        Whether this session's transport supports seamless connection migration
-        (i.e., [`migrate`](Self::migrate) will succeed for UDP sessions).
+        Whether [`migrate`](Self::migrate) can move this session.
 
-        Returns `true` only when the session is backed by `UdpClientTransport`.
-        On TCP, WebSocket, WASI, or Embedded sessions, [`migrate`](Self::migrate)
-        returns [`CoreError::Unsupported`] — use reconnection with 0-RTT resumption
-        instead.
+        Returns `true` only for a **client** session backed by `UdpClientTransport`. On TCP,
+        WebSocket, WASI or Embedded sessions, and on a session accepted by a listener,
+        [`migrate`](Self::migrate) returns [`CoreError::Unsupported`] — use reconnection
+        with 0-RTT resumption instead.
+
+        An accepted PhantomUDP session answers `false` here even though its transport does
+        migrate: the server side moves through the Rust-only
+        [`migrate_server`](Self::migrate_server), and `migrate` is refused there so that the
+        FFI-exported client operation cannot move a server. Answering `true` would name a
+        capability nothing the caller of this method can reach.
 """
         _uniffi_lowered_args = (
             self._uniffi_clone_handle(),
@@ -5745,7 +5851,10 @@ async def connect_pinned_udp(host: str,port: int,pinned_key: bytes) -> PhantomSe
     datagram socket, involves no exchange with the peer at all. The handshake and
     the check that the server holds `pinned_key` run on the background task,
     while the session reports [`ConnectionState::Connecting`] and
-    [`send`](PhantomSession::send) queues bytes rather than refusing them.
+    [`send`](PhantomSession::send) queues bytes rather than refusing them. (The one
+    exception is a `host` that resolves to more than one address: telling those apart
+    takes a handshake, so the candidates before the last one are tried and awaited — see
+    below.)
 
     **Call [`await_ready`](PhantomSession::await_ready) before treating the
     session as authenticated**; it surfaces
@@ -5760,12 +5869,18 @@ async def connect_pinned_udp(host: str,port: int,pinned_key: bytes) -> PhantomSe
     path validation, and passive NAT-rebind recovery are all live for FFI
     consumers.
 
-    `host` is resolved via the system resolver; the **first** returned address is
-    used. Unlike the TCP [`connect_pinned`] (whose `TcpStream::connect` tries every
-    resolved address in turn), this does **not** fall back to subsequent addresses
-    if the first is unreachable — pass an IP literal or a single-family host when
-    that matters. Server-key pinning is mandatory (security invariant 1).
-    Native-only, like [`connect_pinned`].
+    `host` is resolved via the system resolver and **every** address it returns is tried, in
+    the resolver's order, until one answers — like the TCP [`connect_pinned`], whose
+    `TcpStream::connect` does the same. It matters more here than it looks: `localhost`
+    commonly resolves to `::1` before `127.0.0.1`, and a datagram socket "connected" to an
+    address with nothing behind it reports no error at all, so taking only the first address
+    meant a server listening on IPv4 was simply never reached. Only the handshake can tell
+    the addresses apart, so each candidate but the last is given a share of the client
+    handshake deadline to complete one; the whole call stays inside that single deadline
+    however many addresses the name has, and the last candidate is handed back without
+    waiting, which is why a one-address name — every IP literal among them — behaves exactly
+    as it always did. Server-key pinning is mandatory (security invariant 1). Native-only,
+    like [`connect_pinned`].
 
     # Example
 
@@ -5899,8 +6014,18 @@ async def connect_pinned_udp_with_resumption(host: str,port: int,pinned_key: byt
     rejected before the UDP socket is bound. Acceptance is best-effort (security
     invariant 9): an unknown/stale ticket completes 1-RTT and the caller checks
     [`PhantomSession::early_data_accepted`] and re-sends when it is not `Some(true)`.
-    Like [`connect_pinned_udp`], the first resolved address is used with no fallback.
-    Native-only.
+
+    **A resume consumes the ticket, whether or not `early_data` is empty.** The ticket is
+    one-shot (security invariant 9), and the server consumes it the moment the resumption
+    binder verifies — before it looks at whether a sealed blob came with it. Resuming with an
+    empty `early_data` therefore spends the ticket to buy only the cookie / proof-of-work
+    bypass, and [`PhantomSession::early_data_accepted`] answers `None`, which is correct
+    ("no early-data on this connect") and easy to read as "nothing was spent". A caller with
+    nothing to send yet should connect without the hint and keep it for the connect that
+    does have a payload; a caller that resumes twice off one hint gets 1-RTT the second time.
+
+    Like [`connect_pinned_udp`], every address the host resolves to is tried in the
+    resolver's order, inside the one client handshake deadline. Native-only.
 """
     
     _UniffiFfiConverterString.check_lower(host)
@@ -6030,6 +6155,15 @@ async def connect_pinned_with_resumption(host: str,port: int,pinned_key: bytes,h
     It takes no [`PhantomConfig`](crate::config::PhantomConfig), so the session keeps
     the default liveness settings and the thirty-second write deadline of
     [`connect_pinned`].
+
+    **A resume consumes the ticket, whether or not `early_data` is empty.** The ticket is
+    one-shot (security invariant 9), and the server consumes it the moment the resumption
+    binder verifies — before it looks at whether a sealed blob came with it. Resuming with an
+    empty `early_data` therefore spends the ticket to buy only the cookie / proof-of-work
+    bypass, and [`PhantomSession::early_data_accepted`] answers `None`, which is correct
+    ("no early-data on this connect") and easy to read as "nothing was spent". A caller with
+    nothing to send yet should connect without the hint and keep it for the connect that
+    does have a payload; a caller that resumes twice off one hint gets 1-RTT the second time.
 
     Native-only, like [`connect_pinned`]: `TcpSessionTransport` lives
     behind `cfg(not(target_arch = "wasm32"))`.
