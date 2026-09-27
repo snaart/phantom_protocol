@@ -6,7 +6,7 @@ protocol: a single packet shape, a single handshake, and a single pinned
 version byte. The protocol is **not negotiated**: there is no version
 handshake, no fallback, and no protocol-*version* migration path. That is not
 for want of deployed peers — 0.2.x is published and speaks `WIRE_VERSION` 6 /
-`PROTOCOL_VERSION` 3, and 0.3.0 (8 / 5) cannot talk to it. Pre-1.0 a wire
+`PROTOCOL_VERSION` 3, and every 0.3.x release (8 / 5) cannot talk to it. Pre-1.0 a wire
 change is a hard cut: a peer on the other side of it is refused at the
 handshake (§ 1), and both ends of a connection upgrade together. The one
 surviving version byte is a tamper-check anchor and a hook for a future,
@@ -605,12 +605,20 @@ stalls instead of the table growing without bound.
 **A peer that counts differently is handed that stall, and this implementation
 counted differently until 0.3.1.** Before then the whole table was compared against
 the cap, so a 0.3.0 receiver admits 255 peer streams — one fewer for every stream it
-has opened itself — and refuses the 256th. The refusal is silent by the rule above,
-the segment stays outstanding, and the sender's liveness sweep reads the silence as a
-dead path and ends the session seconds later, taking every healthy stream on it.
-Nothing on the wire states which rule a peer applies and there is no field in which
-to ask, so a sender that does not know its peer's build should keep to **255**
-concurrent streams. A second implementation should count the peer's streams alone:
+has opened itself — and refuses the 256th. The refusal is silent by the rule above and
+the segment stays outstanding, so what the sender sees depends on whether it has other
+traffic, and the two outcomes look nothing alike. **A session whose only outstanding
+data is the refused stream** is ended by the sender's own liveness sweep, which reads
+the silence as a dead path: measured, a few seconds later, `Dead` with `Timeout`.
+**A session that keeps carrying other streams** is not ended at all: measured over
+300 s, it oscillates between `Migrating` and `Connected` on the keep-alive tick — the
+refused stream's silence looks like a dead path, the other streams' acknowledgements
+look like a recovered one — never reaches `Dead`, reports `last_error()` as `None`
+throughout, serves its other streams normally, and leaves that one stream stuck for as
+long as the session lives. An operator diagnosing the second case by looking for a
+failed session will not find one. Nothing on the wire states which rule a peer applies
+and there is no field in which to ask, so a sender that does not know its peer's build
+should keep to **255** concurrent streams. A second implementation should count the peer's streams alone:
 it is the only rule under which the number named here is the number a peer may
 actually use.
 
@@ -1425,26 +1433,39 @@ it. Against the timer-driven alternative of § 12.4 — over two minutes for the
 and for a server's demux routes no reclaim at all until traffic happens to trigger one
 — either bound is the same order of magnitude of improvement.
 
-**On an ordered byte-pipe transport the window is not needed and is not taken.** Every
-sentence above is about a datagram transport, where the `CLOSE` and the data behind it
-are separate messages the path may reorder. Over a byte pipe — TCP, a WebSocket, a WASI
-socket, a UART — the transport itself guarantees in-order delivery, so the close cannot
-overtake anything: by the time it is parsed, every byte the sender wrote before it has
-already been handed over. There is nothing left to drain, and the peer's own end-of-stream
-arrives immediately behind the frame, which is a stronger signal than the frame is. A
-receiver on such a transport may therefore conclude at once, and this implementation does:
-it publishes `Draining` and then tears down on the read side's end-of-stream, typically
-tens of microseconds later, rather than holding the floor. The floor is a property of the
-displacement it exists to absorb, and on an ordered transport that displacement is zero.
+**On an ordered byte-pipe transport there is nothing to drain, so the window need not be
+waited out.** Every sentence above is about a datagram transport, where the `CLOSE` and
+the data behind it are separate messages the path may reorder. Of this implementation's
+six transports, five are ordered byte pipes — TCP, the TLS-mimicry leg on top of it, a
+browser WebSocket, a WASI socket, and an embedded UART / USB-CDC link — and one, PhantomUDP,
+is a datagram transport. On the five, the transport itself guarantees in-order delivery, so
+the close cannot overtake anything: by the time it is parsed, every byte the sender wrote
+before it has already been handed over. The floor is a property of the displacement it
+exists to absorb, and on an ordered transport that displacement is zero, so a receiver may
+conclude at once.
+
+**What then ends the session differs across those five, and on one of them nothing arrives
+behind the frame at all.** On the four that are stream *connections* — TCP, TLS-mimicry, a
+WebSocket, a WASI socket — the peer's own end-of-stream follows its close and is a stronger
+signal than the close is; this implementation publishes `Draining` and tears down on the
+read side's end-of-stream, typically tens of microseconds later, rather than holding the
+floor. A UART has **no end-of-stream at all**: a serial line carries no close and no EOF,
+its reader simply never completes another frame, which is exactly why `EmbeddedLeg` has no
+clock of its own and leaves a write deadline to its writer to report. There the `CLOSE`
+frame is the only departure signal that exists, and what ends the session is the draining
+deadline itself, run off the send loop's own tick rather than by anything arriving — the
+same mechanism a datagram transport relies on. So read the rule as "an ordered transport
+need not wait for displacement", not as "an ordered transport is told of the departure
+twice".
 
 Two consequences worth stating, because both have been read the wrong way. An
-implementation that *does* hold the full window on a byte pipe is conformant — it waits
-for something that cannot arrive, which costs a bounded delay and loses nothing. And
-`ConnectionState::Draining` is not a state an application can poll for on a byte-pipe
-session: a consumer sampling `connection_state()` even every millisecond will see
+implementation that *does* wait the full window out on any ordered transport is conformant —
+it waits for something that cannot arrive, which costs a bounded delay and loses nothing.
+And `ConnectionState::Draining` is not a state an application can poll for on a stream
+connection: a consumer sampling `connection_state()` even every millisecond will see
 `Connected` and then `Closed`. Code that must react to a peer's departure should read the
 error from `recv()` — `CoreError::ConnectionClosed` for an orderly one — rather than watch
-for a state that on three of this implementation's five transports is transient by
+for a state that on four of this implementation's six transports is transient by
 construction.
 
 **If it is lost entirely**, nothing breaks and nothing is retried: the receiver falls
@@ -2746,12 +2767,35 @@ either.
 
 ## 13. Last verified against the code
 
-Every constant, byte offset, field order and decode rule above was re-derived
-from the source on **2026-08-15**, against commit `41183f49`. A reader picking
-this up later should treat that pair as the document's expiry stamp: anything
-that has moved in `core/src/transport/`,
-`core/src/crypto/` or `core/src/api/session.rs` since then has not been
-re-checked here.
+The newest stamp is **2026-09-27, the 0.3.1 release**, and it covers three
+sections rather than the whole document: § 4.4, § 4.5 and § 4.11 were re-derived
+from the source in that release and are current as of it. Everything else carries
+the stamp below it. A reader picking this up later should treat the newest stamp
+covering the section they are reading as its expiry date: anything that has moved
+in `core/src/transport/`, `core/src/crypto/` or `core/src/api/session.rs` since
+then has not been re-checked here. The three 0.3.1 items, each named so it can be
+checked rather than taken:
+
+- **§ 4.4** — the concurrent-stream cap counts the streams **the peer** holds, not
+  every entry in the stream table; the paragraph on what a peer counting the other
+  way is handed now states the two measured outcomes, which are a `Dead` session
+  and an indefinite `Migrating` ↔ `Connected` oscillation that never fails.
+- **§ 4.5** — the typed end-of-stream a reader sees: `Ok(None)` for a clean
+  in-order `FIN` against `Err(CoreError::ConnectionClosed)` for an abnormal end,
+  marked as this implementation's surfacing of the rule rather than a wire
+  requirement.
+- **§ 4.11** — the ordered-byte-pipe paragraphs. The transport inventory is six,
+  five of them ordered, and the four that are stream *connections* are the ones
+  where an end-of-stream arrives behind the close; a UART has none, so there the
+  draining deadline itself ends the session.
+
+Commit ids are deliberately absent from this stamp: the history up to the `v0.3.0`
+tag was rewritten once already, and `../policy/versioning.md` § 10 asks for a tag,
+a path or a date in new text rather than a hash. Earlier stamps keep the ids they
+were written with, and those ids do resolve.
+
+Before that, every constant, byte offset, field order and decode rule above was
+re-derived from the source on **2026-08-15**, against commit `41183f49`.
 
 Two changes have landed since that pass and are reflected above. `WIRE_VERSION 6 → 7`
 and `PROTOCOL_VERSION 3 → 4` replaced the `WINDOW_UPDATE` relative credit with a

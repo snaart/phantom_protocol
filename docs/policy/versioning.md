@@ -98,7 +98,7 @@ The wire format is **one protocol with one pinned version byte**. There is no
 `VersionedPacket` enum, no per-session `wire_version` negotiation, and no
 in-protocol fallback. That is a decision, not an absence of peers: 0.2.x is
 published on crates.io and speaks `WIRE_VERSION` 6 / `PROTOCOL_VERSION` 3, and
-0.3.0 (8 / 5) cannot talk to it. Pre-1.0 a wire change ships as a hard cut
+every 0.3.x release (8 / 5) cannot talk to it. Pre-1.0 a wire change ships as a hard cut
 rather than as something to negotiate — a peer on the other side of the cut is
 refused at the handshake, and the two ends of a connection upgrade together.
 
