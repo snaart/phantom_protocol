@@ -1706,3 +1706,259 @@ mod crate_root_paths {
         );
     }
 }
+
+/// The crate's runnable examples resolve the handshake before they use the session.
+///
+/// `connect_with_transport` and every `connect_pinned*` return before the handshake
+/// has run: the transport is ready, the peer's identity is not. `send()` then accepts
+/// bytes into the pending queue and answers `Ok` against an impostor exactly as it
+/// does against the right server, and the mismatch surfaces only from a later
+/// [`PhantomSession::await_ready`] or
+/// [`last_error`](api::PhantomSession::last_error). That is why the crate's own note
+/// says an embedder-facing example must call `await_ready()` immediately after
+/// connecting — it is the line that makes Security Invariant 1 observable to the
+/// caller.
+///
+/// An earlier change in this release fixed five such examples in the documentation.
+/// The runnable ones under `core/examples/` were not in that pass and were still
+/// waiting for the handshake the two wrong ways: `loopback_demo` slept for half a
+/// second and then sent, and `embedded_demo` polled `connection_state()` in a timed
+/// loop, which waits for the same handshake and then discards its answer — a wrong
+/// pinned key reaches `Failed` rather than `Connected`, so the loop spent its whole
+/// budget and reported a timeout for a mismatch that was known on the first round
+/// trip.
+///
+/// These are the first files a reader runs, so the pattern they show is the one that
+/// gets copied. The gate is on the source text because nothing else reaches it: CI
+/// compiles the examples and does not run them, and an example that waits the wrong
+/// way still prints the same output on loopback, where the pin always matches.
+#[cfg(test)]
+mod examples_await_the_pin {
+    /// One runnable example, named so deleting it is a build failure here rather than
+    /// a check that quietly stops looking at anything.
+    struct Example {
+        path: &'static str,
+        source: &'static str,
+    }
+
+    /// Every example under `core/examples/`. The two that build no client session are
+    /// listed as well, so the assertion that each file is accounted for can be made
+    /// against the directory rather than against this list.
+    const EXAMPLES: &[Example] = &[
+        Example {
+            path: "examples/bottleneck_sim.rs",
+            source: include_str!("../examples/bottleneck_sim.rs"),
+        },
+        Example {
+            path: "examples/crypto_bench.rs",
+            source: include_str!("../examples/crypto_bench.rs"),
+        },
+        Example {
+            path: "examples/embedded_demo.rs",
+            source: include_str!("../examples/embedded_demo.rs"),
+        },
+        Example {
+            path: "examples/loopback_demo.rs",
+            source: include_str!("../examples/loopback_demo.rs"),
+        },
+    ];
+
+    /// The ways an example can come to hold a client session. Each returns before the
+    /// handshake, which is what makes the following line matter.
+    const CLIENT_CONSTRUCTORS: &[&str] = &[
+        "connect_with_transport",
+        "connect_pinned",
+        "connect_pinned_udp",
+        ".connect()",
+    ];
+
+    /// Waiting for a handshake by any of these instead of by `await_ready()` is the
+    /// defect: the first cannot distinguish a slow path from a refused pin, and the
+    /// second two read a session that is not up yet.
+    const WRONG_WAYS_TO_WAIT: &[&str] = &["sleep", "connection_state", "is_data_ready"];
+
+    /// `source` with its comments removed and its string literals kept.
+    ///
+    /// Comments have to go, because this module's own explanation of the defect names
+    /// the tokens the defect is made of, and so does the comment beside the fix in
+    /// each example — a gate that read those would fire on the very text that says
+    /// why it exists. String literals stay: they are code, a payload spelled
+    /// `"sleep"` would be worth a second look, and dropping them would mean deciding
+    /// what a quoted token means.
+    ///
+    /// Block comments nest, as Rust says they do, and a `//` inside a string literal
+    /// is not a comment. Both are in the cases below rather than assumed: a stripper
+    /// that handled only `//` would be fooled by `/* */`, and one that ignored
+    /// strings would truncate a line at a URL.
+    fn without_comments(source: &str) -> String {
+        // Over characters rather than bytes, so a multi-byte character inside a string
+        // literal is copied as itself. Copying it byte by byte produced mojibake, which
+        // is only a cosmetic fault in the stripped text and a real one in the byte
+        // offsets the ordering checks below compare.
+        let chars: Vec<char> = source.chars().collect();
+        let at = |i: usize| chars.get(i).copied();
+        let opens = |i: usize, a: char, b: char| at(i) == Some(a) && at(i + 1) == Some(b);
+        let mut out = String::with_capacity(source.len());
+        let mut i = 0usize;
+        let mut block_depth = 0usize;
+        while let Some(ch) = at(i) {
+            if block_depth > 0 {
+                if opens(i, '/', '*') {
+                    block_depth += 1;
+                    i += 2;
+                } else if opens(i, '*', '/') {
+                    block_depth -= 1;
+                    i += 2;
+                } else {
+                    // Newlines are kept so the stripped text still has the shape of a
+                    // file; everything else inside a comment becomes nothing.
+                    if ch == '\n' {
+                        out.push('\n');
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            if opens(i, '/', '*') {
+                block_depth = 1;
+                i += 2;
+                continue;
+            }
+            if opens(i, '/', '/') {
+                while at(i).is_some_and(|c| c != '\n') {
+                    i += 1;
+                }
+                continue;
+            }
+            if ch == '"' {
+                // A string literal, copied whole, so a `//` or `/*` inside it is not
+                // read as the start of a comment. Escapes are honoured, so a literal
+                // ending in `\"` does not leave the string open.
+                out.push('"');
+                i += 1;
+                while let Some(c) = at(i) {
+                    out.push(c);
+                    i += 1;
+                    if c == '\\' {
+                        if let Some(escaped) = at(i) {
+                            out.push(escaped);
+                            i += 1;
+                        }
+                    } else if c == '"' {
+                        break;
+                    }
+                }
+                continue;
+            }
+            out.push(ch);
+            i += 1;
+        }
+        out
+    }
+
+    /// Every example listed above is a file that exists, and every file that exists is
+    /// listed.
+    ///
+    /// `include_str!` already fails the build for a listed file that is gone; this
+    /// covers the other direction, which nothing else would notice: an example added
+    /// later and not listed here would be exempt from the rule for as long as nobody
+    /// looked.
+    #[test]
+    fn the_list_and_the_directory_agree() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|why| panic!("cannot read {}: {why}", dir.display()))
+            .map(|entry| entry.expect("a readable directory entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+            .map(|path| {
+                format!(
+                    "examples/{}",
+                    path.file_name()
+                        .expect("a file with an extension has a name")
+                        .to_string_lossy()
+                )
+            })
+            .collect();
+        on_disk.sort();
+        let mut listed: Vec<String> = EXAMPLES.iter().map(|e| e.path.to_string()).collect();
+        listed.sort();
+        assert_eq!(
+            listed, on_disk,
+            "core/examples/ and the list in this module disagree. An example missing \
+             from the list is exempt from the rule below without anything saying so."
+        );
+    }
+
+    /// An example that builds a client session calls `await_ready()`, and does it
+    /// before it waits any other way.
+    #[test]
+    fn every_example_with_a_client_session_awaits_the_pin_first() {
+        for example in EXAMPLES {
+            let code = without_comments(example.source);
+            let Some(constructor) = CLIENT_CONSTRUCTORS
+                .iter()
+                .filter_map(|name| code.find(name))
+                .min()
+            else {
+                continue; // No client session in this example, so nothing to await.
+            };
+            let awaited = code.find("await_ready").unwrap_or_else(|| {
+                panic!(
+                    "core/{} builds a client session and never calls await_ready(). The \
+                     connect returns before the handshake, so every use of the session \
+                     below it — including send(), which answers Ok by queueing — is \
+                     made against a peer whose identity has not been checked \
+                     (Invariant 1).",
+                    example.path
+                )
+            });
+            assert!(
+                awaited > constructor,
+                "core/{} calls await_ready() before it has a session to await.",
+                example.path
+            );
+            // Between the two, not merely at the first occurrence in the file: a
+            // `sleep` in the example's *server* half, which comes earlier, made the
+            // narrower check pass with the defect restored.
+            let between = code
+                .get(constructor..awaited)
+                .expect("both offsets came from `find` on this string");
+            for wrong in WRONG_WAYS_TO_WAIT {
+                assert!(
+                    !between.contains(wrong),
+                    "core/{} waits for its handshake with `{wrong}` before calling \
+                     await_ready(). Both of the ways that reads — sleeping for a while, \
+                     or polling the state in a loop — wait for the same handshake and \
+                     then throw away what it concluded: a wrong pinned key ends at \
+                     `Failed`, so the wait runs to its budget and reports a timeout for \
+                     a mismatch the first round trip already settled.",
+                    example.path
+                );
+            }
+        }
+    }
+
+    /// The stripper does what the rule above depends on, including the two things a
+    /// simpler one gets wrong.
+    #[test]
+    fn the_comment_stripper_keeps_code_and_drops_every_kind_of_comment() {
+        assert_eq!(without_comments("a // sleep\nb"), "a \nb");
+        assert_eq!(without_comments("a /* sleep */ b"), "a  b");
+        assert_eq!(
+            without_comments("a /* outer /* inner sleep */ still */ b"),
+            "a  b"
+        );
+        // A `//` inside a string literal is not a comment, and neither is a `/*`.
+        assert_eq!(
+            without_comments(r#"let u = "https://x/*y*/z"; // sleep"#),
+            r#"let u = "https://x/*y*/z"; "#
+        );
+        // An escaped quote does not end the literal, so what follows stays code.
+        assert_eq!(without_comments(r#"f("a\"b"); g()"#), r#"f("a\"b"); g()"#);
+        // A comment that runs to the end of the file, with no newline after it.
+        assert_eq!(without_comments("code // trailing"), "code ");
+        // Non-ASCII outside a comment survives, so an example's own output strings are
+        // not mangled into a shorter file with different offsets.
+        assert_eq!(without_comments("p(\"▶ x\"); // y"), "p(\"▶ x\"); ");
+    }
+}

@@ -77,8 +77,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("▶ client: started handshake (pinned server key required)");
 
-    // Give the handshake a moment.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // `connect_with_transport` returns as soon as the transport exists — the
+    // handshake, and with it the check that the peer really holds
+    // `expected_server_key`, runs on a background task. So `send()` below would
+    // return `Ok` (queued) against an impostor too, and the mismatch would surface
+    // only from a later `await_ready()` or `last_error()`. This is the line that
+    // settles Invariant 1, and it is why it comes before the first `send()` rather
+    // than after it: a wrong pin is `CoreError::ServerIdentityMismatch` here.
+    client_session.await_ready().await?;
+    println!("▶ client: handshake complete — the server holds the pinned key");
 
     let request = b"ping from a pinned client".to_vec();
     client_session.send(request).await?;
