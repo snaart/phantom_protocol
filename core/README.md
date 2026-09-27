@@ -280,7 +280,9 @@ the feature set CI's `cross.yml` uses compiles **12** C objects out of `ring` an
 36 out of `zstd-sys`; re-derive it rather than trusting this paragraph:
 
 ```bash
-cargo tree --manifest-path core/Cargo.toml -i cc -e normal,build   --no-default-features --features std,compression-zstd,classical-crypto   --target wasm32-unknown-unknown
+cargo tree --manifest-path core/Cargo.toml -i cc -e normal,build \
+  --no-default-features --features std,compression-zstd,classical-crypto \
+  --target wasm32-unknown-unknown
 # and, after building that row:
 find target/wasm32-unknown-unknown/debug/build -name '*.o' | wc -l
 ```
@@ -889,9 +891,9 @@ of CI. Reaching L3 is a workflow change, not a code change — see
   prints how many, which is the form this claim takes now because the count it
   used to name had been wrong by 65 for a release — and `#[ignore]`-gated loopback
   integration suites (TCP, UDP — including injected loss/reorder via the fault
-  transport — WASI, TLS-mimicry). 0 workspace warnings, 0 clippy warnings. **Note:** broad test
-  coverage, a fault-injection rig, and a WAN measurement campaign are *not* a
-  substitute for an external security audit.
+  transport — WASI, TLS-mimicry). 0 workspace warnings, 0 clippy warnings.
+  **Note:** broad test coverage, a fault-injection rig, and a WAN measurement
+  campaign are *not* a substitute for an external security audit.
 - **Broad feature coverage across the planned phases, but not production-ready.**
   The handshake / identity / data-plane / observability / cross-target work is in
   place and tested; what remains open is an **external security audit**, CMVP/CC

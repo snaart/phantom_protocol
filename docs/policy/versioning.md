@@ -353,9 +353,9 @@ Public items marked `#[deprecated]`:
   sweep can find them.
 
 The same applies to FFI exports (the deprecation is called out in that item's own
-CHANGELOG entry, naming the replacement call in each binding language). The wire format has no deprecation window — it is a single pinned
-version, so a wire change is a hard cut (§3) rather than a coexist-then-remove
-migration.
+CHANGELOG entry, naming the replacement call in each binding language). The wire
+format has no deprecation window — it is a single pinned version, so a wire change
+is a hard cut (§3) rather than a coexist-then-remove migration.
 
 ---
 
