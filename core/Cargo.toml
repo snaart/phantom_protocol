@@ -353,6 +353,14 @@ uniffi = { version = "0.32", features = ["build"] }
 # library spawns a process, reads a file, or listens for a signal — an embedder
 # that does (`server/` handles SIGTERM) asks tokio for them itself. They were
 # enabled here for years, so every consumer paid for the code behind them.
+#
+# Removing one of these is a breaking change for some consumer, and not one any
+# gate in this repository can see. Cargo unifies features across the graph, so a
+# consumer that declares tokio with fewer features has been compiling against the
+# union of theirs and this list; dropping a feature takes it away from their code
+# too, and `cargo-semver-checks` compares this crate's API rather than its
+# dependencies' feature sets. Adding one is the safe direction and removing one
+# belongs in a release whose notes say so — 0.3.1's do, for these four.
 tokio = { version = "1.36", optional = true, features = ["net", "rt-multi-thread"] }
 # socket2 gives portable access to SO_REUSEPORT (Phase 2.9 — Linux
 # multi-accept). Already in the transitive tree via tokio so this is
