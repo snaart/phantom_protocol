@@ -106,7 +106,9 @@ use crate::observability::attrs::{
 use crate::observability::{Observability, ObservabilityConfig};
 use crate::runtime::{Runtime, TokioRuntime};
 use crate::transport::bandwidth_estimator::DrainOutcome;
-use crate::transport::handshake::{HandshakeClient, ServerReject, ServerReply, EARLY_DATA_MAX_LEN};
+use crate::transport::handshake::{
+    HandshakeClient, ServerReject, ServerReply, EARLY_DATA_MAX_LEN, REJECT_PROTOCOL_VARIANT,
+};
 use crate::transport::mtu::{MAX_RECV_FRAME, MAX_RECV_PAYLOAD};
 use crate::transport::multiplexer::StreamDemultiplexer;
 use crate::transport::packet_coalescer_codec::unwrap_coalesced_packet;
@@ -737,7 +739,24 @@ pub struct PhantomSession {
     /// `true` only when the session is backed by `UdpClientTransport` /
     /// `UdpServerTransport`; `false` for TCP, WebSocket, WASI, Embedded, and
     /// the in-memory test pipe.
+    ///
+    /// This is the *transport's* answer, and it is what the handshake metric's leg label
+    /// and [`migrate_server`](Self::migrate_server) read. It is deliberately NOT what
+    /// [`supports_migration`](Self::supports_migration) and [`migrate`](Self::migrate)
+    /// read — see `client_migration_capable`.
     migration_capable: bool,
+    /// Whether *this side* can move the connection through [`migrate`](Self::migrate).
+    ///
+    /// Both halves of a PhantomUDP session rebind without a re-handshake, so both answer
+    /// `true` to [`SessionTransport::supports_migration`] — but a client moves through
+    /// `migrate` and an accepted server through `migrate_server`, and neither is reachable
+    /// from the other, deliberately, so that the FFI-exported client `migrate()` cannot
+    /// move a server. One flag for both therefore made an accepted server session report a
+    /// capability nothing a caller can reach provides, and made its `migrate()` answer
+    /// `Ok(())` for a request the pump then discards. `true` only for a client session over
+    /// a migration-capable transport; `false` for every accepted server session and for the
+    /// inert legacy constructor.
+    client_migration_capable: bool,
     /// Balanced `active_streams` gauge for this session (see [`StreamGauge`]).
     /// Shared with the data pump: `open_stream()` counts here, the pump's
     /// receive path counts peer-initiated streams, and both the pump exit and
@@ -958,11 +977,14 @@ impl PhantomSession {
     /// Create a [`SessionBuilder`] for constructing a client session.
     ///
     /// The builder collects configuration (pinned key, optional resumption hint,
-    /// optional config / runtime) and then `.transport(t).connect().await` drives the
-    /// handshake and returns the session. This is the ergonomic alternative to the
-    /// `connect_with_transport*` family — every option (runtime, config, resumption,
-    /// mimicry) is an orthogonal `SessionBuilder` setter instead of a positional
-    /// argument or a `_with_*` name suffix.
+    /// optional config / runtime) and then `.transport(t).connect().await` starts the
+    /// session and returns it **before the handshake has run** — the hybrid PQC handshake,
+    /// and with it the pinned-identity check, proceeds on a background task. Call
+    /// [`await_ready`](PhantomSession::await_ready) next to learn whether the pinned key
+    /// matched; see [`SessionBuilder::connect`] for the full contract. This is the
+    /// ergonomic alternative to the `connect_with_transport*` family — every option
+    /// (runtime, config, resumption, mimicry) is an orthogonal `SessionBuilder` setter
+    /// instead of a positional argument or a `_with_*` name suffix.
     pub fn builder(addr: impl Into<String>) -> SessionBuilder {
         SessionBuilder {
             peer_addr: addr.into(),
@@ -1055,6 +1077,9 @@ impl PhantomSession {
             ready_tx: ready_tx.clone(),
             ready_rx,
             migration_capable,
+            // A client session: `migrate()` is this side's entry point, so the transport's
+            // answer is also the caller's.
+            client_migration_capable: migration_capable,
             stream_gauge: stream_gauge.clone(),
             recv_tuning: recv_tuning.clone(),
         };
@@ -1146,6 +1171,55 @@ impl PhantomSession {
         observability: Arc<Observability>,
         leg: LegType,
     ) -> Arc<Self> {
+        Self::install_around_established_session(
+            peer_addr,
+            transport,
+            server_session,
+            runtime,
+            observability,
+            leg,
+            false,
+        )
+    }
+
+    /// Install a pump around an already-established [`Session`] as a **client** handle.
+    ///
+    /// The production client path builds the handle before its handshake and installs the
+    /// negotiated `Session` from inside the pump, so a test that starts from a pair of
+    /// already-agreed `Session`s has no way to reach it. This is the accepted-session
+    /// installer with the one field that distinguishes the two roles set the other way:
+    /// the handle is a client's, so [`migrate`](Self::migrate) is its migration entry
+    /// point rather than [`migrate_server`](Self::migrate_server). Everything else,
+    /// including the even/odd stream-id parity of the demultiplexer, is unchanged — a test
+    /// that cares about parity should say so rather than rely on this.
+    #[cfg(test)]
+    pub(crate) fn from_established_client_session<T: SessionTransport>(
+        peer_addr: String,
+        transport: T,
+        session: Arc<Session>,
+    ) -> Arc<Self> {
+        Self::install_around_established_session(
+            peer_addr,
+            transport,
+            session,
+            Arc::new(TokioRuntime),
+            Observability::new(ObservabilityConfig::default()),
+            LegType::Tcp,
+            true,
+        )
+    }
+
+    /// The shared body of the two installers above. `client_migration_capable` is the one
+    /// thing they disagree about — see the field of the same name.
+    fn install_around_established_session<T: SessionTransport>(
+        peer_addr: String,
+        transport: T,
+        server_session: Arc<Session>,
+        runtime: Arc<dyn Runtime>,
+        observability: Arc<Observability>,
+        leg: LegType,
+        client_migration_capable: bool,
+    ) -> Arc<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (close_request, close_requested) = watch::channel(false);
         let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_DEPTH);
@@ -1219,6 +1293,11 @@ impl PhantomSession {
             ready_tx: Arc::new(ready_tx),
             ready_rx,
             migration_capable,
+            // An accepted server session moves through `migrate_server`, never `migrate` —
+            // the transport refuses the client entry point, so reporting it as available
+            // would promise an operation this side cannot perform. A client handle installed
+            // around an established session (tests only) passes `true`.
+            client_migration_capable,
             stream_gauge: stream_gauge.clone(),
             recv_tuning,
         });
@@ -1505,6 +1584,31 @@ impl PhantomSession {
     }
 }
 
+/// Render a believed [`ServerReject`] as the text of a [`CoreError::ProtocolRejected`].
+///
+/// The reject carries a `code`, and reading only `supported_version` is how a refusal that
+/// has nothing to do with the version came out as "client speaks v5, server speaks v5" — a
+/// sentence that names the one field both peers agree on. Each code gets the sentence that
+/// says what the caller can do about it, and an unknown code falls back to the version
+/// wording because that is what code 1 has always meant and a future code is more likely to
+/// be about the version than not.
+fn describe_server_reject(client_version: u8, reject: &ServerReject) -> String {
+    if reject.code == REJECT_PROTOCOL_VARIANT {
+        // Both peers speak the same wire; they were built against different crypto
+        // substrates (`phantom-fips-1` vs `phantom-default-1`). The variant is fixed at
+        // compile time, so there is nothing to retry and nothing to negotiate.
+        return "server rejected the handshake: this build's protocol variant is not one the \
+                server speaks (a fips peer meeting a non-fips one, or the reverse). The \
+                variant is fixed at compile time, so use matching builds."
+            .to_string();
+    }
+    format!(
+        "server rejected the handshake: unsupported protocol version (client speaks v{}, \
+         server speaks v{})",
+        client_version, reject.supported_version
+    )
+}
+
 /// Drive the client side of the Phantom Protocol handshake to completion.
 ///
 /// When `resumption` is `Some((resume_id, resume_secret, early_data))` the
@@ -1572,10 +1676,9 @@ async fn run_client_handshake<T: SessionTransport>(
                     // No further responses: surface a remembered reject (a genuine version
                     // mismatch) over the raw transport error using the typed variant.
                     return match &remembered_reject {
-                        Some(r) => Err(CoreError::ProtocolRejected(format!(
-                            "server rejected the handshake: unsupported protocol version \
-                             (client speaks v{}, server speaks v{})",
-                            hello.version, r.supported_version
+                        Some(r) => Err(CoreError::ProtocolRejected(describe_server_reject(
+                            hello.version,
+                            r,
                         ))),
                         None => Err(e),
                     };
@@ -1599,10 +1702,9 @@ async fn run_client_handshake<T: SessionTransport>(
                         if reject_rounds > MAX_CLIENT_REJECT_ROUNDS {
                             // Use the typed ProtocolRejected variant so callers can branch
                             // without string-matching ("update your client").
-                            return Err(CoreError::ProtocolRejected(format!(
-                                "server rejected the handshake: unsupported protocol version \
-                                 (client speaks v{}, server speaks v{})",
-                                hello.version, reject.supported_version
+                            return Err(CoreError::ProtocolRejected(describe_server_reject(
+                                hello.version,
+                                &reject,
                             )));
                         }
                         // Keep waiting for a valid ServerHello — read the next
@@ -6546,6 +6648,7 @@ impl PhantomSession {
             ready_rx,
             // Inert constructor has no transport; migration is not possible.
             migration_capable: false,
+            client_migration_capable: false,
             // Inert constructor: no pump, so only `Drop` ever drains this.
             // Server parity, matching the `StreamDemultiplexer::new` above; nothing is ever
             // opened on this session, so which it is only has to be consistent.
@@ -6986,15 +7089,20 @@ impl PhantomSession {
             })
     }
 
-    /// Whether this session's transport supports seamless connection migration
-    /// (i.e., [`migrate`](Self::migrate) will succeed for UDP sessions).
+    /// Whether [`migrate`](Self::migrate) can move this session.
     ///
-    /// Returns `true` only when the session is backed by `UdpClientTransport`.
-    /// On TCP, WebSocket, WASI, or Embedded sessions, [`migrate`](Self::migrate)
-    /// returns [`CoreError::Unsupported`] — use reconnection with 0-RTT resumption
-    /// instead.
+    /// Returns `true` only for a **client** session backed by `UdpClientTransport`. On TCP,
+    /// WebSocket, WASI or Embedded sessions, and on a session accepted by a listener,
+    /// [`migrate`](Self::migrate) returns [`CoreError::Unsupported`] — use reconnection
+    /// with 0-RTT resumption instead.
+    ///
+    /// An accepted PhantomUDP session answers `false` here even though its transport does
+    /// migrate: the server side moves through the Rust-only
+    /// [`migrate_server`](Self::migrate_server), and `migrate` is refused there so that the
+    /// FFI-exported client operation cannot move a server. Answering `true` would name a
+    /// capability nothing the caller of this method can reach.
     pub fn supports_migration(&self) -> bool {
-        self.migration_capable
+        self.client_migration_capable
     }
 
     /// Migrate the session to a new local network address (Phase 4 — embedder-
@@ -7023,8 +7131,14 @@ impl PhantomSession {
     /// or Embedded session returns [`CoreError::Unsupported`]. Check
     /// [`supports_migration`](Self::supports_migration) first, or use
     /// `connect_pinned_udp` to ensure UDP backing.
+    ///
+    /// **This is the client's entry point only.** A session handed back by a listener is
+    /// the server end of a PhantomUDP connection, and although its transport does migrate,
+    /// it does so through [`migrate_server`](Self::migrate_server) — calling `migrate()`
+    /// there returns [`CoreError::Unsupported`] rather than accepting a request the pump
+    /// would discard.
     pub async fn migrate(&self, local_addr: String) -> Result<(), CoreError> {
-        if !self.migration_capable {
+        if !self.client_migration_capable {
             return Err(CoreError::Unsupported(
                 "this session does not support connection migration; use a UDP-backed session"
                     .into(),
@@ -8022,7 +8136,9 @@ pub async fn connect_pinned_udp_with_resumption(
 ///
 /// Created via [`PhantomSession::builder`]. Call setters to configure, then
 /// call `.transport(t)` to supply a [`SessionTransport`], then `.connect().await`
-/// to perform the handshake and return a session.
+/// to start the session. `connect()` returns **before the handshake has run** — see
+/// [`SessionBuilder::connect`] for the contract — so `await_ready()` is the call that
+/// settles whether the server is the pinned one, and every example ends with it.
 ///
 /// ```rust,no_run
 /// # use phantom_protocol::api::{PhantomSession, TcpSessionTransport};
@@ -8035,6 +8151,9 @@ pub async fn connect_pinned_udp_with_resumption(
 ///     .transport(transport)
 ///     .connect()
 ///     .await?;
+/// // `connect()` has not checked the pinned key yet; this is where a mismatch surfaces,
+/// // as `CoreError::ServerIdentityMismatch`.
+/// session.await_ready().await?;
 /// # Ok(())
 /// # }
 /// ```
@@ -8427,6 +8546,56 @@ mod tests {
                 && msg.contains(&format!("v{PROTOCOL_VERSION}")),
             "the error must name the versions involved so an operator can act on it, got: \
              {msg}"
+        );
+    }
+
+    /// A reject whose `code` says the *variant* did not match must not be described as a
+    /// version mismatch. The server refuses a fips peer meeting a non-fips one before it
+    /// reads anything else, and both peers speak the same `PROTOCOL_VERSION` when it
+    /// happens — so the version wording renders as "client speaks v5, server speaks v5",
+    /// which names the one field they agree on and tells an operator nothing. The typed
+    /// variant is the same either way (`ProtocolRejected`), so the text is the only thing
+    /// carrying the distinction to a human reading a log.
+    #[tokio::test]
+    async fn client_describes_a_variant_reject_as_a_variant_reject() {
+        use crate::transport::handshake::{ServerReject, ServerReply, PROTOCOL_VERSION};
+
+        let (client_transport, server_transport) = ChannelTransport::pair();
+        // The reject path errors before any key verification, so any key works.
+        let (_sk, expected_vk) = crate::crypto::hybrid_sign::HybridSigningKey::generate();
+
+        let server = tokio::spawn(async move {
+            let _hello = server_transport.recv_bytes().await.unwrap();
+            let reject = ServerReply::Reject(ServerReject::protocol_variant_mismatch())
+                .to_wire()
+                .unwrap();
+            server_transport.send_bytes(&reject).await.unwrap();
+        });
+
+        let result = run_client_handshake(&client_transport, &expected_vk, None).await;
+        server.await.unwrap();
+
+        let err = result.expect_err("a variant mismatch must surface as an error");
+        assert!(
+            matches!(err, CoreError::ProtocolRejected(_)),
+            "expected a typed rejection, got: {err:?}"
+        );
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("protocol variant"),
+            "the message must name the variant, got: {msg}"
+        );
+        assert!(
+            !msg.contains("unsupported protocol version"),
+            "the message must not blame the version, got: {msg}"
+        );
+        // The tautology the old wording produced, spelled out so it cannot come back under
+        // different phrasing: both peers speak this version, and saying so is the defect.
+        assert!(
+            !msg.contains(&format!(
+                "client speaks v{PROTOCOL_VERSION}, server speaks v{PROTOCOL_VERSION}"
+            )),
+            "got: {msg}"
         );
     }
 
@@ -14964,15 +15133,27 @@ mod tests {
         let (migrating_t, peer_t) = ChannelTransport::pair();
         let cut = Arc::new(AtomicBool::new(false));
         let migrations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let migrating = PhantomSession::from_accepted_server_session(
-            "migrating".into(),
-            CuttableTransport {
-                inner: migrating_t,
-                cut: cut.clone(),
-                migrations: migrations.clone(),
-            },
-            migrating_inner,
-        );
+        let migrating_transport = CuttableTransport {
+            inner: migrating_t,
+            cut: cut.clone(),
+            migrations: migrations.clone(),
+        };
+        // The handle has to carry the role the test is about, because the two entry points
+        // are gated separately: `migrate()` is the client's and `migrate_server()` the
+        // accepted server's, and a handle installed as one refuses the other's.
+        let migrating = if server_side {
+            PhantomSession::from_accepted_server_session(
+                "migrating".into(),
+                migrating_transport,
+                migrating_inner,
+            )
+        } else {
+            PhantomSession::from_established_client_session(
+                "migrating".into(),
+                migrating_transport,
+                migrating_inner,
+            )
+        };
         let peer = PhantomSession::from_accepted_server_session("peer".into(), peer_t, peer_inner);
 
         // The peer reads everything it is sent, so once the path is back nothing but the
@@ -15119,7 +15300,9 @@ mod tests {
             server_inner.set_state(SessionState::Connected);
             let (migrating_t, peer_t) = ChannelTransport::pair();
             let migrations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let migrating = PhantomSession::from_accepted_server_session(
+            // A client handle: `migrate()` below is the client's entry point, and an
+            // accepted server handle refuses it.
+            let migrating = PhantomSession::from_established_client_session(
                 "migrating".into(),
                 CuttableTransport {
                     inner: migrating_t,

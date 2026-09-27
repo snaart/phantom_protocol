@@ -4414,3 +4414,78 @@ async fn a_cross_variant_peer_over_udp_is_answered_rather_than_left_to_time_out(
 
     accepting.abort();
 }
+
+/// The FFI-exported `migrate()` is the **client's** operation, and a session handed back by
+/// a listener must refuse it rather than accept a request the pump discards.
+///
+/// Both halves of a PhantomUDP session are address-aware and rebind without a re-handshake,
+/// so `SessionTransport::supports_migration()` is `true` on both. That answer is about the
+/// transport; `PhantomSession::supports_migration()` is read as a precondition for
+/// `migrate()`, which only a client can perform — the server moves through the Rust-only
+/// `migrate_server`, and `UdpServerTransport` refuses the client entry point precisely so
+/// that an FFI caller cannot move a server. Reporting `true` on an accepted session named a
+/// capability nothing the caller could reach, and `migrate()` answered `Ok(())` to a request
+/// that then went nowhere — a success for work that did not happen, which is the one answer
+/// a caller cannot recover from.
+///
+/// The client end of the same connection is asserted in the same test, so a fix that merely
+/// turned the answer off everywhere would fail here rather than pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_accepted_udp_session_refuses_the_client_migration_entry_point() {
+    use phantom_protocol::api::session::connect_pinned_udp;
+    use phantom_protocol::api::udp_listener::PhantomUdpListener;
+    use phantom_protocol::CoreError;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let port = listener
+        .local_addr()
+        .parse::<std::net::SocketAddr>()
+        .unwrap()
+        .port();
+    let pinned = listener.verifying_key_bytes();
+    let acceptor = listener.clone();
+    let accepting = tokio::spawn(async move { acceptor.accept().await });
+
+    let client = connect_pinned_udp("127.0.0.1".to_string(), port, pinned)
+        .await
+        .expect("connect_pinned_udp");
+    client.await_ready().await.expect("handshake");
+
+    let outcome = tokio::time::timeout(Duration::from_secs(10), accepting)
+        .await
+        .expect("accept did not complete")
+        .expect("acceptor task")
+        .expect("accept");
+    let server_session = outcome.session();
+
+    // The client end: `migrate()` is its entry point, so the capability is real.
+    assert!(
+        client.supports_migration(),
+        "a client session over PhantomUDP must report migration as available"
+    );
+
+    // The server end: the capability it reports must be one this method provides.
+    assert!(
+        !server_session.supports_migration(),
+        "an accepted session must not report the client migration entry point as available"
+    );
+    let err = server_session
+        .migrate("127.0.0.1:0".to_string())
+        .await
+        .expect_err("migrate() on an accepted session must be refused, not accepted");
+    assert!(
+        matches!(err, CoreError::Unsupported(_)),
+        "expected CoreError::Unsupported, got {err:?}"
+    );
+
+    // `migrate_server` is the server's own entry point and stays available — the split is
+    // the point, not a blanket refusal.
+    server_session
+        .migrate_server("127.0.0.1:0".to_string())
+        .await
+        .expect("migrate_server must remain available on an accepted UDP session");
+
+    client.disconnect().await.ok();
+}
