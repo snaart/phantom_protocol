@@ -31,7 +31,16 @@ cargo build --profile dist --manifest-path "${REPO_ROOT}/core/Cargo.toml"
 
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"
-VERSION="0.3.0"
+# Read from the manifest rather than restated here. A literal in this script is
+# a version nothing checks: `tests/bindings/check_versions.sh` enforces the
+# manifests and the pkg-config template, not this file, so after a bump the
+# bundle keeps the old name and the tarball is the only place that says so.
+VERSION="$(sed -n '/^\[package\]/,/^\[/ s/^version *= *"\([^"]*\)".*/\1/p' \
+    "${REPO_ROOT}/core/Cargo.toml" | head -n 1)"
+if [ -z "${VERSION}" ]; then
+    echo "could not read the crate version from ${REPO_ROOT}/core/Cargo.toml" >&2
+    exit 1
+fi
 BUNDLE="phantom_protocol-c-${VERSION}-${OS}-${ARCH}"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "${STAGE}"' EXIT
