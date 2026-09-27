@@ -2614,11 +2614,13 @@ async fn udp_integration_disconnect_pushes_a_queued_write_before_announcing() {
 ///
 /// Both listeners build their ticket cache from the same `PhantomConfig`, and the cache kept
 /// one ticket when it was told to keep none — so a server configured with 0-RTT off went on
-/// accepting it. The assertion is one-sided on purpose: over PhantomUDP a resume that the
-/// server *would* accept can still be declined for reasons of its own (the cookie round has
-/// to complete first), so "accepted" is not something a test may demand, while "never
-/// accepted" is exactly what the configuration promises. The payload still has to arrive —
-/// declining early data may never lose it (Invariant 9).
+/// accepting it. What the test demands is one-sided on purpose: over PhantomUDP a resume that
+/// the server *would* accept can still be declined for reasons of its own (the cookie round
+/// has to complete first), so "accepted" is not something a test may demand here, while
+/// "declined" is exactly what the configuration promises. Declined is asserted as a resolved
+/// `Some(false)` rather than as "anything but acceptance", so that a handshake which never
+/// produces a verdict fails the test instead of satisfying it. The payload still has to
+/// arrive — declining early data may never lose it (Invariant 9).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn udp_zero_session_cache_capacity_refuses_zero_rtt() {
@@ -2696,9 +2698,17 @@ async fn udp_zero_session_cache_capacity_refuses_zero_rtt() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_ne!(
+    // `assert_eq!(Some(false))`, not `assert_ne!(Some(true))`: the loop above gives up after
+    // ten seconds and leaves `verdict` at `None`, and `None` satisfies "not accepted" while
+    // meaning "the handshake never resolved a verdict at all" — so the weaker form passed
+    // whether the configuration worked or the connect broke. The client sent early-data, so
+    // a resolved verdict is `Some(_)` by construction (`process_server_hello` maps the
+    // server's signed `early_data_accepted` through `ClientHello.early_data.is_some()`), and
+    // a server keeping no tickets makes it `Some(false)`. Its TCP twin in
+    // `tcp_integration.rs` already asserts exactly this.
+    assert_eq!(
         verdict,
-        Some(true),
+        Some(false),
         "session_cache_capacity = 0 must leave no ticket for a resume to find"
     );
 
