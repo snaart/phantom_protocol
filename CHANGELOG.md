@@ -88,8 +88,10 @@ Pointers only: each item is set out in full in the entry named.
   `CoreError::StreamError`, instead of handing back a stream the peer has no room for.
   Opening and writing on one stream past the cap used to kill the whole session about four
   and a half seconds later, with `last_error() == Some(Timeout)`, taking the 255 healthy
-  streams and their data with it: the peer refuses such a stream silently, so its data
-  stayed outstanding and the liveness sweep read the silence as a dead path. The refusal
+  streams with it: the peer refuses such a stream silently, so its data stayed outstanding
+  and the liveness sweep read the silence as a dead path. What the same refusal looks like
+  when the session is *also* carrying other streams' data is not this, and is set out in the
+  entry below — there it does not end the session at all. The refusal
   spends no stream id and registers no route. The cap is enforced per side and the two ends
   cannot see each other's count, which is stated in the `MAX_STREAMS` rustdoc.
 
@@ -99,17 +101,31 @@ Pointers only: each item is set out in full in the entry named.
   charged against the peer's allowance, so the last stream each side was allowed to open was
   one the other would not take.
 
-  **Against a 0.3.0 peer, keep to 255 concurrent streams.** This is the one place where a
-  0.3.1 and a 0.3.0 peer do not agree, and nothing on the wire carries the disagreement: a
-  0.3.0 receiver compares the whole table, which already holds the reserved
-  raw-application stream, so it admits 255 peer streams — and one fewer for each stream it
-  has opened itself — and refuses the 256th. It refuses it the way this cap has always
-  refused: the stream-creating segment is dropped unrecorded, so it is not acknowledged
-  either, the sender retransmits into silence, and the sender's liveness sweep reads that
-  silence as a dead path and ends the whole session a few seconds later, healthy streams
-  included. That is the failure the first two entries above describe, arriving from the
-  other end of a mixed pair, and neither side can detect the other's rule to work around
-  it. The reverse pair fails the same way for the opposite reason: a 0.3.0 client has no
+  **Against a 0.3.0 peer, keep to 255 concurrent streams — and do not expect a dead
+  session to tell you so.** This is the one place where a 0.3.1 and a 0.3.0 peer do not
+  agree, and nothing on the wire carries the disagreement: a 0.3.0 receiver compares the
+  whole table, which already holds the reserved raw-application stream, so it admits 255
+  peer streams — and one fewer for each stream it has opened itself — and refuses the 256th.
+  It refuses it the way this cap has always refused: the stream-creating segment is dropped
+  unrecorded, so it is not acknowledged either, and the sender retransmits into silence.
+
+  What the sender then observes depends on whether the session carries anything else, and
+  the two outcomes look nothing alike — an earlier draft of this entry described only the
+  first and gave an operator the wrong landmark to look for. **With nothing else
+  outstanding**, the sender's liveness sweep reads the silence as a dead path and ends the
+  session: `ConnectionState::Dead`, `last_error() == Some(Timeout)`, a few seconds later.
+  That is the failure the first two entries above describe, arriving from the other end of a
+  mixed pair. **With other streams still carrying data** — the ordinary case for anything
+  multiplexed — the session does not end at all. Measured over 300 s: it oscillates between
+  `ConnectionState::Migrating` and `Connected` on the keep-alive tick, because the refused
+  stream's silence reads as a dead path while the other streams' acknowledgements read as a
+  recovered one; it **never reaches `Dead`**; `last_error()` stays `None` throughout,
+  because nothing has gone wrong as far as either end can tell; every other stream is served
+  normally; and the one stream stays stuck for as long as the session lives, with its writes
+  accepted and never delivered. An operator debugging that by looking for a failed session
+  will not find one — the signal is the `Migrating` flapping and a stream whose bytes stop
+  arriving. Neither side can detect the other's rule, so there is nothing to work around it
+  with. The reverse pair fails the same way for the opposite reason: a 0.3.0 client has no
   local cap at all — its `open_stream()` only ever fails when stream ids run out — so it
   will go past 256, and the 257th is the one a 0.3.1 server refuses.
 
@@ -202,17 +218,33 @@ Pointers only: each item is set out in full in the entry named.
   classification is an exhaustive match, so a `CoreError` variant added later has to be
   placed rather than joining the discarded class by default. The refusing address and what
   the earlier candidates said go to `log::warn!` rather than into the error, since these
-  variants carry no payload and must stay matchable; where no address answered at all, the
-  returned `CoreError::NetworkError` names every address tried and what each one said, which
-  there is the whole content of the answer. A name whose addresses genuinely hold different
+  variants carry no payload and must stay matchable. **The roster reaches the caller in one
+  case only**, and it is narrower than the first draft of this entry said: the returned
+  `CoreError::NetworkError` naming every address tried and what each one said is produced
+  where **no candidate's socket could be created at all** — no session ever existed, so
+  there is nothing to hand back and the roster is the whole content of the answer.
+  Addresses that merely fail to *answer* do not reach it, because the last candidate is
+  handed back as `Ok` without being awaited, which is the contract these entry points
+  document; what the earlier candidates said goes to the log, and `await_ready()` is where
+  the outcome comes from. A name whose addresses genuinely hold different
   identities no longer connects through a later one — pin per address for that deployment.
 
-  **The per-address share of the handshake deadline has a floor of 2 s**, derived as one
-  flight RTO per handshake flight rather than chosen. An even division gave a name with
-  eight A/AAAA records — ordinary for a CDN or a multi-homed host — 1.25 s each, and a
-  PhantomUDP handshake needs its cookie round plus hello and `ServerHello`, about 1.8 s on a
-  600 ms path: the correct, reachable first address was abandoned mid-handshake, working
-  session and all, and the call handed back the last candidate. **Consequence for the
+  **The per-address share of the handshake deadline has a floor of 2 s**, and it is derived
+  rather than chosen: `UDP_HANDSHAKE_FLIGHTS` (2 — the stateless-cookie round, then the
+  hello that carries the cookie back and is answered with a `ServerHello`) ×
+  `NO_SAMPLE_FLIGHT_RTO` (1 s — what the UDP transport's own handshake shim waits before
+  treating a flight as lost, with no round-trip sample of its own). Below that product a
+  wait decides nothing: until each of the two flights has been outstanding for one such
+  interval, the transport underneath has not itself concluded anything about the path, so a
+  shorter wait cannot tell a candidate that is not answering from one that is merely on a
+  long path. An even division gave a name with eight A/AAAA records — ordinary for a CDN or
+  a multi-homed host — 1.25 s each, which is under the product, so the correct, reachable
+  first address was abandoned mid-handshake, working session and all, and the call handed
+  back the last candidate. (An earlier draft of this entry justified the floor with "a
+  handshake on a 600 ms path takes about 1.8 s". That figure follows from nothing in the
+  crate: two flights on a 600 ms path is 1.2 s, and the floor is not derived from a path
+  length at all. A test holds the constant to the transport's own interval, so the
+  derivation above is checked rather than asserted.) **Consequence for the
   total:** at five addresses or fewer the even division is at or above the floor and the
   whole call stays inside the 10 s deadline, as 0.3.1's first draft of this entry said it
   always would. At six or more the floor wins, and rather than hand out shares that decide
@@ -498,8 +530,17 @@ Pointers only: each item is set out in full in the entry named.
   `docs/compliance/fips-readiness.md`, `docs/operations/{mobile,wasi}.md`,
   `docs/security/panic-sites.md` and the ALC_CMC.1 evidence row in
   `docs/compliance/cc-pp-mapping.md` all pointed at objects this repository does not
-  contain. No citation was left behind: every hex token still in `docs/` is a decimal
-  sysctl value. Commit *subjects*
+  contain. **No citation was left behind, and the check for that is the one to run rather
+  than the sentence to believe:** every hex token in `docs/` that is a commit id resolves —
+  42 of them, confirmed with
+  `grep -rhoE '[0-9a-f]{7,40}' docs/ --include='*.md' | sort -u`, feeding each token to
+  `git cat-file -e <id>^{commit}`. The ten that do not resolve are not commit ids: four
+  decimal sysctl and NDK values (`16777216`, `4194304`, `1048576`, `10909125`), two hex byte
+  strings from a wire table (`00000000`, `01000000`), a run label's date (`20260822`), the
+  algorithm name `ed25519`, and two that the scan matches inside ordinary English words
+  (`feedbac` in "feedback", `cceeded` in "succeeded"). An earlier draft of this entry said
+  "every hex token still in `docs/` is a decimal sysctl value", which was true of none of
+  those three classes. Commit *subjects*
   survived the rewrite, so most were re-derived with `git log --all --grep`; the rest were
   replaced with a path, a tag or a date. Each re-pointed citation now names the implementing
   file as well. `docs/policy/versioning.md` § 10 gains "Commit ids before 0.3.0", which
@@ -512,48 +553,63 @@ Pointers only: each item is set out in full in the entry named.
 
 ### Changed
 
-- **Seven dependencies the crate never referenced no longer reach a consumer's build, and
-  `tokio` is asked for four fewer features.** The `std` feature carried `tokio-util`,
-  `async-trait`, `env_logger`, `argon2`, `base64`, `once_cell` and `bitflags`, and no source
-  file in the crate mentions any of them — not behind a cfg, not behind a feature, never.
-  Since `std` is on in the default set, every consumer resolved, downloaded and compiled all
-  seven, and `argon2`, a password hash, sat in the direct dependency list of a transport
-  library, which is the first thing an auditor asks about. `env_logger` has one real caller,
-  an example, and is a dev-dependency now. `time` stays but moves from `std` to `mimicry`:
-  its only use is the validity window on the synthetic certificate the TLS-mimicry theater
-  presents, and that leg is off by default. `tokio`'s native feature list loses `signal`,
-  `process`, `fs` and `io-std`, none of which has a call site anywhere in the crate, its
-  tests, its benches or its examples — an embedder that needs them asks tokio for them
-  itself, as the reference server already does for its SIGTERM drain. A default consumer
-  build goes from 164 crates to 135, among them `regex`, `jiff`, `blake2`, `password-hash`,
-  `signal-hook-registry` and the whole `anstream`/`anstyle` colour stack.
+- **Seven dependencies the crate never referenced no longer reach a consumer's build.**
+  The `std` feature carried `tokio-util`, `async-trait`, `env_logger`, `argon2`, `base64`,
+  `once_cell` and `bitflags`, and no source file in the crate mentions any of them — not
+  behind a cfg, not behind a feature, never. Since `std` is on in the default set, every
+  consumer resolved, downloaded and compiled all seven, and `argon2`, a password hash, sat
+  in the direct dependency list of a transport library, which is the first thing an auditor
+  asks about. `env_logger` has one real caller, an example, and is a dev-dependency now.
+  `time` stays but moves from `std` to `mimicry`: its only use is the validity window on the
+  synthetic certificate the TLS-mimicry theater presents, and that leg is off by default.
+  A default consumer build goes from **163 crates to 135**, among them `regex`, `jiff`,
+  `blake2`, `password-hash` and the whole `anstream`/`anstyle` colour stack. Re-derive the
+  pair rather than trusting it — each figure is the node count of the default normal
+  dependency graph, the crate itself included:
 
-  **Dropping the four `tokio` features can break a consumer's build, and no tool here
-  reports it.** Cargo unifies features across the whole dependency graph, so a consumer
-  that declares `tokio` itself has been compiling against the union of the features it
-  asked for and the ones asked for here. A consumer whose own manifest says
-  `features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"]`, and whose
-  code calls `tokio::signal::ctrl_c()`, `tokio::io::stdin()`, `tokio::fs::read` or
-  `tokio::process::Command`, compiled against 0.3.0 for no reason of its own and stops
-  compiling on `cargo update -p phantom-protocol`. That is checked rather than reasoned
-  about, for all four. The break is loud and self-describing — rustc names the feature
-  ("the item is gated behind the `signal` feature") — and the fix is one line in the
-  consumer's own manifest: ask tokio for the features you use. Nothing in the tool chain
-  would have warned first: the public API is byte-identical, so `cargo-semver-checks`
-  reports nothing, because a dependency's feature set is not part of the surface it
-  compares.
+  ```bash
+  cargo tree --manifest-path core/Cargo.toml -e normal --prefix none \
+    | sed 's/ (\*)$//' | sort -u | wc -l
+  ```
 
-  **The seven removed crates reach a consumer by the same route and much more narrowly.**
-  Rust will not let code name a crate its own manifest does not declare, so nobody was
-  using them *through* this one; what a consumer could be relying on is the unification
-  again. This crate asked for `tokio-util` with default features plus `codec`, for
+  Run at the `v0.3.0` tag it prints 163; run here, 135.
+
+- **`tokio`'s feature list is unchanged, and trimming it is deferred to the next minor.**
+  Four features it asks for on native targets — `signal`, `process`, `fs`, `io-std` — have
+  no call site anywhere in the crate, its tests, its benches or its examples, and dropping
+  them was prepared in this release and then **withdrawn**, because it can break a
+  consumer's build and a patch release must not. Cargo unifies features across the whole
+  dependency graph, so a consumer that declares `tokio` itself has been compiling against
+  the union of the features it asked for and the ones asked for here. A consumer whose own
+  manifest says `features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"]`,
+  and whose code calls `tokio::signal::ctrl_c()`, `tokio::io::stdin()`, `tokio::fs::read` or
+  `tokio::process::Command`, has been compiling against 0.3.0 for no reason of its own and
+  would have stopped compiling on `cargo update -p phantom-protocol`. That was checked
+  rather than reasoned about, for all four, which is how it came to be withdrawn. Nothing in
+  the tool chain would have warned first: the public API is byte-identical, so
+  `cargo-semver-checks` reports nothing, because a dependency's feature set is not part of
+  the surface it compares.
+
+  Keeping the four costs one crate — `signal-hook-registry` — which is why the figures
+  above are 135 rather than 134. The trim itself is a one-line manifest change and belongs
+  in a release a consumer expects to have to react to; when it lands it will be under
+  **Removed**, and the fix on the consumer's side is one line in their own manifest: ask
+  tokio for the features you use. Applying that line now, ahead of the trim, is the way to
+  take the upgrade without ever meeting the break.
+
+- **The seven removed crates reach a consumer by the same route as a feature would, and
+  much more narrowly.** Rust will not let code name a crate its own manifest does not
+  declare, so nobody was using them *through* this one; what a consumer could be relying on
+  is Cargo's feature unification again. This crate asked for `tokio-util` with default
+  features plus `codec`, for
   `argon2`, `once_cell`, `bitflags` and `env_logger` with their default features, for
   `base64` with `alloc` only, and for `async-trait`, which has no features — so a consumer
   that declares one of those itself with fewer features was being handed ours and now gets
   only its own. `time` is in the same position: it is still a dependency, but only under
-  `mimicry`, which is off by default. The remedy is the same line in the same place, and
-  it is worth applying deliberately rather than waiting to find out, because the missing
-  item can be one an `#[cfg(feature)]` in that crate hides rather than one it names.
+  `mimicry`, which is off by default. The remedy is the same line in the same place — name
+  the crate and the features you use in your own manifest — and it is worth applying
+  deliberately rather than waiting to find out, because the missing item can be one an
+  `#[cfg(feature)]` in that crate hides rather than one it names.
 
 ### Added
 
@@ -709,6 +765,115 @@ Pointers only: each item is set out in full in the entry named.
   falling back to 1-RTT. The same change drops a sentence the address-walk fix left behind:
   `connect_pinned_udp_with_resumption` still said the first resolved address is used with no
   fallback.
+
+- **`docs/known-deviations.md` is new, and it is the one place a surprised reader should
+  look first.** This release documents several behaviours that are deliberate, specified and
+  have still caught a consumer out — the draining window a byte-pipe session does not wait
+  out, the resumption ticket a payload-free resume spends, the stream cap a mixed pair
+  counts two ways — and each of them was written down correctly several hundred lines into a
+  release section or a rustdoc. A reader who has just been surprised cannot guess which
+  document to open. The new file is an index of ten such entries, each in the same three
+  parts: what a consumer observed, what the rule actually is, and what to write instead. It
+  is linked from `README.md`'s pre-1.0 notice and from its documentation list, and it is
+  explicitly not a defect list (those are here, under the release that fixed them) and not a
+  limitations list (those are `docs/DEFERRED_WORK.md`).
+
+- **What is built, what ships and what is tested are three different things, and
+  `README.md` now separates them.** It presented Windows as a "hard gate" and Kotlin/Android
+  as "Production-shape", and its cross-platform highlight read as though every platform named
+  was exercised. A matrix row is `cargo check --lib`, and there are thirteen of them over
+  twelve targets. Prebuilt release artifacts exist for
+  exactly four targets — `x86_64` and `aarch64` × `unknown-linux-gnu` and `apple-darwin`.
+  Test code executes in three places and no more: every suite on x86_64 Linux, one pinned
+  loopback handshake through the Swift binding on `macos-latest`, and the WASI guest
+  fixture under `wasmtime` on a Linux host. So **no unit test and no loopback integration
+  test has ever run on Windows**, although both MSVC rows do compile on a real
+  `windows-latest` runner, and there is no Windows artifact either; the same holds for iOS,
+  musl, browser wasm and bare metal. **Android is in no workflow at all** — a grep for it
+  across all eight returns nothing — while `tests/bindings/kotlin/build-jnilibs.sh`
+  cross-builds three ABIs against an unpinned NDK and `examples/mobile/android/` is a
+  complete Compose application, both run by hand. The new "Platform support" section states
+  all of that in one table, because the risk an adopter takes is not "not packaged" but
+  "never executed": on a target outside the four they stand up their own cross-build, run
+  the suite there themselves, and own every platform failure it turns up.
+  `docs/DEFERRED_WORK.md` § 5 records it as a deliberate deferral, with the cost per
+  platform and the order that buys the most.
+
+- **The threat model had no row for either of the last two wire revisions.** `WIRE_VERSION`
+  6 → 7 and 7 → 8 shipped, and `docs/security/threat-model.md` mentioned neither the
+  `CONTROL` frame, nor the `CLOSE` subtype, nor the draining window — this protocol's newest
+  attack surface, being an in-session control frame a peer can send and a receiver commitment
+  to keep reading. Three § 5 rows now cover it, each naming the receiver rule of
+  `docs/protocol/PROTOCOL.md` § 4.11 that answers it: a forged `CLOSE` from an off-path
+  attacker who guesses a connection id (answered by dispatching **after** the AEAD open and
+  **after** the replay window — rule 4, and the reason the frame could ship at all), an
+  unknown subtype reaching the application as one byte of stream data (rule 3 — every arm
+  consumes the packet, the unknown one included), and a replayed `CLOSE` (refused by the
+  window that already runs ahead of the branch). The draining window is recorded as a
+  **resource bound** rather than as a timeout, because its duration is three round trips
+  clamped to `[200 ms, 600 ms]` and `min_rtt` rises with the delay a peer adds to its own
+  acknowledgements — so the ceiling is what keeps a local commitment from being a number a
+  remote party writes, and the floor is there for the opposite reason. § 7's cross-reference
+  map and § 9's revision history carry the same, and § 8 gains the two limitations these
+  rows imply.
+
+- **The peer-steerable congestion levers are in the threat model rather than only in an
+  engineering brief.** Every round-trip and delivery-rate figure this sender acts on is
+  derived from when acknowledgements arrive, and an authenticated peer chooses that. A § 5
+  DoS row and a § 8 limitation now state what is bounded — the peer-declared
+  `Sack::ack_delay_us` is honoured only while the sample stays at or above the smallest round
+  trip this endpoint has itself timed and is otherwise dropped whole (RFC 9002 § 5.3), a
+  bandwidth sample is bounded by the acknowledgement interval, and no peer figure moves a
+  threshold — and the one thing that is not: `bdp = btl_bw × min_rtt` sets the level the loss
+  response settles at, both factors come from arrival times, and no clamp is available because
+  there is no local lower bound on a path's length. The residual is accepted on the record,
+  including the part that is not about the peer: on a shared bottleneck an inflated `bdp`
+  makes this sender crowd out other flows, not only the one telling the lie.
+
+- **§ 4.11's byte-pipe paragraph was wrong about a UART, and disagreed with its own transport
+  count.** It listed a UART among the transports where "the peer's own end-of-stream arrives
+  immediately behind the data". A UART has no end-of-stream at all: a serial line carries no
+  close and no EOF, its reader simply never completes another frame, which is exactly why
+  `EmbeddedLeg` has no clock and leaves the write deadline to its writer. The ordering
+  argument holds there — an ordered transport has no displacement to absorb — but what *ends*
+  the session does not: on the four transports that are stream connections it is the peer's
+  end-of-stream, and on a UART it is the draining deadline itself, run off the send loop's
+  own tick. The paragraph also spoke of "five transports" while listing four byte pipes;
+  there are six, five of them ordered. Both are corrected, and § 13's stamp — which still
+  read 2026-08-22 against a commit from that pass — now records the three sections this
+  release re-derived (§ 4.4, § 4.5, § 4.11) and carries a date and a release rather than a
+  hash, per `docs/policy/versioning.md` § 10.
+
+- **Figures in these notes that did not follow from anything are corrected or gone, each
+  with the recipe that re-derives it.** Four of them: "a handshake on a 600 ms path takes
+  about 1.8 s", offered as the reason the per-candidate share has a 2 s floor, when two
+  flights on a 600 ms path is 1.2 s and the floor is
+  `UDP_HANDSHAKE_FLIGHTS × NO_SAMPLE_FLIGHT_RTO`, derived from no path length at all; "164
+  crates to 135", each figure one above what `cargo tree` reports, and the only figure in its
+  section with no re-derivation recipe beside it; the address roster described as the answer
+  a caller gets when no address answered, when it is reachable only where no candidate's
+  socket could be created; and "every hex token still in `docs/` is a decimal sysctl value",
+  which holds for none of the three classes the scan actually matches. A figure with no way
+  to re-derive it is a claim, and these notes are long enough that a claim in them is
+  load-bearing.
+
+- **`docs/compliance/cc-pp-mapping.md`'s ATE_FUN.1 row counted 73 negative-security tests,
+  twice, where the suite has 77** — evidence offered to a lab that would run the suite and
+  count. Corrected in both places, with the `grep` that re-derives it beside the figure. The
+  file's other counts were checked against the tree in the same pass and all hold: 5 CAVP
+  vectors, 7 fuzz targets, 23 audited panic sites, four direct `getrandom::fill` call sites,
+  and the three former `thread_rng()` fallbacks, of which the tree now has none.
+
+- **The repository's review posture is stated where a reader weighing the library will meet
+  it.** `CONTRIBUTING.md` said changes under the six security-sensitive paths "require
+  codeowner review before merge"; `.github/CODEOWNERS` says in its own header that codeowner
+  review is advisory unless branch protection enables it; and `main`'s protection has
+  `required_pull_request_reviews` unset with `enforce_admins` false. Of 229 pull requests,
+  none carries a review. `CONTRIBUTING.md` now says what is actually enforced — 35 required
+  status checks, and an auto-requested review that is a request — and `README.md`'s pre-1.0
+  notice and "Status & limitations" state plainly that no release has been reviewed by a
+  second person, alongside the absence of an external audit, with what would change it. The
+  branch-protection settings themselves are a maintainer action and are not touched here.
 ## [0.3.0] - 2026-09-26
 
 **Peers of this release and of 0.2.2 will not talk to each other, and the refusal is
