@@ -1330,7 +1330,8 @@ async fn delaying_relay_inner(
 /// **The defect.** The per-candidate share was `budget / n` with no floor, so a name with
 /// eight A/AAAA records — ordinary for a CDN or a multi-homed host — gave each candidate
 /// 1.25 s of the ten-second client handshake deadline, while a PhantomUDP handshake needs the
-/// cookie round plus hello/ServerHello: about 1.8 s on a 600 ms path. The first address was
+/// cookie round plus hello/ServerHello, which is two flights and so two of the transport's
+/// own first retransmission intervals. The first address was
 /// correct and answering, and the walk dropped it, working session and all.
 ///
 /// **What a consumer sees.** `connect_pinned_udp` against a multi-homed name hands back

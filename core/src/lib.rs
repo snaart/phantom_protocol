@@ -100,10 +100,17 @@
 // ring → aws-lc-rs, blake3 → HKDF-SHA256, drop ChaCha20-Poly1305,
 // CTR_DRBG RNG, POST hook) is **shipped**. `--features fips` now
 // builds and serves a FIPS-substrate Phantom Protocol. The scaffold
-// `compile_error!` from commit `d4d121b` is gone; the only
-// remaining build-time gate enforces mutual exclusion with `no-std`,
-// since `aws-lc-rs` requires libc + dlopen / OpenSSL ABI and cannot
-// run on bare-metal.
+// `compile_error!` that stood here while it was unimplemented is gone
+// (it was removed in 0.2.0; the pre-0.3.0 commit this comment used to
+// cite does not resolve after the history rewrite — see
+// `docs/policy/versioning.md` § 10). The gate below is the first of
+// **four** build-time gates in this file, not the only one: it enforces
+// mutual exclusion with `no-std`, since `aws-lc-rs` requires libc +
+// dlopen / OpenSSL ABI and cannot run on bare-metal. The other three
+// reject `wasi-leg` on the browser target, a feature set with neither
+// `std` nor `no-std`, and a `std` build with neither crypto substrate;
+// the last two were added in 0.3.1 and each replaces a failure that
+// named nothing a consumer could act on.
 #[cfg(all(feature = "fips", feature = "no-std"))]
 compile_error!(
     "Cargo features `fips` and `no-std` are mutually exclusive — \
@@ -1516,6 +1523,98 @@ mod pinned_version_claims {
         assert!(found[0].contains("is not followed by digits"));
         assert!(found[1].contains("not a constant this gate knows"));
         assert!(found[2].contains("starts its line"), "{}", found[2]);
+    }
+}
+
+/// Two claims this file and its neighbours make *about themselves*, held to the code
+/// they describe.
+///
+/// Neither is a property of the protocol; both are sentences a reader is invited to
+/// act on, and both went wrong in exactly the way an unchecked sentence does. A
+/// comment is not compiled, so nothing moves it when the thing it describes moves —
+/// the two here had been false since 0.2.0 and since this release's own first cut
+/// respectively, in a file that `cargo clippy` and `cargo doc` both read without
+/// complaint.
+#[cfg(test)]
+mod claims_this_crate_makes_about_itself {
+    /// This file. `include_str!` of a relative path stays inside `core/`, which is
+    /// what `packaged_readme` requires of every include site here.
+    const LIB: &str = include_str!("lib.rs");
+
+    /// The two files that carried the retired handshake figure.
+    const SESSION: &str = include_str!("api/session.rs");
+    const SESSION_END_TESTS: &str = include_str!("api/session_end_tests.rs");
+
+    /// The build-time feature gates in this file, and the number the prose above the
+    /// first one claims there are.
+    ///
+    /// **The defect.** The comment introducing the first `compile_error!` said "the
+    /// only remaining build-time gate", which stopped being true when the second was
+    /// added in 0.2.0 and was three behind by 0.3.1. It also cited a commit id that
+    /// the pre-0.3.0 history rewrite dissolved.
+    ///
+    /// **What a consumer observed.** A build refused for a feature set the comment
+    /// says is the one thing checked here — `--no-default-features` with nothing
+    /// named, or a `std` build with no crypto substrate — sends the reader looking
+    /// for a `fips`/`no-std` conflict they do not have, because the comment told
+    /// them that is the only gate in the file.
+    ///
+    /// **Why it would come back unnoticed.** Adding a fifth gate is a five-line
+    /// patch a hundred lines below the sentence that counts them, and nothing in the
+    /// tool chain reads prose. The count is asserted here so that the patch which
+    /// adds a gate is the patch that fails, naming the sentence to fix.
+    #[test]
+    fn the_prose_counts_the_build_time_gates_this_file_holds() {
+        // Split so that this line is not itself one of the occurrences it counts.
+        let gates = LIB.matches(concat!("compile_error", "!(")).count();
+        assert_eq!(
+            gates, 4,
+            "this file holds {gates} `compile_error!` gates, and the comment above the \
+             first one says there are four. Whichever moved, move the other: the comment \
+             is the sentence beginning \"The gate below is the first of\", and the count \
+             here is the tripwire."
+        );
+        // Split for the same reason as the needle above: whole, it would match itself.
+        assert!(
+            LIB.contains(concat!("**four**", " build-time gates in this file")),
+            "the sentence that states the gate count is not where this gate expects it; \
+             if it was reworded, reword the assertion with it rather than deleting either"
+        );
+    }
+
+    /// The per-candidate share floor is derived from two constants, and no comment
+    /// may justify it with the figure that was withdrawn.
+    ///
+    /// **The defect.** Four comments justified the 2 s floor with "a handshake over a
+    /// 600 ms path takes about 1.8 s". Two flights on a 600 ms path is 1.2 s, and the
+    /// floor is `UDP_HANDSHAKE_FLIGHTS × NO_SAMPLE_FLIGHT_RTO` — derived from no path
+    /// length at all. The release notes retired the figure and the comments kept it,
+    /// so the crate and its own changelog disagreed about why a constant has its
+    /// value.
+    ///
+    /// **What a consumer observed.** A reader sizing the floor for their own path —
+    /// the one reason to read that comment — reasoned from a number with nothing
+    /// behind it, and a reader who checked it against
+    /// `the_candidate_share_floor_is_two_of_the_transports_first_intervals` found the
+    /// test and the comment giving different derivations of the same constant.
+    ///
+    /// **Why it would come back unnoticed.** The figure is plausible, it reads like a
+    /// measurement, and it appeared in four places at once because each was copied
+    /// from the last. Nothing compiles a comment. This fails the build for any comment
+    /// that reasserts it, which is the only way a retracted number stays retracted.
+    #[test]
+    fn no_comment_justifies_the_share_floor_with_the_withdrawn_figure() {
+        for (name, text) in [
+            ("core/src/api/session.rs", SESSION),
+            ("core/src/api/session_end_tests.rs", SESSION_END_TESTS),
+        ] {
+            assert!(
+                !text.contains("1.8 s"),
+                "{name} states \"1.8 s\" again. The floor is UDP_HANDSHAKE_FLIGHTS x \
+                 NO_SAMPLE_FLIGHT_RTO and follows from no path length; two flights on a \
+                 600 ms path is 1.2 s. Cite the derivation, not a figure."
+            );
+        }
     }
 }
 

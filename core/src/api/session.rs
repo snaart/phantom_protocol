@@ -7601,9 +7601,13 @@ const NO_SAMPLE_FLIGHT_RTO: std::time::Duration = std::time::Duration::from_secs
 /// one of them.
 ///
 /// The failure it exists to stop: a name with eight A/AAAA records — ordinary for a CDN or a
-/// multi-homed host — divided a ten-second budget into 1.25 s shares, while a handshake over
-/// a 600 ms path takes about 1.8 s. The correct,
+/// multi-homed host — divided a ten-second budget into 1.25 s shares, which is under the
+/// product above, so the wait could not tell a slow path from a dead one. The correct,
 /// reachable first address was abandoned and the call handed back the last candidate instead.
+/// The two factors above are the whole derivation — a path length is not one of them, and an
+/// earlier draft of this comment wrongly offered one — and
+/// `the_candidate_share_floor_is_two_of_the_transports_first_intervals` holds the constant to
+/// them rather than asking the next editor to.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) const MIN_CANDIDATE_HANDSHAKE_SHARE: std::time::Duration =
     std::time::Duration::from_millis(
@@ -19087,10 +19091,10 @@ mod tests {
     ///
     /// **The defect.** `share = budget / n` had no floor, so a name with eight A/AAAA records
     /// — ordinary for a CDN or a multi-homed host — gave each candidate 1.25 s of a
-    /// ten-second budget while a PhantomUDP handshake over a 600 ms path needs its cookie
-    /// round plus hello/ServerHello, about 1.8 s. The first address was correct and reachable
-    /// and was abandoned anyway, working session and all, and the call handed back the last
-    /// candidate.
+    /// ten-second budget, under the two flights × one-second-per-flight this floor is derived
+    /// from, so the wait could not tell a slow path from a dead one. The first address was
+    /// correct and reachable and was abandoned anyway, working session and all, and the call
+    /// handed back the last candidate.
     ///
     /// **What a consumer sees.** `connect_pinned_udp` to a multi-homed name fails, or
     /// succeeds against whichever address happens to be last, on a path that worked at 0.3.0.
