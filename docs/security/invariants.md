@@ -91,11 +91,15 @@ changed it for three of them. `connect_pinned`, `connect_pinned_with_config`,
 socket is open, before the handshake has run. The three PhantomUDP entry points do
 the same for a name that resolves to one address — every IP literal, and most real
 names — but for a name with several they walk the list, and each candidate but the
-last has its own handshake awaited inside the call, within a share of the ten-second
-client deadline, because nothing else can tell a datagram address with a server
-behind it from one with nothing behind it. So such a call may return a session that
-is already `Connected`, and it may return after a handshake has failed on an earlier
-address. Neither changes the obligation: `await_ready()` on the session that came
+last has its own handshake awaited inside the call, because nothing else can tell a
+datagram address with a server behind it from one with nothing behind it. Each such
+wait is a share of the ten-second client deadline, floored at 2 s so that it decides
+something; up to five addresses the shares sum to the deadline, and beyond five the
+walk stops waiting once the deadline is spent rather than shortening them, so the
+call is bounded by the deadline plus one share. So such a call may return a session
+that is already `Connected`, it may return after a handshake has failed on an earlier
+address, and on a name with six or more addresses it may return after the deadline
+itself. Neither changes the obligation: `await_ready()` on the session that came
 back is still the only thing that answers about the pin, and it is cheap on a
 session that has already finished.
 
