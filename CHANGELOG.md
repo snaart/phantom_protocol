@@ -8,6 +8,489 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-27
+
+**A patch release, and a wire-compatible one.** `WIRE_VERSION` stays 8 and
+`PROTOCOL_VERSION` stays 5, so a 0.3.1 peer and a 0.3.0 peer interoperate in both
+directions. No public item was removed, no signature changed, and no AEAD plaintext or
+header layout moved. What did change is behaviour that contradicted its own
+documentation — a reader parked forever on a stream the session had already ended, a
+`supports_migration()` that answered for a method the caller could not reach, a ticket
+cache configured to hold nothing that held one — plus the release artifacts themselves,
+which in 0.3.0 were published in a state no consumer could use.
+
+**Almost everything here was found by using the published crate rather than by reading
+it.** Every defect below was green in CI at the 0.3.0 tag. The artifact ones were found
+by downloading the tarball; the API ones by writing a project that depends on the
+crates.io release and then doing ordinary things with it — open a stream, read from it,
+close the session, resolve `localhost`. That is the reason this release also adds two
+gates over the release path and one over the Swift packaging: a release cannot be its own
+regression test, and neither can a packaging script nobody runs.
+
+**Regenerate the language bindings rather than relinking them.** `uniffi` 0.32 folds each
+exported item's doc comment into its checksum, and several rustdoc comments on exported
+items are corrected here — `PhantomSession::supports_migration`, `migrate`, the
+two `*_with_resumption` free functions and the `SessionBuilder` docs among them —
+so the generated Python, Swift and Kotlin files in this
+release differ from 0.3.0's. `UNIFFI_CONTRACT_VERSION` is unchanged at 30, which means the
+coarse gate passes and a stale binding fails at import time in the consumer's process
+instead. The regenerated files ship in `tests/bindings/`.
+
+### Security
+
+Pointers only: each item is set out in full in the entry named.
+
+- The blocking C connect helper returned a session for a server whose pinned identity had
+  not been checked, so a C caller could not tell a mispinned server from a network fault —
+  **Fixed**, "A C caller could not tell a mispinned server from a network fault".
+- The iOS and Android samples, and the connect snippets in `docs/operations/mobile.md`,
+  announced a connection and read `earlyDataAccepted()` without awaiting the handshake, so
+  a sample given the wrong pinned key reported success — **Fixed**, "The mobile samples
+  reported a connection before the pinned key had been checked".
+- A server configured with `session_cache_capacity = 0` kept one resumption ticket and
+  served 0-RTT early data out of it, so an operator who set the field to zero to stop
+  accepting early data went on accepting it — **Fixed**, "`session_cache_capacity = 0` now
+  turns 0-RTT off".
+- `PhantomSession::migrate()` on a session handed back by a listener returned `Ok(())` for a
+  request the data pump then discarded, and `supports_migration()` reported that capability
+  as available — a success for work that did not happen — **Fixed**, "An accepted session
+  reported a migration it could not perform".
+- The published macOS libraries carried an install name pointing into the build tree, so
+  the first consumer to link one died before `main` — **Fixed**, "The published macOS
+  libraries no longer abort every consumer at launch".
+
+### Fixed
+
+- **`PhantomStream::recv()` now returns when the session ends.** A reader parked on a stream
+  was never woken, and a fresh `recv()` on an ended session parked too: still pending
+  fifteen seconds after the path died, with `connection_state()` already `Closed` and
+  `PhantomSession::recv()` already erroring. The delivery route whose sender the read waits
+  on was only ever dropped when the stream itself was retired, so a session that ended took
+  one task per stream with it. Every end of a session now releases the routes — the delivery
+  task does it as it finishes, so a reader with frames still buffered reads all of them
+  first, and `Drop for PhantomSession` and the handshake-failure paths cover the ends that
+  task cannot reach. A session that ends without a `FIN` on the stream reads as
+  `CoreError::ConnectionClosed`, as the method has always documented; a peer's `FIN` still
+  reads as `Ok(None)`, exactly once.
+
+- **`PhantomSession::open_stream()` refuses past `MAX_STREAMS` streams open at once**, with
+  `CoreError::StreamError`, instead of handing back a stream the peer has no room for.
+  Opening and writing on one stream past the cap used to kill the whole session about four
+  and a half seconds later, with `last_error() == Some(Timeout)`, taking the 255 healthy
+  streams and their data with it: the peer refuses such a stream silently, so its data
+  stayed outstanding and the liveness sweep read the silence as a dead path. The refusal
+  spends no stream id and registers no route. The cap is enforced per side and the two ends
+  cannot see each other's count, which is stated in the `MAX_STREAMS` rustdoc.
+
+- **The receive-side stream cap counts the streams the peer has open** rather than every
+  entry in the stream table, so a peer may open the `MAX_STREAMS` the constant documents.
+  The session's own reserved raw-application stream, and this side's own streams, were
+  charged against the peer's allowance, so the last stream each side was allowed to open was
+  one the other would not take.
+
+- **Letting go of a stream nothing was ever written on retires it on the spot** instead of
+  reporting it to the data pump, and a burst of released handles is taken in one pass rather
+  than one apiece. Releasing four times the handles cost 21.7 times the time — 1 000 took
+  470 ms, 4 000 took 10.2 s — and while the backlog drained the peer's `open_stream()` was
+  refused for about fifteen seconds, because each report cost the send loop a walk over
+  every stream the session held.
+
+- **An orderly close and a broken connection are told apart at the surface.** A session that
+  ended in the orderly way — this side's `disconnect()` or the peer's — reports
+  `ConnectionState::Closed`, `last_error() == None`, and `CoreError::ConnectionClosed` from
+  `send()`, `recv()` and `await_ready()`; one whose transport ended without a close reports
+  `ConnectionState::Dead` and the cause it failed with. The two were byte-for-byte
+  identical, down to the message, though they call for opposite reactions. A session torn
+  down because the peer ignored the receive window is likewise no longer reported as an
+  orderly departure, and an end already reached is no longer overwritten by the pump's
+  teardown.
+
+- **`disconnect()` during the handshake is no longer walked back by the handshake
+  completing**, so `await_ready()` answers `CoreError::ConnectionClosed` for a session the
+  caller had already closed instead of `Ok(())` or a generic error.
+
+- **`connect_pinned_udp`, `connect_pinned_udp_with_config` and
+  `connect_pinned_udp_with_resumption` try every address the host resolves to**, in the
+  resolver's order, instead of only the first. A name that resolves `::1` ahead of
+  `127.0.0.1` — plain `localhost` on many machines — failed with `Timeout` against a server
+  listening on IPv4, where the TCP helper on the same name connects: only the handshake can
+  tell UDP candidates apart, because "connecting" a datagram socket succeeds against an
+  address with nothing behind it. The whole call stays inside the existing client handshake
+  deadline rather than multiplying it by the address count, and a name with one address —
+  every IP literal among them — still returns before the handshake as documented.
+
+- **An accepted session reported a migration it could not perform, and accepted the
+  request.** `PhantomSession::supports_migration()` and `migrate()` both read one flag taken
+  from the transport, and both halves of a PhantomUDP session answer `true` there —
+  correctly, about the transport, which rebinds without a re-handshake either way. But
+  `migrate()` is the client's entry point and an accepted server session moves through the
+  Rust-only `migrate_server()`; `UdpServerTransport` refuses `migrate` deliberately, so that
+  the FFI-exported client operation cannot move a server. So a server session advertised a
+  capability nothing its caller could reach and, worse, answered `Ok(())` to a `migrate()`
+  the pump then discarded. On a foreign binding, where `migrate_server` is not exported at
+  all, `supports_migration() == true` named an operation that existed nowhere in the
+  caller's reach. The transport's answer and this side's answer are now separate:
+  `supports_migration()` is `true` only for a client session, `migrate()` returns
+  `CoreError::Unsupported` on an accepted one, and `migrate_server()` and the handshake
+  metric's leg label keep reading the transport. Calling the wrong entry point on a
+  transport directly is also refused by name now, rather than through the trait default's
+  "use a UDP-backed session" — advice that sent the reader of a UDP transport that does
+  migrate looking for one they already had.
+
+- **`PhantomConfig::session_cache_capacity = 0` now turns 0-RTT off, where it used to keep
+  one ticket and serve early data out of it.** The field is documented as the maximum number
+  of resumption tickets a server keeps, so zero reads as "keep none" — and it is the only
+  route a foreign binding has to that posture, since the record has no presets and
+  `set_early_data_enabled(false)` is a separate call. The cache evicted before it inserted,
+  the eviction pass found nothing to evict, and the insert went through anyway, so a server
+  configured to keep no tickets kept exactly one and the next resuming client was served
+  0-RTT from it. `SessionCache::store` and the restore path a failed resume takes now both
+  return before writing when the capacity is zero, so every read path finds nothing, no
+  ticket is consumed, no proof-of-work reduction is granted, and the connection completes as
+  an ordinary 1-RTT handshake with `early_data_accepted == false`. Both listeners build
+  their cache from this field and both are covered. Refusing the value with a `ConfigError`
+  was the alternative and is the worse one: it would turn a config that plainly reads as
+  "off" into an error.
+
+- **A fips peer meeting a non-fips one is now told so, instead of being left to time out.**
+  `ClientHello.protocol_variant` carries the build's variant tag and the server checks it at
+  the first field it reads, before any KEM or signature work — that part worked. What it did
+  with the answer did not: the refusal was a `HandshakeResponse::Fail`, and the listener
+  answers a `Fail` by closing without a reply. Over TCP the client saw a bare connection
+  error; over PhantomUDP, which has no close to observe, it retransmitted its hello on the
+  handshake schedule and then reported `Timeout` — a peer did not answer, said of a peer that
+  had decided it never would, and the one shape of failure a typed refusal exists to
+  replace. The mismatch is now a typed `ServerReject` under a new reject code (2), which
+  both transports already put on the wire, and the client surfaces it as
+  `CoreError::ProtocolRejected` promptly rather than after its ten-second deadline. **No
+  wire format moves:** `ServerReject` keeps its three fields and its byte layout, code 1
+  still means "unsupported version" in every older capture, and the frozen wire vectors pass
+  unregenerated. Over PhantomUDP the reply goes only to a source that has already echoed an
+  IP-bound cookie, since address validation runs ahead of the variant check, and a
+  seven-byte reject against a six-kilobyte hello amplifies nothing. The message the client
+  builds names the variant rather than the version, which it previously did not — a variant
+  mismatch rendered as "client speaks v5, server speaks v5", a sentence naming the one field
+  both peers agree on.
+
+- **A build that names no features, and a `std` build that names no crypto substrate, now
+  fail with a message naming what to enable.** `--no-default-features` on its own switched
+  `std` off, and the bare-metal branch is selected by the absence of `std` rather than by any
+  affirmative choice, so the build entered it on a host target and failed inside `core` with
+  "no global memory allocator found", "`#[panic_handler]` function required" and "unwinding
+  panics are not supported without std" — three errors that name no feature and read as a
+  broken library rather than as a feature set nobody selected. `--no-default-features
+  --features std` compiled a crate whose AEAD and classical KEM have no implementation and
+  led with "unresolved module or unlinked crate `ring`", which reads as a missing dependency
+  rather than as the one word it is. Two `compile_error!`s now catch both and land first in
+  the error list: one names the recipe for a host build, a FIPS host build and bare metal,
+  the other says which substrate `classical-crypto` and `fips` each give and that the two
+  cannot speak to each other on the wire.
+
+- **A C caller could not tell a mispinned server from a network fault.**
+  `phantom_helpers.h` documented `phantom_blocking_connect_pinned` as returning NULL on a
+  handshake failure, and against a live listener with the **wrong** pinned key it returned an
+  ordinary session handle instead: `send` reported success and only a later `recv` returned
+  -1 — the same -1 a flaky path gives. The exported `connect_pinned` future resolves when
+  the socket is connected, and the hybrid PQC handshake carrying the pinned-identity check
+  runs after it, so the helper returned at the first point and described the second. It now
+  drives `await_ready` before handing a handle back. `phantom_blocking_connect_pinned_checked`
+  is the same call with an `int32_t` out-parameter carrying the lowered `CoreError`
+  discriminant, which is what separates `ServerIdentityMismatch` (15) from `NetworkError`
+  (1), `CryptoError` (4) for a malformed pin and `Timeout` (12); `PhantomErrorCode` names all
+  seventeen, and `phantom_blocking_await_ready` / `phantom_blocking_last_error` expose the
+  same machinery on an existing session. `tests/bindings/c/pinning_smoke.c` drives a real
+  in-process listener with the right key, a wrong key, a malformed key and a dead port, and
+  asserts the reason in each case.
+
+- **The mobile samples reported a connection before the pinned key had been checked.** The
+  iOS and Android samples, and the snippets in `docs/operations/mobile.md`, announced a
+  connection and read `earlyDataAccepted()` without ever calling `awaitReady` — the exact
+  footgun the crate documents about its own entry points, since `connectPinned*` returns
+  before the handshake has run and therefore before the pinned key has been checked. A
+  sample given a wrong pinned key reported success and failed later, on a read. Both samples
+  now await the handshake inside the same error path that already reports a connect failure,
+  so a mismatch arrives as the typed reason it is, and the Swift snippet in the guide
+  compiles, which it did not (`disconnect()` is `async throws` and the snippet wrote
+  `await session.disconnect()`).
+
+- **`tests/bindings/swift/build-xcframework.sh` could not produce an XCFramework.** It
+  passed `-headers` the directory it was writing its output into, so `xcodebuild` copied the
+  half-written framework into itself and gave up with `The item couldn't be saved because the
+  file name "ios-arm64" is invalid` after building every slice; the same directory also
+  carried `Package.swift`, `LoopbackTest.swift` and both build scripts into each slice. The
+  recipes in `docs/operations/mobile.md` and `examples/mobile/ios/README.md` did produce a
+  framework, and the generated Swift then failed against it with `cannot find type
+  'RustBuffer' in scope`, because inside a framework clang looks for `module.modulemap` and
+  nothing else — under its generated name `phantom_protocolFFI.modulemap` the framework
+  exported no module, so `#if canImport(phantom_protocolFFI)` was false and the FFI types
+  were simply absent. `Package.swift` also declared `.macOS(.v13)` with no macOS slice ever
+  built, which resolves cleanly and fails at link time on that platform only. The script now
+  stages a headers directory holding exactly the FFI header and `module.modulemap`, writes
+  the framework outside it, and builds a macOS slice as well; both documented recipes are
+  that same sequence.
+
+- **A wheel built from `python/pyproject.toml` could not be imported**: `import
+  phantom_protocol` raised `ImportError: cannot import name '__all__' from
+  'phantom_protocol.phantom_protocol'`, and the `try/except NameError` written around that
+  import could not catch it. maturin's uniffi mode generates a whole package named after the
+  crate, so `python-source = "."` made it merge that package into the hand-written
+  `python/phantom_protocol/` of the same name and the import reached the generated
+  sub-package, whose `__init__.py` only star-imports and so re-exports no `__all__`. The
+  documented command worked only because passing `--manifest-path` changed how
+  `python-source` resolved, so the published recipe never exercised the config. maturin now
+  owns the package outright.
+
+- **`examples/mobile/ios` did not compile even with both artifacts staged** as its README
+  instructs: `PhantomServerConfig.swift` used `Bundle.module` as the default argument of two
+  `public` functions, and SwiftPM generates it as `internal`. Both take `Bundle?` now and
+  resolve it in the body, leaving call sites unchanged; `swift build` and `swift test` both
+  complete on a macOS host against the framework's macOS slice, which the README now says.
+
+- **The published macOS libraries no longer abort every consumer at launch.** A Mach-O
+  library carries the path it expects to be found at, and rustc writes the absolute path of
+  the build tree into it, so both macOS rows of 0.3.0 shipped with an install name of
+  `/Users/runner/work/phantom_protocol/phantom_protocol/target/<target>/release/deps/libphantom_protocol.dylib`
+  — a directory that exists on no machine but the runner. The first consumer to link the
+  library died before `main` with `dyld: Library not loaded`, naming a path they had never
+  seen. The release now rewrites the staged copy's name to
+  `@rpath/libphantom_protocol.dylib`, which the loader resolves against whatever `-rpath` the
+  consumer linked with, and reads the name back before the tarball is produced, because a
+  rewrite that quietly did nothing yields exactly the artifact this entry is about. The C
+  bundle assembled by `tests/bindings/c/package.sh` had the identical defect and is fixed
+  with it, and its pkg-config template now emits `-Wl,-rpath,${libdir}` — without an rpath
+  entry `@rpath` resolves to nothing, so a consumer who links through `pkg-config --libs`
+  would still have failed at launch, differently.
+
+- **The published Linux libraries carry a symbol table again, so `uniffi-bindgen --library`
+  can read them.** The generator finds a crate's interface by looking up the `UNIFFI_META_*`
+  symbols the scaffolding exports, and the release artifacts were built with
+  `[profile.release]`, which sets `strip = "symbols"`. The shipped `.so` reached consumers
+  with no `.symtab` at all: the 75 metadata strings still sat in `.rodata` and the symbol
+  table naming them was gone. Nothing about the file looks empty, and the generator reports
+  `No UniFFI metadata found`, writes nothing, and **exits 0** — so a consumer's generate
+  script reports success over an empty directory. The release path now builds with
+  `[profile.dist]`, which inherits every optimisation setting from `release` and keeps the
+  table; an ordinary `cargo build --release` is unchanged and stays the size it was. The C
+  bundle and the Python wheel are built the same way.
+
+- **The published `.sha256` files verify where they are downloaded.** `shasum` writes the
+  path it is given and `shasum -c` re-reads it, so digests computed as `shasum -a 256
+  dist/…tar.gz` produced files naming `dist/phantom_protocol-….tar.gz`. Verifying the pair
+  as published failed on a missing file for everyone: the only person it worked for is one
+  who happened to reproduce a `dist/` directory. The digest now names the tarball by its
+  basename, and the release verifies the digest it just wrote.
+
+- **The Python wheel job builds a wheel.** maturin generates the wheel's Python module by
+  running `uniffi-bindgen` against the library it has just compiled, so with `--release` it
+  read a stripped `.so`, reported `No UniFFI metadata found` and stopped, leaving a `.whl`
+  with no `.dist-info` that pip rejects as invalid — the job's own `import phantom_protocol`
+  smoke step could never have run. It is `workflow_dispatch`-only, which is why nothing said
+  so. It now builds with the same unstripped profile as the rest of the release.
+
+- **The C bundle is named after the version in the manifest, and ships both headers.**
+  `package.sh` restated the crate version as a literal, and `tests/bindings/check_versions.sh`
+  does not enforce that file, so after a bump the bundle kept the old name and the published
+  tarball was the only place that said the wrong number. It also omitted
+  `phantom_helpers.h`, although the C README's quick-start and `consumer_smoke.c` both
+  include it, so the bundle did not build what it documented. The version is read out of
+  `core/Cargo.toml`, a bundle that cannot be named is not built, and both headers ship.
+
+- **The WASI integration job installs the wasmtime version the tree names.** The step read
+  `curl -sSf https://wasmtime.dev/install.sh | bash` beneath the words "Pinned via the
+  official installer script"; without `--version` that installer resolves the GitHub
+  `latest` release, so the runtime the tests ran against changed whenever wasmtime cut one,
+  with nothing in this repository to show it. That is how wasmtime 49 — which waits for a
+  pending write when an output stream is dropped, where 45 returned immediately — arrived in
+  the middle of the 0.3.0 release and hung the guest fixture. The version is now one `env:`
+  line passed to the installer explicitly, and the job reads `wasmtime --version` back and
+  fails on a mismatch, since the installer falls back to `latest` for an argument it does not
+  understand and an ignored pin otherwise leaves the job green against an unknown runtime.
+
+- **Release artifacts were documented as carrying SLSA-3 build provenance; they carry SLSA
+  v1.0 Build Level 2.** `actions/attest-build-provenance` gives Build L2 on its own. L3
+  additionally requires the build to run in a reusable workflow that is the sole holder of
+  the provenance signing identity, and `release.yml` attests inline in the `build-artifacts`
+  job — the same job that runs `cargo build` and that restores a `Swatinem/rust-cache` shared
+  with the rest of CI. Corrected in `README.md`, `docs/policy/versioning.md`,
+  `docs/operations/mobile.md`, `tests/bindings/PACKAGING.md` and
+  `docs/compliance/cc-pp-mapping.md`, where the overstatement was offered as ALC_CMC.1
+  evidence to a lab that can read the workflow file. `docs/DEFERRED_WORK.md` § 1, which had
+  called L3 shipped and "the top of the track", now states what ships, what L3 needs here,
+  and that both obstacles are a workflow refactor rather than a code change. Nothing about
+  verifying an artifact changed: every corrected site still names the action and gives the
+  `gh attestation verify` and `cosign verify-blob-attestation` invocations.
+
+- **The README claimed the crypto path has no C bindings and that the crate compiles for
+  `wasm32` without them.** `ring` compiles 11 architecture-independent `.c` files on every
+  target it supports, `blake3` compiles `blake3_neon.c` on aarch64 and assembly on x86-64,
+  and `zstd-sys` builds the zstd C library; on the `wasm32-unknown-unknown` row CI checks,
+  `ring` emits 12 objects and `zstd-sys` 36. Replaced with a "What needs a C compiler"
+  section that names each dependency, the feature that reaches it, and the commands that
+  re-derive the figures — and with the one genuinely C-free build, `--no-default-features
+  --features embedded,no-std`, which is also the row without the handshake. `--features fips`
+  is not the C-free route: it swaps `ring` for `aws-lc-rs`, which builds AWS-LC through
+  `cmake`.
+
+- **`docs/policy/versioning.md` had drifted from the wire.** It listed `0x1000 .. 0x8000` as
+  reserved `PacketFlags` bits when `KEEPALIVE`, `PADDED` and `COVER` hold three of them and
+  only `0x8000` is left; it promised that new TLV records could ride in
+  `PhantomPacket::extensions` without a `WIRE_VERSION` bump, when `extensions` has not been
+  on the data-plane wire since v6 and `from_wire` returns an empty `Vec` unconditionally, so
+  such a record reaches no peer; and it prescribed an `FFI:` CHANGELOG prefix that has never
+  appeared in this file. The section now names the three changes that genuinely need no bump
+  — a new `ENCRYPTED | CONTROL` subtype, a flag bit an unaware receiver already discards
+  intact, and a change that leaves the bytes identical — and the § 9 table rows match. The
+  rule that `WIRE_VERSION` and `PROTOCOL_VERSION` move together is kept, and is now the
+  default rather than the exception.
+
+- **Five embedder-facing documentation examples connected and then sent without awaiting the
+  pin.** `connect_pinned*` and `SessionBuilder::connect` return before the handshake has run,
+  so `send()` succeeds by queueing even against the wrong server and only `await_ready()`
+  settles Security Invariant 1. The Swift and Kotlin quickstarts in
+  `docs/operations/mobile.md`, its Kotlin resumption example, `docs/operations/wasm.md`'s
+  resumption example and `docs/protocol/PROTOCOL.md` § 0-RTT now call `awaitReady()` /
+  `await_ready()` immediately, naming the error a wrong key produces. The crate's own
+  `SessionBuilder` rustdoc had the same gap and is corrected with them — its doc example, the
+  one a reader copies, now ends with `await_ready()`, and the two sentences that said
+  `.connect().await` performs the handshake say what it actually does.
+
+- **Forty-five commit ids cited across `docs/` no longer resolved.** The history up to the
+  `v0.3.0` tag was rewritten and nothing recorded it, so the two 2026-06 audit reports, the
+  remediation plan, the 20-row rollout table in `docs/observability/refactor-plan.md`, the
+  FIPS inventory in `docs/compliance/fips-readiness.md`,
+  `docs/operations/{mobile,wasi}.md`, `docs/security/panic-sites.md` and the ALC_CMC.1
+  evidence row all pointed at objects this repository does not contain. Commit *subjects*
+  survived the rewrite, so most were re-derived with `git log --all --grep`; the rest were
+  replaced with a path, a tag or a date. Each re-pointed citation now names the implementing
+  file as well. `docs/policy/versioning.md` § 10 gains "Commit ids before 0.3.0", which
+  records that the rewrite happened, that the six release tags are the durable handles, and
+  that a path should be preferred to a hash in new text.
+
+- **The README claimed 683 library unit tests where the tree has more.** The sentence now
+  names `cargo test --manifest-path core/Cargo.toml --lib` instead of a number, so it cannot
+  go stale again.
+
+### Changed
+
+- **Seven dependencies the crate never referenced no longer reach a consumer's build, and
+  `tokio` is asked for four fewer features.** The `std` feature carried `tokio-util`,
+  `async-trait`, `env_logger`, `argon2`, `base64`, `once_cell` and `bitflags`, and no source
+  file in the crate mentions any of them — not behind a cfg, not behind a feature, never.
+  Since `std` is on in the default set, every consumer resolved, downloaded and compiled all
+  seven, and `argon2`, a password hash, sat in the direct dependency list of a transport
+  library, which is the first thing an auditor asks about. `env_logger` has one real caller,
+  an example, and is a dev-dependency now. `time` stays but moves from `std` to `mimicry`:
+  its only use is the validity window on the synthetic certificate the TLS-mimicry theater
+  presents, and that leg is off by default. `tokio`'s native feature list loses `signal`,
+  `process`, `fs` and `io-std`, none of which has a call site anywhere in the crate, its
+  tests, its benches or its examples — an embedder that needs them asks tokio for them
+  itself, as the reference server already does for its SIGTERM drain. A default consumer
+  build goes from 164 crates to 135, among them `regex`, `jiff`, `blake2`, `password-hash`,
+  `signal-hook-registry` and the whole `anstream`/`anstyle` colour stack. No public item
+  changed; this is a dependency-graph change only.
+
+### Added
+
+- **A gate over the release path, because a release cannot be its own regression test.**
+  Every artifact defect above shipped in 0.3.0, was green in CI, and was found by downloading
+  the published tarball: `build-artifacts` runs on a tag, once, and what it produced was read
+  by nobody until a consumer tried to use it. `scripts/check_release_artifacts.py` reads the
+  files that decide what is shipped and fails when any of the four properties is back to its
+  0.3.0 state — a stripping profile, a macOS install name left as rustc wrote it, a digest
+  line carrying a directory, an unpinned WASI runtime. It strips comment lines before
+  matching, because each fix has prose beside it describing the defect and a scan that
+  matched the prose would pass the tree it exists to fail.
+  `scripts/check_release_artifacts_test.py` is what says it reads them correctly: sixteen
+  cases, each putting one property back and requiring a failure that names it, plus the
+  unmutated tree passing and the case count asserted. The new CI job `release artifact shape`
+  runs both, then does the half a text scan cannot: it builds the shipped profile and hands
+  the library to the bindings generator, checking what was written rather than the exit code,
+  since `uniffi-bindgen` succeeds while finding nothing.
+
+- **A standing check over the Swift XCFramework, and one over the Python wheel.**
+  `tests/bindings/swift/check_xcframework.sh` asserts the per-slice header names, that no
+  framework was copied inside the framework, and that there is one slice per platform
+  `Package.swift` declares; `check_xcframework_test.sh` breaks it eight ways to prove it
+  fires. `python/verify_wheel.sh` builds a wheel, installs it into a throwaway venv and
+  imports and exercises it, which is the only thing that catches an import that the build
+  itself reports as a success.
+
+- **Typed EOF on `PhantomStream::recv` is now documented where a reader looks for it.**
+  `docs/protocol/PROTOCOL.md` § 4.5 names `Ok(None)` (clean in-order `FIN`, half-closed)
+  against `Err(CoreError::ConnectionClosed)` (abnormal end), marked as this implementation's
+  surfacing of the release rule rather than a wire requirement — what the wire requires is
+  that a second implementation be able to surface the two separately at all.
+  `docs/architecture/ARCHITECTURE.md` § 9 records the same distinction beside the
+  typed-`CoreError` contract, with the pre-0.3.0 signature and the two caller shapes the
+  change turns into compile errors.
+
+### Documented
+
+- **The 0.3.0 breaking list did not name `PhantomStream::recv`'s changed signature, and it
+  is the one break a read loop meets at runtime rather than at compile time.** 0.2.2's
+  `recv` returned `Result<Vec<u8>, CoreError>`; 0.3.0's returns
+  `Result<Option<Vec<u8>>, CoreError>`, where `Ok(None)` is the peer's clean `FIN` —
+  half-closed, so this side may still send — and `Err(CoreError::ConnectionClosed)` is an
+  abnormal end. Before 0.3.0 both arrived as the same error, so a read loop could not tell a
+  peer that had finished from a session that had broken. Two caller shapes break, and both
+  break at the `match`: one that handled only `Err` now loops forever on `Ok(None)`, and one
+  that treated the old error as EOF now swallows a real failure. Across the FFI the method's
+  return type moves with it, so every binding must be regenerated rather than relinked —
+  Python `recv()` yields `None`, Swift and Kotlin an optional. The 0.3.0 section's
+  "Every Rust API break in this window, in one list" is left as it was written, which is the
+  rule this project applies to shipped release notes; this entry is where the omission is
+  recorded. `scripts/check_changelog_breaking.py` passed over it because the symbol *is*
+  named in that section — as a trailing sentence inside a bullet about an unrelated removal
+  — which is the floor that gate sets and not a review.
+
+- **`PhantomConfig::write_stall_timeout`'s one-second floor is documented as belonging to
+  the field rather than to the deadline.** The field said the deadline must be at least a
+  second and that the entry points refuse a shorter one; both are true of the field and
+  neither is true of the deadline, because a caller who builds a transport and calls
+  `with_write_stall_timeout` hands over any duration and gets the transport back, not a
+  `Result`. Refusing it there would change a signature, and clamping would contradict the
+  config path, which refuses rather than corrects. So the asymmetry stays and the field now
+  states it, along with the reason it is one: a value in the record is one an operator
+  supplied for connections the library builds out of their sight, while a duration handed
+  straight to a transport is a choice its author made about that transport.
+
+- **Each PhantomUDP transport now says which migration entry point its `supports_migration()`
+  answer is about.** Both halves of a session are address-aware and rebind without a
+  re-handshake, so both answer `true` — and the rustdoc says which method that `true` is
+  about, and on the server half what it costs a caller who reads it through
+  `PhantomSession::supports_migration()`. See **Fixed**, "An accepted session reported a
+  migration it could not perform", for the behaviour that changed with it.
+
+- **The draining window of `docs/protocol/PROTOCOL.md` § 4.11 is a datagram-transport
+  property, and the section said it without qualification.** The window exists because a
+  `CLOSE` is not `RELIABLE` and carries no `stream_offset`, so on a path that reorders it
+  overtakes data nothing will re-send; the 200 ms floor is sized against the displacement a
+  queue produces rather than against the path's length. Over a byte pipe — TCP, a
+  WebSocket, a WASI socket, a UART — there is no such displacement: the transport delivers
+  in order, so by the time the close is parsed everything written before it has been handed
+  over, and the peer's own end-of-stream arrives immediately behind the frame. This
+  implementation therefore publishes `Draining` and tears down on that end-of-stream, tens
+  of microseconds later, which reads as a violated floor for a case the floor was never
+  about. The section now says so, along with the two things that follow: holding the full
+  window on a byte pipe is conformant too, and `ConnectionState::Draining` is **not** a
+  state an application can poll for there — a consumer sampling `connection_state()` even
+  every millisecond sees `Connected` and then `Closed`, and should read the error from
+  `recv()` instead.
+
+- **A resume spends its ticket whether or not early data rides along, and the entry points
+  now say so.** The one-shot rule is decided when the resumption binder verifies, before the
+  server looks for a sealed blob, so resuming with an empty `early_data` buys only the
+  cookie / proof-of-work bypass and leaves nothing for the connect that does have a payload
+  — while `early_data_accepted()` answers `None`, which is correct ("no early-data on this
+  connect") and reads as "nothing was spent". Making the consumption conditional on a
+  payload is not the fix, because a ticket that bought the bypass without being spent would
+  buy it as often as its holder liked. So `connect_pinned_with_resumption`,
+  `connect_pinned_udp_with_resumption` and `SessionBuilder::resumption` state the cost and
+  say to keep the hint until there is something to send, and a `--lib` test drives a hello
+  that names a ticket and carries no blob and then shows the next resume off the same hint
+  falling back to 1-RTT. The same change drops a sentence the address-walk fix left behind:
+  `connect_pinned_udp_with_resumption` still said the first resolved address is used with no
+  fallback.
 ## [0.3.0] - 2026-09-26
 
 **Peers of this release and of 0.2.2 will not talk to each other, and the refusal is
@@ -4108,7 +4591,8 @@ dependency changes** — binary- and wire-compatible with 0.2.0
   stalled all further sends. Send accounting now uses the payload length, so
   inflight balances exactly against the ACK and loss paths.
 
-[Unreleased]: https://github.com/snaart/phantom_protocol/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/snaart/phantom_protocol/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/snaart/phantom_protocol/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/snaart/phantom_protocol/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/snaart/phantom_protocol/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/snaart/phantom_protocol/compare/v0.2.0...v0.2.1
