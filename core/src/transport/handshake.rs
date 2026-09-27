@@ -125,8 +125,10 @@ pub const REJECT_UNSUPPORTED_VERSION: u8 = 1;
 pub const REJECT_PROTOCOL_VARIANT: u8 = 2;
 
 /// [`ServerReject::code`]: the peer never satisfied the cookie / proof-of-work gate
-/// within [`MAX_HANDSHAKE_RETRY_ROUNDS`] rounds, so the server has abandoned this
-/// handshake. `supported_version` carries the version this server speaks, as every
+/// within `MAX_HANDSHAKE_RETRY_ROUNDS` rounds, so the server has abandoned this
+/// handshake. (That constant is crate-private and deliberately not linked from here: a
+/// public item's documentation may not link a private one, which `cargo doc`'s
+/// `-D warnings` makes an error rather than a note.) `supported_version` carries the version this server speaks, as every
 /// reject does, because the version is not what went wrong.
 ///
 /// It exists so the abandonment is something the peer can read. The server used to
