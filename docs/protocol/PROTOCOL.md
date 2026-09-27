@@ -742,7 +742,12 @@ from truncating the data behind it. A FIN closes one direction and nothing more:
 side that sent it keeps receiving until the peer's own FIN, and each side drops the
 stream only once both have happened — its own FIN acknowledged, the peer's half
 ended (released in order, or carried outside the reliable stream as in § 4.3,
-steps 8 and 12). Frames that arrive for it after that are answered as § 4.4
+steps 8 and 12). In this implementation that release is what `PhantomStream::recv`
+returns as `Ok(None)`, distinct from the `Err(CoreError::ConnectionClosed)` an abnormal
+end gives — a second implementation is free to surface it any way its language prefers,
+but it has to be able to surface the two separately, because the wire distinguishes
+them and a reader that conflates them cannot tell a finished peer from a broken
+session. Frames that arrive for it after that are answered as § 4.4
 describes, not taken for a new stream. Note the near-collision with the persist probe
 described below, and that the flag is the whole difference: a `RELIABLE` frame
 with an empty payload and **no** `FIN` is a window probe, delivers nothing, and
