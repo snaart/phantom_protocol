@@ -89,6 +89,31 @@ repos:
         files: ^CHANGELOG\.md$
         pass_filenames: false
 
+      # ── The release-path gates' own cases ─────────────────────────────
+      - id: semver-report-script
+        name: semver_report.sh reads a report the way it claims to
+        # The script decides a CI job by reading text: which release type the
+        # version step calls for, whether the run reached a verdict at all, and
+        # whether the type it used matches the step the tool says it compared.
+        # Each of those is a text-reading rule that can stop working while the
+        # job stays green, so the cases run whenever the script or they change.
+        # cargo is stubbed, so this costs a couple of seconds and no build.
+        entry: scripts/semver_report_test.sh
+        language: system
+        files: ^scripts/semver_report(_test)?\.sh$
+        pass_filenames: false
+
+      - id: check-xcframework-shape
+        name: the XCFramework shape gate rejects every broken shape
+        # `check_xcframework.sh` needs a built framework and so cannot run here;
+        # its mutation cases need nothing but a temp directory and fabricate the
+        # eight broken trees themselves, which is the half that can. They also
+        # assert their own case count, so an early exit is not a clean sweep.
+        entry: tests/bindings/swift/check_xcframework_test.sh
+        language: system
+        files: ^tests/bindings/swift/(check_xcframework\.sh|check_xcframework_test\.sh|Package\.swift|build-xcframework\.sh)$
+        pass_filenames: false
+
       # ── Landing page and license text that ship inside the crate ──────
       - id: sync-readme
         name: core/README.md and core/LICENSE mirror the root copies
