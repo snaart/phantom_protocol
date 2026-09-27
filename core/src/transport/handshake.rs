@@ -2085,14 +2085,23 @@ mod tests {
     /// and arrived as a bare connection close. Two constants in two files is what let
     /// that happen, and one number in one place is the fix — this asserts the number is
     /// usable and leaves "there is only one of it" to there being only one of it.
+    ///
+    /// The assertion is a `const` block rather than a runtime one. Both operands are
+    /// constants, which `clippy::assertions_on_constants` refuses under `-D warnings` —
+    /// and it is right to: as a runtime assertion this said nothing until someone ran
+    /// the test, where in a `const` block a bound below three is a compile error. The
+    /// cost is that the message cannot name the offending value, since formatting is
+    /// not available in a constant.
     #[test]
     fn the_retry_round_bound_leaves_room_for_a_reorder() {
-        assert!(
-            MAX_HANDSHAKE_RETRY_ROUNDS >= 3,
-            "a legitimate handshake needs one cookie round and one proof-of-work round, \
-             and a datagram path can waste one to a reorder; {MAX_HANDSHAKE_RETRY_ROUNDS} \
-             rounds leaves no slack for the third"
-        );
+        const {
+            assert!(
+                MAX_HANDSHAKE_RETRY_ROUNDS >= 3,
+                "a legitimate handshake needs one cookie round and one proof-of-work round, \
+                 and a datagram path can waste one to a reorder, so fewer than three rounds \
+                 leaves no slack for the third"
+            )
+        };
     }
 
     /// H9 forward-compat: a `ClientHello` advertising a `version` the server
