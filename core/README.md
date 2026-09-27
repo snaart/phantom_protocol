@@ -102,10 +102,13 @@ independent multiplexed streams with per-stream flow control.
 ## Highlights
 
 - **Hybrid post-quantum handshake** — X25519 + ML-KEM-768 KEM, Ed25519 + ML-DSA-65
-  signatures. Both halves must verify. Pure-Rust RustCrypto primitives — no C
-  bindings in the crypto path, so the full handshake compiles on native, mobile,
-  and `wasm32`. (Bare-metal `thumbv7em` is `std`-gated to the framing transport
-  only — see [Status & limitations](#status--limitations).)
+  signatures. Both halves must verify. The **post-quantum** halves are pure-Rust
+  RustCrypto (`ml-kem`, `ml-dsa`) — no C anywhere in them, which is why the full
+  handshake compiles on native, mobile and `wasm32` alike. The rest of the crypto
+  substrate is not C-free: see
+  [What needs a C compiler](#what-needs-a-c-compiler). (Bare-metal `thumbv7em` is
+  `std`-gated to the framing transport only — see
+  [Status & limitations](#status--limitations).)
 - **0-RTT resumption** — AEAD-sealed early-data (≤ 16 KiB) folded into the
   single `ClientHello`, one-shot anti-replay via a consumed `SessionCache`
   ticket, best-effort fallback to a 1-RTT handshake when the ticket is
@@ -257,9 +260,42 @@ Runnable forms: [`core/examples/loopback_demo.rs`](https://github.com/snaart/pha
 | KDF | HKDF-SHA-256 + keyed BLAKE3 | RFC 5869 for the KEM combine / rekey / 0-RTT keying; `crypto::kdf::derive_key_32` label derivations use `blake3::derive_key`, swapping to HKDF-SHA-256 under `--features fips` |
 | Hash / MAC | SHA-256, HMAC-SHA-256, blake3 (keyed) | FIPS 180-4 / FIPS 198-1 + non-FIPS |
 
-The PQ primitives moved off the C-bound `pqcrypto-*` crates to the
-RustCrypto FIPS-203 / FIPS-204 implementations. The crate compiles on
-`wasm32-unknown-unknown` and `thumbv7em-none-eabihf` without C bindings.
+The PQ primitives moved off the C-bound `pqcrypto-*` crates to the RustCrypto
+FIPS-203 / FIPS-204 implementations, and *those two* are now pure Rust on every
+target.
+
+### What needs a C compiler
+
+The crate as a whole is **not** C-free, and this section used to say it was. On a
+default build three dependencies run a build script that invokes `cc`:
+
+| Dependency | Why | Reached from |
+| --- | --- | --- |
+| `ring` | the AEAD substrate (`crypto::adaptive_crypto`) — 11 architecture-independent `.c` files plus per-arch assembly | `classical-crypto` (on by default) |
+| `blake3` | the default KDF (`crypto::kdf::derive_key_32`) — SIMD assembly on x86-64, `blake3_neon.c` on aarch64 | `std` |
+| `zstd-sys` | the zstd C library | `compression-zstd` (on by default) |
+
+`wasm32-unknown-unknown` is no exception. Building the crate for that target with
+the feature set CI's `cross.yml` uses compiles **12** C objects out of `ring` and
+36 out of `zstd-sys`; re-derive it rather than trusting this paragraph:
+
+```bash
+cargo tree --manifest-path core/Cargo.toml -i cc -e normal,build   --no-default-features --features std,compression-zstd,classical-crypto   --target wasm32-unknown-unknown
+# and, after building that row:
+find target/wasm32-unknown-unknown/debug/build -name '*.o' | wc -l
+```
+
+`--features fips` does not help: it swaps `ring` for `aws-lc-rs`, which builds
+AWS-LC through **`cmake`** and needs more of a C toolchain, not less.
+
+**The one genuinely C-free build** is the bare-metal row —
+`--no-default-features --features embedded,no-std` — where `cc` is not in the
+dependency graph at all and the build emits no object files. That row is also the
+one without the handshake: no `ring`, no `zstd`, and the PQ crates and
+`PhantomSession` are `std`-gated out of it (see
+[Status & limitations](#status--limitations)). So "C-free" and "post-quantum
+session" are, today, two different builds — which is the honest form of the claim
+this section previously made.
 
 ## Architecture
 
