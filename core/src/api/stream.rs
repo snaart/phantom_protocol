@@ -169,10 +169,22 @@ impl PhantomStream {
     /// Returns:
     /// - `Ok(Some(bytes))` — a data payload arrived.
     /// - `Ok(None)` — the peer sent a clean FIN; the stream is half-closed
-    ///   for reading. No more data will arrive on this stream.
-    /// - `Err(CoreError::ConnectionClosed)` — the underlying session ended
-    ///   (the mpsc channel was dropped) before a clean EOF was signalled.
-    ///   This indicates an abnormal termination rather than a graceful close.
+    ///   for reading. No more data will arrive on this stream. Exactly once: a further
+    ///   call on a stream whose FIN has already been reported gets the `Err` below.
+    /// - `Err(CoreError::ConnectionClosed)` — the session ended before a FIN arrived on
+    ///   this stream.
+    ///
+    /// **The session ending is an `Err` here, not `Ok(None)`, even when it ended in the
+    /// orderly way.** `Ok(None)` is a statement about *this stream*: the peer closed its
+    /// writing half, so everything it meant to send has been read. The end of the session
+    /// says nothing of the kind — the peer may have been half-way through writing on this
+    /// stream — so reporting it as a clean end of stream would tell the caller it had
+    /// everything when the truth is that nobody can now say. The distinction survives in
+    /// both directions: a stream whose FIN did arrive reports `Ok(None)` first and the
+    /// error only afterwards, so a reader that reads to EOF never sees the error at all.
+    ///
+    /// Either way the call resolves. Whatever was already delivered into this stream is
+    /// handed over first, in order, and the end is reported after it.
     pub async fn recv(&self) -> Result<Option<Vec<u8>>, CoreError> {
         let mut rx = self.rx.lock().await;
         loop {
@@ -197,9 +209,11 @@ impl PhantomStream {
                     return Ok(None);
                 }
                 None => {
-                    // The mpsc sender was dropped without a Close signal, meaning
-                    // the session ended abnormally (e.g. network failure, session
-                    // close before stream teardown).
+                    // Every sender for this stream is gone: its route was dropped, which
+                    // happens when the stream is retired and when the session ends. Either
+                    // way no FIN arrived on this stream, so what can be said is that it is
+                    // over and not that it was read to its end — see this method's
+                    // documentation for why that is an error and not `Ok(None)`.
                     return Err(CoreError::ConnectionClosed);
                 }
             }

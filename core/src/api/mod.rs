@@ -42,6 +42,8 @@ mod full_duplex_tests;
 #[cfg(test)]
 mod loss_recovery_tests;
 #[cfg(test)]
+mod session_end_tests;
+#[cfg(test)]
 mod stream_close_tests;
 
 // Cross-target re-exports

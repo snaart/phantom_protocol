@@ -1248,6 +1248,10 @@ impl PhantomSession {
             let core_err = CoreError::FipsSelfTestFailure(format!("{e:?}"));
             *terminal_error.lock() = Some(core_err);
             state.store(ConnectionState::Failed as u8, Ordering::Relaxed);
+            // No pump will run, so no delivery task will ever release this session's
+            // routes: release them here, or a stream opened before the connect resolved
+            // leaves its reader parked for good.
+            demux.close_all_streams();
             // Signal awaiting callers (await_ready) that we have reached a terminal state.
             let _ = ready_tx.send(ConnectionState::Failed as u8);
             return;
@@ -1295,6 +1299,10 @@ impl PhantomSession {
                 // see the error already in place.
                 *terminal_error.lock() = Some(e);
                 state.store(ConnectionState::Failed as u8, Ordering::Relaxed);
+                // Same as the POST gate above: the pump never runs on this path, so the
+                // routes of any stream the application opened while the connect was in
+                // flight have to be released here.
+                demux.close_all_streams();
                 // Signal awaiting callers (await_ready) that we have reached a
                 // terminal Failed state.
                 let _ = ready_tx.send(ConnectionState::Failed as u8);
@@ -2362,6 +2370,22 @@ async fn run_data_pump<T: SessionTransport>(
                     }
                 }
             }
+            // The channel closed: the reader task has gone — which is how every session
+            // ends — and this task has just finished handing over everything that reached
+            // it. So this is the moment the session's routes go, and this is the task that
+            // has to be the one to drop them.
+            //
+            // Dropping a route is what tells a `PhantomStream::recv()` that nothing more
+            // will arrive: the sender lives in the demultiplexer, and until it is gone a
+            // reader parked on the other end has no way to learn the session is over — it
+            // simply waits, for as long as the process lives, one task per stream. Doing it
+            // here rather than from the pump's teardown is what keeps it from costing
+            // anything: a route dropped while items for it were still queued in this task
+            // would discard bytes the peer's `send()` had already been told were away,
+            // whereas a route dropped after they have been handed over costs nothing at all
+            // — a bounded channel gives a reader what is already in it before it reports its
+            // end, so the reader drains its frames and only then sees the close.
+            demux_b.close_all_streams();
         }));
     }
 
@@ -6888,6 +6912,15 @@ impl Drop for PhantomSession {
         // never completed, the inert `connect()`) it is a no-op.
         self.close_request
             .send_modify(|requested| *requested = true);
+        // Release every stream's delivery route, so a `PhantomStream::recv()` still parked
+        // on one is told the session is over instead of waiting for the life of the
+        // process. The session's delivery task does this too, in the ordered place — behind
+        // everything it still had to hand over — and that is the normal path; this is the
+        // backstop for the ends it cannot reach: a session whose pump never started because
+        // the handshake failed, the inert `connect()`, and a delivery task still parked on
+        // a stream whose own reader has stopped reading it. Idempotent, and it takes only
+        // the routing table's shard locks.
+        self.demux.close_all_streams();
         // Retire any stream still counted on the active-streams gauge. The pump
         // drains too (that is the normal path, and it fires promptly); this
         // covers the cases the pump cannot — a session whose pump never started
