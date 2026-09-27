@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Assembles a release tarball with phantom_protocol.h, the host's prebuilt
-# libphantom_protocol, the pkg-config file, and README + LICENSE. Per-OS / arch
-# bundle — run on the platform you intend to publish for.
+# Assembles a release tarball with phantom_protocol.h + phantom_helpers.h, the
+# host's prebuilt libphantom_protocol, the pkg-config file, and README + LICENSE.
+# Per-OS / arch bundle — run on the platform you intend to publish for.
 #
 #     ./package.sh                          # --prefix /usr/local
 #     ./package.sh --prefix /custom/path
@@ -34,7 +34,8 @@ ARCH="$(uname -m)"
 # Read from the manifest rather than restated here. A literal in this script is
 # a version nothing checks: `tests/bindings/check_versions.sh` enforces the
 # manifests and the pkg-config template, not this file, so after a bump the
-# bundle keeps the old name and the tarball is the only place that says so.
+# bundle keeps the old name and the published tarball is the only place that
+# says the wrong number.
 VERSION="$(sed -n '/^\[package\]/,/^\[/ s/^version *= *"\([^"]*\)".*/\1/p' \
     "${REPO_ROOT}/core/Cargo.toml" | head -n 1)"
 if [ -z "${VERSION}" ]; then
@@ -49,7 +50,10 @@ mkdir -p "${STAGE}/${BUNDLE}/include" \
          "${STAGE}/${BUNDLE}/lib" \
          "${STAGE}/${BUNDLE}/lib/pkgconfig"
 
+# Both headers ship: consumer_smoke.c and the README quick-start include
+# phantom_helpers.h, so a bundle without it does not build what it documents.
 cp "${SCRIPT_DIR}/phantom_protocol.h" "${STAGE}/${BUNDLE}/include/"
+cp "${SCRIPT_DIR}/phantom_helpers.h"  "${STAGE}/${BUNDLE}/include/"
 cp "${SCRIPT_DIR}/README.md"      "${STAGE}/${BUNDLE}/"
 cp "${REPO_ROOT}/LICENSE"         "${STAGE}/${BUNDLE}/"
 

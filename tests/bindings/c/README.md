@@ -195,8 +195,17 @@ plain blocking calls:
 #include "phantom_helpers.h"   /* requires C11 <stdatomic.h> */
 
 /* pinned_key = server's HybridVerifyingKey bytes (PhantomListener::verifying_key_bytes) */
-void *s = phantom_blocking_connect_pinned("127.0.0.1", 4242, pinned_key, key_len);
-if (!s) { /* bad key / refused / handshake failed */ }
+int32_t err = PHANTOM_ERR_OK;
+void *s = phantom_blocking_connect_pinned_checked("127.0.0.1", 4242,
+                                                 pinned_key, key_len, &err);
+if (!s) {
+    /* err says which failure it was — the distinction a C caller needs:
+     *   PHANTOM_ERR_SERVER_IDENTITY_MISMATCH  the server is not the pinned one
+     *   PHANTOM_ERR_NETWORK                   refused / unreachable
+     *   PHANTOM_ERR_CRYPTO                    the pinned_key blob is malformed
+     *   PHANTOM_ERR_TIMEOUT                   the handshake did not finish  */
+    return 1;
+}
 phantom_blocking_send(s, (const uint8_t *)"hello", 5);
 uint8_t buf[2048];
 ptrdiff_t n = phantom_blocking_recv(s, buf, sizeof buf);   /* n bytes, or -1 */
@@ -204,8 +213,30 @@ phantom_blocking_disconnect(s);
 uniffi_phantom_protocol_fn_free_phantomsession(s, &(PhantomRustCallStatus){0});
 ```
 
+**The connect waits for the handshake, and that is load-bearing.** The exported
+`connect_pinned` future resolves as soon as the SOCKET is connected; the hybrid
+PQC handshake, and with it the pinned-identity check, runs on a background task
+afterwards. A helper that returned at that point handed back a live-looking
+session for a WRONG pinned key — `send` returned 0 and only a later `recv`
+returned -1, indistinguishable from a network fault. So
+`phantom_blocking_connect_pinned_checked` drives `await_ready` before returning,
+and reports `PHANTOM_ERR_SERVER_IDENTITY_MISMATCH` for a mispinned server.
+`phantom_blocking_connect_pinned(host, port, key, len)` is the same call with the
+reason discarded; it returns NULL in every case the checked form does.
+
+Two more helpers expose the same machinery on an existing session:
+`phantom_blocking_await_ready(session, &err)` (0 = established, -1 = failed with
+`err` set) and `phantom_blocking_last_error(session, &err)` (1 = an error is
+present, 0 = none, -1 = the call itself failed). `PhantomErrorCode` in
+`phantom_helpers.h` enumerates the lowered `CoreError` discriminants.
+
 The wait is a 1 ms `nanosleep` poll on a C11 `_Atomic` flag the UniFFI continuation
-sets — no `-lpthread` needed. `tests/bindings/c/consumer_smoke.c` exercises it (a
-pinned connect to a dead port returns NULL through the full poll/complete/free path).
-The blocking helpers are intended for synchronous C callers; bindings that already
-have an event loop (Python/Swift/Kotlin) should keep using the async surface.
+sets — no `-lpthread` needed for the helpers themselves.
+`tests/bindings/c/consumer_smoke.c` exercises the poll/complete/free path (a
+malformed pin returns NULL with `PHANTOM_ERR_CRYPTO`), and
+`tests/bindings/c/pinning_smoke.c` — built and run by `run_c_pinning_test.sh` —
+drives a real in-process listener with the right key, a wrong key, a malformed key
+and a dead port, asserting the reason in each case. That one links `-lpthread`,
+because it runs the server side on a second thread. The blocking helpers are
+intended for synchronous C callers; bindings that already have an event loop
+(Python/Swift/Kotlin) should keep using the async surface.
