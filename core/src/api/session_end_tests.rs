@@ -101,11 +101,7 @@ impl SessionTransport for Pipe {
             // and then the test would not be pinning the route it names.
             return Ok(());
         }
-        self.out
-            .send(data.to_vec())
-            .await
-            .map_err(|_| vanished())
-            .map(|()| ())
+        self.out.send(data.to_vec()).await.map_err(|_| vanished())
     }
 
     async fn recv_bytes(&self) -> Result<Bytes, CoreError> {
