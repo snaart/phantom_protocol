@@ -1219,6 +1219,37 @@ async fn delaying_relay(
     upstream: std::net::SocketAddr,
     hop: Duration,
 ) {
+    delaying_relay_inner(front, upstream, hop, hop, 0).await
+}
+
+/// The same relay, carrying the first `prompt_downstream` datagrams back with no delay at all
+/// and everything after them with `hop`, and never delaying the upstream direction.
+///
+/// It makes a peer that **answers promptly and finishes slowly**, which is a shape no
+/// symmetric delay produces and which two of the overlapped walk's rules turn on: the first
+/// reply has to arrive well inside [`CANDIDATE_ATTEMPT_DELAY`], so that "this address has said
+/// something" is established with a wide margin, while the verdict has to arrive well after
+/// it, so that the window in which a later address could overtake it is wide too. A symmetric
+/// `hop` cannot do both — the first reply costs two hops, so bringing it under the delay
+/// brings the verdict under it as well.
+#[cfg(not(target_arch = "wasm32"))]
+async fn relay_answering_promptly_and_finishing_slowly(
+    front: tokio::net::UdpSocket,
+    upstream: std::net::SocketAddr,
+    hop: Duration,
+    prompt_downstream: usize,
+) {
+    delaying_relay_inner(front, upstream, Duration::ZERO, hop, prompt_downstream).await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn delaying_relay_inner(
+    front: tokio::net::UdpSocket,
+    upstream: std::net::SocketAddr,
+    upward_hop: Duration,
+    hop: Duration,
+    prompt_downstream: usize,
+) {
     /// One datagram waiting to be forwarded, with the moment it arrived.
     type Queued = (Instant, Vec<u8>);
 
@@ -1252,7 +1283,7 @@ async fn delaying_relay(
         let back = back.clone();
         tokio::spawn(async move {
             while let Some((arrived, bytes)) = upward_rx.recv().await {
-                tokio::time::sleep_until(arrived + hop).await;
+                tokio::time::sleep_until(arrived + upward_hop).await;
                 if back.send(&bytes).await.is_err() {
                     return;
                 }
@@ -1274,8 +1305,12 @@ async fn delaying_relay(
         })
     };
 
+    let mut carried_back = 0usize;
     while let Some((arrived, bytes)) = downward_rx.recv().await {
-        tokio::time::sleep_until(arrived + hop).await;
+        if carried_back >= prompt_downstream {
+            tokio::time::sleep_until(arrived + hop).await;
+        }
+        carried_back += 1;
         let to = *seen_rx.borrow();
         let Some(to) = to else {
             continue;
@@ -1309,11 +1344,23 @@ async fn delaying_relay(
 /// indistinguishable at the surface from an address that did not answer. The relay above is
 /// what makes the case reachable without a second host.
 ///
-/// The two assertions are a pair and neither is enough alone. `spawned == 1` says the first
-/// candidate was the only one ever attempted, so it was not abandoned — that is the fix.
-/// `took > naive` says the handshake really did outlast the share the defect would have
-/// handed out, so the test is exercising the case and not passing because the handshake got
-/// fast.
+/// The two assertions are a pair and neither is enough alone. `await_ready()` answering `Ok`
+/// on the session the walk handed back says the slow first address was the one that won: it is
+/// the only candidate with a listener behind it, so no other attempt can complete a
+/// handshake, and an abandoned first address leaves the walk with nothing but black holes.
+/// `took > naive` says the handshake really did outlast the share the defect would have handed
+/// out, so the test is exercising the case and not passing because the handshake got fast.
+///
+/// It used to assert `spawned == 1` as well, and that went with the serial walk. Attempts now
+/// overlap — the next address is contacted [`CANDIDATE_ATTEMPT_DELAY`] after the one before it
+/// rather than after its whole share — so on a path this slow a few of the black holes are
+/// contacted alongside the address that is working, and stopping at exactly one is no longer
+/// the property to hold. What still is: once the first address *answers*, no further address
+/// is contacted, and that rule is held by
+/// `an_address_that_has_answered_is_not_overtaken_by_a_later_one`, where the first reply
+/// arrives in about a millisecond against a 250 ms delay instead of the 700 ms this relay
+/// takes. An upper bound on the attempt count here would be a hundred milliseconds of margin
+/// on a loaded machine, which is the kind of assertion that reports flakiness as a defect.
 #[cfg(not(target_arch = "wasm32"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_slow_but_working_first_address_is_not_abandoned() {
@@ -1322,7 +1369,6 @@ async fn a_slow_but_working_first_address_is_not_abandoned() {
     };
     use crate::api::udp_listener::PhantomUdpListener;
     use crate::crypto::hybrid_sign::HybridVerifyingKey;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// One-way delay the relay adds. A cookie-gated handshake is two flights, so it crosses
     /// the relay four times and takes about 1.4 s.
@@ -1378,32 +1424,24 @@ async fn a_slow_but_working_first_address_is_not_abandoned() {
         let listener = listener.clone();
         tokio::spawn(async move { listener.accept().await })
     };
-    let spawned = Arc::new(AtomicUsize::new(0));
     let started = Instant::now();
     let session =
         connect_udp_trying_each_address("slow-first", &candidates, CLIENT_HANDSHAKE_DEADLINE, {
             let pinned = pinned.clone();
-            let spawned = spawned.clone();
             move |transport| {
-                spawned.fetch_add(1, Ordering::Relaxed);
                 PhantomSession::connect_with_transport("slow-first", transport, pinned.clone())
             }
         })
         .await
         .expect("the slow first address answers");
+    // The relay is the only candidate with a listener behind it, so a handshake completing at
+    // all says the walk handed back that attempt rather than abandoning it for a black hole.
     timeout(STEP, session.await_ready())
         .await
         .expect("await_ready returned")
         .expect("the slow first address completed its handshake");
     let took = started.elapsed();
 
-    assert_eq!(
-        spawned.load(Ordering::Relaxed),
-        1,
-        "the walk made {} attempts, so the slow first address was abandoned before its \
-         handshake finished",
-        spawned.load(Ordering::Relaxed)
-    );
     assert!(
         took > naive,
         "the handshake finished in {took:?}, inside the {naive:?} share the unfloored \
@@ -1425,6 +1463,383 @@ async fn a_slow_but_working_first_address_is_not_abandoned() {
     relay.abort();
     listener.shutdown();
     drop(holes);
+}
+
+/// A dark first address costs the attempt delay, not a whole candidate share.
+///
+/// **The defect.** The walk tried the addresses strictly in turn: each candidate but the last
+/// was given a whole [`candidate_share`] of the budget to complete its handshake before the
+/// next was contacted at all. So the case the walk exists for worked and was slow — on this
+/// machine `localhost` resolves `::1` first with nothing behind it, and
+/// `connect_pinned_udp("localhost", …)` took 5.04 s where a working first address takes
+/// milliseconds. A six-address name of the same shape cost about twelve seconds.
+///
+/// **What a consumer sees.** Every connect to a name whose preferred address is unreachable
+/// pays seconds before the working one is tried — on the entry point documented as returning
+/// before the handshake. An app that connects on a screen transition shows five seconds of
+/// nothing. 0.3.0 did not have the delay because it did not reach the second address at all;
+/// it failed instead, which is the defect this walk was added to fix, so neither release is a
+/// version to go back to.
+///
+/// **Why it comes back unnoticed.** Nothing about a serial walk looks wrong, and every
+/// functional test of the walk passes either way — the addresses are all tried and one of them
+/// answers. The cost is invisible unless it is measured, and a suite that asserts outcomes
+/// does not measure it.
+///
+/// The bound is derived from the share rather than chosen, and the two regimes it separates
+/// are five seconds and a quarter of one, so the margin is an order of magnitude and does not
+/// depend on how fast a loopback handshake is on the day.
+#[cfg(not(target_arch = "wasm32"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dark_first_address_costs_the_attempt_delay_and_not_a_whole_share() {
+    use crate::api::session::{
+        candidate_share, connect_udp_trying_each_address, CANDIDATE_ATTEMPT_DELAY,
+        CLIENT_HANDSHAKE_DEADLINE,
+    };
+    use crate::api::udp_listener::PhantomUdpListener;
+    use crate::crypto::hybrid_sign::HybridVerifyingKey;
+
+    let listener = PhantomUdpListener::builder("127.0.0.1:0")
+        .bind()
+        .await
+        .expect("bind a PhantomUDP listener");
+    let live: std::net::SocketAddr = listener
+        .local_addr()
+        .parse()
+        .expect("the listener's address");
+    let pinned = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes())
+        .expect("the listener's verifying key");
+
+    // A bound socket nobody reads: datagrams reach it and nothing ever comes back, which is
+    // what `::1` with no listener looks like from a connected UDP socket.
+    let hole = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind a black hole");
+    let hole_addr = hole.local_addr().expect("the black hole's address");
+
+    let accepting = {
+        let listener = listener.clone();
+        tokio::spawn(async move { listener.accept().await })
+    };
+    let share = candidate_share(CLIENT_HANDSHAKE_DEADLINE, 2);
+    let budget_for_the_first_address = share / 2;
+    assert!(
+        budget_for_the_first_address > CANDIDATE_ATTEMPT_DELAY * 4,
+        "this test only says something if half a share ({budget_for_the_first_address:?}) is \
+         comfortably more than the attempt delay ({CANDIDATE_ATTEMPT_DELAY:?}); with a \
+         narrower margin it is measuring the machine"
+    );
+
+    let started = Instant::now();
+    let session = connect_udp_trying_each_address(
+        "dark-first",
+        &[hole_addr, live],
+        CLIENT_HANDSHAKE_DEADLINE,
+        {
+            let pinned = pinned.clone();
+            move |transport| {
+                PhantomSession::connect_with_transport("dark-first", transport, pinned.clone())
+            }
+        },
+    )
+    .await
+    .expect("the second address answers");
+    let took = started.elapsed();
+    timeout(STEP, session.await_ready())
+        .await
+        .expect("await_ready returned")
+        .expect("the live address completed its handshake");
+
+    assert!(
+        took < budget_for_the_first_address,
+        "the walk spent {took:?} before handing back a session — the serial walk's whole \
+         {share:?} share for the dark address, rather than the {CANDIDATE_ATTEMPT_DELAY:?} \
+         the overlap costs"
+    );
+    let accepted = timeout(STEP, accepting)
+        .await
+        .expect("the listener accepted")
+        .expect("accept task")
+        .expect("accept");
+    assert_eq!(
+        accepted.session().connection_state(),
+        ConnectionState::Connected
+    );
+    session.disconnect().await.expect("disconnect");
+    listener.shutdown();
+    drop(hole);
+}
+
+/// An address that has begun answering keeps the walk to itself, and is not overtaken by a
+/// later address that finishes first.
+///
+/// **What the overlap put at risk.** Contacting the next address before the first has finished
+/// is what makes a dark preferred address cheap, and it opens two ways for an impostor to
+/// escape the pin check that ends the walk. Its refusal takes a round trip; a later,
+/// genuine address can complete a whole handshake inside that round trip and be handed back
+/// with `Ok`, and the one signal that an impostor answered for this name would be discarded —
+/// the detection Invariant 1 exists to provide, and exactly what the refusal classification
+/// was added to stop. So an address that has said anything at all stops further addresses
+/// being contacted, and a completed handshake is held while an address ahead of it is still
+/// answering.
+///
+/// **The shape that reaches it.** An impostor that answers promptly and finishes slowly: its
+/// cookie retry comes straight back, so "this address has said something" is established in
+/// about a millisecond against a 250 ms delay, and its `ServerHello` — the flight the pin
+/// check runs on — arrives a second later, which is four times the delay. Both margins are
+/// wide, and the relay's sleeps can only overshoot, which widens the second one. A symmetric
+/// delay cannot produce this: the first reply costs two hops, so bringing it under the delay
+/// brings the verdict under it too.
+///
+/// **Why it comes back unnoticed.** Removing either rule makes the walk *more* likely to reach
+/// a working address, so every functional test of it keeps passing. On loopback, where every
+/// impostor answers in a millisecond, even the impostor test passes: the refusal lands long
+/// before the second address is contacted. It takes a peer that is prompt and slow at once —
+/// which no loopback listener is — for the rules to be load-bearing at all.
+///
+/// The two assertions are a pair. `Err(ServerIdentityMismatch)` says the later success did not
+/// overtake the refusal; `spawned == 1` says the later address was never contacted, which is
+/// the first rule. Each fails on its own mutation.
+#[cfg(not(target_arch = "wasm32"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_address_that_has_answered_is_not_overtaken_by_a_later_one() {
+    use crate::api::session::{
+        connect_udp_trying_each_address, CANDIDATE_ATTEMPT_DELAY, CLIENT_HANDSHAKE_DEADLINE,
+    };
+    use crate::api::udp_listener::PhantomUdpListener;
+    use crate::crypto::hybrid_sign::HybridVerifyingKey;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// How long the impostor takes over everything after its first reply. Four times the
+    /// attempt delay, so the window in which the genuine address could overtake it is wide
+    /// rather than arguable.
+    const VERDICT_DELAY: Duration = Duration::from_millis(1000);
+    /// Datagrams carried back with no delay: the cookie retry is one datagram, and it is the
+    /// one that has to arrive inside the attempt delay.
+    const PROMPT: usize = 1;
+
+    let impostor = PhantomUdpListener::builder("127.0.0.1:0")
+        .bind()
+        .await
+        .expect("bind the impostor");
+    let genuine = PhantomUdpListener::builder("127.0.0.1:0")
+        .bind()
+        .await
+        .expect("bind the genuine listener");
+    let impostor_addr: std::net::SocketAddr = impostor
+        .local_addr()
+        .parse()
+        .expect("the impostor's address");
+    let genuine_addr: std::net::SocketAddr = genuine
+        .local_addr()
+        .parse()
+        .expect("the genuine listener's address");
+    let pinned = HybridVerifyingKey::from_bytes(&genuine.verifying_key_bytes())
+        .expect("the genuine verifying key");
+    assert_ne!(
+        impostor.verifying_key_bytes(),
+        genuine.verifying_key_bytes(),
+        "the two listeners have to hold different identities, or there is no impostor"
+    );
+    assert!(
+        VERDICT_DELAY > CANDIDATE_ATTEMPT_DELAY * 2,
+        "the verdict has to land well after the point a later address would be contacted, or \
+         this test proves nothing about the overtaking"
+    );
+
+    let front = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind the relay's front socket");
+    let relay_addr = front.local_addr().expect("the relay's address");
+    let relay = tokio::spawn(relay_answering_promptly_and_finishing_slowly(
+        front,
+        impostor_addr,
+        VERDICT_DELAY,
+        PROMPT,
+    ));
+
+    // Both listeners accept: the impostor must answer for the mismatch to be reachable, and
+    // the genuine one must be able to, so that its accepting nothing is a fact about the walk
+    // rather than about the harness.
+    let impostor_accept = {
+        let impostor = impostor.clone();
+        tokio::spawn(async move { impostor.accept().await })
+    };
+    let genuine_accept = {
+        let genuine = genuine.clone();
+        tokio::spawn(async move { genuine.accept().await })
+    };
+
+    let spawned = Arc::new(AtomicUsize::new(0));
+    let err = connect_udp_trying_each_address(
+        "prompt-impostor-first",
+        &[relay_addr, genuine_addr],
+        CLIENT_HANDSHAKE_DEADLINE,
+        {
+            let pinned = pinned.clone();
+            let spawned = spawned.clone();
+            move |transport| {
+                spawned.fetch_add(1, Ordering::Relaxed);
+                PhantomSession::connect_with_transport(
+                    "prompt-impostor-first",
+                    transport,
+                    pinned.clone(),
+                )
+            }
+        },
+    )
+    .await
+    .expect_err("the impostor's refusal has to reach the caller");
+    assert!(
+        matches!(err, CoreError::ServerIdentityMismatch),
+        "a later address that finished first was handed back instead of the refusal from the \
+         address contacted before it; got {err:?}"
+    );
+    assert_eq!(
+        spawned.load(Ordering::Relaxed),
+        1,
+        "the walk contacted {} addresses, so an address that had already answered did not \
+         stop the schedule — and the client's hello went to an address the serial walk would \
+         never have sent it to",
+        spawned.load(Ordering::Relaxed)
+    );
+    assert!(
+        timeout(QUIET, genuine_accept).await.is_err(),
+        "the genuine address was contacted, so the walk carried on past an address that was \
+         still answering"
+    );
+
+    impostor_accept.abort();
+    relay.abort();
+    impostor.shutdown();
+    genuine.shutdown();
+}
+
+/// One hostile address *after* the right one in a name's answer does not deny service.
+///
+/// **What the overlap put at risk.** A refusal ends the walk, which is what makes an impostor
+/// answering for the name reach the caller. Contacting addresses in parallel turns that into a
+/// weapon pointed the other way: an added AAAA record refuses in a millisecond, and while the
+/// genuine first address is still handshaking that refusal would end a walk that was about to
+/// succeed. Anyone who can add one record to a zone could then stop every client of the
+/// service, without holding a key or being on the path. The serial walk never had the problem
+/// because it never reached the later address; a refusal is now held until every address ahead
+/// of it has finished.
+///
+/// **What a consumer would see.** `connect_pinned_udp` fails with
+/// `ServerIdentityMismatch` against a name whose preferred address is the right server and is
+/// simply slow — so the error names the one thing that is not wrong, and the operator looks
+/// for a key rotation that never happened.
+///
+/// **Why it comes back unnoticed.** It needs a *slow* correct address and a *fast* wrong one,
+/// and on loopback both are fast: the genuine address wins before the second is contacted at
+/// all, so every other test of the walk passes with the hold removed. The relay is what makes
+/// the first address slow without a second host.
+///
+/// `spawned == 2` is half the assertion and not decoration: the hostile address has to have
+/// been contacted, or the refusal was never held and the test is passing for the wrong reason.
+#[cfg(not(target_arch = "wasm32"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hostile_address_after_the_right_one_does_not_end_the_walk() {
+    use crate::api::session::{
+        connect_udp_trying_each_address, CANDIDATE_ATTEMPT_DELAY, CLIENT_HANDSHAKE_DEADLINE,
+    };
+    use crate::api::udp_listener::PhantomUdpListener;
+    use crate::crypto::hybrid_sign::HybridVerifyingKey;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// One-way delay in front of the *genuine* address. Its first reply therefore takes
+    /// 2 × HOP = 700 ms, comfortably past the attempt delay, so the hostile address really is
+    /// contacted; the whole handshake takes about 1.4 s. The relay's sleeps can only
+    /// overshoot, which widens both margins.
+    const HOP: Duration = Duration::from_millis(350);
+
+    let genuine = PhantomUdpListener::builder("127.0.0.1:0")
+        .bind()
+        .await
+        .expect("bind the genuine listener");
+    let hostile = PhantomUdpListener::builder("127.0.0.1:0")
+        .bind()
+        .await
+        .expect("bind the hostile listener");
+    let genuine_addr: std::net::SocketAddr = genuine
+        .local_addr()
+        .parse()
+        .expect("the genuine listener's address");
+    let hostile_addr: std::net::SocketAddr = hostile
+        .local_addr()
+        .parse()
+        .expect("the hostile listener's address");
+    let pinned = HybridVerifyingKey::from_bytes(&genuine.verifying_key_bytes())
+        .expect("the genuine verifying key");
+    assert_ne!(
+        genuine.verifying_key_bytes(),
+        hostile.verifying_key_bytes(),
+        "the two listeners have to hold different identities, or there is no impostor"
+    );
+    assert!(
+        HOP * 2 > CANDIDATE_ATTEMPT_DELAY * 2,
+        "the genuine address has to stay silent past the point the hostile one is contacted, \
+         or the hostile one is never reached and this test proves nothing"
+    );
+
+    let front = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind the relay's front socket");
+    let relay_addr = front.local_addr().expect("the relay's address");
+    let relay = tokio::spawn(delaying_relay(front, genuine_addr, HOP));
+
+    let accepting = {
+        let genuine = genuine.clone();
+        tokio::spawn(async move { genuine.accept().await })
+    };
+    let hostile_accept = {
+        let hostile = hostile.clone();
+        tokio::spawn(async move { hostile.accept().await })
+    };
+
+    let spawned = Arc::new(AtomicUsize::new(0));
+    let session = connect_udp_trying_each_address(
+        "hostile-second",
+        &[relay_addr, hostile_addr],
+        CLIENT_HANDSHAKE_DEADLINE,
+        {
+            let pinned = pinned.clone();
+            let spawned = spawned.clone();
+            move |transport| {
+                spawned.fetch_add(1, Ordering::Relaxed);
+                PhantomSession::connect_with_transport("hostile-second", transport, pinned.clone())
+            }
+        },
+    )
+    .await
+    .expect("a hostile trailing address must not fail a connect to the right server");
+    timeout(STEP, session.await_ready())
+        .await
+        .expect("await_ready returned")
+        .expect("the genuine first address completed its handshake");
+
+    assert_eq!(
+        spawned.load(Ordering::Relaxed),
+        2,
+        "the hostile address was never contacted, so its refusal was never held and this run \
+         says nothing about holding one"
+    );
+    let accepted = timeout(STEP, accepting)
+        .await
+        .expect("the genuine listener accepted")
+        .expect("accept task")
+        .expect("accept");
+    assert_eq!(
+        accepted.session().connection_state(),
+        ConnectionState::Connected
+    );
+
+    session.disconnect().await.expect("disconnect");
+    hostile_accept.abort();
+    relay.abort();
+    genuine.shutdown();
+    hostile.shutdown();
 }
 
 /// An address that answers for the name and is not the pinned server is reported to the

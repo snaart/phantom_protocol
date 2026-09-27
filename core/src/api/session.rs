@@ -7610,8 +7610,29 @@ pub(crate) const MIN_CANDIDATE_HANDSHAKE_SHARE: std::time::Duration =
         NO_SAMPLE_FLIGHT_RTO.as_millis() as u64 * UDP_HANDSHAKE_FLIGHTS as u64,
     );
 
-/// The wait each candidate but the last is given, out of `budget`, when the name resolved to
-/// `count` addresses.
+/// How long the walk gives a candidate to answer before *also* contacting the next one.
+///
+/// 250 ms: RFC 8305 §5's Connection Attempt Delay, the interval a happy-eyeballs resolver
+/// uses for this exact decision, for the reason that applies here too — an address that has
+/// not answered yet is not evidence that it never will, so the next address is *added* to
+/// the attempt rather than waited for.
+///
+/// The failure it exists to stop: the walk used to try the addresses strictly in turn, so a
+/// name whose first address is dark cost a whole [`candidate_share`] before the second was
+/// contacted at all. On this machine `localhost` resolves `::1` first with nothing behind it,
+/// and `connect_pinned_udp("localhost", …)` took 5.04 s where a working first address takes
+/// milliseconds; a six-address name of the same shape cost about twelve seconds.
+///
+/// A candidate that *has* answered stops the schedule — see
+/// [`connect_udp_trying_each_address`] — so the overlap only ever happens while the addresses
+/// ahead of it are silent, and a name whose first address works is still the only one
+/// contacted.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) const CANDIDATE_ATTEMPT_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(250);
+
+/// The wait each candidate is given from its own start, out of `budget`, when the name
+/// resolved to `count` addresses.
 ///
 /// An even division, floored at [`MIN_CANDIDATE_HANDSHAKE_SHARE`] so that a wait means
 /// something, and then capped back at `budget`: when the caller's whole budget is smaller
@@ -7619,8 +7640,13 @@ pub(crate) const MIN_CANDIDATE_HANDSHAKE_SHARE: std::time::Duration =
 /// budget on the first candidate is the most that can be done without overrunning the bound
 /// the caller set. Split out of the walk because it is the part carrying arithmetic, and
 /// arithmetic is worth checking without sockets.
+///
+/// Since the attempts overlap it is a per-attempt ceiling rather than a slot in a queue: an
+/// even division still bounds how long the walk holds on to an address that is not answering,
+/// which is what lets the attempts still running be narrowed down to one. `budget` bounds the
+/// whole call regardless.
 #[cfg(not(target_arch = "wasm32"))]
-fn candidate_share(budget: std::time::Duration, count: usize) -> std::time::Duration {
+pub(crate) fn candidate_share(budget: std::time::Duration, count: usize) -> std::time::Duration {
     let even = budget
         .checked_div(u32::try_from(count).unwrap_or(u32::MAX))
         .unwrap_or(budget);
@@ -7725,8 +7751,71 @@ fn address_roster(tried: &[(std::net::SocketAddr, CoreError)]) -> String {
     format!("{} address(es) tried — {}", tried.len(), each.join("; "))
 }
 
-/// Open a PhantomUDP session to `addr`, trying each address the name resolves to in turn
-/// until one of them answers or one of them refuses.
+/// Whether an address ahead of `winner` in the resolver's order is still being waited on and
+/// has begun answering.
+///
+/// A completed handshake is not handed over while one is: an address that has said something
+/// may be about to refuse the pin, and a refusal is the caller's answer rather than an address
+/// that did not work. An address that has said *nothing* is the case the overlap exists for
+/// and holds nothing up.
+#[cfg(not(target_arch = "wasm32"))]
+fn an_earlier_address_is_still_answering(winner: usize, waiting: &[Option<Attempt>]) -> bool {
+    waiting
+        .iter()
+        .take(winner)
+        .flatten()
+        .any(|attempt| attempt.answered.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Whether the walk may contact the next address yet.
+///
+/// Three reasons not to, and each is a rule the doc on
+/// [`connect_udp_trying_each_address`] states: there is no address left; a verdict is already
+/// in hand; or an address already contacted has begun answering, and until it has finished
+/// there is nothing a further address could settle. Computed once per pass rather than
+/// inline, because the `select!` below has to be guarded by the same answer as the loop that
+/// does the contacting — a timer arm left enabled while the loop refuses to act on it spins.
+#[cfg(not(target_arch = "wasm32"))]
+fn may_contact_the_next_address(
+    next: usize,
+    total: usize,
+    verdict_in_hand: bool,
+    waiting: &[Option<Attempt>],
+) -> bool {
+    next < total
+        && !verdict_in_hand
+        && !waiting
+            .iter()
+            .flatten()
+            .any(|attempt| attempt.answered.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Whether a refusal from `refuser` is the caller's answer yet.
+///
+/// It is, once no address ahead of it in the resolver's order is still being waited on —
+/// including the ones never contacted, which cannot succeed either. Until then the refusal is
+/// held: otherwise one hostile address *after* the right one in a name's DNS answer would
+/// deny service, because it is contacted while a working-but-slow first address is still
+/// handshaking and its refusal would end a walk that was about to succeed. The serial walk
+/// never had that problem, because it never reached the later address.
+#[cfg(not(target_arch = "wasm32"))]
+fn a_refusal_is_the_answer_now(refuser: usize, waiting: &[Option<Attempt>]) -> bool {
+    waiting.iter().take(refuser).all(Option::is_none)
+}
+
+/// One address the walk has contacted and is still waiting on.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+struct Attempt {
+    /// The session built on that address, handed to the caller if this attempt wins.
+    session: Arc<PhantomSession>,
+    /// Its transport's "this address has said something" flag — see
+    /// [`an_earlier_address_is_still_answering`].
+    answered: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Open a PhantomUDP session to `addr`, contacting the addresses the name resolves to in the
+/// resolver's order and taking the first that completes its handshake.
 ///
 /// **Why this is not simply "take the first address".** It used to be, and the first address
 /// is whichever the resolver felt like putting first: `localhost` commonly resolves to `::1`
@@ -7737,39 +7826,55 @@ fn address_roster(tried: &[(std::net::SocketAddr, CoreError)]) -> String {
 /// with nothing behind it, and the failure surfaces much later as a handshake that timed
 /// out. The only thing that can tell the addresses apart is therefore the handshake itself.
 ///
-/// So each candidate but the last is given a share of `budget` — [`CLIENT_HANDSHAKE_DEADLINE`]
-/// at every call site — to complete its handshake. The share is
-/// [`candidate_share`]: an even division of the budget, floored at
-/// [`MIN_CANDIDATE_HANDSHAKE_SHARE`] so a wait that decides nothing is never handed out.
+/// **Why the attempts overlap.** They used to run strictly in turn, each candidate but the
+/// last given a [`candidate_share`] of `budget` to complete before the next was contacted at
+/// all — so the `localhost` case above, the one the walk was written for, *worked* and took
+/// 5.04 s, and a six-address name of that shape took about twelve seconds. The next address
+/// is now contacted [`CANDIDATE_ATTEMPT_DELAY`] after the one before it, as RFC 8305 §5 has
+/// a happy-eyeballs resolver do, and the first handshake to complete is the one handed back.
+/// The dark-first-address case costs the delay instead of the share.
 ///
-/// **What that means for the total.** Below six addresses on the production budget the even
-/// division is at or above the floor, and the whole call stays inside `budget`. Above it the
-/// floor wins, and `floor × count` exceeds `budget`; the walk does not respond by shortening
-/// the shares, because shares that prove nothing are what the floor exists to prevent.
-/// Instead it stops waiting once `budget` has been spent and hands back the next candidate
-/// whose socket binds, unawaited — which bounds the whole call by `budget` plus one share and
-/// is the same contract a single-address name already has: `Ok` says a socket was opened and
-/// nothing more. A name with more addresses than the budget can pay for therefore has a tail
-/// the walk never reaches, and the caller's own
-/// [`await_ready`](PhantomSession::await_ready) is what tells it so.
+/// Three rules keep that from becoming a race, and each of them is there for a case that
+/// would otherwise be worse than the serial walk was:
 ///
-/// **A refusal ends the walk.** An answer that came *from a peer* — a pinned-identity
-/// mismatch, a protocol rejection — is not an address that did not work, and is returned as
-/// itself; see [`refusal_ends_the_walk`] for the classification and for what discarding it
-/// costs. The typed variant is returned unchanged, because matching on it is the documented
-/// way a caller tells "update your pinned key" from "the network is down", so the address it
-/// came from and what the earlier candidates said go to `log::warn!` rather than into the
-/// error. Where the walk ends without any peer having answered, the error it returns carries
-/// the whole roster — every address tried and what each one said — because there the roster
-/// is the entire content of the answer.
+/// * **An address that has answered stops the schedule.** Once a candidate's transport has
+///   heard anything from it, no further address is contacted until that candidate finishes.
+///   So a name whose first address works is still the only one contacted — including when its
+///   handshake is slow, which is the case the share's floor exists for — and the client's
+///   `ClientHello`, and on the resuming entry point its sealed `early_data`, reaches no more
+///   addresses than the serial walk sent it to.
+/// * **A completed handshake waits for an earlier address that has begun answering.** Such an
+///   address may be about to refuse the pin, and discarding that because a later address
+///   answered correctly is what the refusal classification exists to prevent (see
+///   [`refusal_ends_the_walk`]). An earlier address that has said nothing holds nothing up.
+/// * **A refusal waits for every earlier address to finish.** Otherwise one hostile address
+///   *after* the right one in a name's DNS answer would deny service: it would be contacted
+///   while a working-but-slow first address was still handshaking, and its refusal would end
+///   a walk that was about to succeed. The serial walk never had that problem because it
+///   never reached the later address; held this way, neither does this one.
 ///
-/// The last candidate is returned without waiting, and that is what keeps the contract these
-/// entry points document — that they return before the handshake, and `Ok` says nothing
-/// about the peer's identity — exactly as it was for a name with one address, which is every
-/// literal address and the overwhelming majority of real ones. There is also nothing to be
-/// gained by waiting on the last one: there is no candidate left to fall back to, so the
-/// caller's own [`await_ready`](PhantomSession::await_ready) is the right place to learn the
-/// outcome, and waiting here would only delay the same answer.
+/// What that leaves is one narrowing against the serial walk, and it is worth stating
+/// plainly: an impostor that has not said a *word* by the time a later address completes is
+/// not reported, where a serial walk would have waited out its whole share for it. The
+/// overlap cannot both be fast and wait for silence — that is the trade — and what bounds the
+/// window is the delay plus the winner's own handshake rather than the share. The serial
+/// walk's guarantee was not unconditional either: an impostor silent for longer than its
+/// share was missed there too.
+///
+/// **What that means for the total.** Each attempt is waited on for at most
+/// [`candidate_share`] from its own start, and the whole call is bounded by `budget` —
+/// [`CLIENT_HANDSHAKE_DEADLINE`] at every call site — rather than by `budget` plus a share as
+/// before. When the budget is spent with attempts still running, the first of them is handed
+/// back unawaited; when all of them have failed, the error carries the whole roster, because
+/// there the roster is the entire content of the answer.
+///
+/// A name with one address is handed back as soon as its socket is bound, with no wait at
+/// all, which is what keeps the contract these entry points document — that they return
+/// before the handshake, and `Ok` says nothing about the peer's identity. That is every
+/// literal address and the overwhelming majority of real names. The same happens once every
+/// candidate has been contacted and one attempt is left running: there is no candidate left
+/// to fall back to, so there is nothing further to decide and the caller's own
+/// [`await_ready`](PhantomSession::await_ready) is the right place to learn the outcome.
 ///
 /// **An abandoned attempt is not cut short**, and this is deliberate rather than pending.
 /// Dropping the session raises its close request, but that request is read inside
@@ -7793,58 +7898,196 @@ pub(crate) async fn connect_udp_trying_each_address<F>(
 where
     F: FnMut(crate::api::udp_transport::UdpClientTransport) -> PhantomSession,
 {
+    use futures::StreamExt;
+
     if candidates.is_empty() {
         return Err(CoreError::NetworkError(format!("no address for {}", addr)));
     }
     let share = candidate_share(budget, candidates.len());
-    let started = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + budget;
     // What every candidate the walk tried said, in order. Kept rather than overwritten: a
     // caller told only about the last one cannot tell "none of the four answered" from "the
     // fourth was the only one tried".
     let mut tried: Vec<(std::net::SocketAddr, CoreError)> = Vec::new();
-    let last = candidates.len() - 1;
-    for (i, server) in candidates.iter().enumerate() {
-        let transport = match crate::api::udp_transport::UdpClientTransport::connect(*server).await
+    // The attempts still being waited on, by candidate index; `None` once one has finished.
+    let mut waiting: Vec<Option<Attempt>> = vec![None; candidates.len()];
+    let mut running = futures::stream::FuturesUnordered::new();
+    let mut next = 0usize;
+    // When the next candidate may be contacted. The first one goes at once.
+    let mut contact_next_at = tokio::time::Instant::now();
+    // The lowest-numbered candidate whose handshake completed, held while an earlier address
+    // is still answering, and the refusal likewise.
+    let mut won: Option<(usize, Arc<PhantomSession>)> = None;
+    let mut refused: Option<(usize, CoreError)> = None;
+
+    loop {
+        // Contact the next candidate when its turn has come — and not while the address
+        // ahead of it is answering, or while a verdict is already in hand.
+        while tokio::time::Instant::now() >= contact_next_at
+            && may_contact_the_next_address(
+                next,
+                candidates.len(),
+                won.is_some() || refused.is_some(),
+                &waiting,
+            )
         {
-            Ok(t) => t,
-            Err(e) => {
-                tried.push((*server, e));
-                continue;
+            let server = candidates[next];
+            match crate::api::udp_transport::UdpClientTransport::connect(server).await {
+                Ok(transport) => {
+                    let answered = transport.peer_answered_flag();
+                    let session = Arc::new(spawn(transport));
+                    // One address: handed back before its handshake, as documented.
+                    if candidates.len() == 1 {
+                        return Ok(session);
+                    }
+                    waiting[next] = Some(Attempt {
+                        session: Arc::clone(&session),
+                        answered,
+                    });
+                    let at = next;
+                    running.push(async move {
+                        (at, tokio::time::timeout(share, session.await_ready()).await)
+                    });
+                }
+                Err(e) => tried.push((server, e)),
             }
-        };
-        let session = Arc::new(spawn(transport));
-        // Nothing left to fall back to, or nothing left in the budget to buy a wait that
-        // would decide anything — hand it over and let the caller ask.
-        if i == last || started.elapsed() >= budget {
-            return Ok(session);
+            next += 1;
+            contact_next_at = tokio::time::Instant::now() + CANDIDATE_ATTEMPT_DELAY;
         }
-        let waited = session.await_ready();
-        match tokio::time::timeout(share, waited).await {
-            Ok(Ok(())) => return Ok(session),
-            Ok(Err(e)) => {
-                if refusal_ends_the_walk(&e) {
-                    log::warn!(
-                        "PhantomSession: {server} answered for {addr} and refused the \
-                         connection ({e}); the remaining {} address(es) are not tried, \
-                         because a refusal is an answer and not an address that did not \
-                         work. Before it: {}",
-                        last - i,
-                        address_roster(&tried)
-                    );
+
+        // Which verdict in hand, if two are, is the one to act on: the lower-numbered
+        // address, because the resolver's order is a preference. Getting this the other way
+        // round is a denial of service rather than a preference — a hostile address *after*
+        // the right one refuses in a millisecond while the right one is still handshaking,
+        // and answering with its refusal ends a walk that was about to succeed.
+        let take_the_win = match (&won, &refused) {
+            (Some((w, _)), Some((r, _))) => w < r,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if take_the_win {
+            // A completed handshake, once no earlier address is still answering — that one
+            // may be about to refuse, and a refusal is an answer.
+            if let Some((i, session)) = &won {
+                if !an_earlier_address_is_still_answering(*i, &waiting) {
+                    return Ok(Arc::clone(session));
+                }
+            }
+        } else if refused
+            .as_ref()
+            .is_some_and(|(i, _)| a_refusal_is_the_answer_now(*i, &waiting))
+        {
+            // A refusal, once no earlier address can still produce a verdict at all.
+            if let Some((i, e)) = refused.take() {
+                log::warn!(
+                    "PhantomSession: {} answered for {addr} and refused the connection ({e}); \
+                     the remaining {} address(es) are not tried, because a refusal is an \
+                     answer and not an address that did not work. Before it: {}",
+                    candidates[i],
+                    candidates.len() - 1 - i,
+                    address_roster(&tried)
+                );
+                return Err(e);
+            }
+        }
+        // Every candidate contacted and one attempt left: nothing to choose between, so it
+        // goes back unawaited, exactly as a single-address name does.
+        if next >= candidates.len() && won.is_none() && refused.is_none() && running.len() == 1 {
+            if let Some(attempt) = waiting.iter().flatten().next() {
+                return Ok(Arc::clone(&attempt.session));
+            }
+        }
+        // Nothing running and nothing left to contact: every attempt failed.
+        if running.is_empty() && next >= candidates.len() {
+            break;
+        }
+
+        tokio::select! {
+            biased;
+            Some((at, outcome)) = running.next(), if !running.is_empty() => {
+                let finished = waiting[at].take();
+                match outcome {
+                    Ok(Ok(())) => {
+                        // The lowest-numbered success is the one kept: the resolver's order
+                        // is a preference, and two addresses of a name that both answer
+                        // correctly are the same service.
+                        if let Some(attempt) = finished {
+                            if won.as_ref().is_none_or(|(held, _)| at < *held) {
+                                won = Some((at, attempt.session));
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        if refusal_ends_the_walk(&e) {
+                            if refused.as_ref().is_none_or(|(held, _)| at < *held) {
+                                refused = Some((at, e));
+                            }
+                        } else {
+                            tried.push((candidates[at], e));
+                            // Nothing more to wait for on this address: bring the next
+                            // candidate forward rather than holding its start.
+                            contact_next_at = tokio::time::Instant::now();
+                        }
+                    }
+                    Err(_) => {
+                        tried.push((candidates[at], CoreError::Timeout));
+                        contact_next_at = tokio::time::Instant::now();
+                    }
+                }
+                log::debug!(
+                    "PhantomSession: {addr} — {} finished. So far: {}",
+                    candidates[at],
+                    address_roster(&tried)
+                );
+            }
+            // Ahead of the contact timer, so nothing new is contacted once the budget is
+            // spent.
+            _ = tokio::time::sleep_until(deadline) => {
+                // `budget` is the outer authority. What is in hand goes back, in the order
+                // of how much it settles: a completed handshake, then a refusal — a peer
+                // answered and said no, which is the caller's answer and not an address
+                // that did not work — and only then an attempt still running, unawaited, for
+                // the caller to ask about itself.
+                if take_the_win {
+                    if let Some((_, session)) = won {
+                        return Ok(session);
+                    }
+                }
+                if let Some((_, e)) = refused {
                     return Err(e);
                 }
-                tried.push((*server, e));
+                if let Some((_, session)) = won {
+                    return Ok(session);
+                }
+                if let Some(attempt) = waiting.iter().flatten().next() {
+                    return Ok(Arc::clone(&attempt.session));
+                }
+                break;
             }
-            Err(_) => tried.push((*server, CoreError::Timeout)),
+            _ = tokio::time::sleep_until(contact_next_at), if may_contact_the_next_address(
+                next,
+                candidates.len(),
+                won.is_some() || refused.is_some(),
+                &waiting,
+            ) => {}
         }
-        log::debug!(
-            "PhantomSession: {addr} did not answer as {server}; trying the next address. So \
-             far: {}",
-            address_roster(&tried)
-        );
     }
-    // Every candidate but the last returns above, so reaching here means each of them failed
-    // *before* a session existed — a socket that could not be bound to that family at all.
+    // Same precedence as inside the loop: the lower-numbered verdict answers.
+    if let (Some((w, _)), Some((r, _))) = (&won, &refused) {
+        if w > r {
+            if let Some((_, e)) = refused.take() {
+                return Err(e);
+            }
+        }
+    }
+    if let Some((_, session)) = won {
+        return Ok(session);
+    }
+    if let Some((_, e)) = refused {
+        return Err(e);
+    }
+    // Reaching here means every candidate failed — either before a session existed, a socket
+    // that could not be bound to that family at all, or with an answer the walk goes on from.
     Err(CoreError::NetworkError(format!(
         "no usable address for {addr}: {}",
         address_roster(&tried)
@@ -18914,6 +19157,121 @@ mod tests {
         // A count of zero never reaches this from the walk, which returns first — but the
         // division must not be what says so.
         assert_eq!(candidate_share(budget, 0), budget);
+    }
+
+    /// The three decisions the overlapped address walk makes, read directly.
+    ///
+    /// **The defect they exist for.** The walk tried the addresses strictly in turn, giving
+    /// each but the last a whole [`candidate_share`] before the next was contacted at all. So
+    /// the case it was written for — `localhost` resolving `::1` first with nothing behind it
+    /// — *worked* and cost 5.04 s where a working first address costs milliseconds, and a
+    /// six-address name of the same shape cost about twelve seconds.
+    ///
+    /// **Why they are read here rather than timed.** Overlapping the attempts turns three
+    /// questions into races, and each of the three answers below is what keeps a race from
+    /// being the answer. Two of them are reachable end to end only through a window a few
+    /// tens of milliseconds wide on a loopback path, which is a coin flip dressed as a test;
+    /// read as predicates they are arithmetic over a list, and the wall clock does not come
+    /// into it. The end-to-end tests in `session_end_tests` cover the two cases whose timing
+    /// *can* be separated by a wide margin.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_address_walk_decides_the_three_overlap_questions_by_the_resolver_order() {
+        use std::sync::atomic::AtomicBool;
+
+        /// An attempt that is still being waited on. The session is inert — it is never
+        /// driven here, only held, because every predicate reads the flag beside it.
+        fn attempt(answered: bool) -> Option<Attempt> {
+            Some(Attempt {
+                session: PhantomSession::connect("inert:0".into()),
+                answered: Arc::new(AtomicBool::new(answered)),
+            })
+        }
+        const SILENT: bool = false;
+        const ANSWERING: bool = true;
+
+        // ── Contacting the next address ──
+        // Nothing contacted yet: the first address goes at once.
+        assert!(may_contact_the_next_address(
+            0,
+            3,
+            false,
+            &[None, None, None]
+        ));
+        // A verdict in hand stops the schedule: there is nothing left for a further address
+        // to settle, and contacting one would send it a `ClientHello` for nothing.
+        assert!(!may_contact_the_next_address(
+            1,
+            3,
+            true,
+            &[attempt(SILENT), None, None]
+        ));
+        // The addresses are exhausted.
+        assert!(!may_contact_the_next_address(
+            3,
+            3,
+            false,
+            &[None, None, None]
+        ));
+        // A silent address does not hold the schedule: this is the whole point of the
+        // overlap, and it is what makes the dark-first-address case cost the attempt delay
+        // instead of a share.
+        assert!(may_contact_the_next_address(
+            1,
+            3,
+            false,
+            &[attempt(SILENT), None, None]
+        ));
+        // An address that has begun answering does hold it. So a name whose first address
+        // works is still the only one contacted, including when its handshake is slow — and
+        // the client's hello, with its sealed early-data on the resuming entry point, reaches
+        // no more addresses than the serial walk sent it to.
+        assert!(!may_contact_the_next_address(
+            1,
+            3,
+            false,
+            &[attempt(ANSWERING), None, None]
+        ));
+
+        // ── Handing over a completed handshake ──
+        // The first address winning is never held: there is nothing ahead of it.
+        assert!(!an_earlier_address_is_still_answering(
+            0,
+            &[attempt(ANSWERING), None, None]
+        ));
+        // A later winner is held while an address ahead of it is answering: that one may be
+        // about to refuse the pin, and a refusal is the caller's answer rather than an
+        // address that did not work.
+        assert!(an_earlier_address_is_still_answering(
+            2,
+            &[None, attempt(ANSWERING), None]
+        ));
+        // A silent address ahead of it holds nothing: silence is not an answer that is coming.
+        assert!(!an_earlier_address_is_still_answering(
+            2,
+            &[attempt(SILENT), attempt(SILENT), None]
+        ));
+        // An address ahead of it that has already finished holds nothing either.
+        assert!(!an_earlier_address_is_still_answering(
+            2,
+            &[None, None, None]
+        ));
+
+        // ── Acting on a refusal ──
+        // A refusal from the first address is the answer at once.
+        assert!(a_refusal_is_the_answer_now(0, &[None, attempt(SILENT)]));
+        // A refusal from a later address waits for every earlier one to finish, answering or
+        // not — otherwise one hostile address *after* the right one in a name's DNS answer
+        // would deny service, by refusing while a working-but-slow first address was still
+        // handshaking.
+        assert!(!a_refusal_is_the_answer_now(1, &[attempt(SILENT), None]));
+        assert!(!a_refusal_is_the_answer_now(
+            2,
+            &[None, attempt(ANSWERING), None]
+        ));
+        // Once they have, it is the answer. An address never contacted counts as finished:
+        // it cannot succeed either.
+        assert!(a_refusal_is_the_answer_now(2, &[None, None, None]));
     }
 
     /// An answer that came from a peer ends the walk; an answer that came from the path does

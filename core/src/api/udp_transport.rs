@@ -252,6 +252,23 @@ pub struct UdpClientTransport {
     /// blocked on the OLD socket's `recv_from` wakes up and re-enters the loop on the new one
     /// rather than staying stuck indefinitely.
     migrate_notify: Arc<Notify>,
+    /// Set the first time a datagram arrives from `server_addr` while the handshake is
+    /// still running — "this address has something behind it", and nothing more.
+    ///
+    /// A connected datagram socket cannot tell an address with a server behind it from an
+    /// address with nothing, which is why the multi-address walk in
+    /// [`crate::api::session`] exists at all. That walk contacts several addresses of one
+    /// name at once and takes the first handshake to complete, and this flag is how it tells
+    /// apart the two reasons an earlier address has not answered yet: an address that has
+    /// said nothing has nothing to say, and a later success may be taken; an address that
+    /// has begun answering may be about to refuse the pin, and a refusal is the caller's
+    /// answer rather than an address that did not work (Invariant 1).
+    ///
+    /// Held behind an `Arc` because the walk keeps a handle on it after the transport has
+    /// been moved into its session. Written only during the handshake and only for the
+    /// tracked server address, so a stray datagram from elsewhere — or any post-handshake
+    /// traffic — costs nothing.
+    peer_answered: Arc<AtomicBool>,
 }
 
 impl UdpClientTransport {
@@ -287,7 +304,14 @@ impl UdpClientTransport {
             last_recv_src: ArcSwap::from_pointee(None),
             last_frame_len: AtomicU64::new(0),
             migrate_notify: Arc::new(Notify::new()),
+            peer_answered: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// A handle on [`Self::peer_answered`], readable after this transport has been moved
+    /// into a session.
+    pub(crate) fn peer_answered_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.peer_answered)
     }
 
     /// Rebind to a fresh local socket and route subsequent traffic through it
@@ -442,7 +466,16 @@ impl SessionTransport for UdpClientTransport {
                     // data makes the RTO fire only when recv is genuinely pending.
                     biased;
                     r = active.recv_from(&mut buf) => match classify_recv(r) {
-                        RecvAction::Got(n, src) => (n, false, src),
+                        RecvAction::Got(n, src) => {
+                            if src == server {
+                                // Something is behind this address. Recorded here rather than
+                                // after reassembly, because what the address walk needs to know
+                                // is whether an answer is coming at all, and a fragment whose
+                                // siblings were lost is still an answer.
+                                self.peer_answered.store(true, Ordering::Relaxed);
+                            }
+                            (n, false, src)
+                        }
                         RecvAction::Retry => {
                             log::debug!("PhantomUDP: advisory recv error (ignored, RFC 8085 §5.5)");
                             continue;
