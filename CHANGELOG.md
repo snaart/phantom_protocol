@@ -14,10 +14,21 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 `PROTOCOL_VERSION` stays 5, so a 0.3.1 peer and a 0.3.0 peer complete a handshake and
 carry data in both directions, and no AEAD plaintext or header layout moved. No item was
 removed, no signature changed, and no auto trait went away, so there is no Rust API break
-here and nothing a consumer has to change to take the upgrade. One thing qualifies that,
-and it has an entry of its own below: a mixed pair has a behavioural limit — a 0.3.0 peer
-counts concurrent streams differently and will take 255 of them where a 0.3.1 peer takes
-256 (**Fixed**, "The receive-side stream cap counts the streams the peer has open"). What
+here: everything that compiled against 0.3.0 compiles against this.
+
+**Three things qualify "nothing to change", each with an entry of its own below, and a
+consumer who ignores a `Result` should read them.** A mixed pair has a behavioural limit —
+a 0.3.0 peer counts concurrent streams differently and will take 255 of them where a 0.3.1
+peer takes 256 (**Fixed**, "The receive-side stream cap counts the streams the peer has
+open"). And two calls that used to answer `Ok` for work that did not happen now answer
+`Err`, which is the point of the fix and is still a different answer than 0.3.0 gave:
+`PhantomSession::migrate()` on a session a listener handed back returns
+`CoreError::Unsupported` where it returned `Ok(())` (**Fixed**, "An accepted session
+reported a migration it could not perform"), and `open_stream()` past `MAX_STREAMS`
+returns `CoreError::StreamError` where it used to hand back a stream the peer would not
+take and end the session seconds later (**Fixed**, "`PhantomSession::open_stream()`
+refuses past `MAX_STREAMS` streams open at once"). Code that matched on either `Ok`
+compiles unchanged and takes the other branch. What else
 did change is behaviour that
 contradicted its own documentation — a reader parked forever on a stream the session had
 already ended, a `supports_migration()` that answered for a method the caller could not
