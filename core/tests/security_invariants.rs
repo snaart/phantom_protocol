@@ -4147,3 +4147,270 @@ async fn a_previous_wire_version_frame_is_dropped_before_the_flag_dispatch() {
          version check runs before anything reads a flag"
     );
 }
+
+/// **A cross-variant peer is answered, not left to time out (Invariant 10).**
+///
+/// `ClientHello.protocol_variant` carries the build's `PROTOCOL_VARIANT` tag, so a fips
+/// peer meeting a non-fips one is caught before any KEM or signature work. What happened
+/// to the peer afterwards was the problem: the refusal was a `HandshakeResponse::Fail`,
+/// which the listener answers by closing without a reply, so over TCP the client saw a
+/// bare connection error and over PhantomUDP — where there is no close to observe — it
+/// retransmitted until its handshake deadline and reported `Timeout`. A timeout is the
+/// shape of failure a typed refusal exists to replace: it names no cause, and the cause
+/// here is a compile-time property of the two builds that no retry can change.
+///
+/// This drives the refusal all the way onto the wire through the real listener, because
+/// that is the half that was missing: the server's decision was already typed, and it was
+/// the reply that never left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cross_variant_peer_is_answered_rather_than_left_to_time_out() {
+    use phantom_protocol::api::PhantomListener;
+    use phantom_protocol::transport::handshake::{
+        ServerReply, PROTOCOL_VARIANT, REJECT_PROTOCOL_VARIANT,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = PhantomListener::bind("127.0.0.1:0".to_string())
+        .await
+        .unwrap();
+    let addr = listener.local_addr();
+    // The acceptor is lazily spawned by the first `accept()`; nothing here ever completes
+    // a handshake, so this task exists only to start it.
+    let accepting = tokio::spawn(async move { listener.accept().await });
+
+    let client = HandshakeClient::new().unwrap();
+    let mut hello = client.create_client_hello();
+    assert_eq!(
+        hello.protocol_variant, PROTOCOL_VARIANT,
+        "a hello from this build advertises this build's variant"
+    );
+    hello.protocol_variant = b"phantom-some-other-mode-1".to_vec();
+    let body = borsh::to_vec(&hello).unwrap();
+
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    // The stream transport's framing: a 4-byte big-endian length, then the message.
+    sock.write_all(&(body.len() as u32).to_be_bytes())
+        .await
+        .unwrap();
+    sock.write_all(&body).await.unwrap();
+    sock.flush().await.unwrap();
+
+    let mut len_buf = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(10), sock.read_exact(&mut len_buf))
+        .await
+        .expect("the server must answer a cross-variant hello, not close in silence")
+        .expect("read the reply length");
+    let len = u32::from_be_bytes(len_buf) as usize;
+    assert!(
+        len > 0 && len < 4096,
+        "a reject is a handful of bytes: {len}"
+    );
+    let mut reply = vec![0u8; len];
+    tokio::time::timeout(Duration::from_secs(10), sock.read_exact(&mut reply))
+        .await
+        .expect("the reply body follows its length")
+        .expect("read the reply body");
+
+    match ServerReply::from_wire(&reply).expect("the reply is a well-formed server reply") {
+        ServerReply::Reject(reject) => {
+            assert!(
+                reject.has_marker(),
+                "the reject must carry its integrity tag, or the client discards it"
+            );
+            assert_eq!(
+                reject.code, REJECT_PROTOCOL_VARIANT,
+                "the code must say the variant was the problem, not the version — they \
+                 call for different actions and only one of them is retryable"
+            );
+            assert_eq!(
+                reject.supported_version, PROTOCOL_VERSION,
+                "the field is defined as the version this server speaks, which is still true"
+            );
+        }
+        other => panic!("a cross-variant hello must be answered with a reject, got {other:?}"),
+    }
+
+    accepting.abort();
+}
+
+/// **The cross-variant refusal reaches the client as a typed error, not a timeout.**
+///
+/// The companion to the test above, from the other end: given a server that answers with
+/// the variant reject, the client must surface [`CoreError::ProtocolRejected`] — the
+/// documented typed form of this failure — and must surface it promptly, rather than
+/// waiting out the handshake deadline. Asserting the variant rather than the message is
+/// deliberate: the error string a client builds for a reject still speaks of versions, and
+/// what an embedder branches on is the variant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cross_variant_refusal_reaches_the_client_as_a_typed_error() {
+    use phantom_protocol::api::session::SessionTransport;
+    use phantom_protocol::api::PhantomSession;
+    use phantom_protocol::transport::handshake::{ServerReject, ServerReply};
+    use phantom_protocol::CoreError;
+
+    /// Answers every hello with the variant reject, exactly as a server of the other
+    /// build now does, and counts the hellos so the client's refusal cannot be mistaken
+    /// for it never having sent one.
+    struct AlwaysRejectsTheVariant {
+        hellos: Arc<std::sync::atomic::AtomicU32>,
+        reply: Vec<u8>,
+    }
+    impl SessionTransport for AlwaysRejectsTheVariant {
+        async fn send_bytes(&self, _data: &[u8]) -> Result<(), CoreError> {
+            self.hellos
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn recv_bytes(&self) -> Result<Bytes, CoreError> {
+            Ok(Bytes::from(self.reply.clone()))
+        }
+    }
+
+    let hellos = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let transport = AlwaysRejectsTheVariant {
+        hellos: hellos.clone(),
+        reply: ServerReply::Reject(ServerReject::protocol_variant_mismatch())
+            .to_wire()
+            .unwrap(),
+    };
+    let (_sk, server_key) = HybridSigningKey::generate();
+
+    // The pin is required (Invariant 1) and never reached: the refusal comes before a
+    // `ServerHello` this key could be checked against.
+    let session = PhantomSession::connect_with_transport("127.0.0.1:4242", transport, server_key);
+
+    // The client's own handshake deadline is ten seconds. A bound below it is what makes
+    // this a test of the refusal rather than of the deadline: a reject that never reached
+    // the client would leave this waiting, and waiting is the defect.
+    let outcome = tokio::time::timeout(Duration::from_secs(5), session.await_ready())
+        .await
+        .expect("a refused handshake must resolve well inside the handshake deadline");
+    match outcome {
+        Err(CoreError::ProtocolRejected(_)) => {}
+        other => panic!(
+            "a cross-variant refusal must surface as ProtocolRejected — the variant an \
+             embedder branches on — got {other:?}"
+        ),
+    }
+    assert!(
+        hellos.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "the client must have sent a hello for the reject to be a refusal of anything"
+    );
+    assert!(
+        matches!(
+            session.last_error().await,
+            Some(CoreError::ProtocolRejected(_))
+        ),
+        "the terminal error is captured, so a caller that missed await_ready still sees it"
+    );
+}
+
+/// **Over PhantomUDP too: the cross-variant refusal is a reply, not a silence.**
+///
+/// This is the direction the defect showed worst. A datagram transport has no close for a
+/// client to observe, so a refusal that is not sent is indistinguishable from a lost
+/// packet: the client retransmitted its hello on the handshake schedule and then reported
+/// `Timeout`, which says a peer did not answer — while the peer had in fact decided, at the
+/// first field it read, that it never would.
+///
+/// The hello is driven raw so the variant can be foreign in a single-build test. It takes
+/// the cookie round first, because over UDP the source is unproven and the address
+/// validation runs ahead of everything, which also means the refusal below is sent to an
+/// address that has already echoed an IP-bound cookie — not to a spoofable one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cross_variant_peer_over_udp_is_answered_rather_than_left_to_time_out() {
+    use phantom_protocol::api::udp_listener::PhantomUdpListener;
+    use phantom_protocol::transport::handshake::{ServerReply, REJECT_PROTOCOL_VARIANT};
+    use phantom_protocol::transport::phantom_udp::datagram::encode_datagrams;
+    use phantom_protocol::transport::phantom_udp::envelope::{decode_header, PacketType, PATH_MTU};
+    use tokio::net::UdpSocket;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let server_addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let acceptor = listener.clone();
+    // The demux is started by the first `accept()`; nothing here completes a handshake.
+    let accepting = tokio::spawn(async move { acceptor.accept().await });
+
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sock.connect(server_addr).await.unwrap();
+    let cid: [u8; 8] = [0xA5; 8];
+
+    /// Reads datagrams until one carries a whole single-datagram server reply. Every reply
+    /// this exchange can produce — a retry and a reject — is far inside one datagram, so a
+    /// fragmented one is a reply to something else and is skipped.
+    async fn next_reply(sock: &UdpSocket) -> ServerReply {
+        let mut buf = vec![0u8; PATH_MTU + 64];
+        for _ in 0..16 {
+            let n = tokio::time::timeout(Duration::from_secs(10), sock.recv(&mut buf))
+                .await
+                .expect("the server must answer; a silence here is the defect itself")
+                .expect("recv");
+            let Ok((hdr, frame)) = decode_header(&buf[..n]) else {
+                continue;
+            };
+            if hdr.fragmented {
+                continue;
+            }
+            if let Ok(reply) = ServerReply::from_wire(frame) {
+                return reply;
+            }
+        }
+        panic!("no single-datagram server reply arrived");
+    }
+
+    let client = HandshakeClient::new().unwrap();
+    let mut hello = client.create_client_hello();
+    hello.protocol_variant = b"phantom-some-other-mode-1".to_vec();
+    for d in encode_datagrams(
+        PacketType::Initial,
+        &cid,
+        0,
+        &borsh::to_vec(&hello).unwrap(),
+    )
+    .expect("encode the first flight")
+    {
+        sock.send(&d).await.unwrap();
+    }
+
+    // Address validation comes first: an unproven source gets a cookie demand, and the
+    // variant is not looked at until the source has answered it.
+    let cookie = match next_reply(&sock).await {
+        ServerReply::Retry(retry) => retry
+            .cookie
+            .expect("the address-validation round demands a cookie"),
+        other => panic!("an unvalidated UDP source must get the cookie round first: {other:?}"),
+    };
+
+    hello.cookie = Some(cookie);
+    for d in encode_datagrams(
+        PacketType::Initial,
+        &cid,
+        1,
+        &borsh::to_vec(&hello).unwrap(),
+    )
+    .expect("encode the cookie-bearing flight")
+    {
+        sock.send(&d).await.unwrap();
+    }
+
+    match next_reply(&sock).await {
+        ServerReply::Reject(reject) => {
+            assert!(
+                reject.has_marker(),
+                "the reject must carry its integrity tag"
+            );
+            assert_eq!(
+                reject.code, REJECT_PROTOCOL_VARIANT,
+                "the code must say the variant was the problem"
+            );
+        }
+        other => panic!(
+            "a cross-variant hello from a validated UDP source must be refused on the wire, \
+             not dropped — dropping it is what produced a client-side Timeout. Got {other:?}"
+        ),
+    }
+
+    accepting.abort();
+}

@@ -109,6 +109,21 @@ pub const SERVER_REJECT_MARKER: [u8; 4] = *b"PRJ1";
 /// does not speak. `supported_version` carries the version it *does* speak.
 pub const REJECT_UNSUPPORTED_VERSION: u8 = 1;
 
+/// [`ServerReject::code`]: the client's `ClientHello.protocol_variant` is not this
+/// build's [`PROTOCOL_VARIANT`] — a fips peer meeting a non-fips one, or the reverse
+/// (Invariant 10). `supported_version` still carries the version this server speaks,
+/// because the version is not what went wrong; the variant tag is, and it does not fit
+/// in this message. The variant is a compile-time property of both builds, so there is
+/// nothing for the client to retry and nothing to negotiate — the code exists so the
+/// refusal reaches the client at all, rather than as a connection that goes quiet.
+///
+/// Before 0.3.1 this mismatch was a `HandshakeResponse::Fail`, which the listener
+/// answers by closing without a reply: over TCP the client saw a bare connection error
+/// and over PhantomUDP, where there is no close to see, it waited out its handshake
+/// deadline and reported `Timeout` — the one shape of failure the typed refusal exists
+/// to avoid.
+pub const REJECT_PROTOCOL_VARIANT: u8 = 2;
+
 /// Typed handshake rejection the server returns *instead of* silently dropping
 /// the connection when it structurally cannot satisfy a `ClientHello` — today,
 /// an unknown `version`. It gives a forward/backward-incompatible peer an
@@ -138,6 +153,17 @@ impl ServerReject {
         Self {
             marker: SERVER_REJECT_MARKER,
             code: REJECT_UNSUPPORTED_VERSION,
+            supported_version: PROTOCOL_VERSION,
+        }
+    }
+
+    /// Build the protocol-variant-mismatch reject (Invariant 10). Carries this build's
+    /// [`PROTOCOL_VERSION`] like every reject does, since the field is defined as the
+    /// version the server speaks and that is still true here.
+    pub fn protocol_variant_mismatch() -> Self {
+        Self {
+            marker: SERVER_REJECT_MARKER,
+            code: REJECT_PROTOCOL_VARIANT,
             supported_version: PROTOCOL_VERSION,
         }
     }
@@ -938,17 +964,22 @@ impl HandshakeServer {
         // reflects attempts (including the rejected ones).
         self.record_handshake();
 
-        // Protocol-variant gate. Fail loud (before any KEM / signature work)
+        // Protocol-variant gate. Refuse loud (before any KEM / signature work)
         // if the client and server disagree on the build-side
         // `PROTOCOL_VARIANT` tag. The transcript also binds this constant, so
         // an MITM rewrite of the cleartext field is caught on the client's
         // signature check; this explicit field gives operators a clean
         // diagnostic instead of "Signature check failed" (Invariant 10).
         if client_hello.protocol_variant != PROTOCOL_VARIANT {
-            return HandshakeResponse::Fail(HandshakeError::ProtocolVariantMismatch {
-                expected: PROTOCOL_VARIANT.to_vec(),
-                received: client_hello.protocol_variant.clone(),
-            });
+            // Answered rather than dropped. A `Fail` here closed the connection without
+            // a reply, so the peer this check exists to inform learned nothing: over TCP
+            // a bare connection error, and over PhantomUDP — which has no close to
+            // observe — a client that retransmitted until its handshake deadline and
+            // reported `Timeout`. The reject carries no variant tag (the wire has no
+            // field for one and a patch may not add one), only the code that says the
+            // variant was the problem; the listener builds the operator-facing
+            // `ProtocolVariantMismatch` from the hello it still holds.
+            return HandshakeResponse::Reject(ServerReject::protocol_variant_mismatch());
         }
 
         // Version pin. The protocol is not negotiated — `version` is a
@@ -1923,10 +1954,12 @@ mod tests {
         );
     }
 
-    /// A `ClientHello` advertising a foreign `PROTOCOL_VARIANT`
-    /// (simulating a fips/non-fips cross-mode connect) is rejected by
-    /// the server with [`HandshakeError::ProtocolVariantMismatch`]
-    /// before any KEM / signature work is done.
+    /// A `ClientHello` advertising a foreign `PROTOCOL_VARIANT` (a fips/non-fips
+    /// cross-mode connect) is refused before any KEM / signature work — and refused with
+    /// a [`HandshakeResponse::Reject`], which the listener puts on the wire, rather than
+    /// a `Fail`, which it answers by closing in silence. Silence is what left the client
+    /// with a `Timeout` over PhantomUDP and a bare connection error over TCP, where the
+    /// documentation promises a typed refusal (Invariant 10).
     #[tokio::test]
     async fn protocol_variant_mismatch_rejected() {
         let server = HandshakeServer::new().expect("HandshakeServer::new");
@@ -1939,15 +1972,47 @@ mod tests {
 
         let response = server.process_client_hello(&hello, 0, client_ip);
         match response {
-            HandshakeResponse::Fail(HandshakeError::ProtocolVariantMismatch {
-                expected,
-                received,
-            }) => {
-                assert_eq!(expected, PROTOCOL_VARIANT);
-                assert_eq!(received, b"phantom-some-other-mode-1");
+            HandshakeResponse::Reject(reject) => {
+                assert!(
+                    reject.has_marker(),
+                    "the reject must carry its integrity tag"
+                );
+                assert_eq!(
+                    reject.code, REJECT_PROTOCOL_VARIANT,
+                    "the code has to distinguish this from an unsupported version, or the \
+                     client cannot tell the operator which of the two went wrong"
+                );
+                assert_eq!(reject.supported_version, PROTOCOL_VERSION);
+                // It has to survive the wire, or the listener cannot send it.
+                let wire = ServerReply::Reject(reject).to_wire().expect("encode");
+                match ServerReply::from_wire(&wire).expect("decode") {
+                    ServerReply::Reject(r) => assert_eq!(r.code, REJECT_PROTOCOL_VARIANT),
+                    other => panic!("a reject must decode as a reject, got {other:?}"),
+                }
             }
-            other => panic!("expected ProtocolVariantMismatch, got {other:?}"),
+            other => panic!("expected a typed Reject, got {other:?}"),
         }
+    }
+
+    /// The two reject codes have to be distinct values on the wire, and the version
+    /// reject has to keep the one it already ships — a reader of an older capture reads
+    /// `1` as "unsupported version" and nothing may change that.
+    #[test]
+    fn the_reject_codes_are_distinct_and_the_version_one_is_unchanged() {
+        assert_eq!(REJECT_UNSUPPORTED_VERSION, 1);
+        assert_eq!(REJECT_PROTOCOL_VARIANT, 2);
+        assert_eq!(
+            ServerReject::unsupported_version().code,
+            REJECT_UNSUPPORTED_VERSION
+        );
+        assert_eq!(
+            ServerReject::protocol_variant_mismatch().code,
+            REJECT_PROTOCOL_VARIANT
+        );
+        assert_ne!(
+            ServerReject::unsupported_version(),
+            ServerReject::protocol_variant_mismatch()
+        );
     }
 
     /// H9 forward-compat: a `ClientHello` advertising a `version` the server

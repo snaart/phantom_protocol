@@ -7,7 +7,7 @@ use crate::observability::{Observability, ObservabilityConfig};
 use crate::runtime::{Runtime, SpawnHandle, TokioRuntime};
 use crate::transport::handshake::{
     client_hello_lengths_within_bounds, ClientHello, HandshakeError, HandshakeResponse,
-    HandshakeServer, ServerReply,
+    HandshakeServer, ServerReply, PROTOCOL_VARIANT, PROTOCOL_VERSION, REJECT_PROTOCOL_VARIANT,
 };
 use crate::transport::types::LegType;
 use crate::transport::write_stall::DEFAULT_WRITE_STALL_TIMEOUT;
@@ -633,28 +633,46 @@ pub(crate) async fn drive_server_handshake<T: SessionTransport>(
                 return Ok((session, early_data));
             }
             HandshakeResponse::Reject(reject) => {
-                // Forward-compat (H9): the client spoke a version we can't
-                // satisfy. Hand back a typed reject so it gets an actionable
-                // signal — the version we DO speak — instead of a silent drop,
-                // then close. Best-effort: if the send fails the client just
-                // sees the close, same as before.
+                // Forward-compat (H9) and the cross-variant guard (Invariant 10): the
+                // hello is one this build structurally cannot satisfy. Hand back a typed
+                // reject so the peer gets an actionable signal instead of a silent drop,
+                // then close. Best-effort: if the send fails the client just sees the
+                // close, same as before.
                 // T4.4: frame with the explicit discriminant byte (`[kind] ‖ borsh`).
-                if let Ok(bytes) = ServerReply::Reject(reject.clone()).to_wire() {
+                let code = reject.code;
+                if let Ok(bytes) = ServerReply::Reject(reject).to_wire() {
                     let _ = transport.send_bytes(&bytes).await;
                 }
-                // M-4: a version mismatch is detected BEFORE the address-validation cookie gate,
-                // so charging a reputation violation here could poison a spoofed / on-path-
-                // captured source IP. It is a forward-compat / misconfiguration signal, not
-                // proof of abuse → no reputation escalation.
-                return Err(CoreError::InternalError(format!(
-                    "handshake rejected: unsupported client version (server speaks v{})",
-                    reject.supported_version
-                )));
+                // M-4: both reject reasons are detected BEFORE the address-validation
+                // cookie gate, so charging a reputation violation here could poison a
+                // spoofed / on-path-captured source IP. They are forward-compat /
+                // misconfiguration signals, not proof of abuse → no reputation escalation.
+                //
+                // The server-side error names the actual reason. The reject on the wire
+                // carries only a code — it has no field for a variant tag and a patch
+                // release may not add one — so the variant bytes are taken from the hello
+                // this function still holds, which is also what keeps
+                // `HandshakeError::ProtocolVariantMismatch` the typed form of this failure
+                // on the accepting side.
+                return Err(match code {
+                    REJECT_PROTOCOL_VARIANT => {
+                        CoreError::from(HandshakeError::ProtocolVariantMismatch {
+                            expected: PROTOCOL_VARIANT.to_vec(),
+                            received: client_hello.protocol_variant.clone(),
+                        })
+                    }
+                    _ => CoreError::InternalError(format!(
+                        "handshake rejected: unsupported client version (server speaks v{})",
+                        PROTOCOL_VERSION
+                    )),
+                });
             }
             HandshakeResponse::Fail(e) => {
-                // M-4: the protocol-variant mismatch is also a pre-cookie check, so (like the
-                // version Reject above) it must not escalate a possibly-spoofed IP's reputation.
-                // Every other Fail is reached only after the cookie/PoW gate, i.e. from an
+                // M-4: a variant mismatch used to arrive here as a `Fail`; it is a
+                // `Reject` now, and the arm above is where it does not escalate. The match
+                // stays as a guard, so a future pre-cookie `Fail` of that shape cannot
+                // quietly start poisoning a possibly-spoofed IP's reputation. Every other
+                // `Fail` is reached only after the cookie/PoW gate, i.e. from an
                 // address-validated source, so it remains a genuine violation.
                 if !matches!(e, HandshakeError::ProtocolVariantMismatch { .. }) {
                     hs.record_violation(client_ip);
