@@ -298,6 +298,55 @@ jobs:
       - run: scripts/check_memory_arithmetic_test.py
       - run: scripts/check_memory_arithmetic.py
 
+  release-artifacts:
+    # Nothing in this repository looked at a release artifact after it was built. The
+    # `build-artifacts` job runs on a tag, once, and what it produced was only ever read by
+    # whoever downloaded it — so 0.3.0 shipped macOS libraries that abort every consumer
+    # before `main` (rustc had written the runner's build directory into the install name),
+    # Linux libraries with no symbol table for `uniffi-bindgen --library` to read, and
+    # `.sha256` files that verify nowhere, all green.
+    #
+    # Two halves. The text scan is the regression test a release path can have: it reads the
+    # files that decide what is shipped and fails when any of the four properties is back to
+    # its 0.3.0 state. Then the second half actually builds the shipped profile and hands the
+    # library to the bindings generator, because that is the consumer whose failure was
+    # silent — `uniffi-bindgen` prints "No UniFFI metadata found" and **exits 0**, so only
+    # looking at what it wrote tells the two outcomes apart.
+    name: release artifact shape
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # The script's own cases first, for the reason given in the two jobs above.
+      - run: scripts/check_release_artifacts_test.py
+      - run: scripts/check_release_artifacts.py
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: "."
+          key: release-artifacts
+      - name: The shipped profile produces a library uniffi-bindgen can read
+        run: |
+          # Default features, exactly as the release job builds it — `uniffi-cli`
+          # belongs to the generator below and never to the shipped library.
+          cargo build --manifest-path core/Cargo.toml --profile dist --lib
+          SO=target/dist/libphantom_protocol.so
+          if ! readelf -S "${SO}" | grep -q '\.symtab'; then
+            echo "${SO} has no .symtab; the shipped profile is stripping symbols again" >&2
+            exit 1
+          fi
+          OUT="${RUNNER_TEMP}/release-artifact-bindings"
+          mkdir -p "${OUT}"
+          cargo run --manifest-path core/Cargo.toml --features uniffi-cli \
+            --bin uniffi-bindgen -- generate \
+            --library "${SO}" --language python --no-format --out-dir "${OUT}"
+          # The exit code says nothing: a stripped library makes the generator report no
+          # metadata and succeed. What it wrote is the only evidence.
+          if [ ! -s "${OUT}/phantom_protocol.py" ]; then
+            echo "uniffi-bindgen read ${SO} and produced no bindings" >&2
+            exit 1
+          fi
+          echo "bindings generated from the dist-profile library: $(wc -l < "${OUT}/phantom_protocol.py") lines"
+
   changelog-structure:
     # `[Unreleased]` had two `### Documented` sections a thousand lines apart.
     # Neither branch was wrong on its own — each added a heading that did not yet
