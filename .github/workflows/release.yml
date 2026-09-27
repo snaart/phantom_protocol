@@ -250,7 +250,14 @@ jobs:
           # unknown header. COPYFILE_DISABLE stops the `._` members on macOS;
           # --no-xattrs is understood by both bsdtar and GNU tar.
           COPYFILE_DISABLE=1 tar --no-xattrs -czf "dist/${NAME}.tar.gz" -C dist "${NAME}"
-          shasum -a 256 "dist/${NAME}.tar.gz" > "dist/${NAME}.tar.gz.sha256"
+          # Hashed from inside `dist/`, so the digest line names the tarball by
+          # its basename. `shasum -c` re-reads the path written in the file, and
+          # a released pair carrying `dist/phantom_protocol-….tar.gz` verifies
+          # only for someone who happens to have reproduced that directory —
+          # which is nobody who downloaded the two files side by side. 0.3.0
+          # shipped the prefix, so every published checksum failed in place.
+          ( cd dist && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
+          ( cd dist && shasum -a 256 -c "${NAME}.tar.gz.sha256" )
       - name: Generate SLSA build provenance attestation
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -280,10 +287,11 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Compute checksums
-        run: |
-          cd dist
-          ls -la
+      # Named for what it does. It computed nothing — the digests are written
+      # beside each tarball in the job that built it, because that is the only
+      # place the tarball and its name are both known.
+      - name: List the collected artifacts
+        run: ls -la dist
       - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           draft: true
