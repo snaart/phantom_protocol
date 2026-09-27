@@ -107,7 +107,8 @@ use crate::observability::{Observability, ObservabilityConfig};
 use crate::runtime::{Runtime, TokioRuntime};
 use crate::transport::bandwidth_estimator::DrainOutcome;
 use crate::transport::handshake::{
-    HandshakeClient, ServerReject, ServerReply, EARLY_DATA_MAX_LEN, REJECT_PROTOCOL_VARIANT,
+    HandshakeClient, ServerReject, ServerReply, EARLY_DATA_MAX_LEN, MAX_HANDSHAKE_RETRY_ROUNDS,
+    REJECT_PROTOCOL_VARIANT, REJECT_RETRY_LIMIT, REJECT_UNSUPPORTED_VERSION,
 };
 use crate::transport::mtu::{MAX_RECV_FRAME, MAX_RECV_PAYLOAD};
 use crate::transport::multiplexer::StreamDemultiplexer;
@@ -1645,6 +1646,30 @@ fn describe_server_reject(client_version: u8, reject: &ServerReject) -> String {
                 variant is fixed at compile time, so use matching builds."
             .to_string();
     }
+    if reject.code == REJECT_RETRY_LIMIT {
+        // The server gave up on the cookie / proof-of-work exchange. Retrying the connect
+        // is the right reaction and the only one available, which is why the sentence says
+        // so: nothing about this client's build is wrong.
+        return format!(
+            "server rejected the handshake: it abandoned the address-validation and \
+             proof-of-work exchange after {MAX_HANDSHAKE_RETRY_ROUNDS} rounds without a \
+             satisfied gate. Nothing is wrong with this build — retry the connect."
+        );
+    }
+    if reject.code != REJECT_UNSUPPORTED_VERSION && reject.supported_version == client_version {
+        // Every code this build knows is handled above, so this one is from a future
+        // server — and it says both peers speak the same version. Falling through to the
+        // version wording is how a refusal with nothing to do with the version came out as
+        // "client speaks v5, server speaks v5", a sentence naming the one field the two
+        // agree on. Where the versions *do* differ the fallback is a reasonable guess and
+        // is kept; where they agree it is known to be wrong.
+        return format!(
+            "server rejected the handshake for a reason this client does not recognise \
+             (reject code {}); both peers speak protocol v{}, so the version is not it. A \
+             newer client may name the reason.",
+            reject.code, reject.supported_version
+        );
+    }
     format!(
         "server rejected the handshake: unsupported protocol version (client speaks v{}, \
          server speaks v{})",
@@ -1687,11 +1712,13 @@ async fn run_client_handshake<T: SessionTransport>(
         None => handshake.create_client_hello(),
     };
 
-    // HS-02: cap the number of HelloRetryRequest rounds. The legitimate flow
-    // needs at most one cookie round + one PoW round; a bound of 3 leaves slack
-    // for a benign reorder. Without it, a MITM answering every ClientHello with
-    // a fresh cheap HelloRetryRequest could loop the client forever.
-    const MAX_CLIENT_RETRY_ROUNDS: u32 = 3;
+    // HS-02: cap the number of HelloRetryRequest rounds. Without it, a MITM answering
+    // every ClientHello with a fresh cheap HelloRetryRequest could loop the client
+    // forever. The bound is read from `transport::handshake` because the server reads it
+    // from there too: it used to be a `3` here and a `2` in `api::listener`, so the
+    // server abandoned a handshake the client was still working on and the client was
+    // left with a bare connection close.
+    const MAX_CLIENT_RETRY_ROUNDS: u32 = MAX_HANDSHAKE_RETRY_ROUNDS;
     // Bound how many injected/genuine ServerRejects we read past while still
     // waiting for a ServerHello, so a reject flood can't loop the inner read forever.
     const MAX_CLIENT_REJECT_ROUNDS: u32 = 3;
@@ -8975,6 +9002,106 @@ mod tests {
         );
     }
 
+    /// A server that abandons the cookie / proof-of-work exchange is described as having
+    /// abandoned it, and the caller gets the typed variant it branches on.
+    ///
+    /// **The defect.** The server closed without a reply when it ran out of retry rounds,
+    /// so the client reported `CoreError::NetworkError("early eof")` — a byte-pipe error,
+    /// the same shape as the network breaking, for a decision the server made on purpose.
+    /// A caller cannot tell "retry this connect" from "the link is down" out of that, and a
+    /// reviewer reading a log sees an EOF.
+    ///
+    /// **Why it comes back unnoticed.** With the gate's difficulty now fixed for the life
+    /// of a handshake, an honest client never reaches this path at all, so no functional
+    /// test goes near it; and the failure it produced was indistinguishable from a network
+    /// error, which reads as flakiness rather than as a missing message.
+    #[tokio::test]
+    async fn client_describes_a_retry_limit_reject_as_an_abandoned_gate() {
+        use crate::transport::handshake::{ServerReject, ServerReply, PROTOCOL_VERSION};
+
+        let (client_transport, server_transport) = ChannelTransport::pair();
+        // The reject path errors before any key verification, so any key works.
+        let (_sk, expected_vk) = crate::crypto::hybrid_sign::HybridSigningKey::generate();
+
+        let server = tokio::spawn(async move {
+            let _hello = server_transport.recv_bytes().await.expect("the hello");
+            let reject = ServerReply::Reject(ServerReject::retry_limit())
+                .to_wire()
+                .expect("encode the reject");
+            server_transport
+                .send_bytes(&reject)
+                .await
+                .expect("send the reject");
+        });
+
+        let result = run_client_handshake(&client_transport, &expected_vk, None).await;
+        server.await.expect("the server half");
+
+        let err = result.expect_err("an abandoned gate must surface as an error");
+        assert!(
+            matches!(err, CoreError::ProtocolRejected(_)),
+            "the caller needs the typed variant, not a byte-pipe error; got {err:?}"
+        );
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("proof-of-work"),
+            "the message has to name the gate, or it says no more than the EOF it replaced; \
+             got {msg}"
+        );
+        assert!(
+            !msg.contains("unsupported protocol version"),
+            "the message must not blame the version, got: {msg}"
+        );
+        assert!(
+            !msg.contains(&format!(
+                "client speaks v{PROTOCOL_VERSION}, server speaks v{PROTOCOL_VERSION}"
+            )),
+            "got: {msg}"
+        );
+    }
+
+    /// A reject code this build does not know, from a server that speaks the same version,
+    /// is described as unrecognised rather than as a version mismatch.
+    ///
+    /// The fallback reads `supported_version` and nothing else, which is how a refusal with
+    /// nothing to do with the version came out as "client speaks v5, server speaks v5" —
+    /// twice now, once for the variant code and once for the retry-limit code, each fixed
+    /// only after it shipped. A third code will be added by a future server to a client
+    /// built today, so the fallback itself has to stop producing that sentence. Where the
+    /// versions genuinely differ the old wording is a reasonable guess and is kept.
+    #[test]
+    fn an_unknown_reject_code_from_a_same_version_server_is_not_called_a_version_mismatch() {
+        use crate::transport::handshake::{ServerReject, PROTOCOL_VERSION, SERVER_REJECT_MARKER};
+
+        // A code past every one this build assigns.
+        let future = ServerReject {
+            marker: SERVER_REJECT_MARKER,
+            code: 200,
+            supported_version: PROTOCOL_VERSION,
+        };
+        let msg = describe_server_reject(PROTOCOL_VERSION, &future);
+        assert!(
+            msg.contains("does not recognise") && msg.contains("200"),
+            "the message has to say the reason is unknown and name the code, got: {msg}"
+        );
+        assert!(
+            !msg.contains(&format!(
+                "client speaks v{PROTOCOL_VERSION}, server speaks v{PROTOCOL_VERSION}"
+            )),
+            "got: {msg}"
+        );
+
+        // A future code from a server that really does speak another version keeps the
+        // version wording: there the guess is a useful one and the two figures differ.
+        let elsewhere = ServerReject {
+            marker: SERVER_REJECT_MARKER,
+            code: 200,
+            supported_version: PROTOCOL_VERSION.wrapping_add(9),
+        };
+        let msg = describe_server_reject(PROTOCOL_VERSION, &elsewhere);
+        assert!(msg.contains("unsupported protocol version"), "got: {msg}");
+    }
+
     /// A rejection is a definitive answer, so the client must not spend the whole connect
     /// arriving at it. The tolerance loop reads past up to `MAX_CLIENT_REJECT_ROUNDS`
     /// rejects before it believes one, and over PhantomUDP each of those reads is answered
@@ -9520,6 +9647,99 @@ mod tests {
             session.bandwidth_snapshot().await.is_none(),
             "no negotiated session yet, so there is no window to report"
         );
+    }
+
+    /// The client answers every retry round the server is willing to send.
+    ///
+    /// **The defect.** The two sides held their own copy of the bound and the copies
+    /// disagreed: `api::listener` stopped after two rounds while `run_client_handshake`
+    /// was prepared for three. The server therefore abandoned a handshake the client was
+    /// still working on, and because it abandoned it by closing, the client reported
+    /// `NetworkError("early eof")` — a byte-pipe error for a decision the server made on
+    /// purpose. Both now read
+    /// [`MAX_HANDSHAKE_RETRY_ROUNDS`](crate::transport::handshake::MAX_HANDSHAKE_RETRY_ROUNDS),
+    /// and this is the half that says the client goes as far as the server will: the
+    /// server-side half, that it emits that many and then refuses with a typed reject,
+    /// is in `api::listener`'s tests.
+    ///
+    /// **Why it comes back unnoticed.** An honest handshake needs one round, so every
+    /// other test in the tree spends one and neither bound is reached. It takes a server
+    /// that keeps retrying — which a functional test has no reason to build — for the
+    /// difference between three and two to show up at all.
+    ///
+    /// Driven with a hand-written server half rather than the real listener, because what
+    /// is under test is how many rounds the *client* will answer, and a real listener
+    /// would stop at its own bound before asking the question.
+    #[tokio::test]
+    async fn the_client_answers_every_retry_round_the_server_will_send() {
+        use crate::transport::handshake::MAX_HANDSHAKE_RETRY_ROUNDS;
+
+        let (client_transport, server_transport) = ChannelTransport::pair();
+        let server_hs = HandshakeServer::new().expect("HandshakeServer::new");
+        let pinned = server_hs.verifying_key().clone();
+        let session = Arc::new(PhantomSession::connect_with_transport(
+            "test-server:9000",
+            client_transport,
+            pinned,
+        ));
+
+        let server = tokio::spawn(async move {
+            let client_ip = "127.0.0.1".parse().expect("parse IP");
+            let mut rounds = 0u32;
+            loop {
+                let bytes = server_transport.recv_bytes().await.expect("a hello");
+                let hello = borsh::from_slice::<ClientHello>(&bytes).expect("decode hello");
+                // Keep retrying until the bound is spent, then admit. The gate is asked
+                // for its verdict with the hello as it arrives, so the retry the client
+                // answers is a real one and not a fabricated blob.
+                if rounds < MAX_HANDSHAKE_RETRY_ROUNDS {
+                    rounds += 1;
+                    let mut stripped = hello.clone();
+                    // Withhold the cookie, so the gate asks for one again however many
+                    // times it is asked.
+                    stripped.cookie = None;
+                    match server_hs.process_client_hello(&stripped, 0, client_ip) {
+                        HandshakeResponse::Retry(retry) => {
+                            let wire = ServerReply::Retry(retry).to_wire().expect("encode retry");
+                            server_transport
+                                .send_bytes(&wire)
+                                .await
+                                .expect("send retry");
+                        }
+                        other => panic!("round {rounds}: expected a retry, got {other:?}"),
+                    }
+                    continue;
+                }
+                match server_hs.process_client_hello(&hello, 0, client_ip) {
+                    HandshakeResponse::Success(server_hello, session, _) => {
+                        let wire = ServerReply::Hello(server_hello)
+                            .to_wire()
+                            .expect("encode ServerHello");
+                        server_transport
+                            .send_bytes(&wire)
+                            .await
+                            .expect("send hello");
+                        // The transport goes back to the caller with the session. Dropping
+                        // it here would close the pipe the moment the ServerHello was
+                        // sent, and the client's pump would read that as the far end
+                        // vanishing — so the state would be `Dead` by the time
+                        // `await_ready()` looked at it, and the test would fail for a
+                        // reason that has nothing to do with retry rounds.
+                        return (rounds, session, server_transport);
+                    }
+                    other => panic!("after {rounds} rounds: expected success, got {other:?}"),
+                }
+            }
+        });
+
+        let ready = session.await_ready().await;
+        let (rounds, inner, link) = server.await.expect("the server half");
+        ready.expect("the client has to answer every round the server sends");
+        assert_eq!(
+            rounds, MAX_HANDSHAKE_RETRY_ROUNDS,
+            "this test only says something if the server actually spent the whole bound"
+        );
+        drop((inner, link));
     }
 
     /// Integration test: Client handshake via ChannelTransport with a

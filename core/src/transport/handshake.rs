@@ -124,6 +124,38 @@ pub const REJECT_UNSUPPORTED_VERSION: u8 = 1;
 /// to avoid.
 pub const REJECT_PROTOCOL_VARIANT: u8 = 2;
 
+/// [`ServerReject::code`]: the peer never satisfied the cookie / proof-of-work gate
+/// within [`MAX_HANDSHAKE_RETRY_ROUNDS`] rounds, so the server has abandoned this
+/// handshake. `supported_version` carries the version this server speaks, as every
+/// reject does, because the version is not what went wrong.
+///
+/// It exists so the abandonment is something the peer can read. The server used to
+/// close without a reply, which reached the client as `CoreError::NetworkError("early
+/// eof")` — a byte-pipe error, indistinguishable from the network breaking, for a
+/// decision the server made on purpose. With the difficulty now pinned for the life of
+/// one handshake this is no longer reachable by an honest client at all; the peers that
+/// do reach it are the ones that keep answering the gate wrongly, and telling them so
+/// is cheaper than leaving them to retry.
+pub const REJECT_RETRY_LIMIT: u8 = 3;
+
+/// Cookie / proof-of-work `HelloRetryRequest` rounds one handshake may spend, read by
+/// both sides from here.
+///
+/// The server will emit at most this many retries for one connection and refuse the
+/// next; the client will answer at most this many and give up on the next. One number,
+/// because two numbers disagreed: the server stopped at two while the client was
+/// prepared for three, so a handshake the client was still working on was abandoned
+/// mid-flight and reached it as a bare connection close.
+///
+/// Three, not one, and the slack is for reordering rather than for escalation — a
+/// retried hello and its answer can cross on a datagram path, and the round that
+/// wastes is nobody's fault. Escalation is not a reason to need more rounds, because
+/// [`crate::api::listener::drive_server_handshake`] fixes the difficulty it demands
+/// when the first hello of a connection arrives and re-uses that figure for the rest of
+/// it; a gate whose bar moved between the demand and the verification is what made
+/// three rounds insufficient in the first place.
+pub(crate) const MAX_HANDSHAKE_RETRY_ROUNDS: u32 = 3;
+
 /// Typed handshake rejection the server returns *instead of* silently dropping
 /// the connection when it structurally cannot satisfy a `ClientHello` — today,
 /// an unknown `version`. It gives a forward/backward-incompatible peer an
@@ -164,6 +196,16 @@ impl ServerReject {
         Self {
             marker: SERVER_REJECT_MARKER,
             code: REJECT_PROTOCOL_VARIANT,
+            supported_version: PROTOCOL_VERSION,
+        }
+    }
+
+    /// Build the retry-limit reject ([`REJECT_RETRY_LIMIT`]). Carries this build's
+    /// [`PROTOCOL_VERSION`] like every reject does.
+    pub fn retry_limit() -> Self {
+        Self {
+            marker: SERVER_REJECT_MARKER,
+            code: REJECT_RETRY_LIMIT,
             supported_version: PROTOCOL_VERSION,
         }
     }
@@ -1994,24 +2036,60 @@ mod tests {
         }
     }
 
-    /// The two reject codes have to be distinct values on the wire, and the version
-    /// reject has to keep the one it already ships — a reader of an older capture reads
-    /// `1` as "unsupported version" and nothing may change that.
+    /// The reject codes have to be distinct values on the wire, and each one already
+    /// shipped has to keep the number it shipped with — a reader of an older capture
+    /// reads `1` as "unsupported version" and nothing may change that.
     #[test]
-    fn the_reject_codes_are_distinct_and_the_version_one_is_unchanged() {
+    fn the_reject_codes_are_distinct_and_the_shipped_ones_are_unchanged() {
         assert_eq!(REJECT_UNSUPPORTED_VERSION, 1);
         assert_eq!(REJECT_PROTOCOL_VARIANT, 2);
-        assert_eq!(
-            ServerReject::unsupported_version().code,
-            REJECT_UNSUPPORTED_VERSION
-        );
-        assert_eq!(
-            ServerReject::protocol_variant_mismatch().code,
-            REJECT_PROTOCOL_VARIANT
-        );
-        assert_ne!(
-            ServerReject::unsupported_version(),
-            ServerReject::protocol_variant_mismatch()
+        assert_eq!(REJECT_RETRY_LIMIT, 3);
+        let built = [
+            (
+                ServerReject::unsupported_version(),
+                REJECT_UNSUPPORTED_VERSION,
+            ),
+            (
+                ServerReject::protocol_variant_mismatch(),
+                REJECT_PROTOCOL_VARIANT,
+            ),
+            (ServerReject::retry_limit(), REJECT_RETRY_LIMIT),
+        ];
+        for (reject, code) in &built {
+            assert!(reject.has_marker(), "{code}: a reject carries its marker");
+            assert_eq!(reject.code, *code);
+            assert_eq!(reject.supported_version, PROTOCOL_VERSION);
+            // It has to survive the wire, or the listener cannot send it.
+            let wire = ServerReply::Reject(reject.clone())
+                .to_wire()
+                .expect("encode");
+            match ServerReply::from_wire(&wire).expect("decode") {
+                ServerReply::Reject(r) => assert_eq!(r.code, *code),
+                other => panic!("a reject must decode as a reject, got {other:?}"),
+            }
+        }
+        for (i, (a, _)) in built.iter().enumerate() {
+            for (b, _) in built.iter().skip(i + 1) {
+                assert_ne!(a, b, "two rejects must not be the same bytes");
+            }
+        }
+    }
+
+    /// The two sides read one retry-round bound, so they cannot disagree about when a
+    /// handshake has run out of rounds.
+    ///
+    /// They did: the server stopped after two rounds while the client was prepared for
+    /// three, so a handshake the client was still working on was abandoned mid-flight
+    /// and arrived as a bare connection close. Two constants in two files is what let
+    /// that happen, and one number in one place is the fix — this asserts the number is
+    /// usable and leaves "there is only one of it" to there being only one of it.
+    #[test]
+    fn the_retry_round_bound_leaves_room_for_a_reorder() {
+        assert!(
+            MAX_HANDSHAKE_RETRY_ROUNDS >= 3,
+            "a legitimate handshake needs one cookie round and one proof-of-work round, \
+             and a datagram path can waste one to a reorder; {MAX_HANDSHAKE_RETRY_ROUNDS} \
+             rounds leaves no slack for the third"
         );
     }
 
