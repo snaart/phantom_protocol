@@ -109,7 +109,7 @@
 // dlopen / OpenSSL ABI and cannot run on bare-metal. The other three
 // reject `wasi-leg` on the browser target, a feature set with neither
 // `std` nor `no-std`, and a `std` build with neither crypto substrate;
-// the last two were added in 0.3.1 and each replaces a failure that
+// the last two were added in 0.4.0 and each replaces a failure that
 // named nothing a consumer could act on.
 #[cfg(all(feature = "fips", feature = "no-std"))]
 compile_error!(
@@ -1550,7 +1550,7 @@ mod claims_this_crate_makes_about_itself {
     ///
     /// **The defect.** The comment introducing the first `compile_error!` said "the
     /// only remaining build-time gate", which stopped being true when the second was
-    /// added in 0.2.0 and was three behind by 0.3.1. It also cited a commit id that
+    /// added in 0.2.0 and was three behind by 0.4.0. It also cited a commit id that
     /// the pre-0.3.0 history rewrite dissolved.
     ///
     /// **What a consumer observed.** A build refused for a feature set the comment

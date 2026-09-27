@@ -117,7 +117,7 @@ pub const REJECT_UNSUPPORTED_VERSION: u8 = 1;
 /// nothing for the client to retry and nothing to negotiate — the code exists so the
 /// refusal reaches the client at all, rather than as a connection that goes quiet.
 ///
-/// Before 0.3.1 this mismatch was a `HandshakeResponse::Fail`, which the listener
+/// Before 0.4.0 this mismatch was a `HandshakeResponse::Fail`, which the listener
 /// answers by closing without a reply: over TCP the client saw a bare connection error
 /// and over PhantomUDP, where there is no close to see, it waited out its handshake
 /// deadline and reported `Timeout` — the one shape of failure the typed refusal exists
