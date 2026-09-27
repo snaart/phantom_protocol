@@ -1487,3 +1487,139 @@ mod pinned_version_claims {
         assert!(found[2].contains("starts its line"), "{}", found[2]);
     }
 }
+
+/// The dependency features a consumer of this crate inherits, and which of them may
+/// not be taken away without a major release.
+///
+/// Cargo unifies features across the whole dependency graph, so what this crate asks
+/// of a shared dependency is added to what a consumer asked of the same dependency,
+/// and the consumer's own code compiles against the union. A consumer that writes
+/// `tokio = { version = "1", features = ["rt-multi-thread", "macros"] }` and then
+/// calls `tokio::signal::ctrl_c()` compiles only because this crate enables `signal`;
+/// remove it and their build breaks on `cargo update`, which the `= "0.3"`
+/// requirement the README recommends invites.
+///
+/// 0.3.1 removed four such tokio features and moved `time` out of `std`, and both
+/// were reproduced twice against unchanged consumer source: a program that built
+/// against 0.3.0 gave five compile errors, none of which named this crate or a
+/// feature. They were restored, and this module is why they stay restored: nothing
+/// else in the repository can see the break. `cargo-semver-checks` compares this
+/// crate's public API and not its dependencies' feature selections; the cross-target
+/// matrix, the integration suites and the trial consumer all name enough features of
+/// their own to paper over the loss; and a consumer is the only party who finds out.
+///
+/// So the gate is deliberately a text assertion about the manifest rather than a test
+/// that uses the features. A test using them would compile whenever any
+/// **dev**-dependency happened to enable them — and dev-dependencies are not part of
+/// what a consumer inherits, so such a test would be green for the exact change it
+/// is supposed to catch.
+#[cfg(test)]
+mod inherited_dependency_features {
+    /// This crate's manifest, read as text. It sits inside the package, so this
+    /// resolves both here and in an extracted `cargo package` archive.
+    const MANIFEST: &str = include_str!("../Cargo.toml");
+
+    /// The `tokio` features a consumer has been inheriting from the native
+    /// dependency block since long before 0.3.0, with what each one provides.
+    ///
+    /// The first two are what this library itself calls. The other four are not used
+    /// anywhere in `core/src`, and that is exactly why they are easy to delete and
+    /// why they are listed here: their only remaining job is to keep compiling
+    /// somebody else's code.
+    const INHERITED_TOKIO_FEATURES: &[(&str, &str)] = &[
+        ("net", "this library's own TCP/UDP sockets"),
+        ("rt-multi-thread", "this library's own spawned tasks"),
+        ("signal", "a consumer's `tokio::signal::ctrl_c()`"),
+        ("process", "a consumer's `tokio::process::Command`"),
+        ("fs", "a consumer's `tokio::fs`"),
+        ("io-std", "a consumer's `tokio::io::stdin` / `stdout`"),
+    ];
+
+    /// The native dependency block's `tokio` entry, as text.
+    ///
+    /// Taken from the target table rather than from the whole file, so the
+    /// cross-target `tokio` entry near the top — which names `time`, a tokio feature
+    /// with nothing to do with the `time` crate below — cannot satisfy an assertion
+    /// about the native one.
+    fn native_tokio_entry() -> &'static str {
+        let table = "[target.'cfg(not(target_arch = \"wasm32\"))'.dependencies]";
+        let after = MANIFEST
+            .split_once(table)
+            .unwrap_or_else(|| panic!("the manifest has no {table} table"))
+            .1;
+        let entry = after
+            .split_once("\ntokio = ")
+            .unwrap_or_else(|| panic!("the {table} table declares no tokio"))
+            .1;
+        // To the end of the inline table, which spans several lines.
+        let end = entry
+            .find(" }")
+            .unwrap_or_else(|| panic!("tokio's entry in {table} does not close"));
+        &entry[..=end]
+    }
+
+    /// Every feature above is still named in the native `tokio` entry.
+    #[test]
+    fn the_native_tokio_entry_still_names_every_inherited_feature() {
+        let entry = native_tokio_entry();
+        for (feature, who_needs_it) in INHERITED_TOKIO_FEATURES {
+            assert!(
+                entry.contains(&format!("\"{feature}\"")),
+                "core/Cargo.toml no longer enables tokio's `{feature}` for native \
+                 targets, which is what provides {who_needs_it}. Cargo unifies features \
+                 across the graph, so taking it away breaks the build of every consumer \
+                 that relied on inheriting it and named fewer features itself — a \
+                 breaking change, and one no other gate here can see. It may go in a \
+                 major release, with a note a consumer reads before upgrading, and not \
+                 before. The entry reads: {entry}"
+            );
+        }
+    }
+
+    /// `std` still enables `time`, so a consumer that declares the crate with
+    /// `default-features = false` keeps inheriting `time/std` from us.
+    ///
+    /// `time` is read nowhere outside the `mimicry` leg, so by this crate's own needs
+    /// the line is dead — which is how it came to be deleted. What it carries is
+    /// `time`'s **default features**, and `time/std` is where `OffsetDateTime::now_utc`
+    /// lives: a consumer with `time = { version = "0.3", default-features = false }`
+    /// lost that method and was told `no function or associated item named 'now_utc'`.
+    #[test]
+    fn the_std_feature_still_carries_the_time_crate() {
+        let std_block = MANIFEST
+            .split_once("\nstd = [")
+            .expect("the manifest declares a `std` feature")
+            .1
+            .split_once("\n]")
+            .expect("the `std` feature list closes")
+            .0;
+        assert!(
+            std_block.contains("\"dep:time\""),
+            "core/Cargo.toml's `std` feature no longer enables `dep:time`. Nothing in \
+             this crate reads `time` outside the `mimicry` leg, so this looks like dead \
+             weight — but it is what hands a consumer `time`'s default features, and \
+             dropping it took `OffsetDateTime::now_utc` away from consumer code that \
+             declared `time` with `default-features = false`. It may go in a major \
+             release and not before. The `std` list reads: {std_block}"
+        );
+    }
+
+    /// The manifest says, beside both of them, that they are compatibility entries and
+    /// when they may go.
+    ///
+    /// Without this the next reader finds two feature selections the crate does not
+    /// use, deletes them as cleanup, and the two assertions above become a puzzle
+    /// rather than an explanation — which is how the first deletion happened.
+    #[test]
+    fn both_compatibility_entries_carry_the_note_that_says_why() {
+        let note = "KEPT ON THE 0.3.x LINE FOR COMPATIBILITY";
+        assert_eq!(
+            MANIFEST.matches(note).count(),
+            2,
+            "core/Cargo.toml should carry the `{note}` note exactly twice — once beside \
+             `dep:time` in the `std` feature and once beside the native `tokio` entry — \
+             so a reader who finds either selection unused learns why it is there \
+             before deleting it."
+        );
+    }
+}

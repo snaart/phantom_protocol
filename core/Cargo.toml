@@ -96,6 +96,21 @@ std = [
     "dep:hkdf",
     "dep:sha2",
     "dep:getrandom",
+    # KEPT ON THE 0.3.x LINE FOR COMPATIBILITY — REMOVE IN 0.4.0, NOT BEFORE.
+    #
+    # Nothing in the crate reads `time` outside the `mimicry` leg, which names it
+    # itself, so by this crate's own needs this line is dead. It stays because
+    # Cargo unifies features across the whole graph: a consumer that declares
+    # `time` with `default-features = false` has been compiling against the union
+    # of its own selection and ours, and ours turns on `time/std` — which is what
+    # `OffsetDateTime::now_utc` and the rest of the wall-clock surface live behind.
+    # Dropping this line took that surface away from such a consumer's own code and
+    # produced `no function or associated item named 'now_utc'` — a message that
+    # names neither this crate nor the feature. That is not a thing a patch release
+    # may do, and it was reproduced twice against unchanged consumer source before
+    # the line came back. It goes out in 0.4.0, where a consumer expects to read
+    # release notes before upgrading.
+    "dep:time",
     # Native (non-wasm32) optional deps; activating these on a wasm32 target
     # is a no-op because the deps themselves are gated by the
     # `[target.'cfg(not(target_arch = "wasm32"))']` table.
@@ -176,11 +191,12 @@ wasi-leg = ["std", "dep:wasi"]
 # change (outer, leg-local framing). The outer TLS is anti-DPI obfuscation ONLY,
 # and is DETECTABLE by active probing — see the module head + threat model.
 #
-# It carries `dep:time`, which nothing else in the crate reads: the synthetic
+# It names `dep:time`, which nothing else in the crate reads: the synthetic
 # certificate the theater prelude presents needs a wall-clock validity window in
-# X.509's own calendar form, and that is the crate's only use of a date. It used
-# to hang off `std`, so every consumer of the default build compiled it for a leg
-# they had not enabled.
+# X.509's own calendar form, and that is the crate's only use of a date. Naming it
+# here is what makes the leg's own dependency explicit. `std` also carries it on
+# the 0.3.x line, for the compatibility reason recorded against that entry, so
+# this line changes nothing in a default build until 0.4.0 drops the other one.
 mimicry = ["std", "dep:time"]
 
 # OpenTelemetry pipeline (Phase 8). Off by default; the `core` library exposes
@@ -202,10 +218,11 @@ telemetry-otel = [
 # `tokio` is split per target (Phase 3.5 conditional compilation matrix):
 # - Cross-target features: sync primitives, time, io-util, macros, single-thread
 #   runtime. These work on both native and wasm32.
-# - Native-only features (`net`, `rt-multi-thread`) are added in the
+# - Native-only features (`net`, `rt-multi-thread`, and — on the 0.3.x line, for
+#   compatibility only — `signal`, `process`, `fs`, `io-std`) are added in the
 #   `[target.'cfg(not(target_arch = "wasm32"))']` block at the bottom of this
-#   file. That block names only what the library calls; an embedder that needs
-#   signals, processes or files asks tokio for them in its own manifest.
+#   file. Only the first two are what the library calls; the note there says why
+#   the other four are still enabled and when they go.
 tokio = { version = "1.36", default-features = false, optional = true, features = [
     "sync", "macros", "rt", "time", "io-util",
 ] }
@@ -308,9 +325,10 @@ zstd = { version = "0.14", optional = true }
 # `[target.'cfg(not(target_arch = "wasm32"))']` block at the bottom.
 
 # Wall-clock dates in X.509 calendar form, for the validity window on the
-# synthetic certificate the TLS-mimicry theater presents. Gated by `mimicry`
-# rather than `std`: it is the only reader in the crate, and while this hung off
-# `std` the crate compiled a date library into every default build.
+# synthetic certificate the TLS-mimicry theater presents — the only reader of this
+# crate anywhere in the tree. `mimicry` names it for that reason; `std` also names
+# it on the 0.3.x line so a consumer that has been getting `time/std` through us
+# keeps getting it (see the entry in `std`), and that is the line 0.4.0 removes.
 time = { version = "0.3", optional = true }
 
 # --- FFI ---
@@ -349,19 +367,29 @@ uniffi = { version = "0.32", features = ["build"] }
 # TCP/UDP transport legs and raw sockets live here. wasm32 builds
 # skip these entirely and use the `WebSocketLeg` instead (see below).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-# `signal`, `process`, `fs` and `io-std` are deliberately absent: nothing in this
-# library spawns a process, reads a file, or listens for a signal — an embedder
-# that does (`server/` handles SIGTERM) asks tokio for them itself. They were
-# enabled here for years, so every consumer paid for the code behind them.
+# `net` and `rt-multi-thread` are what this library itself calls.
 #
-# Removing one of these is a breaking change for some consumer, and not one any
-# gate in this repository can see. Cargo unifies features across the graph, so a
-# consumer that declares tokio with fewer features has been compiling against the
-# union of theirs and this list; dropping a feature takes it away from their code
-# too, and `cargo-semver-checks` compares this crate's API rather than its
-# dependencies' feature sets. Adding one is the safe direction and removing one
-# belongs in a release whose notes say so — 0.3.1's do, for these four.
-tokio = { version = "1.36", optional = true, features = ["net", "rt-multi-thread"] }
+# For `signal`, `process`, `fs` and `io-std`:
+# KEPT ON THE 0.3.x LINE FOR COMPATIBILITY — REMOVE IN 0.4.0, NOT BEFORE.
+# Nothing here spawns a process, reads a file or listens for a signal, so by this
+# library's own needs the four are dead weight, and 0.3.1 tried to drop them.
+#
+# They came back because Cargo unifies features across the whole graph, which
+# makes removing one a breaking change for a consumer, and not one any gate in
+# this repository can see. A consumer that declares tokio with fewer features has
+# been compiling against the union of its selection and this list, so a program
+# that calls `tokio::signal::ctrl_c()` or `tokio::io::stdin()` while naming only
+# `rt-multi-thread` and `macros` in its own manifest compiled purely because this
+# crate unified the feature in — and stops compiling on `cargo update`, which the
+# `phantom-protocol = "0.3"` the README recommends invites. It was reproduced
+# twice on unchanged consumer source. `cargo-semver-checks` compares this crate's
+# API rather than its dependencies' feature sets, so nothing flagged it either.
+#
+# Adding a feature is the safe direction; removing one belongs in a release whose
+# notes a consumer reads before upgrading. Do not clean this up before 0.4.0.
+tokio = { version = "1.36", optional = true, features = [
+    "net", "rt-multi-thread", "signal", "process", "fs", "io-std",
+] }
 # socket2 gives portable access to SO_REUSEPORT (Phase 2.9 — Linux
 # multi-accept). Already in the transitive tree via tokio so this is
 # free from a build-size standpoint.
