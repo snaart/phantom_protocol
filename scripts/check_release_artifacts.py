@@ -35,8 +35,32 @@ below are invisible on the machine that produced them:
 
 The workflows cannot test themselves -- a release happens on a tag, once -- so this is the
 regression test for all four: a text scan over the files that decide what is shipped.  Its
-own cases live in `scripts/check_release_artifacts_test.sh`, which mutates each property
+own cases live in `scripts/check_release_artifacts_test.py`, which mutates each property
 back to its 0.3.0 state and requires this script to fail.
+
+WHAT THE FIRST VERSION OF THIS SCRIPT DID NOT ASSERT.  Three of the four properties could
+be put back to their 0.3.0 state while this script still printed all four as satisfied,
+because each was checked by looking for a string rather than for the thing the string is
+supposed to do:
+
+  * Both install-name read-backs and the wasmtime read-back were satisfied by the presence
+    of `otool -D` / `wasmtime --version` and a second mention of the expected value.  An
+    `echo` mentioning it counts as a mention, so deleting the `exit 1` -- turning the
+    read-back into a log line that reports the wrong install name and ships it anyway --
+    changed nothing here.  A read-back is now only accepted when a `!=` comparison against
+    the expected value is followed, within the same block, by a non-zero `exit`.
+
+  * The digest's basename requirement was a scan for `.tar.gz` literals carrying a `/`.
+    Assigning the path to a shell variable first (`TGZ="dist/${NAME}.tar.gz"`;
+    `shasum -a 256 "${TGZ}"`) reproduced the exact 0.3.0 defect with no literal to find.
+    Shell assignments in the same file are now resolved before the argument is judged, and
+    every argument is judged, not only the ones that spell out a tarball name.
+
+Those two rules are why this script reads assignments and block structure rather than
+single lines.  What it still cannot see is anything a step computes at run time -- a path
+built from a command substitution is opaque here, and the read-back inside the job is what
+covers it.  Each of the strengthened checks has a case in the test harness that mutates
+the file exactly the way the reviewer did.
 
 Usage:  scripts/check_release_artifacts.py [--repo-root DIR]
 Exit:   0 when every property holds, 1 when one does not, 2 on bad input.
@@ -46,6 +70,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -58,6 +83,21 @@ C_PACKAGER = Path("tests/bindings/c/package.sh")
 # macOS library has to carry.
 SHIP_PROFILE = "dist"
 INSTALL_NAME = "@rpath/libphantom_protocol.dylib"
+
+# `exit 1` and friends. `exit 0` deliberately does not match: a read-back that ends the
+# step successfully is the defect, not the fix.
+NONZERO_EXIT = re.compile(r"\bexit\s+[1-9][0-9]*\b")
+
+# `${NAME}` / `$NAME`. `${{ matrix.target }}` does not match (the character after `${` is
+# not an identifier start) and neither does `${VAR#v}`, which is what keeps the expansion
+# below from pretending to understand shell it does not.
+VAR_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)\b")
+
+ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+
+# A value this scan cannot resolve -- a command substitution, in practice. Marked rather
+# than dropped so an argument built out of one is never mistaken for a bare basename.
+OPAQUE = "\x00"
 
 
 def read(root: Path, rel: Path) -> str:
@@ -90,6 +130,87 @@ def profile_block(manifest: str, name: str) -> str | None:
 def setting(block: str, key: str) -> str | None:
     m = re.search(rf"^\s*{re.escape(key)}\s*=\s*(\S+)", block, re.MULTILINE)
     return None if m is None else m.group(1).strip().strip('"')
+
+
+def shell_assignments(body: str) -> dict[str, str]:
+    """Collect `VAR=value` assignments out of a comment-stripped shell body.
+
+    A value holding a command substitution is recorded as OPAQUE: this scan cannot know
+    what it expands to, and pretending it expands to nothing would let a path hide inside
+    one.  Everything else is kept verbatim, references and all, for `expand` to resolve.
+    """
+    env: dict[str, str] = {}
+    for raw in body.splitlines():
+        m = ASSIGNMENT.match(raw.strip())
+        if m is None:
+            continue
+        name, value = m.group(1), m.group(2).strip()
+        if "$(" in value or "`" in value:
+            env[name] = OPAQUE
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        env[name] = value
+    return env
+
+
+def expand(value: str, env: dict[str, str], rounds: int = 4) -> str:
+    """Resolve `${VAR}` / `$VAR` against `env`, leaving unknown names alone."""
+    for _ in range(rounds):
+        def one(m: re.Match[str]) -> str:
+            name = m.group(1) or m.group(2)
+            return env.get(name, m.group(0))
+
+        grown = VAR_REF.sub(one, value)
+        if grown == value:
+            break
+        value = grown
+    return value
+
+
+def enforced_readback(
+    body: str,
+    anchor: re.Pattern[str],
+    compared_with: tuple[str, ...],
+    context: tuple[str, ...] = (),
+    window: int = 8,
+) -> tuple[bool, bool, bool]:
+    """Judge a read-back-and-compare block.
+
+    `anchor` matches the line that reads a value back off the artifact.  Within the next
+    `window` lines there has to be a `!=` comparison naming everything in `compared_with`,
+    every string in `context` has to appear, and a non-zero `exit` has to come *after* the
+    comparison.  Returns `(found, compared, enforced)`.
+
+    The ordering requirement is the point: a block that reads the value, prints it, and
+    carries on has all the same words in it as one that fails the job, and only the exit
+    tells them apart.  That is precisely how the first version of this gate could be
+    satisfied by a tree that shipped the 0.3.0 artifact.
+    """
+    lines = body.splitlines()
+    found = compared = enforced = False
+    for i, line in enumerate(lines):
+        if not anchor.search(line):
+            continue
+        found = True
+        block = lines[i : i + window]
+        if not all(token in "\n".join(block) for token in context):
+            continue
+        at = next(
+            (
+                j
+                for j, seg in enumerate(block)
+                if "!=" in seg and all(token in seg for token in compared_with)
+            ),
+            None,
+        )
+        if at is None:
+            continue
+        compared = True
+        if any(NONZERO_EXIT.search(seg) for seg in block[at + 1 :]):
+            enforced = True
+            break
+    return found, compared, enforced
 
 
 def check_unstripped(root: Path, problems: list[str]) -> None:
@@ -140,11 +261,28 @@ def check_unstripped(root: Path, problems: list[str]) -> None:
             f"target/<target>/{SHIP_PROFILE}/; cargo names the directory after the profile, "
             "so this and the build command have to agree"
         )
+    # Staging the library from a hard-coded `release/` directory ships the stripped one no
+    # matter what LIBDIR says, and the copy would still succeed: `cargo build --profile
+    # dist` leaves an earlier `target/<target>/release/` tree untouched.
+    for line in release.splitlines():
+        if "libphantom_protocol" in line and "/release/" in line:
+            problems.append(
+                f"  {RELEASE_WORKFLOW}: `{line.strip()}` stages a library out of a "
+                f"release/ directory; the shipped one is built into {SHIP_PROFILE}/ and the "
+                "release tree may still hold a stripped library from an earlier build"
+            )
 
     # maturin compiles the library and then runs uniffi-bindgen against it, so the wheel
     # job does not ship a broken artifact when the library is stripped -- it fails, having
-    # written a `.whl` with no `.dist-info` in it.
-    for line in [ln.strip() for ln in release.splitlines() if "maturin build" in ln]:
+    # written a `.whl` with no `.dist-info` in it.  Checked only for the lines that exist,
+    # so the assertion has to be that a workflow mentioning maturin at all runs one.
+    maturin_builds = [ln.strip() for ln in release.splitlines() if "maturin build" in ln]
+    if "maturin" in release and not maturin_builds:
+        problems.append(
+            f"  {RELEASE_WORKFLOW}: mentions maturin but runs no `maturin build`; the wheel "
+            "job's own build is what proves the shipped library still generates bindings"
+        )
+    for line in maturin_builds:
         if f"--profile {SHIP_PROFILE}" not in line:
             problems.append(
                 f"  {RELEASE_WORKFLOW}: `{line}` does not build --profile {SHIP_PROFILE}; "
@@ -173,32 +311,72 @@ def check_install_name(root: Path, problems: list[str]) -> None:
                 "records the build directory's absolute path and every consumer that links "
                 "the shipped dylib dies at launch with `dyld: Library not loaded`"
             )
-        if "otool -D" not in text or INSTALL_NAME not in text.replace(
-            "install_name_tool -id " + INSTALL_NAME, ""
-        ):
+        found, compared, enforced = enforced_readback(
+            text,
+            re.compile(r"otool\s+-D"),
+            compared_with=("!=", INSTALL_NAME),
+        )
+        if not found:
             problems.append(
-                f"  {rel}: does not read the install name back with otool -D and compare it "
-                f"against {INSTALL_NAME}; a rewrite that did nothing looks like one that "
-                "worked"
+                f"  {rel}: does not read the install name back with otool -D; a rewrite "
+                "that did nothing looks like one that worked"
             )
+        elif not compared:
+            problems.append(
+                f"  {rel}: reads the install name back with otool -D but never compares it "
+                f"against {INSTALL_NAME}"
+            )
+        elif not enforced:
+            problems.append(
+                f"  {rel}: compares the install name it read back but no non-zero exit "
+                "follows, so a wrong install name is logged and then shipped; the read-back "
+                "has to fail the step"
+            )
+
+
+def digest_arguments(call: str) -> list[str]:
+    """The path-shaped arguments of a shasum invocation, flags and operators removed."""
+    try:
+        words = shlex.split(call, posix=True)
+    except ValueError:
+        # Unbalanced quoting across a continued line -- fall back to whitespace splitting
+        # rather than reporting nothing, which is the vacuous answer.
+        words = [w.strip("\"'") for w in call.split()]
+    skip = {"(", ")", "{", "}", "&&", "||", ";", ">", ">>", "|", "cd", "shasum", "then", "fi"}
+    out: list[str] = []
+    for word in words:
+        cleaned = word.lstrip(">")
+        if not cleaned or cleaned in skip or cleaned.startswith("-") or cleaned.isdigit():
+            continue
+        out.append(cleaned)
+    return out
 
 
 def check_checksums(root: Path, problems: list[str]) -> None:
     release = strip_comments(read(root, RELEASE_WORKFLOW))
+    env = shell_assignments(release)
     calls = re.findall(r"shasum[^\n]*", release)
     if not calls:
         problems.append(
             f"  {RELEASE_WORKFLOW}: nothing computes a checksum for the published tarballs"
         )
     for call in calls:
-        for token in re.findall(r'"?\$?\{?[^\s"\']*\.tar\.gz(?:\.sha256)?"?', call):
-            name = token.strip('"')
-            if "/" in name:
-                problems.append(
-                    f"  {RELEASE_WORKFLOW}: `{call.strip()}` names {name}, which puts a "
-                    "directory into the digest line; `shasum -c` then fails for everyone "
-                    "who downloaded the tarball and its .sha256 side by side"
-                )
+        if "||" in call:
+            problems.append(
+                f"  {RELEASE_WORKFLOW}: `{call.strip()}` swallows its own exit status; a "
+                "digest that could not be written or could not be verified has to fail the "
+                "release"
+            )
+        for argument in digest_arguments(call):
+            resolved = expand(argument, env)
+            if "/" not in resolved:
+                continue
+            via = "" if resolved == argument else f" (`{argument}` expands to `{resolved}`)"
+            problems.append(
+                f"  {RELEASE_WORKFLOW}: `{call.strip()}` names {resolved}{via}, which puts a "
+                "directory into the digest line; `shasum -c` then fails for everyone who "
+                "downloaded the tarball and its .sha256 side by side"
+            )
     if not re.search(r"shasum\s+-a\s+256\s+-c\b", release):
         problems.append(
             f"  {RELEASE_WORKFLOW}: nothing verifies the digest it just wrote; the check "
@@ -235,11 +413,27 @@ def check_wasmtime_pin(root: Path, problems: list[str]) -> None:
                 f"  {CROSS_WORKFLOW}: `{ln.strip()}` does not pass --version "
                 '"${WASMTIME_VERSION}"; the installer defaults to the latest release'
             )
-    if not re.search(r"wasmtime[\"']?\s+--version", body) or "WASMTIME_VERSION#v" not in body:
+    found, compared, enforced = enforced_readback(
+        body,
+        re.compile(r"wasmtime[\"']?\s+--version"),
+        compared_with=("!=",),
+        context=("WASMTIME_VERSION#v",),
+    )
+    if not found:
         problems.append(
-            f"  {CROSS_WORKFLOW}: nothing reads the installed wasmtime version back and "
-            "compares it against WASMTIME_VERSION; an argument the installer ignores leaves "
-            "the pin looking honoured"
+            f"  {CROSS_WORKFLOW}: nothing reads the installed wasmtime version back; an "
+            "argument the installer ignores leaves the pin looking honoured"
+        )
+    elif not compared:
+        problems.append(
+            f"  {CROSS_WORKFLOW}: reads the installed wasmtime version back but never "
+            "compares it against WASMTIME_VERSION"
+        )
+    elif not enforced:
+        problems.append(
+            f"  {CROSS_WORKFLOW}: compares the installed wasmtime version against the pin "
+            "but no non-zero exit follows, so a run against an unpinned runtime is logged "
+            "and then treated as a pass"
         )
 
 

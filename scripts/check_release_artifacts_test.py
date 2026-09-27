@@ -12,6 +12,16 @@ uninteresting reason that the copy is not a faithful one -- and the case count i
 because a harness that has quietly stopped mutating anything reports the same success as one
 that checked everything.
 
+Ten of the cases exist because the first version of the gate did not fail on them.  A
+reviewer put three of its four properties back to their 0.3.0 state while it went on
+reporting all four satisfied, by mutating the *shape* of a check rather than its words: a
+read-back whose `exit 1` is deleted still mentions everything the scan looked for, and a
+tarball path assigned to a shell variable first carries no literal directory for it to find.
+Those mutations are `..._not_compared`, `..._mismatch_not_fatal`, `..._via_variable` and
+`..._exit_swallowed` below.  They are the reason the gate now reads block structure and
+resolves assignments, and they are here rather than in a commit message because a property
+nobody can re-break on demand is a claim, not a gate.
+
 Usage:  scripts/check_release_artifacts_test.py
 Exit:   0 when every case behaves, 1 when one does not.
 """
@@ -37,7 +47,7 @@ FILES = [
     Path("tests/bindings/c/package.sh"),
 ]
 
-EXPECTED_CASES = 16
+EXPECTED_CASES = 26
 
 
 def stage() -> Path:
@@ -189,6 +199,114 @@ def case_wheel_release_profile(root: Path) -> None:
     edit(root, RELEASE, "maturin build --profile dist", "maturin build --release")
 
 
+# ── The mutations the first version of the gate passed ─────────────────────────────────
+#
+# Each of these leaves every string the old scan looked for in place and removes only the
+# part that makes the check do something.  A gate that passes one of them is asserting the
+# vocabulary of the fix rather than the fix.
+
+
+def case_install_name_readback_not_compared(root: Path) -> None:
+    # The read-back becomes a log line. `otool -D` is still there and so is the expected
+    # install name -- in the echo -- which is all the first version of the gate required.
+    edit(
+        root,
+        RELEASE,
+        '''            if [ "${got}" != "@rpath/libphantom_protocol.dylib" ]; then
+              echo "install name is \'${got}\', expected \'@rpath/libphantom_protocol.dylib\'" >&2
+              exit 1
+            fi
+''',
+        '''            echo "install name is \'${got}\', want \'@rpath/libphantom_protocol.dylib\'"
+''',
+    )
+
+
+def case_install_name_mismatch_not_fatal(root: Path) -> None:
+    # The comparison survives; only the exit does not. A wrong install name is then
+    # reported on stdout and shipped, which is 0.3.0's outcome with a diagnostic.
+    edit(root, RELEASE, "              exit 1\n            fi", "            fi")
+
+
+def case_packager_readback_not_compared(root: Path) -> None:
+    edit(
+        root,
+        PACKAGER,
+        '''    if [ "${got}" != "@rpath/libphantom_protocol.dylib" ]; then
+        echo "install name is \'${got}\', expected \'@rpath/libphantom_protocol.dylib\'" >&2
+        exit 1
+    fi
+''',
+        '''    echo "install name is \'${got}\', want \'@rpath/libphantom_protocol.dylib\'"
+''',
+    )
+
+
+def case_packager_mismatch_not_fatal(root: Path) -> None:
+    edit(root, PACKAGER, "        exit 1\n    fi", "    fi")
+
+
+def case_wasmtime_readback_not_compared(root: Path) -> None:
+    edit(
+        root,
+        CROSS,
+        '''          if [ "${got}" != "${want}" ]; then
+            echo "installed wasmtime ${got}, expected ${want}" >&2
+            exit 1
+          fi
+''',
+        '''          echo "installed wasmtime ${got}, wanted ${want}"
+''',
+    )
+
+
+def case_wasmtime_mismatch_not_fatal(root: Path) -> None:
+    edit(root, CROSS, "            exit 1\n          fi", "          fi")
+
+
+def case_checksum_directory_via_variable(root: Path) -> None:
+    # The 0.3.0 defect exactly -- the digest line names `dist/<tarball>` -- written so that
+    # no `.tar.gz` literal in the file carries a separator.
+    edit(
+        root,
+        RELEASE,
+        '''          ( cd dist && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
+          ( cd dist && shasum -a 256 -c "${NAME}.tar.gz.sha256" )''',
+        '''          TGZ="dist/${NAME}.tar.gz"
+          shasum -a 256 "${TGZ}" > "${TGZ}.sha256"
+          shasum -a 256 -c "${TGZ}.sha256"''',
+    )
+
+
+def case_checksum_exit_swallowed(root: Path) -> None:
+    # The verification runs and its verdict is discarded, which is the same as not running
+    # it while looking like the fix.
+    edit(
+        root,
+        RELEASE,
+        '( cd dist && shasum -a 256 -c "${NAME}.tar.gz.sha256" )',
+        '( cd dist && shasum -a 256 -c "${NAME}.tar.gz.sha256" ) || true',
+    )
+
+
+def case_library_staged_from_release_dir(root: Path) -> None:
+    # LIBDIR still says `dist`, and the copy still succeeds: `cargo build --profile dist`
+    # does not remove an earlier `target/<target>/release/` tree, so this ships the
+    # stripped library from whatever built last.
+    edit(
+        root,
+        RELEASE,
+        'cp "${LIBDIR}/libphantom_protocol.rlib" "dist/${NAME}/"',
+        'cp "target/${{ matrix.target }}/release/libphantom_protocol.rlib" "dist/${NAME}/"',
+    )
+
+
+def case_maturin_build_removed(root: Path) -> None:
+    # The wheel job keeps its comments, its venv smoke test and its upload, and builds
+    # nothing. The per-line check over `maturin build` lines then has no line to judge.
+    drop_line(root, RELEASE, "maturin build --profile dist")
+
+
 CASES = [
     ("the shipped profile strips symbols again", "strip", case_strip_symbols),
     ("no [profile.dist] at all", "no [profile.dist]", case_no_dist_profile),
@@ -222,6 +340,57 @@ CASES = [
     ("C bundle keeps the runner's install name", "install name", case_packager_no_install_name),
     ("C bundle built --release", "does not build --profile dist", case_packager_release_profile),
     ("Python wheel built --release", "does not build --profile dist", case_wheel_release_profile),
+    # The ten the first version of the gate passed.
+    (
+        "install-name read-back reduced to a log line",
+        "release.yml: reads the install name back with otool -D but never compares",
+        case_install_name_readback_not_compared,
+    ),
+    (
+        "install-name mismatch no longer fails the step",
+        "release.yml: compares the install name it read back but no non-zero exit",
+        case_install_name_mismatch_not_fatal,
+    ),
+    (
+        "C bundle's read-back reduced to a log line",
+        "package.sh: reads the install name back with otool -D but never compares",
+        case_packager_readback_not_compared,
+    ),
+    (
+        "C bundle's install-name mismatch no longer fails",
+        "package.sh: compares the install name it read back but no non-zero exit",
+        case_packager_mismatch_not_fatal,
+    ),
+    (
+        "wasmtime read-back reduced to a log line",
+        "never compares it against WASMTIME_VERSION",
+        case_wasmtime_readback_not_compared,
+    ),
+    (
+        "wasmtime mismatch no longer fails the job",
+        "a run against an unpinned runtime is logged",
+        case_wasmtime_mismatch_not_fatal,
+    ),
+    (
+        "digest line carries dist/ through a shell variable",
+        "expands to `dist/",
+        case_checksum_directory_via_variable,
+    ),
+    (
+        "digest verification's verdict discarded",
+        "swallows its own exit status",
+        case_checksum_exit_swallowed,
+    ),
+    (
+        "library staged out of the stripped release/ tree",
+        "stages a library out of a release/ directory",
+        case_library_staged_from_release_dir,
+    ),
+    (
+        "wheel job builds nothing at all",
+        "mentions maturin but runs no",
+        case_maturin_build_removed,
+    ),
 ]
 
 
