@@ -1,0 +1,21 @@
+# The interop peer built against the PUBLISHED 0.3.0 crate. Its twin, `peer-head`, builds the
+# same source against this tree; a run pairs the two in both orders over both transports.
+#
+# `=0.3.0` is exact on purpose. `"0.3.0"` would resolve to 0.3.1 -- 0.x treats the minor as
+# the breaking axis, so the two are semver-compatible -- and the job would then compare this
+# tree against itself and pass no matter what the wire did.
+#
+# Its own `[workspace]` table, like every other sibling crate here: the root workspace is
+# `core` alone, and a cargo command aimed at core must never reach this.
+[workspace]
+
+[package]
+name = "phantom-interop-peer-030"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+[dependencies]
+phantom-protocol = "=0.3.0"
+tokio = { version = "1", features = ["rt", "macros", "time"] }

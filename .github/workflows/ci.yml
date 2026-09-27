@@ -393,6 +393,46 @@ jobs:
       - run: scripts/check_changelog_breaking_test.sh
       - run: python3 scripts/check_changelog_breaking.py --structure-only
 
+  interop-published:
+    # The release notes lead with "a 0.3.1 peer and a 0.3.0 peer interoperate in
+    # both directions" and nothing in the tree tested it. That claim fails in
+    # silence: a packet whose `PacketHeader.version` disagrees is DROPPED with no
+    # reply and before any flag is read, so two incompatible peers complete a
+    # handshake, agree keys, and then never deliver a byte — with nothing at
+    # either end to say why. Reading `WIRE_VERSION` and `PROTOCOL_VERSION` off
+    # both sides is not the same proof: the wire is also the 47-byte AEAD AAD
+    # image, the header-protection mask over all 15 header bytes, the rotating
+    # connection id and the payload codec behind each flag, and any of those
+    # moving in a patch breaks interop with both constants unchanged. Verified
+    # by breaking it three ways — `WIRE_VERSION` 8 -> 9, and two field swaps in
+    # the AAD image with both constants left alone; the two that change a byte
+    # any session actually sends both fail here.
+    #
+    # Four pairings — each version as server and as client, over PhantomUDP and
+    # over TCP — and each pairing is itself bidirectional and sends 4000 bytes
+    # each way, which is more than one `MAX_APP_CHUNK` and so exercises the split
+    # and the reassembly rather than a single packet.
+    #
+    # On every pull request rather than the tag path: a wire change is made in
+    # the branch that makes it, and a gate that only runs on the tag reports it
+    # when the release is already being cut. The published 0.3.0 crate is an
+    # immutable dependency, so its build is a cache hit after the first run.
+    name: interop with the published release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Both peer crates carry their own `[workspace]`, so each is its own
+          # cache root; the tree's own `target/` is shared with nothing here.
+          workspaces: |
+            .
+            scripts/interop/peer-030
+            scripts/interop/peer-head
+          key: interop-published
+      - run: scripts/interop/run_interop_test.sh
+
   deny:
     name: cargo deny
     runs-on: ubuntu-latest

@@ -1,0 +1,20 @@
+# The interop peer built against THIS TREE. Its twin, `peer-030`, builds the same source
+# against the published `=0.3.0` crate; a run pairs the two in both orders over both
+# transports.
+#
+# A path dependency, so what is tested is the working copy rather than anything published.
+#
+# Its own `[workspace]` table, like every other sibling crate here: the root workspace is
+# `core` alone, and a cargo command aimed at core must never reach this.
+[workspace]
+
+[package]
+name = "phantom-interop-peer-head"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+[dependencies]
+phantom-protocol = { path = "../../../core" }
+tokio = { version = "1", features = ["rt", "macros", "time"] }
