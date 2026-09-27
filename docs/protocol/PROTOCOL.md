@@ -2036,12 +2036,17 @@ regardless of the 0-RTT path.
 
 **API surface.** Client (Rust):
 ```rust
-PhantomSession::builder(addr)
+let session = PhantomSession::builder(addr)
     .pinned_key(expected_server_key)
     .resumption(resumption_hint, early_data)
     .transport(transport)
     .connect()
-    .await?
+    .await?;
+
+// `connect()` returns before the handshake has run, so the line above proves
+// nothing about the server's identity and `early_data_accepted()` means nothing
+// yet. Both are settled here (Invariant 1):
+session.await_ready().await?;
 ```
 Client (native FFI): `connect_pinned_with_resumption` / `connect_pinned_udp_with_resumption`.
 The `resumption_hint` comes from a prior session's

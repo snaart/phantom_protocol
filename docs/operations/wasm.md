@@ -137,6 +137,11 @@ let session = PhantomSession::builder("wss://phantom.example.com")
     .connect()
     .await?;
 
+// `connect()` returns once the WebSocket is open — before the handshake, so
+// before the pinned key has been checked (Invariant 1). Resolve it first;
+// `early_data_accepted()` is meaningless until it has.
+session.await_ready().await?;
+
 // None = no 0-RTT attempt; Some(true) = server accepted early data.
 if session.early_data_accepted().await == Some(true) { /* ... */ }
 ```

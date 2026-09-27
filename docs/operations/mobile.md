@@ -314,6 +314,10 @@ session.resumptionHint()?.use { hint ->
 val session = ResumptionHint(sessionId = sid, resumptionSecret = secret).use { hint ->
     connectPinnedUdpWithResumption(host, port, pinnedKey, hint, earlyData)
 }
+// The early-data blob is already on the wire at this point and the pin is still
+// unchecked. Resolve the handshake before reading earlyDataAccepted(), which says
+// nothing until it has.
+session.awaitReady()
 ```
 
 **Connection migration (Wi-Fi ↔ LTE) — use the UDP transport + `migrate()`.**
