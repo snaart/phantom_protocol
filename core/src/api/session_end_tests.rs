@@ -62,27 +62,52 @@ struct Pipe {
     out: mpsc::Sender<Vec<u8>>,
     inbox: Mutex<mpsc::Receiver<Vec<u8>>>,
     cut: Cut,
+    /// While this reads `true`, a write on **this** end parks instead of completing.
+    ///
+    /// A pipe with a deep enough channel never blocks a writer, and one test needs a
+    /// writer that does: it has to read a state the session's own pump would overwrite
+    /// a fraction of a millisecond later, and the pump's next step is a write. Holding
+    /// the write holds the overwrite, which turns a sample of a transient into a
+    /// reading of a state that stays put. Each end has its own switch, so the side
+    /// under test can be stopped while the other side goes on driving the handshake.
+    hold: watch::Receiver<bool>,
 }
 
 impl Pipe {
     /// A connected pair, plus the switch that cuts the link for both of them.
     fn pair() -> (Self, Self, watch::Sender<bool>) {
+        let (a, b, cut, _holds) = Self::pair_with_holds();
+        (a, b, cut)
+    }
+
+    /// The same pair, plus the two write-holding switches: `[0]` holds the first
+    /// returned end's writes and `[1]` the second's.
+    ///
+    /// `pair()` drops both, which leaves each `hold` receiver on a closed channel
+    /// holding `false` — and a write consults it by waiting for `false`, which a closed
+    /// channel already satisfies, so nothing waits.
+    fn pair_with_holds() -> (Self, Self, watch::Sender<bool>, [watch::Sender<bool>; 2]) {
         const DEPTH: usize = 4096;
         let (cut_tx, cut_rx) = watch::channel(false);
         let (a_tx, b_rx) = mpsc::channel(DEPTH);
         let (b_tx, a_rx) = mpsc::channel(DEPTH);
+        let (a_hold_tx, a_hold_rx) = watch::channel(false);
+        let (b_hold_tx, b_hold_rx) = watch::channel(false);
         (
             Self {
                 out: a_tx,
                 inbox: Mutex::new(a_rx),
                 cut: cut_rx.clone(),
+                hold: a_hold_rx,
             },
             Self {
                 out: b_tx,
                 inbox: Mutex::new(b_rx),
                 cut: cut_rx,
+                hold: b_hold_rx,
             },
             cut_tx,
+            [a_hold_tx, b_hold_tx],
         )
     }
 }
@@ -101,6 +126,12 @@ impl SessionTransport for Pipe {
             // and then the test would not be pinning the route it names.
             return Ok(());
         }
+        // Checked after the cut, so a cut link still drops writes rather than parking
+        // on a hold nobody is going to release. `wait_for` inspects the current value
+        // first, and an `Err` — the switch's sender dropped, which is what `pair()`
+        // does — means there is nobody left to hold this end and the write goes on.
+        let mut hold = self.hold.clone();
+        let _ = hold.wait_for(|held| !*held).await;
         self.out.send(data.to_vec()).await.map_err(|_| vanished())
     }
 
@@ -572,10 +603,30 @@ async fn a_session_that_never_tried_is_not_reported_as_closed() {
 /// edit to the failure arm reintroduces a bare `store` and nothing notices: the state is
 /// correct for every session that was *not* closed during its handshake, which is all of
 /// them in every other test.
+///
+/// **Why the client's writes are held.** The success arm used to sample
+/// `connection_state()` every millisecond for six hundred milliseconds and assert that
+/// `Connected` was never among the samples. With the fix reverted it caught the reversion in
+/// four runs out of sixteen, because the walked-back `Connected` is a transient: the pump
+/// starts, reads the close the caller asked for, and publishes `Closed` over it about a
+/// quarter of a millisecond later. Every other assertion in the test passed either way — the
+/// readiness answer is read afterwards, by which time the state has settled — so a test
+/// reporting green was the usual outcome, and green was what it was cited for. A test that
+/// catches half of what it names is worse than none.
+///
+/// Holding the client's writes removes the race instead of narrowing it. The pump's first act
+/// after the handshake is a write, the close frame `disconnect()` asks for, and while that
+/// write is parked the pump cannot reach the `publish_end` at its exit. So the state the
+/// handshake left behind stays put, and `await_ready()` — which resolves off the handshake's
+/// own signal and then reads the state — becomes the discriminator: `Ok(())` under the
+/// reversion, `Err(ConnectionClosed)` with the fix. The failure arm needs no hold, because
+/// its handshake never starts a pump at all, and it was already deterministic; it takes the
+/// same path so the two arms stay one piece of code.
 async fn a_close_during_the_handshake_is_not_walked_back(handshake_succeeds: bool) {
     let server_hs = HandshakeServer::new().expect("HandshakeServer::new");
     let pinned = server_hs.verifying_key().clone();
-    let (client_link, server_link, cut) = Pipe::pair();
+    let (client_link, server_link, cut, holds) = Pipe::pair_with_holds();
+    let [hold_client_writes, _hold_server_writes] = holds;
     let client = Arc::new(PhantomSession::connect_with_transport(
         "test-server:9000",
         client_link,
@@ -595,19 +646,10 @@ async fn a_close_during_the_handshake_is_not_walked_back(handshake_succeeds: boo
     client.disconnect().await.expect("disconnect");
     assert_eq!(client.connection_state(), ConnectionState::Closed);
 
-    // Watch for the state moving off the close while the handshake resolves behind us.
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let poller = {
-        let client = client.clone();
-        let seen = seen.clone();
-        tokio::spawn(async move {
-            let until = Instant::now() + Duration::from_millis(600);
-            while Instant::now() < until {
-                seen.lock().await.push(client.connection_state());
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-    };
+    // Stop the client's pump before it can publish an end of its own. The client has sent
+    // everything the handshake needs from it by now, so this holds only what comes after.
+    hold_client_writes.send_replace(true);
+
     if handshake_succeeds {
         // Release the reply: the client's handshake now succeeds.
         server_link
@@ -619,7 +661,6 @@ async fn a_close_during_the_handshake_is_not_walked_back(handshake_succeeds: boo
         // ends in its failure arm with a cause of its own to record.
         cut.send_replace(true);
     }
-    poller.await.expect("poller task");
 
     let ready = timeout(STEP, client.await_ready())
         .await
@@ -629,23 +670,49 @@ async fn a_close_during_the_handshake_is_not_walked_back(handshake_succeeds: boo
         matches!(ready, CoreError::ConnectionClosed),
         "the readiness answer has to be the close the caller asked for; got {ready:?}"
     );
+    // Read while the pump is still held, so this is the state the handshake published and
+    // not one anything downstream has had a chance to correct.
+    assert_eq!(
+        client.connection_state(),
+        ConnectionState::Closed,
+        "the handshake wrote over the close the caller asked for"
+    );
     assert!(
         client.last_error().await.is_none(),
         "the caller's own close is not a failure; last_error() gave {:?}",
         client.last_error().await
     );
+
+    // Let the pump go and finish its teardown. The end it reaches has to be the same one,
+    // so that holding the writes above was reading the answer early rather than reading a
+    // different answer.
+    hold_client_writes.send_replace(false);
+    timeout(STEP, async {
+        while client.connection_state() != ConnectionState::Closed {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the released pump left the session on {:?} rather than the close the caller \
+             asked for",
+            client.connection_state()
+        )
+    });
+    // And it stays there for longer than the pump takes to finish leaving.
+    tokio::time::sleep(QUIET).await;
     assert_eq!(
         client.connection_state(),
         ConnectionState::Closed,
-        "the close the caller asked for is the end this session reached"
+        "the pump published an end other than the close the caller asked for"
     );
-    let seen = seen.lock().await;
-    for walked_back in [ConnectionState::Connected, ConnectionState::Failed] {
-        assert!(
-            !seen.contains(&walked_back),
-            "the session was published as {walked_back:?} after the caller closed it: {seen:?}"
-        );
-    }
+    assert!(
+        client.last_error().await.is_none(),
+        "the pump recorded a cause against a session the caller closed; last_error() gave \
+         {:?}",
+        client.last_error().await
+    );
     drop(inner);
 }
 
