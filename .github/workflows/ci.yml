@@ -305,6 +305,16 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - run: scripts/check_panic_sites.py
+      # `ServerReject`'s codes, in the same job for the same reason the memory
+      # arithmetic is in its own: a text scan needing no toolchain, over a
+      # document that cannot see the constants it describes. Code 2 shipped
+      # undocumented for a release because nothing here could notice — no wire
+      # format moves when a code is added, and the frame is never sent on the
+      # success path, so the whole suite stays green. The cases run first: a
+      # pattern that has stopped matching reports the same success as a tree
+      # that agrees.
+      - run: scripts/check_reject_codes_test.py
+      - run: scripts/check_reject_codes.py
 
   memory-arithmetic:
     # The published receive-window-growth product has two factors in two crates

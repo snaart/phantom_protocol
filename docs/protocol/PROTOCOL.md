@@ -108,14 +108,17 @@ They exist so that:
 - a future protocol revision can deliberately increment one or both, gated by
   a code change rather than runtime negotiation.
 
-**Unsupported-version signal (`ServerReject`).** When a `ClientHello.version`
-is not `PROTOCOL_VERSION`, the server does not drop silently — it replies with a
-small typed `ServerReject` frame *before* any KEM / signature work:
+**Typed refusal signal (`ServerReject`).** Where the server can say *why* it is
+refusing, it does not drop silently — it replies with a small typed
+`ServerReject` frame. Two of its three reasons are settled *before* any KEM /
+signature work (a `ClientHello.version` that is not `PROTOCOL_VERSION`, and a
+`protocol_variant` that is not this build's); the third is reached only after the
+address-validation exchange has run its rounds without satisfying the gate:
 
 | Offset | Field | Size | Notes |
 |---|---|---|---|
 | 0 | `marker` | 4 | `= b"PRJ1"` (`SERVER_REJECT_MARKER`); an extra sanity check on top of the T4.4 discriminant byte (`kind = 2`) that frames the reply |
-| 4 | `code` | 1 | reject reason; `1 = REJECT_UNSUPPORTED_VERSION` |
+| 4 | `code` | 1 | reject reason; `1 = REJECT_UNSUPPORTED_VERSION`, `2 = REJECT_PROTOCOL_VARIANT`, `3 = REJECT_RETRY_LIMIT` |
 | 5 | `supported_version` | 1 | the `PROTOCOL_VERSION` this server speaks |
 
 The client surfaces this as a hard error reporting both versions and **does not
@@ -2288,20 +2291,36 @@ this table is the most it can be asked for.
 pub struct ServerReject {
     pub marker:            [u8; 4],   // = b"PRJ1" (SERVER_REJECT_MARKER)
     pub code:              u8,        // 1 = REJECT_UNSUPPORTED_VERSION
+                                     // 2 = REJECT_PROTOCOL_VARIANT
+                                     // 3 = REJECT_RETRY_LIMIT
     pub supported_version: u8,        // the PROTOCOL_VERSION the server speaks
 }
 ```
 
 Source: `core/src/transport/handshake.rs`. A fixed 6 bytes. Returned by
-`process_client_hello` as `HandshakeResponse::Reject(..)` when
-`ClientHello.version != PROTOCOL_VERSION`, and serialised back to the client by
+`process_client_hello` as `HandshakeResponse::Reject(..)` for any of the three
+codes, and serialised back to the client by
 the listener (and the UDP demo path) *before* the connection closes — the one
 case where the server speaks after an unacceptable hello instead of dropping
 silently.
 
-The client identifies it by the T4.4 discriminant byte (`kind = 2`, with the
-`b"PRJ1"` marker as an extra check) and surfaces a hard error naming both
-versions. It deliberately does **not**
+**The three codes.** `1 = REJECT_UNSUPPORTED_VERSION` — the hello's `version` is
+not the one this server speaks; `supported_version` names the server's.
+`2 = REJECT_PROTOCOL_VARIANT` — the hello's `protocol_variant` is not this
+build's, so a default peer met a FIPS one or the reverse (Invariant 10); the two
+cannot interoperate and no retry helps. `3 = REJECT_RETRY_LIMIT` — the server
+abandoned the address-validation / proof-of-work exchange (§ 8) after
+`MAX_HANDSHAKE_RETRY_ROUNDS` rounds without a satisfied gate; nothing about the
+client's build is wrong and retrying the connect is the correct reaction. A
+receiver that does not know a code must not read it as a version refusal: where
+`supported_version` equals the version the client sent, the refusal is by
+construction about something else. Codes are additive, so a second
+implementation treats an unknown one as a fatal, non-retryable refusal it cannot
+name.
+
+The client identifies the frame by the T4.4 discriminant byte (`kind = 2`, with
+the `b"PRJ1"` marker as an extra check) and surfaces a hard error. For code 1 it
+names both versions. It deliberately does **not**
 auto-downgrade to `supported_version`: the version is bound into the signed
 transcript (§6.5, Invariant 7), so honouring an attacker-injected reject would
 be a downgrade oracle. The frame is purely diagnostic. Because it is an
@@ -2767,13 +2786,13 @@ either.
 
 ## 13. Last verified against the code
 
-The newest stamp is **2026-09-27, the 0.3.1 release**, and it covers three
-sections rather than the whole document: § 4.4, § 4.5 and § 4.11 were re-derived
-from the source in that release and are current as of it. Everything else carries
+The newest stamp is **2026-09-27, the 0.3.1 release**, and it covers four
+sections rather than the whole document: § 4.4, § 4.5, § 4.11 and § 6.10 were
+re-derived from the source in that release and are current as of it. Everything else carries
 the stamp below it. A reader picking this up later should treat the newest stamp
 covering the section they are reading as its expiry date: anything that has moved
 in `core/src/transport/`, `core/src/crypto/` or `core/src/api/session.rs` since
-then has not been re-checked here. The three 0.3.1 items, each named so it can be
+then has not been re-checked here. The four 0.3.1 items, each named so it can be
 checked rather than taken:
 
 - **§ 4.4** — the concurrent-stream cap counts the streams **the peer** holds, not
@@ -2788,6 +2807,12 @@ checked rather than taken:
   five of them ordered, and the four that are stream *connections* are the ones
   where an end-of-stream arrives behind the close; a UART has none, so there the
   draining deadline itself ends the session.
+- **§ 6.10** and the `ServerReject` table in § 2 — the reject `code` field has
+  three assigned values, not one: `2 = REJECT_PROTOCOL_VARIANT` shipped in an
+  earlier release without reaching this document, and `3 = REJECT_RETRY_LIMIT` is
+  new in 0.3.1. The section now also says what a receiver does with a code it does
+  not know, which matters because the message carries `supported_version` whatever
+  the reason is.
 
 Commit ids are deliberately absent from this stamp: the history up to the `v0.3.0`
 tag was rewritten once already, and `../policy/versioning.md` § 10 asks for a tag,

@@ -66,6 +66,29 @@ repos:
         files: ^(core/src/.*\.rs|docs/security/panic-sites\.md)$
         pass_filenames: false
 
+      # ── ServerReject codes vs the protocol specification ──────────────
+      - id: check-reject-codes
+        name: documented ServerReject codes match the ones assigned
+        # A reject code is a `pub const` and a match arm: no wire format
+        # moves, no frozen vector changes, and the frame is never sent on the
+        # success path, so adding one leaves every test green while the
+        # specification describes a smaller protocol than the one that ships.
+        # Code 2 travelled a whole release that way.
+        entry: scripts/check_reject_codes.py
+        language: system
+        files: ^(core/src/transport/handshake\.rs|docs/protocol/PROTOCOL\.md)$
+        pass_filenames: false
+
+      - id: check-reject-codes-cases
+        name: the ServerReject code gate still fails when it should
+        # The gate's own mutation cases. They need nothing but a temporary
+        # directory, so they run here rather than only in CI; a pattern that
+        # has stopped matching reports the same success as a tree that agrees.
+        entry: scripts/check_reject_codes_test.py
+        language: system
+        files: ^scripts/check_reject_codes(_test)?\.py$
+        pass_filenames: false
+
       # ── Published memory arithmetic ───────────────────────────────────
       - id: check-memory-arithmetic
         name: published memory arithmetic matches its constants
