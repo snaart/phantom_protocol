@@ -127,6 +127,50 @@ compile_error!(
      instead."
 );
 
+// `--no-default-features` with nothing named enters the bare-metal branch above,
+// because that branch is selected by the *absence* of `std` rather than by any
+// affirmative choice. On a host target the build then fails inside `core` with
+// "no global memory allocator found", "`#[panic_handler]` function required" and
+// "unwinding panics are not supported without std" — three errors that name
+// nothing this crate's consumer can act on, and that a consumer reasonably reads
+// as the library being broken rather than as a feature set that was never
+// selected. The `no-std` feature is the affirmative marker for that branch, so
+// its absence alongside `std`'s is the misconfiguration.
+#[cfg(all(not(feature = "std"), not(feature = "no-std")))]
+compile_error!(
+    "No Phantom Protocol feature set was selected: `--no-default-features` \
+     switched off `std` and nothing turned it, or the bare-metal subset, back \
+     on. Name one. A host build: `--features std,classical-crypto` (add \
+     `bindings` for the UniFFI surface and `compression-zstd` for the zstd \
+     algorithm menu), or drop `--no-default-features` and take the default set. \
+     A FIPS host build: `--features fips,bindings`. Bare metal: \
+     `--features embedded,no-std`."
+);
+
+// A `std` build needs one of the two crypto substrates. `classical-crypto` gives
+// it `ring` + `x25519-dalek`; `fips` gives it `aws-lc-rs` with ECDH-P-256 in
+// place of X25519. Neither is implied by `std` — deliberately, so the `fips`
+// build (which implies `std`) can drop the classical crates entirely — with the
+// result that `--no-default-features --features std` alone compiles a crate whose
+// AEAD and classical KEM have no implementation, and fails with five errors
+// inside `crypto/` whose first line is `unresolved module or unlinked crate
+// `ring``. That reads as a missing dependency rather than as the one-word feature
+// it is.
+#[cfg(all(
+    feature = "std",
+    not(feature = "classical-crypto"),
+    not(feature = "fips")
+))]
+compile_error!(
+    "A `std` build of Phantom Protocol needs a crypto substrate, and `std` \
+     implies neither (so that the FIPS build can drop the classical crates). \
+     Add `classical-crypto` for the default substrate (X25519 + ML-KEM-768, \
+     `ring` AEAD) or `fips` for the FIPS-140-3 one (ECDH-P-256 + ML-KEM-768, \
+     `aws-lc-rs` AEAD, ChaCha20-Poly1305 refused). The two do not interoperate \
+     on the wire — their handshakes advertise different `PROTOCOL_VARIANT` \
+     tags — so this is a deployment-wide choice, not a build detail."
+);
+
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
