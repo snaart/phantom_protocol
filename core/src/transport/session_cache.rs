@@ -116,7 +116,17 @@ impl Default for SessionCache {
 }
 
 impl SessionCache {
-    /// Create with custom limits (for Device Profiles)
+    /// Create with custom limits (for Device Profiles).
+    ///
+    /// **A `max_entries` of zero disables the cache.** It stores nothing, so every
+    /// resuming `ClientHello` finds no ticket and completes as a normal 1-RTT
+    /// handshake — which is what a server whose configuration says it keeps no
+    /// tickets should do. It used to keep one: [`store`](Self::store) evicted
+    /// before inserting, and with nothing to evict the insert went through anyway,
+    /// so an operator who set the capacity to zero to turn 0-RTT off still served
+    /// it. The check is here rather than at the configuration boundary so it holds
+    /// for every caller of this constructor, and because refusing the value would
+    /// make a config that plainly reads as "off" an error instead of an instruction.
     pub fn with_capacity(max_entries: usize, ticket_lifetime: Duration) -> Self {
         Self {
             tickets: HashMap::with_capacity(max_entries),
@@ -124,6 +134,12 @@ impl SessionCache {
             max_entries,
             ticket_lifetime,
         }
+    }
+
+    /// `true` when this cache holds no tickets and never will, because its
+    /// capacity is zero. A server built with one accepts no 0-RTT early-data.
+    pub fn is_disabled(&self) -> bool {
+        self.max_entries == 0
     }
 
     /// Store a ticket after a successful handshake.
@@ -137,6 +153,13 @@ impl SessionCache {
         resumption_secret: &[u8; 32],
         cipher_suite: CipherSuite,
     ) {
+        // A capacity of zero means no cache at all. Without this the eviction pass
+        // below would find nothing to evict and the insert would proceed, leaving a
+        // cache configured to hold nothing holding one ticket — and a server
+        // configured with 0-RTT off still accepting it on the next connection.
+        if self.is_disabled() {
+            return;
+        }
         // Evict if full
         if self.tickets.len() >= self.max_entries {
             self.evict_oldest();
@@ -213,8 +236,10 @@ impl SessionCache {
         created_at: Instant,
         expires_at: Instant,
     ) {
-        // Never resurrect a ticket that expired in the meantime.
-        if Instant::now() >= expires_at {
+        // Never resurrect a ticket that expired in the meantime, and never put one
+        // into a cache whose capacity is zero — the restore path must not be a way
+        // back into a cache that `store` refuses to write.
+        if self.is_disabled() || Instant::now() >= expires_at {
             return;
         }
         if self.tickets.len() >= self.max_entries {
@@ -302,6 +327,70 @@ mod tests {
         // `resumption_hint()` exposes the identical bytes, which is
         // what lets both sides derive the same early-data key.
         assert_eq!(returned, secret);
+    }
+
+    /// A capacity of zero is a disabled cache, not a cache of one.
+    ///
+    /// The eviction pass in `store` runs before the insert, so with nothing to evict
+    /// the insert used to go through and the cache held a ticket it was configured
+    /// not to hold. Every read path has to agree that nothing is there: `peek` is
+    /// what the server's resume gate calls, `try_resume` is what the older path
+    /// calls, and `len` is what an operator would look at.
+    #[test]
+    fn a_zero_capacity_cache_stores_nothing() {
+        let mut cache = SessionCache::with_capacity(0, Duration::from_secs(3600));
+        assert!(cache.is_disabled());
+
+        let session_id = [0x11u8; 32];
+        let secret = [0x22u8; 32];
+        cache.store(session_id, &secret, CipherSuite::Aes256Gcm);
+
+        assert_eq!(cache.len(), 0, "a disabled cache must store nothing");
+        assert!(cache.is_empty());
+        assert!(
+            cache.peek(&session_id).is_none(),
+            "the server's resume gate must find no ticket"
+        );
+        assert!(
+            cache.try_resume(&session_id).is_none(),
+            "no ticket can be resumed out of a disabled cache"
+        );
+
+        // Many stores, not just one: the defect was an off-by-one on the eviction
+        // bound, so a loop is what distinguishes "holds nothing" from "holds one".
+        for i in 0..8u8 {
+            cache.store([i; 32], &secret, CipherSuite::Aes256Gcm);
+        }
+        assert_eq!(cache.len(), 0);
+    }
+
+    /// The restore path a failed resume takes must not be a way into a disabled
+    /// cache either — it bypasses `store` entirely.
+    #[test]
+    fn a_zero_capacity_cache_refuses_a_reinserted_ticket() {
+        let mut cache = SessionCache::with_capacity(0, Duration::from_secs(3600));
+        let now = Instant::now();
+        cache.reinsert_with_expiry(
+            [0x33u8; 32],
+            &[0x44u8; 32],
+            CipherSuite::Aes256Gcm,
+            now,
+            now + Duration::from_secs(3600),
+        );
+        assert_eq!(cache.len(), 0, "a disabled cache must refuse a restore");
+        assert!(cache.peek(&[0x33u8; 32]).is_none());
+    }
+
+    /// One is a capacity, not a synonym for off: the boundary above zero must still
+    /// hold a ticket, or the fix for zero would have turned the smallest real cache
+    /// off as well.
+    #[test]
+    fn a_capacity_of_one_still_holds_a_ticket() {
+        let mut cache = SessionCache::with_capacity(1, Duration::from_secs(3600));
+        assert!(!cache.is_disabled());
+        cache.store([0x55u8; 32], &[0x66u8; 32], CipherSuite::Aes256Gcm);
+        assert_eq!(cache.len(), 1);
+        assert!(cache.peek(&[0x55u8; 32]).is_some());
     }
 
     #[test]

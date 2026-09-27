@@ -780,3 +780,136 @@ async fn tcp_bind_with_signing_key_bytes_is_stable_across_restart() {
         "a persisted seed must yield a stable pinned identity"
     );
 }
+
+/// `PhantomConfig::session_cache_capacity == 0` must turn 0-RTT off, and any capacity
+/// above zero must leave it on.
+///
+/// The field reads as a maximum, so zero reads as "keep no tickets" — but the listener's
+/// cache evicted before it inserted, and with nothing to evict the insert went through
+/// anyway. A server configured with zero therefore kept exactly one ticket and served
+/// 0-RTT out of it, so an operator who set the field to zero to turn the feature off had
+/// not. The two halves of this test run the identical three-connection flow against two
+/// listeners that differ only in that number, which is what makes the comparison a
+/// statement about the field rather than about the flow: with `1` the server takes the
+/// early-data as 0-RTT and the client's verdict is `Some(true)`, with `0` neither happens
+/// and the payload arrives over the 1-RTT session instead — declined, never dropped
+/// (Invariant 9).
+#[tokio::test]
+#[ignore]
+async fn tcp_zero_session_cache_capacity_refuses_zero_rtt() {
+    use phantom_protocol::api::identity::generate_signing_key;
+    use phantom_protocol::api::session::{connect_pinned, connect_pinned_with_resumption};
+    use phantom_protocol::config::PhantomConfig;
+
+    const PAYLOAD: &[u8] = b"early-data-under-a-disabled-cache";
+
+    /// Returns `(server saw it as 0-RTT, the client's own verdict)`.
+    async fn run(capacity: u32) -> (bool, Option<bool>) {
+        let seed = generate_signing_key().expect("generate_signing_key");
+        // `PhantomConfig` is `#[non_exhaustive]`, so an outside consumer reaches this
+        // field the same way this test does: take a preset and assign.
+        let mut config = PhantomConfig::default();
+        config.session_cache_capacity = capacity;
+        let listener =
+            PhantomListener::bind_with_config_bytes("127.0.0.1:0".to_string(), seed, config)
+                .await
+                .expect("bind_with_config_bytes");
+        let local = listener.local_addr();
+        let (host, port_str) = local.rsplit_once(':').expect("local_addr is host:port");
+        let host = host.to_string();
+        let port: u16 = port_str.parse().expect("port parses");
+        let pinned = listener.verifying_key_bytes();
+
+        let server = tokio::spawn(async move {
+            // Connection 1 (plain): lets the client harvest a hint. The hint is derived
+            // client-side, so it arrives whether or not the server kept a ticket — which
+            // is exactly why the capacity has to be checked on the server's side of the
+            // second connection rather than by the client failing to resume.
+            let first = listener.accept().await.expect("accept 1").session();
+            assert_eq!(first.recv().await.expect("recv 1"), b"warmup");
+            // Connection 2 (resume): either the server takes the payload as 0-RTT, or it
+            // declines and the client re-sends it over the established session.
+            let outcome = listener.accept().await.expect("accept 2");
+            let taken = outcome.take_early_data();
+            let session = outcome.session();
+            let as_zero_rtt = match taken {
+                Some(early) => {
+                    assert_eq!(early, PAYLOAD, "0-RTT early-data arrives byte-exact");
+                    true
+                }
+                None => {
+                    let mut buf = Vec::with_capacity(PAYLOAD.len());
+                    while buf.len() < PAYLOAD.len() {
+                        buf.extend(session.recv().await.expect("re-sent early-data"));
+                    }
+                    assert_eq!(buf, PAYLOAD, "a declined payload is re-sent, not dropped");
+                    false
+                }
+            };
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(first);
+            as_zero_rtt
+        });
+
+        let c1 = connect_pinned(host.clone(), port, pinned.clone())
+            .await
+            .expect("connect_pinned c1");
+        c1.send(b"warmup".to_vec()).await.expect("c1 send");
+        let hint = timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(h) = c1.resumption_hint().await {
+                    return h;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("resumption hint did not arrive");
+
+        let c2 = connect_pinned_with_resumption(host, port, pinned, hint, PAYLOAD.to_vec())
+            .await
+            .expect("connect_pinned_with_resumption c2");
+        timeout(Duration::from_secs(15), c2.await_ready())
+            .await
+            .expect("handshake resolved in time")
+            .expect("a declined early-data payload must never fail the handshake");
+
+        let mut verdict = None;
+        for _ in 0..500 {
+            verdict = c2.early_data_accepted().await;
+            if verdict.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let as_zero_rtt = timeout(Duration::from_secs(20), server)
+            .await
+            .expect("server task finished")
+            .expect("server task");
+        (as_zero_rtt, verdict)
+    }
+
+    // Control: the smallest cache that is a cache at all still serves 0-RTT, so the
+    // zero case below cannot pass by the flow being broken.
+    let (server_saw_zero_rtt, verdict) = run(1).await;
+    assert!(
+        server_saw_zero_rtt,
+        "with capacity 1 the server must take the early-data as 0-RTT"
+    );
+    assert_eq!(
+        verdict,
+        Some(true),
+        "with capacity 1 the client's verdict must be acceptance"
+    );
+
+    let (server_saw_zero_rtt, verdict) = run(0).await;
+    assert!(
+        !server_saw_zero_rtt,
+        "session_cache_capacity = 0 must keep no ticket, so no 0-RTT can be accepted"
+    );
+    assert_eq!(
+        verdict,
+        Some(false),
+        "session_cache_capacity = 0 must leave the client's 0-RTT verdict a refusal"
+    );
+}

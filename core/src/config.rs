@@ -64,6 +64,15 @@ pub struct PhantomConfig {
     ///
     /// Maps to [`SessionCache`] capacity; excess entries are evicted LRU.
     ///
+    /// **Zero turns 0-RTT off.** A listener configured with `0` stores no tickets,
+    /// so every resuming `ClientHello` finds nothing and completes as an ordinary
+    /// 1-RTT handshake with `early_data_accepted == false`. That is the same
+    /// posture `PhantomListener::set_early_data_enabled(false)` gives, reached from
+    /// a config record instead of a method call — which is the only route a foreign
+    /// binding has when it builds this record field by field. Until 0.3.1 the value
+    /// was read as a bound to evict against rather than as a capacity, so a cache
+    /// configured to hold nothing held one ticket and served 0-RTT out of it.
+    ///
     /// Defaults: 32 (`mobile`), 1024 (`server`), 4 (`iot`). Consumed by both
     /// listeners, not only the TCP one.
     ///
@@ -335,6 +344,39 @@ mod tests {
         // s1 should have been evicted (LRU); s2 and s3 should still be present
         assert!(cache.try_resume(&s1).is_none(), "s1 should be evicted");
         assert!(cache.try_resume(&s3).is_some(), "s3 should be present");
+    }
+
+    /// `session_cache_capacity: 0` must reach the cache as a disabled cache. This is
+    /// the config-side half of the fix — the listeners build their cache through
+    /// exactly this method, so a cache that stores nothing here is a listener that
+    /// accepts no 0-RTT.
+    #[test]
+    fn a_zero_session_cache_capacity_disables_the_cache() {
+        use crate::crypto::adaptive_crypto::CipherSuite;
+        let cfg = PhantomConfig {
+            session_cache_capacity: 0,
+            ..PhantomConfig::default()
+        };
+        let mut cache = cfg.session_cache();
+        assert!(cache.is_disabled(), "capacity 0 must disable the cache");
+        cache.store([7u8; 32], &[8u8; 32], CipherSuite::Aes256Gcm);
+        assert_eq!(cache.len(), 0, "a disabled cache must store no ticket");
+        assert!(
+            cache.peek(&[7u8; 32]).is_none(),
+            "the resume gate must find nothing"
+        );
+        // Every preset ships a real cache; the disabled posture is opt-in.
+        for preset in [
+            PhantomConfig::mobile(),
+            PhantomConfig::server(),
+            PhantomConfig::iot(),
+        ] {
+            assert!(
+                !preset.session_cache().is_disabled(),
+                "preset with capacity {} must keep its cache",
+                preset.session_cache_capacity
+            );
+        }
     }
 
     #[test]
