@@ -182,9 +182,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
-      - name: cargo build --release
+      # `--profile dist`, not `--release`. The two differ in one setting: `dist`
+      # keeps the symbol table. A shipped cdylib is what `uniffi-bindgen
+      # --library` reads to generate the four language bindings, and it finds
+      # the interface by looking up `UNIFFI_META_*` symbols — which
+      # `[profile.release] strip = "symbols"` removes. The 0.3.0 Linux artifacts
+      # were stripped: the metadata strings were still in the binary and the
+      # symbol table naming them was gone, so the generator reported no
+      # namespace and there was nothing in the tarball to say why. See the
+      # profile's comment in the root Cargo.toml for why this does not live in
+      # `release`.
+      - name: cargo build --profile dist
         run: |
-          cargo build --manifest-path core/Cargo.toml --release --target ${{ matrix.target }}
+          cargo build --manifest-path core/Cargo.toml --profile dist --target ${{ matrix.target }}
       - name: Package
         run: |
           mkdir -p dist
@@ -194,9 +204,11 @@ jobs:
           # the cdylib (.so on Linux, .dylib on macOS), which is what every
           # UniFFI / C consumer links against. `core` is the root workspace's
           # only member, so cargo's target dir is the repo-root `target/`, not
-          # `core/target/`. No `|| true` on the library copies: a missing library
-          # must fail the release loudly rather than ship an empty tarball.
-          LIBDIR="target/${{ matrix.target }}/release"
+          # `core/target/`. The directory is named after the profile, so it is
+          # `dist/` here and not `release/`. No `|| true` on the library copies:
+          # a missing library must fail the release loudly rather than ship an
+          # empty tarball.
+          LIBDIR="target/${{ matrix.target }}/dist"
           cp "${LIBDIR}/libphantom_protocol.rlib" "dist/${NAME}/"
           if [ -f "${LIBDIR}/libphantom_protocol.so" ]; then
             cp "${LIBDIR}/libphantom_protocol.so" "dist/${NAME}/"

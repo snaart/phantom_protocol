@@ -45,5 +45,22 @@ strip = "none"
 
 # Dist profile for final shipped artifacts: identical to release plus PGO-ready
 # layout. PGO instrumentation is added on the command line, not in this profile.
+#
+# One deliberate difference from `release`, and it is the reason the release
+# workflow builds with this profile rather than that one: the symbol table
+# stays. `release` sets `strip = "symbols"`, which is right for a developer's
+# build and wrong for a shipped library — `uniffi-bindgen --library` reads the
+# `UNIFFI_META_*` symbols out of the cdylib to generate the bindings, and a
+# stripped Linux `.so` keeps the metadata *strings* in `.rodata` while losing
+# the `.symtab` entries that name them, so the generator finds no namespace and
+# refuses. The 0.3.0 Linux artifacts shipped in exactly that state.
+#
+# Keeping the table costs bytes, not speed: every optimisation setting is
+# inherited unchanged, `debug` stays `false`, so what comes back is the symbol
+# names and nothing else. Putting it here rather than in `release` is what keeps
+# an ordinary `cargo build --release` as small as it was; the three
+# `tests/bindings/generate_*.sh` scripts reach the same state from the other
+# direction, with `CARGO_PROFILE_RELEASE_STRIP=none` on a release build.
 [profile.dist]
 inherits = "release"
+strip = "none"

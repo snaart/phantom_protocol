@@ -21,8 +21,13 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-echo "==> Building libphantom_protocol (release)"
-cargo build --release --manifest-path "${REPO_ROOT}/core/Cargo.toml"
+# `dist`, not `release`: the two profiles differ only in that `dist` keeps the
+# symbol table, and a shipped library needs it — `uniffi-bindgen --library`
+# reads the interface out of the cdylib's `UNIFFI_META_*` symbols, which
+# `[profile.release] strip = "symbols"` removes. See the profile's comment in
+# the root Cargo.toml.
+echo "==> Building libphantom_protocol (dist)"
+cargo build --profile dist --manifest-path "${REPO_ROOT}/core/Cargo.toml"
 
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"
@@ -40,7 +45,7 @@ cp "${SCRIPT_DIR}/README.md"      "${STAGE}/${BUNDLE}/"
 cp "${REPO_ROOT}/LICENSE"         "${STAGE}/${BUNDLE}/"
 
 for ext in dylib so dll; do
-    src="${REPO_ROOT}/target/release/libphantom_protocol.${ext}"
+    src="${REPO_ROOT}/target/dist/libphantom_protocol.${ext}"
     [ -f "${src}" ] && cp "${src}" "${STAGE}/${BUNDLE}/lib/"
 done
 
