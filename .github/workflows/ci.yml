@@ -98,6 +98,21 @@ jobs:
       # first, for the reason the memory-arithmetic job gives.
       - run: scripts/check_gate_wiring_test.py
       - run: scripts/check_gate_wiring.py
+      # `scripts/required_status_checks.py` derives the set of contexts that
+      # should block a merge from the workflow files themselves, because a list
+      # written down goes stale the next time a job is added -- which is how the
+      # `release artifact shape` job and seven older ci.yml jobs ended up
+      # advisory. The derivation cannot be checked against the live setting here
+      # (that needs rights over the repository's settings), but it can be checked
+      # for the two ways it goes wrong on its own: missing a job, and inventing a
+      # context name GitHub will never report, which leaves every merge pending.
+      # A venv because the script needs PyYAML and the runner's python is
+      # externally managed.
+      - name: The required-context derivation still reads the workflows
+        run: |
+          python3 -m venv /tmp/required-contexts-venv
+          /tmp/required-contexts-venv/bin/pip install --quiet pyyaml
+          /tmp/required-contexts-venv/bin/python scripts/required_status_checks_test.py
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
