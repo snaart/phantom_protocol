@@ -171,8 +171,11 @@ when it bumps, update every version-locked manifest in lock step:
 - `tests/bindings/c/phantom_protocol.pc.in` (`Version: ...`) — enforced by `check_versions.sh`
 - `server/Cargo.toml` (`version = ...`) — enforced by `check_versions.sh`
 - `cli/Cargo.toml` (`version = ...`) — enforced by `check_versions.sh`
-- `tests/bindings/c/package.sh` (`VERSION=...`) — **not** enforced by
-  `check_versions.sh`; bump it by hand.
+- `testbed/Cargo.toml` (`version = ...`) — enforced by `check_versions.sh`
+- `docker-compose.yml` (`image: phantom-server:<tag>`) — enforced by
+  `check_versions.sh`
+- `tests/bindings/c/package.sh` — nothing to bump: it reads the version out of
+  `core/Cargo.toml` when it names the tarball.
 - `tests/bindings/swift/Package.swift` — no version field, but git-tag
   the release at the same SemVer.
 - `tests/bindings/kotlin/build.gradle.kts` — add a `version =` if you

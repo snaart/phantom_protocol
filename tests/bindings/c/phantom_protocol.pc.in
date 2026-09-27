@@ -10,5 +10,10 @@ Description: Phantom Protocol — post-quantum-secure L4/L6 transport (C FFI)
 URL: https://github.com/SNAcorp/phantom-protocol
 Version: 0.3.0
 Cflags: -I${includedir}
-Libs: -L${libdir} -lphantom_protocol
+# The macOS dylib's install name is `@rpath/libphantom_protocol.dylib`, which the loader
+# resolves against the consumer's own `-rpath` entries. Without one it finds nothing and
+# the program dies at launch, so the rpath travels with the link flags rather than being
+# left for every consumer to remember. On ELF the same flag is a DT_RUNPATH and is
+# equally what a library installed outside the default search path needs.
+Libs: -L${libdir} -Wl,-rpath,${libdir} -lphantom_protocol
 Libs.private: -lpthread -lm -ldl

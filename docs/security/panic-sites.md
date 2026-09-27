@@ -107,7 +107,10 @@ non-native target, so a native build compiles no `unsafe` at all:
 | `core/src/transport/legs/wasi.rs` | `unsafe impl Send` + `unsafe impl Sync` for `WasiLeg`. The WIT-bindgen `Resource<TcpSocket>` / `Resource<InputStream>` / `Resource<OutputStream>` types hide an opaque numeric host handle and are `!Send + !Sync` by default. The internal `std::sync::Mutex` wrappers enforce single-accessor discipline; the unsafe impl is the contract that any cross-thread access goes through that mutex. WASI Preview 2 today provides no thread primitive, so the contract is vacuously satisfied — the explicit `unsafe impl` (plus the SAFETY block in the file) keeps the argument auditable if a future WASI threading proposal stabilizes. `cfg(all(feature = "wasi-leg", target_os = "wasi"))` only. |
 
 The pre-Phase-5.1 opt-in `core/src/crypto/keys.rs` was deleted when the crate
-moved off `pqcrypto-internals` (see commit `7c7bde7`). The pure-Rust RustCrypto
+moved off `pqcrypto-internals` (see commit `a91b2c9`, "crypto: replace
+pqcrypto-* with pure-Rust ml-kem / ml-dsa (Phase 5.1)"; the id this note used to
+carry did not survive the history rewrite before 0.3.0 — see
+`docs/policy/versioning.md` § 10). The pure-Rust RustCrypto
 swap (`ml-kem` / `ml-dsa`) eliminated the only other place `unsafe` was needed
 inside `crypto/`.
 
