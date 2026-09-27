@@ -22,8 +22,14 @@ by active probing — see [Status & limitations](#status--limitations).)
 
 > **Pre-1.0 (`0.3.1`).** Wire format may break between minors; SemVer kicks in at
 > 1.0. 0 workspace warnings, 0 `unsafe` outside two audited opt-ins, MSRV Rust
-> 1.93, CI green across the full cross-target matrix. See
-> [Status & limitations](#status--limitations).
+> 1.93, every row of the cross-target matrix green. Those rows are
+> `cargo check --lib`; which targets ship a prebuilt artifact and which ones the
+> test suite has ever run on is [Platform support](#platform-support).
+> **No release of this project has been reviewed by a second person, and there has
+> been no external security audit** — both are set out in
+> [Status & limitations](#status--limitations), with what would change them.
+> Known behaviours that have surprised consumers are collected in
+> [`docs/known-deviations.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/known-deviations.md).
 
 ## Install
 
@@ -145,9 +151,15 @@ independent multiplexed streams with per-stream flow control.
 - **Signed build provenance** — every release artifact carries a sigstore-backed
   in-toto attestation naming the workflow, commit and runner that produced it
   (SLSA v1.0 Build **L2**; verify with `gh attestation verify`).
-- **Cross-platform** — every CI target is a hard gate (Linux x4, macOS x2,
-  iOS x2, Windows x2, wasm32-unknown-unknown, wasm32-wasip2,
-  thumbv7em-none-eabihf); **no `allow_failure` rows**.
+- **Cross-platform, and precisely so** — thirteen matrix rows over twelve targets
+  are hard-gated in CI with **no `allow_failure` rows**, but a row is
+  `cargo check --lib`: it proves the crate compiles there and nothing else. Four targets ship a prebuilt release
+  artifact (linux-gnu and apple-darwin, x86_64 and aarch64). The Rust test suite
+  runs on x86_64 Linux; aarch64 macOS additionally runs one pinned loopback
+  handshake through the Swift binding. Windows, iOS, musl, browser wasm and bare
+  metal are compiled and never executed, and **Android is in no workflow at all**.
+  Full breakdown in [Platform support](#platform-support) — read it before
+  choosing a target.
 
 ## Quick start
 
@@ -461,11 +473,12 @@ Read these before reusing any of them:
 - **Duplex** — the download half of a transfer running both ways at once,
   against the one-way download of the same run: 81–89% in the morning, 49–63% in
   the afternoon.
-- **The released 0.3.0 is not the build measured here.** One congestion-control
-  change landed after these campaigns — the loss-driven volume bound no longer
-  applies during Startup — and it has so far been measured only in the in-tree
-  bottleneck model (see [`CHANGELOG.md`](https://github.com/snaart/phantom_protocol/blob/main/CHANGELOG.md)),
-  not on this route.
+- **No released build is the build measured here** — not 0.3.0 and not 0.3.1. One
+  congestion-control change landed after these campaigns — the loss-driven volume
+  bound no longer applies during Startup — and it has so far been measured only in
+  the in-tree bottleneck model (see [`CHANGELOG.md`](https://github.com/snaart/phantom_protocol/blob/main/CHANGELOG.md)),
+  not on this route. Nothing in 0.3.1 touches the data plane's rate behaviour, so
+  the gap is the same one change wide as it was at 0.3.0.
 
 **2026-08-17 and 2026-08-22.** Upload only, and against a round-trip echo,
 because no one-way upward control was taken in these runs:
@@ -629,24 +642,62 @@ cargo run --manifest-path cli/Cargo.toml -- version
 
 ## Platforms & language bindings
 
-### Cross-compile matrix (`.github/workflows/cross.yml`)
+### Platform support
 
-| Target | Status |
-| --- | --- |
-| `x86_64-unknown-linux-gnu` / `aarch64-unknown-linux-gnu` / `aarch64-unknown-linux-musl` | hard gate |
-| `x86_64-apple-darwin` / `aarch64-apple-darwin` | hard gate |
-| `aarch64-apple-ios` (device) / `aarch64-apple-ios-sim` | hard gate |
-| `x86_64-pc-windows-msvc` / `aarch64-pc-windows-msvc` | hard gate |
-| `wasm32-unknown-unknown` | hard gate |
-| `thumbv7em-none-eabihf` | hard gate (`--no-default-features --features embedded,no-std`) |
-| `wasm32-wasip2` | hard gate (compile + host round-trip; WASI is client-side framing-only — see [`docs/operations/wasi.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/operations/wasi.md)) |
+Three different things get called "supported", and the difference decides how much
+work an adopter has to do, so they are separated here. **Compiled** means
+`.github/workflows/cross.yml` runs `cargo check --lib` for that target on every
+push — a hard gate, no `allow_failure` row, and no more than a compile. There are
+thirteen such rows over twelve targets: `x86_64-unknown-linux-gnu` appears twice,
+once with the default features and once with the ring-free `fips` set.
+**Prebuilt artifact** means a tagged release publishes a library tarball for it
+(`release.yml`, job `build-artifacts`), with a sigstore-backed provenance
+attestation. **Tests executed** means test code has actually run on that target.
+
+| Target | Compiled in CI | Prebuilt artifact | Tests executed there |
+| --- | --- | --- | --- |
+| `x86_64-unknown-linux-gnu` | yes | **yes** | **the whole suite** — every job in `ci.yml` (unit, `security_invariants`, `property`, wire vectors, KATs, TCP + PhantomUDP loopback, and the `embedded` / `mimicry` / `telemetry-otel` / `fips` feature jobs) |
+| `aarch64-apple-darwin` | yes | **yes** | one test: the Swift binding's pinned loopback round-trip, on `macos-latest` (`bindings.yml`, job `swift`) |
+| `x86_64-apple-darwin` | yes | **yes** | none |
+| `aarch64-unknown-linux-gnu` | yes (via `cross`) | **yes** | none |
+| `aarch64-unknown-linux-musl` | yes (via `cross`) | no | none |
+| `x86_64-pc-windows-msvc` | yes, on a real `windows-latest` runner | no | **none** |
+| `aarch64-pc-windows-msvc` | yes, on a real `windows-latest` runner | no | **none** |
+| `aarch64-apple-ios` (device) / `aarch64-apple-ios-sim` | yes | no | none |
+| `wasm32-unknown-unknown` | yes | no | none — [`examples/wasm-demo/`](https://github.com/snaart/phantom_protocol/tree/main/examples/wasm-demo/) is driven by hand |
+| `wasm32-wasip2` | yes | no | two: the guest fixture's round-trips, executed under `wasmtime` on a Linux host (`cross.yml`, job `wasi-integration`). WASI is client-side framing-only — see [`docs/operations/wasi.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/operations/wasi.md) |
+| `thumbv7em-none-eabihf` (`--no-default-features --features embedded,no-std`) | yes | no | none — the `embedded` feature's tests run on the x86_64 Linux host, not on the device |
+| `aarch64-linux-android` / `armv7-linux-androideabi` / `x86_64-linux-android` | **no** | no | **none** |
+
+**If you are not on x86_64 Linux, read this.** The risk is not that a target is
+unpackaged; it is that nothing has ever been run there. On Windows, in particular:
+the crate compiles for both MSVC targets on a real Windows runner, and not one unit
+test or loopback integration test has ever executed on Windows. There is no
+artifact either, so a Windows adopter builds the crate themselves, stands up their
+own cross-build if they need a cdylib for a binding, runs the suite on the target
+themselves, and owns any platform-specific failure it turns up — sockets, path
+handling and timer behaviour included. The same applies to iOS, musl, browser wasm
+and bare metal.
+
+**Android is the widest gap**, because the tree looks equipped and CI is not: a grep
+for "android" across all eight workflows returns nothing, while
+`tests/bindings/kotlin/build-jnilibs.sh` cross-builds three ABIs
+(`aarch64-linux-android`, `armv7-linux-androideabi`, `x86_64-linux-android`) and
+[`examples/mobile/android/`](https://github.com/snaart/phantom_protocol/tree/main/examples/mobile/android/)
+is a complete Jetpack Compose application. Both are run by hand, against an NDK the
+repository does not pin. Treat the Android path as a recipe that worked when it was
+written, not as a gated one.
+
+This is a deliberate deferral rather than an oversight, and what closing it would
+take is written down in
+[`docs/DEFERRED_WORK.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/DEFERRED_WORK.md) § 5.
 
 ### Language bindings (`tests/bindings/`)
 
 | Binding | Maturity | Notes |
 | --- | --- | --- |
-| **Swift** | Production-shape | Auto-gen via UniFFI 0.32; iOS XCFramework recipe in [`docs/operations/mobile.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/operations/mobile.md) |
-| **Kotlin** | Production-shape | Auto-gen; Android NDK + Gradle `jniLibs` recipe in `mobile.md` |
+| **Swift** | Generated; one loopback test runs in CI | Auto-gen via UniFFI 0.32. `bindings.yml`'s `swift` job builds the cdylib on `macos-latest` and runs a pinned loopback round-trip through the binding. The iOS XCFramework is built and shape-checked by `build-xcframework.sh` + `check_xcframework.sh`, by hand — no workflow runs either, and no test has run on an iOS target; recipe in [`docs/operations/mobile.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/operations/mobile.md) |
+| **Kotlin** | Generated; compile-checked only | Auto-gen. `run_kotlin_test.sh` type-checks the generated Kotlin against JNA + coroutines on Linux and **does not execute it**. No workflow builds or tests an Android target: the NDK + Gradle `jniLibs` recipe in `mobile.md` and `build-jnilibs.sh` (three ABIs) are manual — see [Platform support](#platform-support) |
 | **Python** | UniFFI surface auto-gen | Demo harness `tests/run_test.py` |
 | **C** | Experimental | **Hand-curated** header — UniFFI 0.32 has no C generator. Covers `connect_pinned` / `connect_pinned_udp` (incl. `_with_config` / `_with_resumption`), the `bind*_with_signing_key_bytes` / `bind*_with_config_bytes` constructors, `generate_signing_key`, and `PhantomConfig`; the typed `HybridSigningKey` / `HybridVerifyingKey` objects and runtime injection stay Rust-only. README recommends Swift / Kotlin / Python instead |
 | **WASM (browser)** | Demo shipped | [`examples/wasm-demo/`](https://github.com/snaart/phantom_protocol/tree/main/examples/wasm-demo/) pairs with [`docs/operations/wasm.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/operations/wasm.md); uses `WebSocketLeg` + `WasmRuntime` |
@@ -760,6 +811,25 @@ of CI. Reaching L3 is a workflow change, not a code change — see
 > plane. Do not protect anything high-risk with this until it has been
 > independently audited.
 
+- **No release has been reviewed by a second person, and there has been no
+  external security audit.** Of 229 pull requests, none carries a review.
+  `main`'s branch protection has `required_pull_request_reviews` unset and
+  `enforce_admins` false, so its 35 required status checks are the entire gate:
+  every design argument in `docs/`, every security invariant and every line of
+  crypto here was written and merged by one person. `CODEOWNERS` auto-requests
+  review on the six security-sensitive paths, which is a request and not a
+  requirement — the file says so itself. Nothing about this is hidden in the
+  history; it is stated here because a reader weighing the library cannot see it
+  from the outside. What would change it: a second maintainer, plus "Require
+  approvals" and "Require review from Code Owners" enabled on `main`. Until then,
+  read the code rather than the rationale, and do not protect anything high-risk
+  with it.
+- **Platform coverage is narrower than the matrix suggests.** Thirteen hard
+  compile gates over twelve targets, four prebuilt artifacts, and a test suite that
+  runs on x86_64 Linux plus one loopback handshake on aarch64 macOS. Windows, iOS, musl, browser wasm and
+  bare metal compile and never execute; Android is in no workflow. See
+  [Platform support](#platform-support) and
+  [`docs/DEFERRED_WORK.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/DEFERRED_WORK.md) § 5.
 - **Pre-1.0 (`0.3.1`).** Wire format may break between minors; SemVer applies
   once 1.0 ships. The current wire protocol is a single pinned version — the
   former V1/V2/V3 axes were collapsed pre-1.0, with no negotiation and no
@@ -768,8 +838,13 @@ of CI. Reaching L3 is a workflow change, not a code change — see
   and `PROTOCOL_VERSION` <!--pinned:PROTOCOL_VERSION-->5, where 0.2.x spoke 6 and
   3, and the handshake refuses the mismatch with a typed `ServerReject` rather
   than negotiating down. Upgrade both ends together, and regenerate the language
-  bindings rather than relinking them — every UniFFI checksum moved in 0.3.0 (see
-  [`CHANGELOG.md`](https://github.com/snaart/phantom_protocol/blob/main/CHANGELOG.md)).
+  bindings rather than relinking them on **every** upgrade in this series: every
+  UniFFI checksum moved in 0.3.0, and eleven of them move again in 0.3.1, because
+  `uniffi` folds an exported item's doc comment into its checksum and 0.3.1
+  corrects eleven of those comments. `UNIFFI_CONTRACT_VERSION` is unchanged, so the
+  coarse gate passes and a stale binding fails at import time in your process
+  instead. Both lists are in
+  [`CHANGELOG.md`](https://github.com/snaart/phantom_protocol/blob/main/CHANGELOG.md).
 - **Native UDP transport (PhantomUDP): handshake + demux + reliability shipped.**
   `PhantomSession` runs an authenticated session over TCP, WebSocket, and raw UDP
   (connection-ID demux, server accept, fragmented handshake). The UDP data plane
@@ -940,6 +1015,11 @@ of CI. Reaching L3 is a workflow change, not a code change — see
   `perf-tuning.md`, `deployment.md`, `docker.md`, `systemd.md`,
   `kubernetes.md` (+ `helm/`), `mobile.md`, `wasm.md`, `wasi.md`,
   `zero-rtt.md`
+- **Known deviations:** [`docs/known-deviations.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/known-deviations.md) —
+  behaviour that is deliberate, documented and has still surprised a consumer:
+  read it before filing a bug
+- **Deferred work:** [`docs/DEFERRED_WORK.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/DEFERRED_WORK.md) —
+  capabilities consciously deferred, including the platform-coverage gap
 - **Policy:** [`docs/policy/versioning.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/policy/versioning.md)
 - **Performance:** [`BENCHMARKS.md`](https://github.com/snaart/phantom_protocol/blob/main/BENCHMARKS.md)
   (loopback benches), [`testbed/README.md`](https://github.com/snaart/phantom_protocol/blob/main/testbed/README.md)

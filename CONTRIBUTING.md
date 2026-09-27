@@ -50,7 +50,7 @@ not a replacement.
 
 ## Security-sensitive changes
 
-Files in these paths require **codeowner review** before merge:
+Changes under these paths are the ones to treat as security-relevant:
 
 - `core/src/crypto/`
 - `core/src/transport/handshake.rs`
@@ -58,6 +58,17 @@ Files in these paths require **codeowner review** before merge:
 - `core/src/api/udp_transport.rs`
 - `core/src/transport/legs/mimic_tls/`
 - `core/src/security/`
+
+**What is actually enforced, stated plainly.** `.github/CODEOWNERS` lists the same
+six paths in the same order and **auto-requests** a review on a PR that touches
+one. That is a request, not a gate: codeowner review becomes a requirement only
+when branch protection enables "Require review from Code Owners", and on `main` it
+does not — `required_pull_request_reviews` is unset and `enforce_admins` is false,
+so the 35 required status checks are the whole of the merge gate. This file
+previously said review was required before merge, which contradicted both
+`CODEOWNERS` and the repository's settings. No release of this project has been
+reviewed by a second person; `README.md`'s "Status & limitations" says so, and what
+would change it. Until it changes, the obligation below falls on the author.
 
 The eleven numbered security invariants listed in
 [`docs/security/invariants.md`](docs/security/invariants.md) must be preserved,
