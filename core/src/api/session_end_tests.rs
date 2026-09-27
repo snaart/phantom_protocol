@@ -519,3 +519,186 @@ async fn the_peer_takes_every_stream_the_cap_allows() {
     client.disconnect().await.expect("disconnect");
     drop(client);
 }
+
+// ── Releasing handles ────────────────────────────────────────────────────────
+
+/// Two samples of [`drain_passes`] this far apart, and the most the second may exceed the
+/// first by for the send loop to count as having nothing of its own to do.
+///
+/// The 10 ms heartbeat drains unconditionally, so an idle pump still makes three passes in
+/// this interval; anything much above that is the pump with work in hand — the pacer wakes it
+/// as often as every millisecond while it has something to send, which is most of what it
+/// does under load.
+const QUIET_SAMPLE: Duration = Duration::from_millis(30);
+const QUIET_PASSES: u64 = 5;
+
+/// Wait until the send loop has nothing of its own left to do, so that what it does next can
+/// be attributed to what the test does next.
+async fn wait_until_quiet(session: &PhantomSession) {
+    let deadline = Instant::now() + STEP;
+    loop {
+        let before = drain_passes(session).await;
+        tokio::time::sleep(QUIET_SAMPLE).await;
+        let delta = drain_passes(session).await - before;
+        if delta <= QUIET_PASSES {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the send loop never went quiet: {delta} passes in {QUIET_SAMPLE:?}"
+        );
+    }
+}
+
+/// Total drain passes the send loop has made, whatever each of them stopped on. One pass
+/// costs a walk over every stream the session holds, which is what made releasing handles
+/// cost time quadratic in their number.
+async fn drain_passes(session: &PhantomSession) -> u64 {
+    session
+        .bandwidth_snapshot()
+        .await
+        .expect("an established session has an estimator")
+        .drain_outcomes
+        .iter()
+        .sum()
+}
+
+/// Letting go of a stream nothing was ever written on costs the session's pump nothing: the
+/// stream is out of both tables before `drop` returns, and the send loop makes no pass at
+/// all on its account.
+///
+/// That is what makes releasing handles proportional to how many are released. It used to
+/// go to the pump like any other release, and each one cost a wake-up — and a wake-up costs
+/// the send loop a walk over every stream the session holds, so four times the handles cost
+/// twenty-one times the time, and for as long as the backlog lasted the peer's own streams
+/// were refused.
+///
+/// The count deliberately exceeds [`MAX_STREAMS`]: a slot freed as the handle is dropped is
+/// what lets a caller open and let go of streams in a loop without ever reaching the cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn letting_go_of_an_unused_stream_costs_the_pump_nothing() {
+    const CYCLES: usize = 4 * MAX_STREAMS;
+
+    let (client, server, _cut) = establish().await;
+    let before = drain_passes(&client).await;
+
+    for i in 0..CYCLES {
+        let stream = client
+            .open_stream()
+            .unwrap_or_else(|e| panic!("open {i} of {CYCLES}: {e:?}"));
+        assert!(client.demux().has_stream(stream.stream_id()));
+        let id = stream.stream_id();
+        drop(stream);
+        // No await between the drop and these two reads: whatever releases the stream has
+        // to have done it by the time `drop` returned.
+        assert!(
+            !client.demux().has_stream(id),
+            "stream {id} still had a route after its only handle was dropped"
+        );
+        assert_eq!(
+            client.observability().snapshot().active_streams,
+            0,
+            "stream {id} was still counted open after its only handle was dropped"
+        );
+    }
+
+    // The send loop is allowed to have run for its own reasons — the 10 ms heartbeat drains
+    // unconditionally — but not once per stream. A pass per release is the shape being
+    // ruled out, and CYCLES/4 separates that from any amount of heartbeat.
+    let passes = drain_passes(&client).await - before;
+    assert!(
+        passes < (CYCLES / 4) as u64,
+        "{CYCLES} released streams cost the send loop {passes} passes; a pass per release is \
+         the cost this is here to rule out"
+    );
+
+    client.disconnect().await.expect("disconnect");
+    drop(server);
+}
+
+/// A burst of released handles on streams that *were* written on is taken in batches, not
+/// one send-loop pass apiece.
+///
+/// These cannot go the way the unused ones do — each has a close to send, behind the writes
+/// its handle queued — so they do travel to the pump. What the pump must not do is come
+/// back through its whole stream table once per handle.
+///
+/// **What the bar is made of**, since a pass count is not a constant of nature. The streams
+/// are written on *unreliably*, which is what puts the release on the pump's path — the
+/// handle has used its command channel, so its report cannot be acted on until the pump has
+/// taken those commands in — while leaving the pump with nothing to send when the reports
+/// arrive: an unreliable write is long gone, and a stream no reliable byte ever went out on
+/// has no close to send either. So in the window measured below the send loop has no work of
+/// its own, and the only things that can make it run are its 10 ms heartbeat and a wake-up
+/// caused by a release. The window is fixed rather than "until the table empties", so the
+/// heartbeat's share is a known `WINDOW / 10 ms` rather than something that grows with
+/// however long the burst takes. A pass per release would be the burst itself, an order of
+/// magnitude away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_of_released_streams_is_not_a_pass_each() {
+    const BURST: usize = MAX_STREAMS / 2;
+    /// Long enough for the pump to act on every report — one pass per release is a few
+    /// milliseconds of work at this stream count — and short enough that the heartbeat's
+    /// share of the count is a handful.
+    const WINDOW: Duration = Duration::from_millis(50);
+
+    let (client, server, _cut) = establish().await;
+    // Somebody has to take the peer's streams, or their handles are dropped on arrival and
+    // the server closes its halves for its own reasons.
+    let collector = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            let mut taken: Vec<Arc<PhantomStream>> = Vec::new();
+            while let Ok(Ok(stream)) = timeout(Duration::from_secs(5), server.accept_stream()).await
+            {
+                taken.push(stream);
+            }
+            taken
+        })
+    };
+
+    let mut ours = Vec::with_capacity(BURST);
+    for _ in 0..BURST {
+        let stream = client.open_stream().expect("open a stream");
+        stream
+            .send_unreliable(b"request".to_vec())
+            .await
+            .expect("send on a fresh stream");
+        ours.push(stream);
+    }
+    // Let the writes go, so that when the reports below arrive the send loop has nothing of
+    // its own left to do and every pass it makes is either its heartbeat or a release. Waited
+    // for rather than assumed: the pacer wakes the pump as often as every millisecond while
+    // it has anything to send, which would swamp what is counted below.
+    wait_until_quiet(&client).await;
+
+    let before = drain_passes(&client).await;
+    drop(ours);
+    tokio::time::sleep(WINDOW).await;
+    let passes = drain_passes(&client).await - before;
+    // What a quiet pump makes in this window, by the definition waited for above, plus one
+    // pass for the batch and a few for the scheduling around it.
+    let bar = QUIET_PASSES * (WINDOW.as_millis() / QUIET_SAMPLE.as_millis()) as u64 + 8;
+    assert!(
+        passes <= bar,
+        "a burst of {BURST} released streams cost the send loop {passes} passes against a bar \
+         of {bar} (the heartbeat's share of the window, plus the batch and some slack); \
+         taking the reports one pump turn apiece is the shape this rules out, and it costs \
+         about {BURST}"
+    );
+
+    // And they really were acted on: the table empties.
+    let deadline = Instant::now() + STEP;
+    while client.observability().snapshot().active_streams > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "{} of {BURST} released streams were never dropped",
+            client.observability().snapshot().active_streams
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    collector.abort();
+    client.disconnect().await.expect("disconnect");
+    drop(server);
+}

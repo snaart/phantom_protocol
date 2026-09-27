@@ -837,6 +837,73 @@ pub(crate) struct StreamLink {
     /// nothing disables, so what waits in it is a burst of drops the pump has not reached
     /// yet rather than anything that accumulates.
     pub(crate) released: mpsc::UnboundedSender<u32>,
+    /// The session's own stream bookkeeping, so that a handle to a stream nothing of which
+    /// ever left this machine can take it out itself. See [`StreamRegistry`].
+    pub(crate) registry: StreamRegistry,
+}
+
+/// The session bookkeeping a [`PhantomStream`](crate::api::stream::PhantomStream) needs to
+/// retire its own stream as it is dropped, instead of asking the pump to.
+///
+/// It exists for one case, and only that case is safe to do here: a stream **this side
+/// opened**, on which **no write was ever issued**, and of which therefore **nothing ever
+/// reached the peer** — only a reliable segment opens a stream there, so the peer has never
+/// heard of it and there is nothing to tell it. Such a stream has no FIN to send, no writes
+/// waiting in the command channel to stay ordered behind, and no reader left to hand
+/// anything to, so the whole reason the report travels to the pump does not apply: it is
+/// simply an entry in two tables and a number on a gauge.
+///
+/// Retiring it here rather than there is what makes opening a stream and letting it go a
+/// constant-cost operation. Through the pump it costs a wake-up, and a wake-up costs the
+/// send loop a pass over the entire stream table — so a thousand streams opened and dropped
+/// cost a thousand such passes, and four thousand cost sixteen times that.
+#[derive(Clone)]
+pub(crate) struct StreamRegistry {
+    streams: Arc<DashMap<u32, Arc<Stream>>>,
+    demux: Arc<StreamDemultiplexer>,
+    gauge: Arc<StreamGauge>,
+}
+
+impl StreamRegistry {
+    /// Take `stream_id` out of the session now, if it is one this side opened and nothing
+    /// of it ever went out. Returns whether it did; `false` means the caller has to report
+    /// the drop to the pump in the usual way.
+    ///
+    /// Synchronous and lock-light by construction — it is called from a `Drop`, which can
+    /// neither await nor fail. Racing the pump is safe for the same reason the pump's own
+    /// two retire paths are safe with each other: taking the stream out of the table is a
+    /// single map removal, and only whoever performs it goes on to touch the gauge.
+    pub(crate) fn retire_untouched_local(&self, stream_id: u32) -> bool {
+        if !self.demux.is_local_stream_id(stream_id) {
+            return false;
+        }
+        // Nothing on the wire: the pump has never drawn a reliable segment out of this
+        // stream, so the peer cannot know it exists. Checked in addition to the handle's own
+        // "never wrote" flag because the flag says only that this handle queued nothing —
+        // and these are the two halves of the same claim from either end of the channel.
+        let untouched = self
+            .streams
+            .get(&stream_id)
+            .is_some_and(|s| !s.has_sent_reliable());
+        if !untouched {
+            return false;
+        }
+        retire_released_stream(stream_id, &self.streams, &self.demux, &self.gauge);
+        true
+    }
+}
+
+/// A registry belonging to no session: its tables are empty, so nothing is ever retired
+/// through it and a handle built on it always reports its drop to (an absent) pump. For
+/// tests that build a stream handle by hand.
+#[cfg(test)]
+pub(crate) fn detached_stream_registry() -> StreamRegistry {
+    let (demux, _ctrl) = StreamDemultiplexer::new_with_role(1, false);
+    StreamRegistry {
+        streams: Arc::new(DashMap::new()),
+        demux: Arc::new(demux),
+        gauge: StreamGauge::new(Observability::new(ObservabilityConfig::default()), false),
+    }
 }
 
 impl PhantomSession {
@@ -998,6 +1065,12 @@ impl PhantomSession {
         // and natural shutdown comes via the close request that
         // `disconnect()` and dropping the handle raise.
         let runtime_for_pump = runtime.clone();
+        // Cloned before the spawn call below, whose argument list moves the originals: the
+        // `StreamLink` handed to it is built in the middle of that list, and the stream
+        // handles it builds need the same three tables the pump has (see `StreamRegistry`).
+        let streams_for_link = streams.clone();
+        let demux_for_link = demux.clone();
+        let stream_gauge_for_link = stream_gauge.clone();
         let _detached = runtime.spawn(Box::pin(Self::background_task(
             state,
             send_queue,
@@ -1023,6 +1096,11 @@ impl PhantomSession {
                 commands: cmd_tx,
                 control: control_tx,
                 released: released_tx,
+                registry: StreamRegistry {
+                    streams: streams_for_link,
+                    demux: demux_for_link,
+                    gauge: stream_gauge_for_link,
+                },
             },
             incoming_stream_tx,
             terminal_error,
@@ -1161,6 +1239,10 @@ impl PhantomSession {
             observability.clone(),
             leg,
         ));
+        // See the client path: cloned ahead of the argument list that moves the originals.
+        let streams_for_link = streams.clone();
+        let demux_for_link = demux.clone();
+        let stream_gauge_for_link = stream_gauge.clone();
         let _detached = runtime.spawn(Box::pin(run_data_pump(
             server_session,
             session_id,
@@ -1181,6 +1263,11 @@ impl PhantomSession {
                 commands: cmd_tx,
                 control: control_tx,
                 released: released_tx,
+                registry: StreamRegistry {
+                    streams: streams_for_link,
+                    demux: demux_for_link,
+                    gauge: stream_gauge_for_link,
+                },
             },
             incoming_stream_tx,
             stream_gauge,
@@ -3008,7 +3095,21 @@ async fn run_data_pump<T: SessionTransport>(
             // channel holds nothing. Never gated: a report that waited on the command arm
             // could wait as long as that arm does, and the channel it arrives on grows.
             Some(stream_id) = released_rx.recv() => {
+                // Every report already waiting is taken in this one turn, each with the
+                // command count read at the moment it is taken. Reading it once for the whole
+                // batch instead would be wrong by a hair and lose data for it: a handle
+                // writes and *then* is dropped, so a report that arrives during the drain
+                // below belongs to a write that may have been queued after the count was
+                // read — and a release acted on before that write is admitted puts the
+                // stream's close in front of it, which discards it. `commands_taken` does
+                // not move here and the channel only grows, so the figures stay in
+                // non-decreasing order, which is what `releases` requires. Taking the
+                // reports one pump turn apiece is what made letting go of many handles
+                // quadratic — see `release_due_streams`.
                 releases.push_back((stream_id, commands_taken + cmd_rx.len() as u64));
+                while let Ok(also_released) = released_rx.try_recv() {
+                    releases.push_back((also_released, commands_taken + cmd_rx.len() as u64));
+                }
                 release_due_streams(
                     &mut releases, commands_taken, &mut deferred, &transport, &crypto_session,
                     session_id, &streams, &demux, &stream_gauge, &observability,
@@ -3421,6 +3522,15 @@ async fn take_control<T: SessionTransport>(
 /// acknowledged FIN is enough to drop it. Then either that is already true and the stream
 /// goes now, or a [`Deferred::Release`] is queued behind the writes still waiting for room
 /// — the handle's own among them — to close the writing half once they are in.
+///
+/// **Every release due is taken in one pass, and the queue is flushed once at the end.**
+/// The per-release flush this used to do, and the wake-up that went with it, made the cost
+/// of letting go of handles quadratic in how many were let go of: each wake-up costs the
+/// send loop a pass over the *whole* stream table, so releasing four times the handles cost
+/// twenty-one times the time, and a peer opening a stream meanwhile waited out the backlog.
+/// Flushing once per pass is the same work in the same FIFO order — the queue is drained
+/// from its head either way, and a buffer that refuses one item stops the pass either way —
+/// with one pass over the table instead of one per handle.
 #[allow(clippy::too_many_arguments)]
 async fn release_due_streams<T: SessionTransport>(
     releases: &mut VecDeque<(u32, u64)>,
@@ -3434,6 +3544,7 @@ async fn release_due_streams<T: SessionTransport>(
     stream_gauge: &Arc<StreamGauge>,
     observability: &Observability,
 ) {
+    let mut queued_any = false;
     while let Some(&(stream_id, due)) = releases.front() {
         if due > commands_taken {
             break;
@@ -3441,7 +3552,8 @@ async fn release_due_streams<T: SessionTransport>(
         releases.pop_front();
         // Clone the Arc out so no table guard is held across the awaits below. A stream
         // already gone was dropped while its handle was on its way out — closed from both
-        // ends, or by the offset-exhaustion fallback behind a `disconnect()`.
+        // ends, by the offset-exhaustion fallback behind a `disconnect()`, or by the
+        // handle itself, for a stream nothing of which ever reached the peer.
         let Some(stream) = streams.get(&stream_id).map(|s| s.clone()) else {
             continue;
         };
@@ -3451,6 +3563,9 @@ async fn release_due_streams<T: SessionTransport>(
             continue;
         }
         deferred.push_back(Deferred::Release { stream_id, stream });
+        queued_any = true;
+    }
+    if queued_any {
         flush_deferred_sends(
             deferred,
             transport,
@@ -6447,6 +6562,11 @@ impl PhantomSession {
                 commands: self.cmd_tx.clone(),
                 control: self.control_tx.clone(),
                 released: self.released_tx.clone(),
+                registry: StreamRegistry {
+                    streams: self.streams.clone(),
+                    demux: self.demux.clone(),
+                    gauge: self.stream_gauge.clone(),
+                },
             },
             self.state.clone(),
         )))
@@ -7940,6 +8060,7 @@ mod tests {
             commands,
             control,
             released,
+            registry: detached_stream_registry(),
         }
     }
 

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -55,6 +55,18 @@ pub struct PhantomStream {
     /// `send_reliable` during the peer's draining window reports success for bytes
     /// that never reach the wire — the session-level defect, one layer down.
     session_state: Arc<AtomicU8>,
+    /// Whether anything has ever been put on this handle's command channel — a write, or
+    /// its close.
+    ///
+    /// Read by `Drop` to tell a stream that has been used from one that has not. A handle
+    /// that queued nothing has nothing waiting in that channel for its stream's close to
+    /// stay ordered behind, which is what lets an unused stream be retired on the spot
+    /// instead of through the pump (see
+    /// [`StreamRegistry`](crate::api::session::StreamRegistry)). Set before the send rather
+    /// than after it, so a `send` abandoned mid-`await` still counts as having used the
+    /// handle: erring towards "used" costs a trip through the pump and nothing else, while
+    /// erring the other way would be a queued write whose stream had already gone.
+    issued_command: AtomicBool,
 }
 
 impl PhantomStream {
@@ -68,6 +80,7 @@ impl PhantomStream {
             link,
             rx: Mutex::new(handle.rx),
             session_state,
+            issued_command: AtomicBool::new(false),
         }
     }
 
@@ -120,6 +133,7 @@ impl PhantomStream {
     /// `data` on the wire.
     pub async fn send_reliable(&self, data: Vec<u8>) -> Result<(), CoreError> {
         self.refuse_while_draining()?;
+        self.issued_command.store(true, Ordering::Relaxed);
         self.link
             .commands
             .send(SessionCommand::SendStreamReliable {
@@ -154,6 +168,7 @@ impl PhantomStream {
     /// for the same reason as [`send_reliable`](Self::send_reliable).
     pub async fn send_unreliable(&self, data: Vec<u8>) -> Result<(), CoreError> {
         self.refuse_while_draining()?;
+        self.issued_command.store(true, Ordering::Relaxed);
         self.link
             .commands
             .send(SessionCommand::SendStreamUnreliable {
@@ -263,6 +278,7 @@ impl PhantomStream {
     /// never see the EOF, and the stream is about to end with the session anyway.
     pub async fn disconnect(&self) -> Result<(), CoreError> {
         self.refuse_while_draining()?;
+        self.issued_command.store(true, Ordering::Relaxed);
         self.link
             .commands
             .send(SessionCommand::CloseStream {
@@ -280,8 +296,22 @@ impl PhantomStream {
 /// every write this handle queued before it went — see the type's documentation for what
 /// it does then. A session that has already ended has no pump to tell, and the send fails
 /// harmlessly.
+///
+/// **A stream nothing was ever written on does not go that way.** It has no close to send,
+/// no writes to stay ordered behind and nobody left to read it, and the peer has never
+/// heard of it, so the pump would have nothing to do but take it out of two tables — which
+/// this does here instead, at the cost of two map removals. The difference is not a
+/// micro-optimisation: reporting it costs the pump a wake-up, and a wake-up costs its send
+/// loop a pass over every stream the session holds, so opening and dropping handles used to
+/// cost time quadratic in how many were dropped, and held up the peer's own streams while
+/// the backlog cleared.
 impl Drop for PhantomStream {
     fn drop(&mut self) {
+        if !self.issued_command.load(Ordering::Relaxed)
+            && self.link.registry.retire_untouched_local(self.stream_id)
+        {
+            return;
+        }
         let _ = self.link.released.send(self.stream_id);
     }
 }
@@ -300,6 +330,7 @@ mod tests {
             commands,
             control,
             released,
+            registry: crate::api::session::detached_stream_registry(),
         }
     }
 
