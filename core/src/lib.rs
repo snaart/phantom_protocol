@@ -227,14 +227,38 @@ pub mod test_harness;
 pub use config::PhantomConfig;
 pub use errors::CoreError;
 
-// Re-export the one-shot connect helpers at the crate root so callers can write
-// `phantom_protocol::connect_pinned_udp(...)` without qualifying the module path.
-// Native-only: the free functions live behind `cfg(not(target_arch = "wasm32"))`.
+// The types a caller has to name to use the crate-root entry points, re-exported
+// beside them.
+//
+// `CoreError` and `PhantomConfig` were here and the rest were not, which made the
+// import a reader writes from the signature of a crate-root function fail:
+// `connect_pinned_udp` hands back an `Arc<PhantomSession>`, the session answers
+// with a `ConnectionState`, opens a `PhantomStream` and produces a
+// `ResumptionHint` that the resuming entry point takes back — and every one of
+// those lived only at `phantom_protocol::api::…`, so `use
+// phantom_protocol::ConnectionState;` did not compile while
+// `use phantom_protocol::CoreError;` did. Nothing is moved: these are additions,
+// and the `api::` paths keep working.
+#[cfg(feature = "std")]
+pub use api::{
+    ConnectionState, PaddingPolicy, PhantomSession, PhantomStream, ResumptionHint,
+    TrafficShapingConfig,
+};
+/// The flat metrics record [`PhantomSession::metrics_snapshot`] returns.
+#[cfg(feature = "std")]
+pub use observability::MetricsSnapshotFfi;
+
+// The server-side surface and the one-shot connect helpers. Native-only: the
+// listeners and the free functions all live behind
+// `cfg(not(target_arch = "wasm32"))`, so a browser-wasm build sees neither here
+// nor under `api::`.
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub use api::session::{
     connect_pinned, connect_pinned_udp, connect_pinned_udp_with_config,
     connect_pinned_udp_with_resumption, connect_pinned_with_config, connect_pinned_with_resumption,
 };
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+pub use api::{AcceptOutcome, PhantomListener, PhantomUdpListener};
 
 // UniFFI scaffolding. Gated on the `bindings` feature so the WASI
 // guest build (which sets `--features wasi-leg` without `bindings`)
@@ -1620,6 +1644,65 @@ mod inherited_dependency_features {
              `dep:time` in the `std` feature and once beside the native `tokio` entry — \
              so a reader who finds either selection unused learns why it is there \
              before deleting it."
+        );
+    }
+}
+
+/// The paths a caller writes from the signature of a crate-root entry point.
+///
+/// The crate root exported [`CoreError`] and [`PhantomConfig`] and none of the rest,
+/// which made the obvious import fail: `connect_pinned_udp` hands back an
+/// `Arc<PhantomSession>`, that session answers with a `ConnectionState`, opens a
+/// `PhantomStream`, takes a `TrafficShapingConfig` with a `PaddingPolicy` inside it
+/// and produces a `ResumptionHint` the resuming entry point takes back — and every
+/// one of those could only be named through `phantom_protocol::api::…`, or, for
+/// `PaddingPolicy`, through `phantom_protocol::transport::shaping`, a module a caller
+/// of an `api` method has no reason to have opened. So
+/// `use phantom_protocol::ConnectionState;` did not compile beside a
+/// `use phantom_protocol::CoreError;` that did.
+///
+/// Naming each type is the whole test. A path that does not resolve is a compile
+/// error, so a re-export deleted here cannot report itself as a passing run — which
+/// is the one thing a test asserting a value could not give: there is no value to
+/// read, only a name, and an absent name stops the build.
+#[cfg(test)]
+mod crate_root_paths {
+    use std::sync::Arc;
+
+    #[test]
+    fn every_type_a_caller_must_name_resolves_at_the_crate_root() {
+        let _: Option<Arc<crate::PhantomSession>> = None;
+        let _: Option<Arc<crate::PhantomStream>> = None;
+        let _: Option<Arc<crate::ResumptionHint>> = None;
+        let _: Option<crate::ConnectionState> = None;
+        let _: Option<crate::CoreError> = None;
+        let _: Option<crate::PhantomConfig> = None;
+        let _: Option<crate::TrafficShapingConfig> = None;
+        let _: Option<crate::PaddingPolicy> = None;
+        let _: Option<crate::MetricsSnapshotFfi> = None;
+    }
+
+    /// The server side, which is native-only in both places — so a browser-wasm build
+    /// finds these neither at the crate root nor under `api::`, and this assertion is
+    /// gated exactly as the re-exports are.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_server_types_resolve_at_the_crate_root_on_native_targets() {
+        let _: Option<Arc<crate::PhantomListener>> = None;
+        let _: Option<Arc<crate::PhantomUdpListener>> = None;
+        let _: Option<Arc<crate::AcceptOutcome>> = None;
+    }
+
+    /// The re-export is the type itself and not a second declaration that happens to
+    /// share a name, so a value produced through one path is usable through the other.
+    #[test]
+    fn the_crate_root_name_and_the_module_name_are_one_type() {
+        let through_the_module: crate::api::ConnectionState =
+            crate::api::ConnectionState::Connected;
+        let through_the_root: crate::ConnectionState = through_the_module;
+        assert_eq!(
+            through_the_root,
+            crate::api::session::ConnectionState::Connected
         );
     }
 }
