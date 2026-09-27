@@ -340,8 +340,17 @@ jobs:
         # The --manifest-path in pyproject.toml is relative to the pyproject dir,
         # so we need to override here with the absolute-from-cwd form; the --out
         # flag lands the wheel in the repo-root target/wheels directory.
+        #
+        # `--profile dist` for the reason step 3 above gives: maturin runs
+        # uniffi-bindgen against the library it just compiled, so a stripped one
+        # ends the build. With `--release` this job does not produce a broken
+        # wheel — it fails, `No UniFFI metadata found in …/libphantom_protocol.so`,
+        # leaving a `.whl` with no `.dist-info` and nothing installable. It is
+        # `workflow_dispatch`-only, which is why nothing said so. maturin's own
+        # `strip = true` in python/pyproject.toml still applies and is harmless:
+        # it runs on the copy it bundles, after the bindings are generated.
         run: |
-          maturin build --release \
+          maturin build --profile dist \
             --manifest-path ../core/Cargo.toml \
             --features bindings \
             --out ../target/wheels
