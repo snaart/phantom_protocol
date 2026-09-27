@@ -1098,13 +1098,13 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned() != 13736) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp() != 30504) {
+    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp() != 4269) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_config() != 35502) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption() != 52362) {
+    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption() != 38681) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_config() != 36966) {
@@ -1224,7 +1224,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable() != 18144) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_set_priority() != 63660) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_set_priority() != 8714) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_stream_id() != 46486) {
@@ -4440,6 +4440,23 @@ public interface PhantomStreamInterface {
      * The request does not wait behind writes queued on the session, so it
      * applies to whatever the stream holds at that pass — writes made before
      * this call included, even if they are still waiting for room.
+     *
+     * Returns [`CoreError::ConnectionClosed`] when the session is over, which is the same
+     * answer [`send_reliable`](Self::send_reliable), [`send_unreliable`](Self::send_unreliable)
+     * and [`disconnect`](Self::disconnect) give. It used to be a
+     * `NetworkError("Session closed")` here alone, so three of this type's four outbound
+     * calls reported an ended session as a typed close and the fourth reported it as a
+     * network fault — which is worse for a caller matching on the error than either answer
+     * consistently would be: the one arm that has to be written as a string comparison is
+     * the one nobody writes, and a session that ended in the orderly way was reported as a
+     * failure.
+     *
+     * Unlike the three of them it is not refused while the session is
+     * [`Draining`](crate::api::session::ConnectionState::Draining). Those carry a payload
+     * the pump would throw away, and returning `Ok` for bytes that never reach the wire is
+     * the defect that refusal exists to stop; a priority is not a payload — it is applied
+     * to the stream's own scheduling for as long as the stream still has one, and asks
+     * nothing of the peer.
      */
     suspend fun `setPriority`(`priority`: kotlin.UInt)
     
@@ -4773,6 +4790,23 @@ open class PhantomStream: Disposable, AutoCloseable, PhantomStreamInterface
      * The request does not wait behind writes queued on the session, so it
      * applies to whatever the stream holds at that pass — writes made before
      * this call included, even if they are still waiting for room.
+     *
+     * Returns [`CoreError::ConnectionClosed`] when the session is over, which is the same
+     * answer [`send_reliable`](Self::send_reliable), [`send_unreliable`](Self::send_unreliable)
+     * and [`disconnect`](Self::disconnect) give. It used to be a
+     * `NetworkError("Session closed")` here alone, so three of this type's four outbound
+     * calls reported an ended session as a typed close and the fourth reported it as a
+     * network fault — which is worse for a caller matching on the error than either answer
+     * consistently would be: the one arm that has to be written as a string comparison is
+     * the one nobody writes, and a session that ended in the orderly way was reported as a
+     * failure.
+     *
+     * Unlike the three of them it is not refused while the session is
+     * [`Draining`](crate::api::session::ConnectionState::Draining). Those carry a payload
+     * the pump would throw away, and returning `Ok` for bytes that never reach the wire is
+     * the defect that refusal exists to stop; a priority is not a payload — it is applied
+     * to the stream's own scheduling for as long as the stream still has one, and asks
+     * nothing of the peer.
      */
     @Throws(CoreException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
@@ -7249,17 +7283,36 @@ public object FfiConverterOptionalTypeCoreError: FfiConverterRustBuffer<CoreExce
          * consumers.
          *
          * `host` is resolved via the system resolver and **every** address it returns is tried, in
-         * the resolver's order, until one answers — like the TCP [`connect_pinned`], whose
-         * `TcpStream::connect` does the same. It matters more here than it looks: `localhost`
+         * the resolver's order, until one answers or one refuses — like the TCP [`connect_pinned`],
+         * whose `TcpStream::connect` does the same. It matters more here than it looks: `localhost`
          * commonly resolves to `::1` before `127.0.0.1`, and a datagram socket "connected" to an
          * address with nothing behind it reports no error at all, so taking only the first address
          * meant a server listening on IPv4 was simply never reached. Only the handshake can tell
          * the addresses apart, so each candidate but the last is given a share of the client
-         * handshake deadline to complete one; the whole call stays inside that single deadline
-         * however many addresses the name has, and the last candidate is handed back without
-         * waiting, which is why a one-address name — every IP literal among them — behaves exactly
-         * as it always did. Server-key pinning is mandatory (security invariant 1). Native-only,
-         * like [`connect_pinned`].
+         * handshake deadline to complete one, and the last is handed back without waiting — which
+         * is why a one-address name, every IP literal among them, behaves exactly as it always
+         * did. Two things about the walk are worth knowing before relying on it:
+         *
+         * * **A refusal is returned, not walked past.** An address that *answers* and is not the
+         * pinned server ends the walk with [`CoreError::ServerIdentityMismatch`], and one that
+         * answers with a protocol rejection ends it with [`CoreError::ProtocolRejected`]. An
+         * extra address in a name's DNS answer — an added AAAA record, a poisoned resolver, a
+         * hostile split-horizon zone — is contacted first on every one of these calls and gets
+         * the whole `ClientHello`, so being told that something answered for this name and was
+         * not the server you pinned is the point of the pin. Where every address merely failed
+         * to answer, the returned [`CoreError::NetworkError`] names each one and what it said.
+         * A deployment whose addresses genuinely hold *different* identities has to pin per
+         * address; one key cannot be the right answer for all of them.
+         * * **The share has a floor**, so the call is not guaranteed to fit inside the single
+         * handshake deadline. A share shorter than a handshake decides nothing and abandons
+         * reachable addresses — a name with eight records divided a ten-second budget into
+         * 1.25 s while a handshake on a 600 ms path takes about 1.8 s — so the share is floored
+         * at two seconds. Below six addresses that changes nothing. Above six the walk stops
+         * waiting once the deadline is spent and hands back the next candidate unawaited, which
+         * bounds the call by the deadline plus one share.
+         *
+         * Server-key pinning is mandatory (security invariant 1). Native-only, like
+         * [`connect_pinned`].
          *
          * # Example
          *
@@ -7394,7 +7447,12 @@ public object FfiConverterOptionalTypeCoreError: FfiConverterRustBuffer<CoreExce
          * does have a payload; a caller that resumes twice off one hint gets 1-RTT the second time.
          *
          * Like [`connect_pinned_udp`], every address the host resolves to is tried in the
-         * resolver's order, inside the one client handshake deadline. Native-only.
+         * resolver's order — including the two qualifications described there: an address that
+         * answers and refuses ends the walk with that refusal, and the per-address share has a
+         * floor, so a name with more than five addresses can take longer than the one client
+         * handshake deadline. On this entry point the first of those is the sharper of the two: the
+         * sealed `early_data` blob goes out in the first flight, so it reaches whatever answers
+         * first at the name, and the refusal is what tells the caller that happened. Native-only.
          */
     @Throws(CoreException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
