@@ -1421,15 +1421,22 @@ impl PhantomSession {
                 "PhantomSession: FIPS POST self-test failed; refusing to handshake: {:?}",
                 e
             );
-            let core_err = CoreError::FipsSelfTestFailure(format!("{e:?}"));
-            *terminal_error.lock() = Some(core_err);
-            state.store(ConnectionState::Failed as u8, Ordering::Relaxed);
+            // Through `publish_failure`, not a bare store: the caller can have closed this
+            // session while the connect was in flight, and an end it asked for is not
+            // overwritten by one it did not (see that function).
+            publish_failure(
+                &state,
+                &terminal_error,
+                CoreError::FipsSelfTestFailure(format!("{e:?}")),
+            );
             // No pump will run, so no delivery task will ever release this session's
             // routes: release them here, or a stream opened before the connect resolved
             // leaves its reader parked for good.
             demux.close_all_streams();
             // Signal awaiting callers (await_ready) that we have reached a terminal state.
-            let _ = ready_tx.send(ConnectionState::Failed as u8);
+            // Read from the state rather than written as a literal `Failed`, so what
+            // resolves is what happened.
+            let _ = ready_tx.send(state.load(Ordering::Relaxed));
             return;
         }
 
@@ -1470,18 +1477,20 @@ impl PhantomSession {
                     AeadAlgorithm::Aes256Gcm,
                     ProtocolVersion::Current,
                 );
-                // Capture the terminal error BEFORE setting state so
-                // await_ready() readers that wake on the state transition always
-                // see the error already in place.
-                *terminal_error.lock() = Some(e);
-                state.store(ConnectionState::Failed as u8, Ordering::Relaxed);
+                // The cause is captured BEFORE the state is published, so `await_ready()`
+                // readers that wake on the state transition always see the error already in
+                // place — and neither is written at all if the caller has already closed
+                // this session, because an end it asked for is not a failure. Both halves
+                // are `publish_failure`'s job.
+                publish_failure(&state, &terminal_error, e);
                 // Same as the POST gate above: the pump never runs on this path, so the
                 // routes of any stream the application opened while the connect was in
                 // flight have to be released here.
                 demux.close_all_streams();
-                // Signal awaiting callers (await_ready) that we have reached a
-                // terminal Failed state.
-                let _ = ready_tx.send(ConnectionState::Failed as u8);
+                // Signal awaiting callers (await_ready) that we have reached a terminal
+                // state — whichever one it is. Published from the state rather than as a
+                // literal `Failed`, for the reason above.
+                let _ = ready_tx.send(state.load(Ordering::Relaxed));
                 return;
             }
         };
@@ -3790,19 +3799,14 @@ fn apply_liveness(
     }
 }
 
-/// Publish `next` — a state the session can still leave, `Connected` or `Migrating` —
-/// unless the session has already reached one it cannot: an end (`Closed`, `Failed`,
-/// `Dead`) or the peer's announced close (`Draining`).
+/// Publish `next` — an end the session has just reached — unless it has already reached one,
+/// in which case the first end is the one to report.
 ///
-/// The liveness verdict is not the only writer of the state. The receive task publishes
-/// `Dead` when the transport gives up and `Draining` when the peer's close arrives, and
-/// `disconnect()` publishes `Closed` from the caller's thread, each of them possibly
-/// between the moment the send loop read the path's signals and the moment it publishes
-/// what they said. A verdict landing after one of them must not walk it back: a caller
-/// that read `Dead`, then `Connected`, then `Dead` again was told the session recovered.
-/// The check and the write are one atomic step, so no end published in between is lost.
-/// Publish `next` — an end the session has just reached — unless it has already reached
-/// one, in which case the first end is the one to report.
+/// The two publishers are a pair, and the difference is which side of the state machine they
+/// are writing from. This one is for the ends — `Closed`, `Failed`, `Dead` — and it defends
+/// the *first* end against the second. [`publish_unless_ended`] is for the states a session
+/// can still leave, and it defends any end against a later `Connected` or `Migrating`.
+/// Between them, an end published once is the end a caller reads.
 ///
 /// The ends are not interchangeable, which is why the order matters. `Closed` says the
 /// session finished in the orderly way and nothing is owed an explanation;
@@ -3813,10 +3817,16 @@ fn apply_liveness(
 /// receive task had already diagnosed into an orderly close, and a caller could not tell
 /// "the peer said goodbye" from "the connection broke".
 ///
-/// Two deaths deliberately do not go through this: the transport giving up on a peer that
-/// stopped taking bytes, which `disconnect`'s own documentation says replaces the `Closed`
-/// it published, and the liveness sweep's idle timeout. Both are the session failing on its
-/// way out, and both record a cause.
+/// `Draining` is **not** in the guarded set here, and that is the one asymmetry between the
+/// two: the peer's announced close is not an end this side has reached, so an end that
+/// happens afterwards is the truth and replaces it.
+///
+/// A failure that carries a cause has [`publish_failure`] instead — it publishes through
+/// this and records the cause under the same decision, so the pair cannot disagree. Two
+/// deaths deliberately bypass all of it: the transport giving up on a peer that stopped
+/// taking bytes, which `disconnect`'s own documentation says replaces the `Closed` it
+/// published, and the liveness sweep's idle timeout. Both are the session failing on its way
+/// out, and both record a cause.
 fn publish_end(state: &AtomicU8, next: ConnectionState) {
     let _ = state.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         match ConnectionState::from_u8(current) {
@@ -3826,6 +3836,25 @@ fn publish_end(state: &AtomicU8, next: ConnectionState) {
     });
 }
 
+/// Publish `next` — a state the session can still leave, `Connected` or `Migrating` — unless
+/// it has already reached one it cannot: an end (`Closed`, `Failed`, `Dead`) or the peer's
+/// announced close (`Draining`).
+///
+/// The other half of the pair described on [`publish_end`]. Reach for this one when what is
+/// being published is a *stage* the session is passing through, and for `publish_end` when it
+/// is the session stopping.
+///
+/// The liveness verdict is not the only writer of the state. The receive task publishes
+/// `Dead` when the transport gives up and `Draining` when the peer's close arrives, and
+/// `disconnect()` publishes `Closed` from the caller's thread, each of them possibly between
+/// the moment the send loop read the path's signals and the moment it publishes what they
+/// said. A verdict landing after one of them must not walk it back: a caller that read
+/// `Dead`, then `Connected`, then `Dead` again was told the session recovered. The check and
+/// the write are one atomic step, so no end published in between is lost.
+///
+/// `Draining` is guarded here and not in `publish_end`, for the reason given there: a
+/// session whose peer has said goodbye has not stopped, but it is not going back to
+/// `Connected` either.
 fn publish_unless_ended(state: &AtomicU8, next: ConnectionState) {
     let _ = state.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         match ConnectionState::from_u8(current) {
@@ -3836,6 +3865,54 @@ fn publish_unless_ended(state: &AtomicU8, next: ConnectionState) {
             _ => Some(next as u8),
         }
     });
+}
+
+/// Publish `Failed` with `cause` — unless the session has already ended, in which case
+/// neither the state nor the cause is touched.
+///
+/// The client's handshake runs on a background task, so a `disconnect()` — or a dropped
+/// handle — can publish `Closed` from the caller's own thread while it is still in flight.
+/// A handshake that then fails used to store `Failed` over that `Closed` and record a cause
+/// beside it, so a session the caller had closed itself reported
+/// `state = Failed, last_error = Some(NetworkError("the far end vanished"))`. That is the
+/// opposite of the contract this release states for an orderly end — `Closed` with
+/// [`last_error`](PhantomSession::last_error) answering `None` — and the caller had already
+/// been told the close was carried out. The far end vanishing *after* a session was closed
+/// on purpose is not news, and it is certainly not what happened to the session.
+///
+/// The state and the cause are decided together rather than written one after the other. The
+/// cause goes in first, because a caller polling
+/// [`connection_state`](PhantomSession::connection_state) reads the two in that order and a
+/// `Failed` with nothing recorded against it reads as an orderly close; and it is taken back
+/// out if the publish finds an end already there, so the pair a caller can observe once the
+/// dust settles is either `Failed` with this cause or the end that was already published with
+/// whatever belonged to it. The `terminal_error` lock is held across both steps, so no other
+/// recorder can interleave.
+fn publish_failure(
+    state: &AtomicU8,
+    terminal_error: &parking_lot::Mutex<Option<CoreError>>,
+    cause: CoreError,
+) {
+    let mut slot = terminal_error.lock();
+    // Only this call's own write is taken back below; a cause that was already recorded is
+    // somebody else's and stays whatever the publish decides.
+    let recorded_here = slot.is_none();
+    if recorded_here {
+        *slot = Some(cause);
+    }
+    let published = state
+        .fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| match ConnectionState::from_u8(current) {
+                ConnectionState::Closed | ConnectionState::Failed | ConnectionState::Dead => None,
+                _ => Some(ConnectionState::Failed as u8),
+            },
+        )
+        .is_ok();
+    if !published && recorded_here {
+        *slot = None;
+    }
 }
 
 /// How long an unanswered PATH_CHALLENGE is allowed to stay outstanding before
@@ -18679,5 +18756,77 @@ mod tests {
             );
         }
         assert_eq!(address_roster(&[]), "no address was tried");
+    }
+
+    /// A close that lands while the handshake is still running, and a handshake failure
+    /// arriving after it, leave the orderly end in place — the state *and* the cause.
+    ///
+    /// **The defect.** The handshake-failure arm stored `Failed` unconditionally and recorded
+    /// a cause beside it, over a `Closed` that `disconnect()` had already published from the
+    /// caller's thread.
+    ///
+    /// **What a consumer sees.** A session it closed itself reporting
+    /// `state = Failed, last_error = Some(NetworkError(..))` — the exact opposite of the
+    /// orderly-end contract this release advertises, and about an event (the far end going
+    /// away) that happened after the caller had finished with the session.
+    ///
+    /// **Why it comes back unnoticed.** The state is an atomic with several writers and no
+    /// one place that owns it, so the next edit to this arm is as likely as not to be another
+    /// bare `store`. Driven here against the two publishers directly, with no sockets and no
+    /// handshake, because that is the level the ordering lives at: an end-to-end test can
+    /// only reach it by winning a race.
+    #[test]
+    fn a_failure_after_an_orderly_close_changes_neither_the_state_nor_the_cause() {
+        let state = AtomicU8::new(ConnectionState::Connecting as u8);
+        let terminal_error = parking_lot::Mutex::new(None);
+
+        // The caller's close, exactly as `disconnect()` publishes it.
+        publish_end(&state, ConnectionState::Closed);
+
+        publish_failure(
+            &state,
+            &terminal_error,
+            CoreError::NetworkError("the far end vanished".into()),
+        );
+        assert_eq!(
+            ConnectionState::from_u8(state.load(Ordering::Relaxed)),
+            ConnectionState::Closed,
+            "a handshake failure arriving after the caller's close overwrote it"
+        );
+        assert!(
+            terminal_error.lock().is_none(),
+            "an orderly end has no cause; got {:?}",
+            terminal_error.lock()
+        );
+
+        // And the ordinary case still works: a failure with nothing before it publishes both.
+        let state = AtomicU8::new(ConnectionState::Connecting as u8);
+        let terminal_error = parking_lot::Mutex::new(None);
+        publish_failure(&state, &terminal_error, CoreError::ServerIdentityMismatch);
+        assert_eq!(
+            ConnectionState::from_u8(state.load(Ordering::Relaxed)),
+            ConnectionState::Failed
+        );
+        assert!(matches!(
+            *terminal_error.lock(),
+            Some(CoreError::ServerIdentityMismatch)
+        ));
+
+        // A cause somebody else recorded is the first one, and stays — `publish_failure`
+        // only ever takes back a write of its own.
+        let state = AtomicU8::new(ConnectionState::Connecting as u8);
+        let terminal_error = parking_lot::Mutex::new(Some(CoreError::Timeout));
+        publish_failure(&state, &terminal_error, CoreError::ServerIdentityMismatch);
+        assert!(matches!(*terminal_error.lock(), Some(CoreError::Timeout)));
+        publish_end(&state, ConnectionState::Closed);
+        let state = AtomicU8::new(ConnectionState::Dead as u8);
+        let terminal_error = parking_lot::Mutex::new(Some(CoreError::Timeout));
+        publish_failure(&state, &terminal_error, CoreError::ServerIdentityMismatch);
+        assert_eq!(
+            ConnectionState::from_u8(state.load(Ordering::Relaxed)),
+            ConnectionState::Dead,
+            "a death already diagnosed is not replaced by a later failure"
+        );
+        assert!(matches!(*terminal_error.lock(), Some(CoreError::Timeout)));
     }
 }

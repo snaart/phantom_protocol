@@ -548,19 +548,34 @@ async fn a_session_that_never_tried_is_not_reported_as_closed() {
 
 // ── A close that arrives while the handshake runs ────────────────────────────
 
-/// A close that lands while the handshake is still running is not walked back by the
-/// handshake finishing.
+/// A close that lands while the handshake is still running is not walked back by what the
+/// handshake does next — whichever way it goes.
 ///
 /// The handshake is asynchronous, so `disconnect()` — or dropping the handle — can happen
-/// while it is in flight, and it publishes `Closed` from the caller's own thread. The
-/// completion then stored `Connected` over it unconditionally and published that as the
-/// readiness answer, so `await_ready()` said `Ok(())` for a session the caller had already
-/// closed, and a poller saw it go live after being told to stop.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_close_during_the_handshake_is_not_walked_back() {
+/// while it is in flight, and it publishes `Closed` from the caller's own thread. Both of the
+/// handshake's exits then wrote over that unconditionally, and both were wrong in their own
+/// way:
+///
+/// * the **success** exit stored `Connected` and published it as the readiness answer, so
+///   `await_ready()` said `Ok(())` for a session the caller had already closed, and a poller
+///   saw it go live after being told to stop;
+/// * the **failure** exit stored `Failed` *and recorded a cause*, so a session the caller
+///   closed itself reported `state = Failed, last_error = Some(NetworkError("the far end
+///   vanished"))` — a failure, about an event after the caller was done, in place of the
+///   orderly end this release advertises.
+///
+/// Which exit runs is `handshake_succeeds`: the reply is composed either way and then either
+/// sent or withheld while the link is cut, so both arms are the same race with the same
+/// timing and differ only in what the handshake concludes. The failure arm exists because
+/// the one that shipped covered only the success arm — the two exits are separate statements
+/// about the same atomic, and fixing one says nothing about the other. Without it the next
+/// edit to the failure arm reintroduces a bare `store` and nothing notices: the state is
+/// correct for every session that was *not* closed during its handshake, which is all of
+/// them in every other test.
+async fn a_close_during_the_handshake_is_not_walked_back(handshake_succeeds: bool) {
     let server_hs = HandshakeServer::new().expect("HandshakeServer::new");
     let pinned = server_hs.verifying_key().clone();
-    let (client_link, server_link, _cut) = Pipe::pair();
+    let (client_link, server_link, cut) = Pipe::pair();
     let client = Arc::new(PhantomSession::connect_with_transport(
         "test-server:9000",
         client_link,
@@ -580,7 +595,7 @@ async fn a_close_during_the_handshake_is_not_walked_back() {
     client.disconnect().await.expect("disconnect");
     assert_eq!(client.connection_state(), ConnectionState::Closed);
 
-    // Watch for the state going back up while the handshake completes behind us.
+    // Watch for the state moving off the close while the handshake resolves behind us.
     let seen = Arc::new(Mutex::new(Vec::new()));
     let poller = {
         let client = client.clone();
@@ -593,11 +608,17 @@ async fn a_close_during_the_handshake_is_not_walked_back() {
             }
         })
     };
-    // Release the reply: the client's handshake now succeeds.
-    server_link
-        .send_bytes(&reply)
-        .await
-        .expect("send ServerHello");
+    if handshake_succeeds {
+        // Release the reply: the client's handshake now succeeds.
+        server_link
+            .send_bytes(&reply)
+            .await
+            .expect("send ServerHello");
+    } else {
+        // Withhold it and cut the link instead: the client's read fails, so the handshake
+        // ends in its failure arm with a cause of its own to record.
+        cut.send_replace(true);
+    }
     poller.await.expect("poller task");
 
     let ready = timeout(STEP, client.await_ready())
@@ -610,14 +631,32 @@ async fn a_close_during_the_handshake_is_not_walked_back() {
     );
     assert!(
         client.last_error().await.is_none(),
-        "the caller's own close is not a failure"
+        "the caller's own close is not a failure; last_error() gave {:?}",
+        client.last_error().await
+    );
+    assert_eq!(
+        client.connection_state(),
+        ConnectionState::Closed,
+        "the close the caller asked for is the end this session reached"
     );
     let seen = seen.lock().await;
-    assert!(
-        !seen.contains(&ConnectionState::Connected),
-        "the session was published as Connected after the caller closed it: {seen:?}"
-    );
+    for walked_back in [ConnectionState::Connected, ConnectionState::Failed] {
+        assert!(
+            !seen.contains(&walked_back),
+            "the session was published as {walked_back:?} after the caller closed it: {seen:?}"
+        );
+    }
     drop(inner);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_during_a_handshake_that_then_succeeds_is_not_walked_back() {
+    a_close_during_the_handshake_is_not_walked_back(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_during_a_handshake_that_then_fails_is_not_walked_back() {
+    a_close_during_the_handshake_is_not_walked_back(false).await;
 }
 
 /// Read the client's hello (answering the DoS gate's cookie retry, which *is* sent) and
