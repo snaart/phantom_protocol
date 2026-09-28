@@ -711,6 +711,83 @@ Pointers only: each item is set out in full in the entry named.
   no script that itself runs. Eight mutation cases, including the case where its own naming
   convention stops matching, so a convention change is reported rather than passing silently.
 
+- **The record of what this release takes away from a consumer named five of the twelve
+  selections it takes.** `inherited_dependency_features` in `core/src/lib.rs` holds a row per
+  withdrawn selection, saying what a consumer's own code loses with it, and it recorded
+  `dep:time` and the four tokio features and read as though that were all of them.
+  `dep:tokio-util`, `dep:env_logger`, `dep:argon2`, `dep:base64`, `dep:once_cell`,
+  `dep:async-trait` and `dep:bitflags` had no row at all, so the seven crates the entry under
+  **Changed** is about were withdrawn with nothing written down about their cost. Five of the
+  seven are a real loss to a consumer who declared the same crate more narrowly —
+  `tokio-util`'s `codec` above all, since that crate's default feature set is empty, so every
+  consumer who took its defaults was inheriting `Framed`, `Decoder`, `Encoder` and
+  `LengthDelimitedCodec` from here — and two are not: `async-trait` declares no features, and
+  the only one `bitflags` gained was bitflags 2's `std`, whose body is empty. Each row now
+  says which of the two it is and why. The record's stated reason for leaving per-dependency
+  feature lists out of the guarded set was also false — it held that every such list had an
+  in-crate reader, when nothing in `core/src` reads `bytes/serde` and `ed25519-dalek`'s
+  `rand_core` is kept compiling by a dev-dependency a consumer does not inherit — so every
+  inherited dependency feature list is recorded and held to the manifest now, those two
+  included.
+
+- **A backdated withdrawal row passed the rule it was written to enforce.** A row names the
+  release that took the selection away, and its patch number has to be zero, because a patch
+  release may not change what a consumer's build inherits. The check read the string: that it
+  parsed, that it ended in a zero, that it was not in the future, and that words came with it.
+  A tree cutting 0.4.1 could therefore delete a selection, write `release: "0.4.0"` beside it
+  and pass — shipping in exactly the release the rule forbids, with the record saying it
+  happened in the one before. A row is now proved against the release it claims: against the
+  manifest's own version where it names the release being cut, and against that release's git
+  tag where it names an earlier one, by reading whether the selection is still there. A
+  checkout with no tags says so and refuses the row rather than passing it.
+
+- **The reject-code gate read the whole specification where only two sites are normative.**
+  `scripts/check_reject_codes.py` asked whether each `REJECT_*` constant is named in
+  `docs/protocol/PROTOCOL.md` anywhere, and the document names them in several places on
+  purpose: a byte-level field table an implementer decodes from, a struct listing they write
+  their own type from, and prose around both. Restoring either of the first two to its 0.3.0
+  content — the exact lag this release fixes — left the other and the prose naming all three
+  codes, so the gate stayed green while an implementer reading the table still built a decoder
+  that knew one code. Each normative site is read on its own now, and a site the script cannot
+  locate is a failure rather than a site with nothing in it to check.
+
+- **A check counted as invoked because its own mutation harness named it.**
+  `scripts/check_gate_wiring.py` fails when a runner in the tree is invoked by no workflow, no
+  hook and no script that is itself reachable — and it credited `X_test.sh` with invoking
+  `X.sh`, which is its own failure mode one level up: a harness runs a gate against trees it
+  fabricates and says nothing about whether anything runs it against *this* tree.
+  `tests/bindings/swift/check_xcframework.sh` was reported as wired on that basis and by
+  nothing else in the repository, including `build-xcframework.sh`, which this script's own
+  prose offered as the example of a legitimate relay. A runner's own cases no longer vouch for
+  it; a runner that genuinely cannot be run against the tree is a named exception carrying its
+  reason, and the exception is refused as stale the moment something does run it. The
+  inventory also reaches `python/` now, where `python/verify_wheel.sh` had been invoked by
+  nothing — it runs in `release.yml`'s `build-python-wheel` job, in place of the inline
+  `import phantom_protocol` that job used to do.
+
+- **Between two verdicts the address walk had no test for which one answers, and a pin refusal
+  an earlier address's success overruled was written to no log at all.** The overlapped walk
+  can hold a completed handshake and a peer's refusal at once, and the lower-numbered address
+  decides — the rule was written out three times, in the loop, at the budget deadline and
+  after it, as two different-looking expressions each of which reads correctly on its own. It
+  is one function used at all three points now, tested as the integer comparison it is. The
+  second half is what a consumer saw: where an impostor refuses and a later address succeeds,
+  the caller is handed the success, `last_error()` is `None`, and the roster naming every
+  address tried is built only for the error path — so an operator with a poisoned resolver, a
+  hostile split-horizon zone or one extra AAAA record in a DNS answer saw a clean connect
+  every time, and the one signal Security Invariant 1 exists to produce reached nobody. The
+  overruled refusal is logged at `warn` naming both addresses. A candidate whose socket cannot
+  be opened at all also no longer costs the 250 ms inter-attempt delay before the next address
+  is tried: the delay exists to give a contacted address a head start, and nothing was
+  contacted.
+
+- **`scripts/semver_report.sh` took an empty `--release-type` for no release type at all.** It
+  asked whether the variable held a non-empty string rather than whether the flag had been
+  given, so `--release-type "${BUMP}"` in a caller where `BUMP` was never set fell through to
+  the derivation and produced a report naming the type as derived — in the one place a caller
+  had asked it not to guess. An empty value is a caller error and exits 2 without running a
+  comparison, in both the separated and the joined spelling.
+
 ### Changed
 
 - **Seven dependencies the crate never referenced are no longer declared.** The `std`
