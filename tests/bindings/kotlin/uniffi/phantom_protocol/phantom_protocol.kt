@@ -6183,7 +6183,7 @@ data class PhantomConfig (
      * 1-RTT handshake with `early_data_accepted == false`. That is the same
      * posture `PhantomListener::set_early_data_enabled(false)` gives, reached from
      * a config record instead of a method call — which is the only route a foreign
-     * binding has when it builds this record field by field. Until 0.3.1 the value
+     * binding has when it builds this record field by field. Until 0.4.0 the value
      * was read as a bound to evict against rather than as a capacity, so a cache
      * configured to hold nothing held one ticket and served 0-RTT out of it.
      *
