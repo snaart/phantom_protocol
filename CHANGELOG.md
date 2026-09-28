@@ -914,12 +914,17 @@ Pointers only: each item is set out in full in the entry named.
   **Where each of those actually runs, since a check nothing invokes is a script.** The
   mutation cases need nothing but a temporary directory, so they are a pre-commit hook now,
   firing on the four Swift packaging files. The other two need an artifact to look at — a
-  built framework, a built wheel — and belong in `bindings.yml`'s `swift` job, after
-  `build-xcframework.sh`, and in `release.yml`'s `build-python-wheel` job; adding those two
-  steps, and the branch-protection contexts that make them count, is a maintainer action
-  this release does not take. Until then they are run by hand from the flow in
-  `tests/bindings/PACKAGING.md`. The release-artifact gate above is the only new CI job
-  here.
+  built framework, a built wheel — and only one of them has one to look at here.
+  `python/verify_wheel.sh` runs in `release.yml`'s `build-python-wheel` job, on the wheel
+  that job has just built, replacing the inline `import phantom_protocol` that was the whole
+  of that job's smoke test and that a wheel with no bindings in it passes. The XCFramework
+  check belongs in `bindings.yml`'s `swift` job after `build-xcframework.sh`, and nothing in
+  the repository builds a framework, so it is run by hand from the flow in
+  `tests/bindings/PACKAGING.md` and is carried as a named exception in
+  `scripts/check_gate_wiring.py` — an exception that is refused as stale the moment anything
+  does run it. Making that job's step, and the branch-protection contexts that make either of
+  them count, is a maintainer action this release does not take. The release-artifact gate
+  above is the only new CI job here.
 
 - **Typed EOF on `PhantomStream::recv` is now documented where a reader looks for it.**
   `docs/protocol/PROTOCOL.md` § 4.5 names `Ok(None)` (clean in-order `FIN`, half-closed)
