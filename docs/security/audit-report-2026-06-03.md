@@ -4,7 +4,8 @@
 - **Target:** `phantom_core` library (`core/`), at `main` as it stood on
   2026-06-03. The commit id this line used to give did not survive the pre-0.3.0
   history rewrite (`docs/policy/versioning.md` § 10, "Commit ids before 0.3.0");
-  the findings below cite files and functions, which did
+  the findings below cite files and functions instead, and a rewrite that only
+  replaced commit ids left those untouched.
 - **Scope:** ~25,000 LoC across crypto, handshake, session/AEAD, transport legs, wire codec, API/FFI, `unsafe`, DoS/concurrency, supply chain, observability. Sibling crates (`server/`, `cli/`) referenced where they embed the library.
 - **Method:** source review organised by 13 dimensions. Each finding was then re-checked against the code on three questions — is the code read faithfully, is the issue exploitable, does an existing mitigation already cover it — before being classified. A finding is **Confirmed** when the re-check held on at least two of the three, **Disputed** when it held on only one, and **Dropped** when it held on none. Supply-chain baseline from `cargo audit` against `Cargo.lock` (343 deps).
 
