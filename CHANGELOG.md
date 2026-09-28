@@ -285,16 +285,18 @@ Pointers only: each item is set out in full in the entry named.
   six-address name of that shape cost about twelve seconds. Each address is now contacted
   `CANDIDATE_ATTEMPT_DELAY` — 250 ms, RFC 8305 § 5's Connection Attempt Delay, the interval a
   happy-eyeballs resolver uses for this same decision — after the one before it, and the
-  first handshake to complete is the one handed back. Three rules keep that from becoming a
+  first handshake to complete is the one handed back. Four rules keep that from becoming a
   race, and each exists for a case that would otherwise be worse than the serial walk:
   **an address that has answered stops the schedule**, so a name whose first address works is
   still the only one contacted and the `ClientHello` — with its sealed `early_data` on the
   resuming entry point — reaches no more addresses than before; **a completed handshake waits
   for an earlier address that has begun answering**, since that one may be about to refuse the
-  pin and discarding it is what the classification above exists to prevent; and **a refusal
+  pin and discarding it is what the classification above exists to prevent; **a refusal
   waits for every earlier address to finish**, or one hostile address *after* the right one in
   a name's DNS answer would deny service by refusing in a millisecond while the right one was
-  still handshaking. One property is narrower than the serial walk's, and it is in the
+  still handshaking; and **between two verdicts in hand, the lower-numbered address answers**,
+  the resolver's order being a preference — which is the rule the entry below, "Between two
+  verdicts the address walk had no test for which one answers", is about. One property is narrower than the serial walk's, and it is in the
   function's own documentation: an impostor that has not said a *word* by the time a later
   address completes is no longer reported, where a serial walk would have waited out its whole
   share for it. The overlap cannot be both fast and patient with silence; what bounds that
