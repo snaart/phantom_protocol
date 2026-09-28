@@ -1132,10 +1132,10 @@ Pointers only: each item is set out in full in the entry named.
   about 1.8 s", offered as the reason the per-candidate share has a 2 s floor, when two
   flights on a 600 ms path is 1.2 s and the floor is
   `UDP_HANDSHAKE_FLIGHTS × NO_SAMPLE_FLIGHT_RTO`, derived from no path length at all; "164
-  crates to 135", where the first figure is one above what `cargo tree` reports and the
-  second was the count of a manifest this release prepared and then withdrew — the real pair
-  is 163 to 140 — and which was the only figure in its section with no re-derivation recipe
-  beside it; the address roster described as the answer
+  crates to 135", neither of which is a figure `cargo tree` prints — the measured pair is
+  163 at the `v0.3.0` tag and 134 here, and the entry under **Changed** that gives it now
+  carries the command that prints both — and which was the only figure in its section with
+  no re-derivation recipe beside it; the address roster described as the answer
   a caller gets when no address answered, when it is reachable only where no candidate's
   socket could be created; and "every hex token still in `docs/` is a decimal sysctl value",
   which holds for none of the three classes the scan actually matches. A figure with no way
