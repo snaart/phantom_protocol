@@ -1150,6 +1150,22 @@ Pointers only: each item is set out in full in the entry named.
   checksums that move in *this* release, listed at the head of this section, were counted
   the same way: by diffing that file against the one at the `v0.3.0` tag.
 
+- **Two documents still described the address walk this release replaced, and a security
+  invariant cited a test that does not exist.** `docs/known-deviations.md` § 7 and
+  `docs/security/invariants.md` both still set out the serial walk, including a tail of
+  addresses that a name with six or more of them never reached — a limitation the overlapped
+  walk does not have, because the per-candidate shares run concurrently instead of end to
+  end: the tenth address of a ten-address name is contacted 2.25 s into a ten-second
+  deadline, and all ten are reached. Both now describe what ships, with the two ordering
+  rules the overlap needed to keep Invariant 1's pin refusal and the one property it
+  narrows against the serial walk. Separately, Invariant 10's "Pinned by" line named
+  `the_reject_codes_are_distinct_and_the_version_one_is_unchanged`, a test this tree does
+  not contain — the name is `…_and_the_shipped_ones_are_unchanged`. A citation that names
+  nothing reads as covered, which is worse than citing nothing, so that file's header now
+  carries the `comm` that holds every name in every "Pinned by" line against the `fn`s in
+  `core/src` and `core/tests`. It prints nine lines, all of them modules or fields; a tenth
+  is a citation that has gone stale, and a run of it before this change printed one.
+
 - **`docs/compliance/cc-pp-mapping.md`'s ATE_FUN.1 row counted 73 negative-security tests,
   twice, where the suite has 77** — evidence offered to a lab that would run the suite and
   count. Corrected in both places, with the `grep` that re-derives it beside the figure. The

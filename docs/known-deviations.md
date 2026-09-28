@@ -166,11 +166,13 @@ a caller usually gets.
 each address 250 ms after the one before it — RFC 8305 § 5's Connection Attempt Delay
 — and hands back the first handshake to complete. An address that has answered stops
 the schedule, so a name whose first address works is still the only one contacted.
-Each attempt is waited on for at most an even share of the deadline, floored at 2 s;
-at six addresses or more `floor × count` exceeds the deadline, which leaves such a
-name a tail of addresses the walk never reaches. The deadline is the outer authority,
-so the whole call fits inside it — that was not true before 0.4.0, where the walk ran
-the addresses strictly in turn and could take the deadline plus a share. One property
+Each attempt is waited on for at most an even share of the deadline, floored at 2 s,
+but those shares run concurrently rather than end to end, so they do not add up: the
+tenth address of a ten-address name is contacted 2.25 s into a ten-second deadline,
+and every one of the ten is reached. The deadline is the outer authority, so the
+whole call fits inside it — that was not true before 0.4.0, where the walk ran the
+addresses strictly in turn, reached each only once the one before it had spent its
+whole share, and could take the deadline plus a share. One property
 is narrower than the serial walk's: an impostor that says nothing at all before a
 later address completes is not reported, where the serial walk would have waited out
 its whole share for it. One that answers still ends the walk. An abandoned candidate

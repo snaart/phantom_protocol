@@ -11,6 +11,26 @@ number, for the reason given at the top of
 [`threat-model.md`](threat-model.md): a name survives the edits a line number
 does not.
 
+A "Pinned by" name that no longer exists is worse than no name at all, because it
+reads as covered. One sat in Invariant 10 through most of the 0.4.0 work — a test
+renamed under the citation. Every name in every "Pinned by" line below is a `fn` in
+`core/src` or `core/tests`, so the whole list is checkable in one pass without
+running anything:
+
+```bash
+grep -ohE '`[a-z_0-9:]+`' docs/security/invariants.md \
+  | tr -d '`' | sed 's/.*:://' | grep '_' | sort -u > /tmp/cited
+grep -rhoE 'fn [a-z_0-9]+' core/src core/tests --include='*.rs' \
+  | sed 's/^fn //' | sort -u > /tmp/defined
+comm -23 /tmp/cited /tmp/defined
+```
+
+It prints nine lines, and every one of them is a module or a field rather than a
+test: `early_data`, `mimic_tls_integration`, `path_id`, `protocol_variant`,
+`resume_session_id`, `security_invariants`, `self_tests`, `tcp_integration`,
+`udp_integration`. A tenth line is a citation that has gone stale; run against this
+file before the Invariant 10 correction, it printed one.
+
 **The numbers are stable.** They are cited in more than two hundred places, so an
 invariant keeps its number for as long as it exists, and a new one is appended
 rather than inserted. A change that weakens or removes one needs a deliberate
@@ -90,18 +110,19 @@ changed it for three of them. `connect_pinned`, `connect_pinned_with_config`,
 `connect_pinned_with_resumption` and `connect_pinned_mimic` return as soon as the
 socket is open, before the handshake has run. The three PhantomUDP entry points do
 the same for a name that resolves to one address — every IP literal, and most real
-names — but for a name with several they walk the list, and each candidate but the
-last has its own handshake awaited inside the call, because nothing else can tell a
-datagram address with a server behind it from one with nothing behind it. Each such
-wait is a share of the ten-second client deadline, floored at 2 s so that it decides
-something; up to five addresses the shares sum to the deadline, and beyond five the
-walk stops waiting once the deadline is spent rather than shortening them, so the
-call is bounded by the deadline plus one share. So such a call may return a session
-that is already `Connected`, it may return after a handshake has failed on an earlier
-address, and on a name with six or more addresses it may return after the deadline
-itself. Neither changes the obligation: `await_ready()` on the session that came
-back is still the only thing that answers about the pin, and it is cheap on a
-session that has already finished.
+names — but for a name with several they walk the list inside the call, because
+nothing else can tell a datagram address with a server behind it from one with
+nothing behind it. The attempts overlap: each address is contacted 250 ms after the
+one before it, the first handshake to complete is the one handed back, and an
+address that has begun answering stops the schedule, so a name whose first address
+works is still the only one contacted. Each attempt is bounded by an even share of
+the ten-second client deadline, floored at 2 s so that a wait decides something, and
+because those shares run concurrently rather than end to end the whole call is
+bounded by the deadline — not by the deadline plus a share, as it was through 0.3.0.
+So such a call may return a session that is already `Connected`, and it may return
+after a handshake has failed on an earlier address. Neither changes the obligation:
+`await_ready()` on the session that came back is still the only thing that answers
+about the pin, and it is cheap on a session that has already finished.
 
 **Do not let a candidate walk swallow a pin mismatch.** Which candidate produced a
 session is not a security question — every candidate's handshake checks the pin
@@ -114,6 +135,19 @@ definitive answer about this attempt. Carrying on past the second replaces the t
 `ServerIdentityMismatch` this invariant exists to deliver with whatever the last
 candidate reports — `Timeout`, for an address with nothing behind it — and a typed
 error that arrives as the wrong type is the string-matching problem in a new place.
+An answering peer's refusal therefore ends the walk: `ServerIdentityMismatch`,
+`ProtocolRejected` and `CipherSuiteUnavailable` are returned unchanged rather than
+being replaced by whatever a later address said.
+
+Overlapping the attempts costs two ordering rules to keep that property. A completed
+handshake is held while an *earlier* address is still answering, because that address
+may be about to refuse the pin; and a refusal is held until every earlier attempt has
+finished, so that one hostile address placed *after* the right one in a name's DNS
+answer cannot end a walk that was about to succeed. What overlapping cannot do is
+wait out silence: an impostor that has not said a word by the time a later address
+completes is not reported. The serial walk did not guarantee that either — an
+impostor silent for longer than its own share was missed there too — but the window
+is now the attempt delay plus the winner's handshake rather than a full share.
 
 Enforced in: `core/src/api/session.rs` (`PhantomSession::connect_with_transport`,
 `SessionBuilder::connect`, `spawn_client`, the `connect_pinned*` functions,
@@ -408,7 +442,7 @@ Enforced in: `core/src/transport/handshake.rs` (`PROTOCOL_VARIANT`,
 `ServerReject::protocol_variant_mismatch`, `REJECT_PROTOCOL_VARIANT`).
 
 Pinned by: `transport::handshake::tests::protocol_variant_mismatch_rejected`,
-`the_reject_codes_are_distinct_and_the_version_one_is_unchanged`,
+`the_reject_codes_are_distinct_and_the_shipped_ones_are_unchanged`,
 `handshake_succeeds_with_matching_protocol_variant` and
 `transcript_hash_wire_vector`;
 `api::session::tests::client_describes_a_variant_reject_as_a_variant_reject`;
