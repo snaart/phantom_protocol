@@ -1142,6 +1142,14 @@ Pointers only: each item is set out in full in the entry named.
   to re-derive it is a claim, and these notes are long enough that a claim in them is
   load-bearing.
 
+- **The 0.3.0 section undercounted this crate's UniFFI checksums.** It said "fifty-nine" in
+  one place and "59" in another, where the generated bindings of both 0.3.0 and this release
+  assert **62** — eight constructors, eight free functions and forty-six methods. The figure
+  is the whole content of that entry, which asks a consumer to regenerate the bindings
+  rather than relink them, so it now carries the command that prints it. The eleven
+  checksums that move in *this* release, listed at the head of this section, were counted
+  the same way: by diffing that file against the one at the `v0.3.0` tag.
+
 - **`docs/compliance/cc-pp-mapping.md`'s ATE_FUN.1 row counted 73 negative-security tests,
   twice, where the suite has 77** — evidence offered to a lab that would run the suite and
   count. Corrected in both places, with the `grep` that re-derives it beside the figure. The
@@ -1173,7 +1181,7 @@ before any session exists. Upgrade both ends; there is no negotiation and no fal
 design, pre-1.0.
 
 **Every language binding must be regenerated, not just relinked.** `uniffi` 0.32 changed
-the metadata each exported item hashes into its checksum, so all fifty-nine of this crate's
+the metadata each exported item hashes into its checksum, so all sixty-two of this crate's
 checksums moved while `UNIFFI_CONTRACT_VERSION` stayed at 30 — the coarse gate passes and
 the mismatch lands at import time in the consumer's process. `ResumptionHint` also changed
 from a record to an object in the same release, which changes the C parameter type and
@@ -1854,8 +1862,11 @@ Pointers only: each item is set out in full in the entry named.
 
   **`uniffi` 0.32 is a binding-ABI break even though no Rust source changed.** The macro
   now writes an `orig_name` field into every function's metadata buffer, and the per-item
-  checksum is an FNV hash *of that buffer* — so all 59 checksums this crate exports moved,
-  and none of them landed on its old value. `UNIFFI_CONTRACT_VERSION` did **not** move: it
+  checksum is an FNV hash *of that buffer* — so all 62 checksums this crate exports moved,
+  and none of them landed on its old value. That count is what the generated bindings
+  assert, and it re-derives from any of them — `grep -cE
+  'uniffi_phantom_protocol_checksum_[a-z_0-9]+\(\) != '
+  tests/bindings/phantom_protocol.py`. `UNIFFI_CONTRACT_VERSION` did **not** move: it
   is 30 in both releases. That combination is the part worth writing down, because the
   coarse gate stays green through it — a consumer who updates the native library and keeps
   the binding files generated against 0.31 gets `UniFFI API checksum mismatch` at import
