@@ -23,6 +23,13 @@ categories = ["network-programming", "cryptography", "no-std"]
 features = ["telemetry-otel", "mimicry", "embedded"]
 rustdoc-args = ["--cfg", "docsrs"]
 
+# INHERITED BY CONSUMERS — every list in this table activates dependencies that land in
+# a consumer's own graph, where Cargo unifies our selection with theirs, so a `dep:`
+# here can be what makes somebody else's code compile long after this crate has stopped
+# reading it. `inherited_dependency_features` in `src/lib.rs` records every list below
+# token for token and asserts the two agree, so adding a selection needs a row and
+# taking one away needs a row that says what it cost and which release took it. It is
+# the record 0.3.1 did not have when it removed five selections that looked unused.
 [features]
 # `classical-crypto` (SUPPLY-03) is folded into `default` so the normal
 # (non-FIPS) build pulls the classical AEAD + KEM substrate (`ring` /
@@ -68,6 +75,15 @@ uniffi-cli = ["bindings", "uniffi/cli"]
 #
 # Bare-metal targets pass `--no-default-features --features embedded,no-std` to
 # drop this entirely.
+#
+# INHERITED BY CONSUMERS — every dependency this list activates is one a consumer of
+# the default build gets in their own graph, with the features named here unified into
+# whatever they asked of the same crate. `inherited_dependency_features` in
+# `src/lib.rs` holds this list token for token and fails the build when the two
+# disagree, so a `dep:` may not leave without a row saying which release took it and
+# what a consumer lost. `dep:time` is the one that has: 0.4.0 removed it, because
+# nothing outside the `mimicry` leg had read it for as long as anyone could establish
+# and a consumer was inheriting it anyway.
 std = [
     "dep:tokio",
     "dep:futures",
@@ -96,21 +112,6 @@ std = [
     "dep:hkdf",
     "dep:sha2",
     "dep:getrandom",
-    # KEPT ON THE 0.3.x LINE FOR COMPATIBILITY — REMOVE IN 0.4.0, NOT BEFORE.
-    #
-    # Nothing in the crate reads `time` outside the `mimicry` leg, which names it
-    # itself, so by this crate's own needs this line is dead. It stays because
-    # Cargo unifies features across the whole graph: a consumer that declares
-    # `time` with `default-features = false` has been compiling against the union
-    # of its own selection and ours, and ours turns on `time/std` — which is what
-    # `OffsetDateTime::now_utc` and the rest of the wall-clock surface live behind.
-    # Dropping this line took that surface away from such a consumer's own code and
-    # produced `no function or associated item named 'now_utc'` — a message that
-    # names neither this crate nor the feature. That is not a thing a patch release
-    # may do, and it was reproduced twice against unchanged consumer source before
-    # the line came back. It goes out in 0.4.0, where a consumer expects to read
-    # release notes before upgrading.
-    "dep:time",
     # Native (non-wasm32) optional deps; activating these on a wasm32 target
     # is a no-op because the deps themselves are gated by the
     # `[target.'cfg(not(target_arch = "wasm32"))']` table.
@@ -193,10 +194,11 @@ wasi-leg = ["std", "dep:wasi"]
 #
 # It names `dep:time`, which nothing else in the crate reads: the synthetic
 # certificate the theater prelude presents needs a wall-clock validity window in
-# X.509's own calendar form, and that is the crate's only use of a date. Naming it
-# here is what makes the leg's own dependency explicit. `std` also carries it on
-# the 0.3.x line, for the compatibility reason recorded against that entry, so
-# this line changes nothing in a default build until 0.4.0 drops the other one.
+# X.509's own calendar form, and that is the crate's only use of a date. Since 0.4.0
+# this is the crate's only activation of it — `std` carried it as well until then, so
+# a default build compiled a date library for a leg it had not enabled, and a consumer
+# who had been inheriting `time`'s default features through us stopped when that went
+# (recorded in `inherited_dependency_features` in `src/lib.rs`).
 mimicry = ["std", "dep:time"]
 
 # OpenTelemetry pipeline (Phase 8). Off by default; the `core` library exposes
@@ -218,11 +220,17 @@ telemetry-otel = [
 # `tokio` is split per target (Phase 3.5 conditional compilation matrix):
 # - Cross-target features: sync primitives, time, io-util, macros, single-thread
 #   runtime. These work on both native and wasm32.
-# - Native-only features (`net`, `rt-multi-thread`, and — on the 0.3.x line, for
-#   compatibility only — `signal`, `process`, `fs`, `io-std`) are added in the
+# - Native-only features (`net`, `rt-multi-thread`) are added in the
 #   `[target.'cfg(not(target_arch = "wasm32"))']` block at the bottom of this
-#   file. Only the first two are what the library calls; the note there says why
-#   the other four are still enabled and when they go.
+#   file. That block names only what the library calls; an embedder that needs
+#   signals, processes or files asks tokio for them in its own manifest, which
+#   since 0.4.0 it has to — see the note there.
+#
+# INHERITED BY CONSUMERS — a consumer who declares tokio themselves compiles against
+# the union of their selection and this list, so every token below is one their own
+# code may be relying on without naming. All five are what this library itself calls;
+# `inherited_dependency_features` in `src/lib.rs` records them, and taking one away
+# means moving its row there rather than editing this line alone.
 tokio = { version = "1.36", default-features = false, optional = true, features = [
     "sync", "macros", "rt", "time", "io-util",
 ] }
@@ -326,9 +334,12 @@ zstd = { version = "0.14", optional = true }
 
 # Wall-clock dates in X.509 calendar form, for the validity window on the
 # synthetic certificate the TLS-mimicry theater presents — the only reader of this
-# crate anywhere in the tree. `mimicry` names it for that reason; `std` also names
-# it on the 0.3.x line so a consumer that has been getting `time/std` through us
-# keeps getting it (see the entry in `std`), and that is the line 0.4.0 removes.
+# crate anywhere in the tree. Gated by `mimicry` alone since 0.4.0: while `std` named
+# it too, every default build compiled a date library for a leg it had not enabled,
+# and a consumer who declared `time` with `default-features = false` was inheriting
+# `time/std` — and so `OffsetDateTime::now_utc` — from us without asking. Both ended
+# together; `inherited_dependency_features` in `src/lib.rs` is where the second one is
+# written down, because it is the half a consumer feels.
 time = { version = "0.3", optional = true }
 
 # --- FFI ---
@@ -367,29 +378,28 @@ uniffi = { version = "0.32", features = ["build"] }
 # TCP/UDP transport legs and raw sockets live here. wasm32 builds
 # skip these entirely and use the `WebSocketLeg` instead (see below).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-# `net` and `rt-multi-thread` are what this library itself calls.
+# `net` and `rt-multi-thread` are what this library itself calls, and since 0.4.0 they
+# are all it asks for: `signal`, `process`, `fs` and `io-std` were enabled here for
+# years and nothing in this crate spawns a process, reads a file or listens for a
+# signal. An embedder that does — `server/` handles SIGTERM — asks tokio for them in
+# its own manifest, and every such embedder in this tree does.
 #
-# For `signal`, `process`, `fs` and `io-std`:
-# KEPT ON THE 0.3.x LINE FOR COMPATIBILITY — REMOVE IN 0.4.0, NOT BEFORE.
-# Nothing here spawns a process, reads a file or listens for a signal, so by this
-# library's own needs the four are dead weight, and 0.3.1 tried to drop them.
-#
-# They came back because Cargo unifies features across the whole graph, which
-# makes removing one a breaking change for a consumer, and not one any gate in
-# this repository can see. A consumer that declares tokio with fewer features has
-# been compiling against the union of its selection and this list, so a program
-# that calls `tokio::signal::ctrl_c()` or `tokio::io::stdin()` while naming only
-# `rt-multi-thread` and `macros` in its own manifest compiled purely because this
-# crate unified the feature in — and stops compiling on `cargo update`, which the
-# `phantom-protocol = "0.3"` the README recommends invites. It was reproduced
-# twice on unchanged consumer source. `cargo-semver-checks` compares this crate's
-# API rather than its dependencies' feature sets, so nothing flagged it either.
-#
-# Adding a feature is the safe direction; removing one belongs in a release whose
-# notes a consumer reads before upgrading. Do not clean this up before 0.4.0.
-tokio = { version = "1.36", optional = true, features = [
-    "net", "rt-multi-thread", "signal", "process", "fs", "io-std",
-] }
+# INHERITED BY CONSUMERS — Cargo unifies features across the whole graph, so what this
+# crate asks of tokio is added to what a consumer asked of the same tokio and their own
+# code compiles against the union. A program naming only `rt-multi-thread` and `macros`
+# itself, which called `tokio::signal::ctrl_c()` or `tokio::io::stdin()`, compiled
+# purely because this list carried the feature: removing one therefore breaks such a
+# program, with an error that names neither this crate nor a feature, and nothing else
+# in this repository can see it — `cargo-semver-checks` compares this crate's API and
+# not its dependencies' feature selections, and every consumer in the tree names enough
+# features of its own to paper over the loss. That is why the four went out with a minor
+# version and release notes that say so, after a first attempt in a patch had to be
+# undone. `inherited_dependency_features` in `src/lib.rs` is the record: adding to this
+# list is the safe direction and still needs a row, and taking something away means
+# moving its row into `WITHDRAWN` with the release that took it and what a consumer
+# loses — which is what stops the next removal from being silent, since the release it
+# names has to have a patch number of zero.
+tokio = { version = "1.36", optional = true, features = ["net", "rt-multi-thread"] }
 # socket2 gives portable access to SO_REUSEPORT (Phase 2.9 — Linux
 # multi-accept). Already in the transitive tree via tokio so this is
 # free from a build-size standpoint.

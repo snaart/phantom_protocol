@@ -1618,158 +1618,896 @@ mod claims_this_crate_makes_about_itself {
     }
 }
 
-/// The dependency features a consumer of this crate inherits, and which of them may
-/// not be taken away without a major release.
+/// Everything a consumer's own build inherits from this crate's manifest, and the
+/// record that keeps one of it from being taken away in silence.
 ///
 /// Cargo unifies features across the whole dependency graph, so what this crate asks
 /// of a shared dependency is added to what a consumer asked of the same dependency,
-/// and the consumer's own code compiles against the union. A consumer that writes
-/// `tokio = { version = "1", features = ["rt-multi-thread", "macros"] }` and then
-/// calls `tokio::signal::ctrl_c()` compiles only because this crate enables `signal`;
-/// remove it and their build breaks on `cargo update`, which the `= "0.3"`
-/// requirement the README recommends invites.
+/// and the consumer's own code compiles against the union. A program that declares
+/// `tokio = { version = "1", features = ["rt-multi-thread", "macros"] }` and calls
+/// `tokio::signal::ctrl_c()` compiled for years only because this crate enabled
+/// `signal`, and nothing in its own manifest said so.
 ///
-/// 0.3.1 removed four such tokio features and moved `time` out of `std`, and both
-/// were reproduced twice against unchanged consumer source: a program that built
-/// against 0.3.0 gave five compile errors, none of which named this crate or a
-/// feature. They were restored, and this module is why they stay restored: nothing
-/// else in the repository can see the break. `cargo-semver-checks` compares this
-/// crate's public API and not its dependencies' feature selections; the cross-target
-/// matrix, the integration suites and the trial consumer all name enough features of
-/// their own to paper over the loss; and a consumer is the only party who finds out.
+/// **The defect this module exists for.** 0.3.1 removed four such tokio features
+/// (`signal`, `process`, `fs`, `io-std`) and moved `dep:time` out of `std`. By this
+/// crate's own needs all five were dead weight — nothing in `core/src` reads any of
+/// them — so the removal read as cleanup and nothing in the repository disagreed. A
+/// consumer that had been inheriting them got five compile errors on unchanged source,
+/// none of which named this crate or a feature, and the way to reach that consumer was
+/// `cargo update` inside the `= "0.3"` requirement the README recommends. The removal
+/// came back out of the patch release and shipped in 0.4.0 instead, where a consumer
+/// opts in by version and reads notes first.
 ///
-/// So the gate is deliberately a text assertion about the manifest rather than a test
-/// that uses the features. A test using them would compile whenever any
-/// **dev**-dependency happened to enable them — and dev-dependencies are not part of
-/// what a consumer inherits, so such a test would be green for the exact change it
-/// is supposed to catch.
+/// **Why no other gate sees it.** `cargo-semver-checks` compares this crate's public
+/// API, not its dependencies' feature selections. The cross-target matrix, the
+/// integration suites and every sibling crate in this tree name enough tokio features
+/// of their own to paper the loss over. A test that *used* the features would be worse
+/// than nothing: dev-dependencies are not part of what a consumer inherits, so such a
+/// test stays green for exactly this change.
 ///
-/// It reads the manifest as written, which is the one being guarded. `cargo package`
-/// normalizes the copy it puts in an archive — every comment gone, each dependency in a
-/// table of its own — but nothing runs these tests from there: `cargo package --verify`
-/// builds the extracted crate and does not test it, and `cargo test` inside one does not
-/// compile at all, because `pinned_version_claims` beside this module includes documents
-/// that live outside `core/`. The one shape assumption that could be dropped for free was:
-/// the tokio features are found by content rather than by walking to a table, so the
-/// search reads either form.
+/// **What is gated, and what changed at 0.4.0.** The first version of this module
+/// asserted the five selections were *present*. That was right for a patch release
+/// holding them and wrong the moment 0.4.0 took them, and presence was never the
+/// property worth gating: a selection may legitimately go. What may not happen is that
+/// it goes quietly. So [`GUARDED`] is an exact inventory and the gate is set equality
+/// against the manifest in both directions. A token removed from a list fails the
+/// build until its row moves to [`WITHDRAWN`] with the release that took it and what a
+/// consumer loses; a token added without a row fails too, because an unrecorded
+/// selection is one a later removal could take unnoticed. A withdrawal is additionally
+/// held to the rule the episode above settled: the release that takes a selection away
+/// has a patch number of zero.
+///
+/// **Scope.** Every list in the manifest's `[features]` table — which is where this
+/// crate decides what enters a consumer's graph at all — plus both `tokio` feature
+/// selections. The other per-dependency selections in the manifest (`ml-kem`'s
+/// `zeroize`, `ed25519-dalek`'s `rand_core`, `web-sys`'s interface list) are not
+/// recorded, and the reason is the shape of the risk rather than tidiness: each of
+/// those is named because this crate's own code needs it, so removing one stops this
+/// crate compiling and cannot be silent. The two classes recorded here are the ones
+/// where a selection can outlive its last in-crate reader — a `dep:` in a feature list,
+/// and a tokio feature — and outliving its last reader is exactly what happened.
+///
+/// It reads the manifest as written, which is the copy being guarded. `cargo package`
+/// normalizes the copy it puts in an archive — comments gone, each dependency in a
+/// table of its own — and nothing runs these tests from there: `cargo package
+/// --verify` builds the extracted crate without testing it, and `cargo test` inside one
+/// does not compile at all, because `packaged_readme` and `pinned_version_claims` beside
+/// this module include documents from outside `core/`. The one shape assumption that could
+/// be dropped for free was dropped: a tokio selection is found by its contents rather
+/// than by walking to a table, so either form is read.
 #[cfg(test)]
 mod inherited_dependency_features {
     /// This crate's manifest, read as text. It sits inside the package, so this
     /// resolves both here and in an extracted `cargo package` archive.
     const MANIFEST: &str = include_str!("../Cargo.toml");
 
-    /// The `tokio` features a consumer has been inheriting from the native
-    /// dependency block since long before 0.3.0, with what each one provides.
+    /// How a guarded list is located in [`MANIFEST`].
+    enum Anchor {
+        /// A crate feature's own list in the `[features]` table, found by its name.
+        CrateFeature,
+        /// The one dependency `features = [...]` list whose body names this token.
+        ///
+        /// By content and not by position, because the manifest has two shapes: the
+        /// inline `tokio = { … features = [ … ] }` written here, and the
+        /// `[target.….dependencies.tokio]` table `cargo package` normalizes it into.
+        DependencyFeatures(&'static str),
+    }
+
+    /// A list in `core/Cargo.toml` whose contents reach a consumer's own build.
+    struct Guarded {
+        /// The name used in failure messages and referenced by [`Withdrawal::list`].
+        name: &'static str,
+        /// Where to find it.
+        anchor: Anchor,
+        /// What a consumer gets out of this list, said from their side rather than ours.
+        reaches: &'static str,
+        /// Exactly the tokens the list carries. Order does not matter; membership does.
+        recorded: &'static [&'static str],
+    }
+
+    /// A selection this crate used to make and does not any more.
+    struct Withdrawal {
+        /// The [`Guarded::name`] it left.
+        list: &'static str,
+        /// The token, spelled as the list spelled it.
+        token: &'static str,
+        /// The release that took it away. Its patch number is zero, because a patch
+        /// release may not change what a consumer's build inherits.
+        release: &'static str,
+        /// Why this crate stopped naming it.
+        reason: &'static str,
+        /// What a consumer's own code lost with it. This is the half that decides
+        /// whether a removal needs a release of its own, and the half the first
+        /// attempt did not look at.
+        cost: &'static str,
+    }
+
+    /// Every list a consumer's build inherits from, and what each one currently says.
     ///
-    /// The first two are what this library itself calls. The other four are not used
-    /// anywhere in `core/src`, and that is exactly why they are easy to delete and
-    /// why they are listed here: their only remaining job is to keep compiling
-    /// somebody else's code.
-    const INHERITED_TOKIO_FEATURES: &[(&str, &str)] = &[
-        ("net", "this library's own TCP/UDP sockets"),
-        ("rt-multi-thread", "this library's own spawned tasks"),
-        ("signal", "a consumer's `tokio::signal::ctrl_c()`"),
-        ("process", "a consumer's `tokio::process::Command`"),
-        ("fs", "a consumer's `tokio::fs`"),
-        ("io-std", "a consumer's `tokio::io::stdin` / `stdout`"),
+    /// The `[features]` rows are held to be the whole table by
+    /// [`the_record_covers_every_list_in_the_features_table`], so a feature added to
+    /// the manifest lands here or fails the build.
+    const GUARDED: &[Guarded] = &[
+        Guarded {
+            name: "default",
+            anchor: Anchor::CrateFeature,
+            reaches: "the graph of every consumer who does not pass \
+                      `default-features = false`",
+            recorded: &["compression-zstd", "std", "bindings", "classical-crypto"],
+        },
+        Guarded {
+            name: "bindings",
+            anchor: Anchor::CrateFeature,
+            reaches: "`uniffi` in the graph of a consumer who takes the default build",
+            recorded: &["std", "dep:uniffi"],
+        },
+        Guarded {
+            name: "uniffi-cli",
+            anchor: Anchor::CrateFeature,
+            reaches: "uniffi's own `cli` feature, for whoever runs the bindings codegen",
+            recorded: &["bindings", "uniffi/cli"],
+        },
+        Guarded {
+            name: "std",
+            anchor: Anchor::CrateFeature,
+            reaches: "every crate named here, with its default features, in the graph \
+                      of a consumer who takes the default build — including the ones \
+                      this crate stops reading",
+            recorded: &[
+                "dep:tokio",
+                "dep:futures",
+                "dep:parking_lot",
+                "dep:dashmap",
+                "dep:arc-swap",
+                "dep:tracing",
+                "dep:crossbeam-queue",
+                "dep:crossbeam-utils",
+                "dep:lz4_flex",
+                "dep:anyhow",
+                "dep:thiserror",
+                "dep:ed25519-dalek",
+                "dep:ml-kem",
+                "dep:ml-dsa",
+                "dep:log",
+                "dep:hmac",
+                "dep:borsh",
+                "dep:hex",
+                "dep:zeroize",
+                "dep:subtle",
+                "dep:blake3",
+                "dep:hkdf",
+                "dep:sha2",
+                "dep:getrandom",
+                "dep:socket2",
+                "bytes/std",
+                "serde/std",
+                "header-protection",
+            ],
+        },
+        Guarded {
+            name: "classical-crypto",
+            anchor: Anchor::CrateFeature,
+            reaches: "`ring` and `x25519-dalek` in a default (non-fips) consumer's graph",
+            recorded: &["dep:ring", "dep:x25519-dalek"],
+        },
+        Guarded {
+            name: "header-protection",
+            anchor: Anchor::CrateFeature,
+            reaches: "the RustCrypto `aes` / `chacha20` mask primitives, which `std` \
+                      turns on for everyone",
+            recorded: &["dep:aes", "dep:chacha20"],
+        },
+        Guarded {
+            name: "compression-zstd",
+            anchor: Anchor::CrateFeature,
+            reaches: "`zstd` and its C bindings in a default consumer's graph",
+            recorded: &["dep:zstd", "std"],
+        },
+        Guarded {
+            name: "embedded",
+            anchor: Anchor::CrateFeature,
+            reaches: "`embedded-io-async` and `async-lock` for a bare-metal embedder",
+            recorded: &["dep:embedded-io-async", "dep:async-lock"],
+        },
+        Guarded {
+            name: "no-std",
+            anchor: Anchor::CrateFeature,
+            reaches: "nothing — it is a marker, and a `dep:` appearing here would be \
+                      the first thing a bare-metal consumer inherits from it",
+            recorded: &[],
+        },
+        Guarded {
+            name: "fips",
+            anchor: Anchor::CrateFeature,
+            reaches: "`aws-lc-rs` for a consumer who asks for the FIPS substrate",
+            recorded: &["std", "dep:aws-lc-rs"],
+        },
+        Guarded {
+            name: "wasi-leg",
+            anchor: Anchor::CrateFeature,
+            reaches: "the `wasi` crate for a WASI Preview 2 guest",
+            recorded: &["std", "dep:wasi"],
+        },
+        Guarded {
+            name: "mimicry",
+            anchor: Anchor::CrateFeature,
+            reaches: "`time` for a consumer who enables the mimicry leg — since 0.4.0 \
+                      this crate's only activation of it",
+            recorded: &["std", "dep:time"],
+        },
+        Guarded {
+            name: "telemetry-otel",
+            anchor: Anchor::CrateFeature,
+            reaches: "the OpenTelemetry crates for an embedder who wires a pipeline, \
+                      who is near-certain to declare them as well",
+            recorded: &[
+                "std",
+                "dep:opentelemetry",
+                "dep:opentelemetry_sdk",
+                "dep:tracing-opentelemetry",
+            ],
+        },
+        Guarded {
+            name: "cross-target tokio selection",
+            anchor: Anchor::DependencyFeatures("io-util"),
+            reaches: "these five tokio features in the build of any consumer who \
+                      declares tokio themselves, on every target",
+            recorded: &["sync", "macros", "rt", "time", "io-util"],
+        },
+        Guarded {
+            name: "native tokio selection",
+            anchor: Anchor::DependencyFeatures("net"),
+            reaches: "these tokio features in the build of any consumer who declares \
+                      tokio themselves, off wasm32",
+            recorded: &["net", "rt-multi-thread"],
+        },
     ];
 
-    /// Every `features = [...]` list in the manifest that names tokio's `net`.
+    /// Selections that have been taken away, with the release that took them.
     ///
-    /// Located by content rather than by walking to the native target table, because the
-    /// manifest has two shapes: an inline table as written, and a `[target.….dependencies.
-    /// tokio]` table of its own after `cargo package` has normalized it. `net` is what
-    /// identifies the native entry either way — the cross-target one does not name it, and
-    /// it does name `time`, which is a tokio feature with nothing to do with the `time`
-    /// crate asserted below.
-    fn tokio_feature_lists_naming_net() -> Vec<&'static str> {
+    /// A row here is the whole point of the module: it is what a removal costs, written
+    /// down at the moment of the removal by whoever could still see why. Restoring a
+    /// selection means moving its row back into [`GUARDED`]; both directions fail the
+    /// build until the record agrees with the manifest.
+    const WITHDRAWN: &[Withdrawal] = &[
+        Withdrawal {
+            list: "std",
+            token: "dep:time",
+            release: "0.4.0",
+            reason: "nothing in this crate reads `time` outside the `mimicry` leg, \
+                     which names it itself, so a default build was compiling a date \
+                     library for a leg it had not enabled",
+            cost: "`time`'s default features, `time/std` among them: a consumer with \
+                   `time = { version = \"0.3\", default-features = false }` lost \
+                   `OffsetDateTime::now_utc` and was told `no function or associated \
+                   item named 'now_utc'`, which names neither this crate nor a feature",
+        },
+        Withdrawal {
+            list: "native tokio selection",
+            token: "signal",
+            release: "0.4.0",
+            reason: "nothing in this crate listens for a signal; `server/` does and \
+                     names the feature in its own manifest",
+            cost: "`tokio::signal::ctrl_c()` in a consumer that named fewer tokio \
+                   features than this crate did",
+        },
+        Withdrawal {
+            list: "native tokio selection",
+            token: "process",
+            release: "0.4.0",
+            reason: "nothing in this crate spawns a process",
+            cost: "`tokio::process::Command` in a consumer that named fewer tokio \
+                   features than this crate did",
+        },
+        Withdrawal {
+            list: "native tokio selection",
+            token: "fs",
+            release: "0.4.0",
+            reason: "nothing in this crate reads a file; the signing-key load in \
+                     `server/` is blocking `std::fs`",
+            cost: "`tokio::fs` in a consumer that named fewer tokio features than this \
+                   crate did",
+        },
+        Withdrawal {
+            list: "native tokio selection",
+            token: "io-std",
+            release: "0.4.0",
+            reason: "nothing in this crate touches the process's own standard streams",
+            cost: "`tokio::io::stdin` / `stdout` / `stderr` in a consumer that named \
+                   fewer tokio features than this crate did",
+        },
+    ];
+
+    /// The dependencies declared with `default-features = false`, and why each one is.
+    ///
+    /// This is the second way to take a crate's surface away from a consumer, and it
+    /// leaves the lists above untouched. `dep:time` in `std` activated `time` *with its
+    /// default features*, and `time/std` is where `OffsetDateTime::now_utc` lives —
+    /// writing `default-features = false` on the `time` entry would have cost a consumer
+    /// the same method as deleting the activation did, with nothing in [`GUARDED`]
+    /// changing. So the waivers are a recorded set too, and adding one is a change a
+    /// consumer can feel.
+    ///
+    /// Dev- and build-dependencies are excluded, here and by the search: a consumer
+    /// inherits neither, so a waiver on one costs nobody anything.
+    const DEFAULTS_WAIVED: &[(&str, &str)] = &[
+        (
+            "tokio",
+            "cross-target: its features are named explicitly here",
+        ),
+        (
+            "bytes",
+            "no_std subset; `std` re-adds it through `bytes/std`",
+        ),
+        (
+            "serde",
+            "no_std subset; `std` re-adds it through `serde/std`",
+        ),
+        ("borsh", "no_std subset, `derive` named explicitly"),
+        ("hex", "no_std subset, `alloc` named explicitly"),
+        ("subtle", "no_std subset"),
+        ("aes", "no_std subset"),
+        ("chacha20", "no_std subset, `cipher` named explicitly"),
+        (
+            "opentelemetry",
+            "the embedder picks the exporter; `metrics` + `trace` only",
+        ),
+        ("opentelemetry_sdk", "as above, plus `rt-tokio`"),
+        ("tracing-opentelemetry", "as above, `tracing-log` only"),
+        ("async-lock", "no_std subset for the embedded leg"),
+        (
+            "aws-lc-rs",
+            "`fips` replaces the default substrate, not adds to it",
+        ),
+    ];
+
+    /// [`MANIFEST`] with every comment blanked out to spaces of the same length.
+    ///
+    /// Same length so every offset into the result is also an offset into [`MANIFEST`],
+    /// which is what lets [`comment_block_above`] read the comments back. Blanking them
+    /// first is not cosmetic: a comment in this file contains `]`
+    /// (`[target.'cfg(not(target_arch = "wasm32"))']`), and a search for the end of a
+    /// list would stop there.
+    ///
+    /// The cut is at the first `#` outside a double-quoted string, which is TOML's own
+    /// comment rule for every construct this manifest uses.
+    fn manifest_without_comments() -> String {
+        let mut out = String::with_capacity(MANIFEST.len());
+        for line in MANIFEST.split_inclusive('\n') {
+            let mut quoted = false;
+            let mut comment_from = None;
+            for (i, ch) in line.char_indices() {
+                match ch {
+                    '"' => quoted = !quoted,
+                    '#' if !quoted => {
+                        comment_from = Some(i);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            match comment_from {
+                None => out.push_str(line),
+                Some(i) => {
+                    out.push_str(&line[..i]);
+                    for ch in line[i..].chars() {
+                        out.push(if ch == '\n' { '\n' } else { ' ' });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The `[…]` table header a byte belongs to, or `""` before the first one.
+    fn enclosing_table(stripped: &str, line_start: usize) -> &str {
+        stripped[..line_start]
+            .rsplit('\n')
+            .find(|line| line.starts_with('['))
+            .unwrap_or("")
+    }
+
+    /// Every dependency the manifest declares with `default-features = false`.
+    ///
+    /// Read in both manifest shapes, like the tokio selections: the name comes from the
+    /// `name = { … }` the waiver sits inside, or, when the waiver is on a line of its own,
+    /// from the `[dependencies.name]` table above it. Dev- and build-dependencies are
+    /// skipped, because nothing a consumer compiles comes from them.
+    fn dependencies_with_defaults_waived(stripped: &str) -> Vec<String> {
+        const NEEDLE: &str = "default-features = false";
+        let mut names = Vec::new();
+        let mut from = 0;
+        while let Some(rel) = stripped[from..].find(NEEDLE) {
+            let at = from + rel;
+            from = at + NEEDLE.len();
+            let line_start = stripped[..at].rfind('\n').map_or(0, |i| i + 1);
+            let table = enclosing_table(stripped, line_start);
+            if table.contains("dev-dependencies") || table.contains("build-dependencies") {
+                continue;
+            }
+            let before = stripped[line_start..at].trim_start();
+            if let Some((name, _)) = before.split_once(" = {") {
+                names.push(name.trim().to_string());
+                continue;
+            }
+            let inner = table.trim_start_matches('[').trim_end_matches(']');
+            names.push(inner.rsplit('.').next().unwrap_or(inner).to_string());
+        }
+        names
+    }
+
+    /// Every list body matching a [`Guarded`]'s anchor, as `(offset, body)` pairs where
+    /// the offset is that of the list's opening `[` in [`MANIFEST`].
+    fn locate(guarded: &Guarded, stripped: &str) -> Vec<(usize, String)> {
         let mut found = Vec::new();
-        let mut rest = MANIFEST;
-        while let Some((_, after)) = rest.split_once("features = [") {
-            let Some((list, tail)) = after.split_once(']') else {
+        let opener = match guarded.anchor {
+            Anchor::CrateFeature => format!("\n{} = [", guarded.name),
+            Anchor::DependencyFeatures(_) => "features = [".to_string(),
+        };
+        let mut from = 0;
+        while let Some(rel) = stripped[from..].find(&opener) {
+            let open = from + rel + opener.len() - 1;
+            let Some(close_rel) = stripped[open..].find(']') else {
                 break;
             };
-            rest = tail;
-            if list.contains("\"net\"") {
-                found.push(list);
+            let body = stripped[open + 1..open + close_rel].to_string();
+            from = open + close_rel;
+            let keep = match guarded.anchor {
+                Anchor::CrateFeature => true,
+                Anchor::DependencyFeatures(token) => body.contains(&format!("\"{token}\"")),
+            };
+            if keep {
+                found.push((open, body));
             }
         }
         found
     }
 
-    /// Every feature above is still named on the native `tokio` dependency.
-    #[test]
-    fn the_native_tokio_dependency_still_names_every_inherited_feature() {
-        let lists = tokio_feature_lists_naming_net();
+    /// The quoted tokens of a list body, in the order written.
+    fn tokens(body: &str) -> Vec<String> {
+        body.split('"')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The one list body a [`Guarded`] resolves to, with its offset.
+    fn body_of(guarded: &Guarded, stripped: &str) -> (usize, String) {
+        let found = locate(guarded, stripped);
         assert_eq!(
-            lists.len(),
+            found.len(),
             1,
-            "expected exactly one feature list naming tokio's `net` — the native \
-             dependency — and found {}. The search below cannot say which one it is \
-             checking otherwise.",
-            lists.len()
+            "`{}` should resolve to exactly one list in core/Cargo.toml and resolved to \
+             {}. Either the list was renamed or the anchor no longer picks it out; \
+             nothing below can say what it is checking until that is fixed.",
+            guarded.name,
+            found.len()
         );
-        for list in &lists {
-            for (feature, who_needs_it) in INHERITED_TOKIO_FEATURES {
+        found
+            .into_iter()
+            .next()
+            .expect("the length was just asserted to be one")
+    }
+
+    /// The contiguous run of comment lines immediately above `offset`.
+    fn comment_block_above(offset: usize) -> String {
+        let head = &MANIFEST[..offset];
+        let mut lines: Vec<&str> = head.split('\n').collect();
+        // The last element is the part of the anchor's own line before `offset`.
+        lines.pop();
+        let mut block = Vec::new();
+        while let Some(line) = lines.pop() {
+            if line.trim_start().starts_with('#') {
+                block.push(line);
+            } else {
+                break;
+            }
+        }
+        block.reverse();
+        block.join("\n")
+    }
+
+    /// This crate's version, as `(major, minor, patch)`.
+    fn crate_version() -> (u64, u64, u64) {
+        let line = MANIFEST
+            .lines()
+            .find(|line| line.starts_with("version = \""))
+            .expect("core/Cargo.toml declares a package version");
+        parse_version(line.split('"').nth(1).expect("the version is quoted"))
+            .expect("core/Cargo.toml's package version is three numbers")
+    }
+
+    /// `major.minor.patch` as numbers, or `None` if it is not that shape.
+    fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
+        let mut parts = text.split('.');
+        let triple = (
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+        );
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(triple)
+    }
+
+    /// The `[features]` table's own list names, read from the manifest.
+    fn feature_names_in_the_manifest(stripped: &str) -> Vec<String> {
+        let table = stripped
+            .split_once("\n[features]\n")
+            .expect("core/Cargo.toml has a `[features]` table")
+            .1;
+        let table = match table.split_once("\n[") {
+            Some((before, _)) => before,
+            None => table,
+        };
+        table
+            .lines()
+            .filter_map(|line| line.split_once(" = ["))
+            .filter(|(name, _)| !name.is_empty() && !name.starts_with(char::is_whitespace))
+            .map(|(name, _)| name.to_string())
+            .collect()
+    }
+
+    /// The record covers the whole `[features]` table, not a chosen part of it.
+    ///
+    /// **The defect.** The gate this replaces named five selections by hand. Anything
+    /// it did not name could be removed without a word, and the reason those five were
+    /// named is that a consumer had already been broken by them — which is the one way
+    /// of finding out that this module exists to make unnecessary. A hand-picked list
+    /// is only ever as complete as the last incident.
+    ///
+    /// **What a consumer would observe.** A feature added to the manifest, its `dep:`
+    /// removed a release later as unused, and a build that stops compiling on `cargo
+    /// update` with an error naming neither this crate nor a feature.
+    ///
+    /// **Why it would come back unnoticed.** Adding a feature to `[features]` is
+    /// routine and has nothing to do with this module; nobody would think to come here.
+    /// This fails the build until they do.
+    #[test]
+    fn the_record_covers_every_list_in_the_features_table() {
+        let stripped = manifest_without_comments();
+        let in_manifest = feature_names_in_the_manifest(&stripped);
+        let recorded: Vec<&str> = GUARDED
+            .iter()
+            .filter(|g| matches!(g.anchor, Anchor::CrateFeature))
+            .map(|g| g.name)
+            .collect();
+        for name in &in_manifest {
+            assert!(
+                recorded.contains(&name.as_str()),
+                "core/Cargo.toml declares the feature `{name}` and GUARDED has no row \
+                 for it. Every list in the `[features]` table activates dependencies a \
+                 consumer inherits, and an unrecorded list is one a later removal can \
+                 empty without anything failing. Add a row naming what it reaches."
+            );
+        }
+        for name in &recorded {
+            assert!(
+                in_manifest.iter().any(|m| m == name),
+                "GUARDED has a row for the feature `{name}`, which core/Cargo.toml no \
+                 longer declares. A row for a list that does not exist guards nothing \
+                 and its tokens cannot be checked; if the feature was renamed, rename \
+                 the row, and if it was dropped, say so in WITHDRAWN."
+            );
+        }
+        assert_eq!(
+            in_manifest.len(),
+            recorded.len(),
+            "the `[features]` table and GUARDED's feature rows must be the same set; \
+             manifest {in_manifest:?} vs record {recorded:?}"
+        );
+    }
+
+    /// Every guarded list resolves to one list, and no list names a token twice.
+    ///
+    /// **The defect.** The first version of this gate walked to the native target table
+    /// and then to an inline `tokio = { … }` entry, which is the manifest as written
+    /// and not the only manifest there is — `cargo package` normalizes its copy into
+    /// `[target.'cfg(…)'.dependencies.tokio]` with the features on a line of their own,
+    /// and the walk would have found nothing there. It is the same failure in a second
+    /// form if a list is renamed: an anchor that resolves to nothing, or to two things,
+    /// makes every assertion below vacuous while still reporting a passing run.
+    ///
+    /// **What a consumer would observe.** Nothing, directly — and that is the problem.
+    /// A vacuous gate lets the removal it was written to stop through to a release.
+    ///
+    /// **Why it would come back unnoticed.** A resolution failure is silent by nature:
+    /// an empty `Vec` iterated over asserts nothing. This states the count.
+    ///
+    /// The token count is asserted in the same place for a second reason: set equality
+    /// holds for a list that names one of its tokens twice, and a duplicate is how a
+    /// token survives being deleted from one of the two places it is written.
+    #[test]
+    fn every_guarded_list_resolves_to_one_list_holding_no_token_twice() {
+        let stripped = manifest_without_comments();
+        for guarded in GUARDED {
+            let (_, body) = body_of(guarded, &stripped);
+            let present = tokens(&body);
+            assert_eq!(
+                present.len(),
+                guarded.recorded.len(),
+                "`{name}` reads {read} token(s) and the record holds {held}. If the two \
+                 sets agree, one side names something twice. The list reads: {body}",
+                name = guarded.name,
+                read = present.len(),
+                held = guarded.recorded.len()
+            );
+        }
+    }
+
+    /// Each guarded list carries exactly the tokens recorded for it.
+    ///
+    /// This is the gate. Equality in both directions is deliberate: the missing
+    /// direction catches the removal, and the extra direction is what keeps the record
+    /// complete enough for the missing direction to mean anything.
+    ///
+    /// **The defect.** 0.3.1 removed four tokio features and `dep:time` from `std`
+    /// because nothing in `core/src` read them. Nothing in this repository could fail
+    /// for it: the crate compiled, every suite passed, every cross-target row passed,
+    /// and `cargo-semver-checks` does not look at a dependency's feature selection.
+    ///
+    /// **What a consumer would observe.** Five compile errors on source they had not
+    /// touched, after a `cargo update` inside a `= "0.3"` requirement — `no function or
+    /// associated item named 'now_utc'`, `could not find 'signal' in 'tokio'` — none of
+    /// which names this crate or a feature, so the search starts in the wrong crate.
+    ///
+    /// **Why it would come back unnoticed.** A selection nothing in the crate reads
+    /// looks exactly like dead weight, because from inside the crate it is dead weight.
+    /// The only reader who can tell the difference is not present. This turns the
+    /// removal into a build failure that names the cost.
+    #[test]
+    fn every_guarded_list_carries_exactly_the_tokens_recorded_here() {
+        let stripped = manifest_without_comments();
+        for guarded in GUARDED {
+            let (_, body) = body_of(guarded, &stripped);
+            let present = tokens(&body);
+            for recorded in guarded.recorded {
                 assert!(
-                    list.contains(&format!("\"{feature}\"")),
-                    "core/Cargo.toml no longer enables tokio's `{feature}` for native \
-                     targets, which is what provides {who_needs_it}. Cargo unifies \
-                     features across the graph, so taking it away breaks the build of \
-                     every consumer that relied on inheriting it and named fewer features \
-                     itself — a breaking change, and one no other gate here can see. It \
-                     may go in a major release, with a note a consumer reads before \
-                     upgrading, and not before. The list reads: {list}"
+                    present.iter().any(|t| t == recorded),
+                    "core/Cargo.toml's `{list}` no longer carries `{recorded}`, and the \
+                     record still says it does. That list reaches {reaches}, so \
+                     dropping the token changes what a consumer's own code compiles \
+                     against — with an error that names neither this crate nor the \
+                     token. If the removal is meant, move it to WITHDRAWN with the \
+                     release that takes it and what it costs, and cut that release with \
+                     a patch number of zero. The list reads: {body}",
+                    list = guarded.name,
+                    reaches = guarded.reaches
+                );
+            }
+            for token in &present {
+                assert!(
+                    guarded.recorded.contains(&token.as_str()),
+                    "core/Cargo.toml's `{list}` carries `{token}`, which the record does \
+                     not mention. An unrecorded selection is one a later removal takes \
+                     without anything failing, which is how {reaches} was lost once \
+                     already. Add it to the row's `recorded` list.",
+                    list = guarded.name,
+                    reaches = guarded.reaches
                 );
             }
         }
     }
 
-    /// `std` still enables `time`, so a consumer that declares the crate with
-    /// `default-features = false` keeps inheriting `time/std` from us.
+    /// Nothing in [`WITHDRAWN`] is still in the list it left.
     ///
-    /// `time` is read nowhere outside the `mimicry` leg, so by this crate's own needs
-    /// the line is dead — which is how it came to be deleted. What it carries is
-    /// `time`'s **default features**, and `time/std` is where `OffsetDateTime::now_utc`
-    /// lives: a consumer with `time = { version = "0.3", default-features = false }`
-    /// lost that method and was told `no function or associated item named 'now_utc'`.
+    /// **The defect.** A withdrawal row is a claim about a past release: this selection
+    /// stopped being made in 0.4.0, and here is what it cost. Restore the token without
+    /// moving the row and the claim goes false — the release notes say a consumer must
+    /// name the feature themselves while the manifest still hands it to them, so the
+    /// next removal looks like it has already been announced.
+    ///
+    /// **What a consumer would observe.** Notes telling them to add four tokio features
+    /// to their own manifest for a change that has not happened, and then the change
+    /// happening later with no notes at all.
+    ///
+    /// **Why it would come back unnoticed.** Restoring a feature fixes somebody's build
+    /// and is the easiest thing in the world to do in a hurry. This makes the record
+    /// move with it.
     #[test]
-    fn the_std_feature_still_carries_the_time_crate() {
-        let std_block = MANIFEST
-            .split_once("\nstd = [")
-            .expect("the manifest declares a `std` feature")
-            .1
-            .split_once("\n]")
-            .expect("the `std` feature list closes")
-            .0;
-        assert!(
-            std_block.contains("\"dep:time\""),
-            "core/Cargo.toml's `std` feature no longer enables `dep:time`. Nothing in \
-             this crate reads `time` outside the `mimicry` leg, so this looks like dead \
-             weight — but it is what hands a consumer `time`'s default features, and \
-             dropping it took `OffsetDateTime::now_utc` away from consumer code that \
-             declared `time` with `default-features = false`. It may go in a major \
-             release and not before. The `std` list reads: {std_block}"
+    fn every_withdrawn_selection_is_gone_from_the_list_it_left() {
+        let stripped = manifest_without_comments();
+        for withdrawal in WITHDRAWN {
+            let guarded = GUARDED
+                .iter()
+                .find(|g| g.name == withdrawal.list)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "WITHDRAWN names the list `{}`, which GUARDED does not have. A \
+                         withdrawal from a list nothing locates cannot be checked.",
+                        withdrawal.list
+                    )
+                });
+            let (_, body) = body_of(guarded, &stripped);
+            assert!(
+                !tokens(&body).iter().any(|t| t == withdrawal.token),
+                "core/Cargo.toml's `{list}` carries `{token}` again, and WITHDRAWN says \
+                 {release} took it away. One of the two is wrong: if the restoration is \
+                 meant, move the row back into GUARDED, and if the record is right, the \
+                 token goes. Leaving both is a release note describing a change the \
+                 manifest has not made. It reads: {body}",
+                list = withdrawal.list,
+                token = withdrawal.token,
+                release = withdrawal.release
+            );
+        }
+    }
+
+    /// Every withdrawal names a released minor-or-major version and says what it cost.
+    ///
+    /// **The defect.** 0.3.1 — a patch release — took four tokio features and `time`
+    /// away from consumers. A patch release is the one slot where a consumer has no
+    /// opportunity to read anything: `= "0.3"` picks it up on the next `cargo update`.
+    /// The rule that came out of it is that a selection may only be withdrawn where the
+    /// version itself says something changed, which for this project's `0.x` line means
+    /// a patch number of zero.
+    ///
+    /// **What a consumer would observe.** Exactly what they did observe: a build that
+    /// stopped compiling on a dependency bump they did not choose, against a version
+    /// requirement that promised compatibility.
+    ///
+    /// **Why it would come back unnoticed.** The removal is correct by the crate's own
+    /// needs, so it lands in whatever release is open. This checks which release that
+    /// is, and that the row says what the removal costs rather than only that it
+    /// happened — a row with an empty `cost` is a decision nobody weighed.
+    #[test]
+    fn every_withdrawal_names_a_released_minor_or_major_version_and_says_what_it_cost() {
+        let current = crate_version();
+        for withdrawal in WITHDRAWN {
+            let release = parse_version(withdrawal.release).unwrap_or_else(|| {
+                panic!(
+                    "WITHDRAWN's `{}` names the release `{}`, which is not \
+                     `major.minor.patch`.",
+                    withdrawal.token, withdrawal.release
+                )
+            });
+            assert_eq!(
+                release.2,
+                0,
+                "WITHDRAWN says `{token}` left `{list}` in {release_text}, whose patch \
+                 number is not zero. A patch release reaches a consumer through `cargo \
+                 update` against the `= \"0.3\"` requirement the README recommends, so \
+                 it is the one release that may not change what their build inherits — \
+                 which is how this was found. Cut the removal in the next minor release \
+                 instead.",
+                token = withdrawal.token,
+                list = withdrawal.list,
+                release_text = withdrawal.release
+            );
+            assert!(
+                release <= current,
+                "WITHDRAWN says `{token}` left `{list}` in {release_text}, and this \
+                 crate is {major}.{minor}.{patch}. The selection is already gone from \
+                 the manifest, so it left in a release that has been cut or is being \
+                 cut — a row naming a later one means the removal shipped before the \
+                 release its notes are in.",
+                token = withdrawal.token,
+                list = withdrawal.list,
+                release_text = withdrawal.release,
+                major = current.0,
+                minor = current.1,
+                patch = current.2
+            );
+            assert!(
+                !withdrawal.reason.trim().is_empty(),
+                "WITHDRAWN's `{}` gives no reason for the removal.",
+                withdrawal.token
+            );
+            assert!(
+                !withdrawal.cost.trim().is_empty(),
+                "WITHDRAWN's `{}` says nothing about what a consumer loses, which is \
+                 the half that decides whether the removal needed a release of its own.",
+                withdrawal.token
+            );
+        }
+    }
+
+    /// Every dependency whose default features this crate waives is recorded.
+    ///
+    /// **The defect.** The gate above watches what the feature lists activate, and a
+    /// crate's surface can be taken from a consumer without touching them. `dep:time` in
+    /// `std` activated `time` with its default features; writing `default-features =
+    /// false` on the `time` entry would have taken `time/std` — and with it
+    /// `OffsetDateTime::now_utc` — from the same consumer, with every list still reading
+    /// exactly as recorded. It is the same loss by the other door, and it looks even more
+    /// like housekeeping, because narrowing a dependency is what a no_std audit does.
+    ///
+    /// **What a consumer would observe.** The same thing they did observe: a method gone
+    /// from a crate they declared themselves, reported against their own source, naming
+    /// neither this crate nor a feature.
+    ///
+    /// **Why it would come back unnoticed.** Twelve entries already carry the waiver for
+    /// good reasons, so a thirteenth reads as consistency rather than as a change. This
+    /// fails the build until the reason is written next to it.
+    #[test]
+    fn every_dependency_with_its_defaults_waived_is_recorded() {
+        let stripped = manifest_without_comments();
+        let waived = dependencies_with_defaults_waived(&stripped);
+        for name in &waived {
+            assert!(
+                DEFAULTS_WAIVED.iter().any(|(recorded, _)| recorded == name),
+                "core/Cargo.toml declares `{name}` with `default-features = false` and \
+                 DEFAULTS_WAIVED has no row for it. A consumer who declares `{name}` \
+                 themselves compiles against the union of their selection and ours, so \
+                 waiving its defaults here can take a method away from their own code — \
+                 which is how a consumer lost `OffsetDateTime::now_utc`. Record it with \
+                 the reason, and cut it in a release whose patch number is zero."
+            );
+        }
+        for (name, why) in DEFAULTS_WAIVED {
+            assert!(
+                waived.iter().any(|w| w == name),
+                "DEFAULTS_WAIVED records `{name}` as declared with `default-features = \
+                 false` ({why}), and core/Cargo.toml no longer does. Handing a consumer \
+                 more than before breaks nothing, but a record that does not match the \
+                 manifest cannot be read to find out what is waived, so drop the row."
+            );
+            assert!(
+                !why.trim().is_empty(),
+                "DEFAULTS_WAIVED's `{name}` gives no reason."
+            );
+        }
+        assert_eq!(
+            waived.len(),
+            DEFAULTS_WAIVED.len(),
+            "the manifest waives defaults on {} dependencies and the record holds {}; \
+             manifest {waived:?}",
+            waived.len(),
+            DEFAULTS_WAIVED.len()
         );
     }
 
-    /// The manifest says, beside both of them, that they are compatibility entries and
-    /// when they may go.
+    /// The manifest points here from the places a selection is easiest to delete.
     ///
-    /// Without this the next reader finds two feature selections the crate does not
-    /// use, deletes them as cleanup, and the two assertions above become a puzzle
-    /// rather than an explanation — which is how the first deletion happened.
+    /// **The defect.** The first deletion happened because the manifest said nothing:
+    /// four tokio features and a `dep:` no in-crate code reads, with no comment on
+    /// either, read as leftovers. A gate that fails the build is not the same thing as
+    /// a manifest that explains itself — the gate is read after the edit, and the
+    /// comment before it.
+    ///
+    /// **What a consumer would observe.** Nothing that can be told apart from the
+    /// defect above, which is the point: this is what stops the edit being attempted,
+    /// and the set-equality tests are what stop it landing.
+    ///
+    /// **Why it would come back unnoticed.** Comments drift out during a reflow and
+    /// nothing compiles them. Naming this module is the whole requirement, so a reader
+    /// who reaches either place has somewhere to go.
     #[test]
-    fn both_compatibility_entries_carry_the_note_that_says_why() {
-        let note = "KEPT ON THE 0.3.x LINE FOR COMPATIBILITY";
-        assert_eq!(
-            MANIFEST.matches(note).count(),
-            2,
-            "core/Cargo.toml should carry the `{note}` note exactly twice — once beside \
-             `dep:time` in the `std` feature and once beside the native `tokio` entry — \
-             so a reader who finds either selection unused learns why it is there \
-             before deleting it."
-        );
+    fn the_manifest_points_here_from_where_a_selection_is_easiest_to_delete() {
+        let stripped = manifest_without_comments();
+        let mut anchors = vec![(
+            "the `[features]` table".to_string(),
+            stripped
+                .find("\n[features]\n")
+                .expect("core/Cargo.toml has a `[features]` table")
+                + 1,
+        )];
+        for name in [
+            "std",
+            "cross-target tokio selection",
+            "native tokio selection",
+        ] {
+            let guarded = GUARDED
+                .iter()
+                .find(|g| g.name == name)
+                .expect("the record holds this list");
+            let (offset, _) = body_of(guarded, &stripped);
+            anchors.push((format!("`{name}`"), offset));
+        }
+        for (what, offset) in anchors {
+            let block = comment_block_above(offset);
+            assert!(
+                block.contains("inherited_dependency_features"),
+                "the comment block above {what} in core/Cargo.toml does not name \
+                 `inherited_dependency_features`. A reader who finds a selection that \
+                 nothing in this crate reads needs to be told, where they are looking, \
+                 that somebody else is reading it — otherwise it reads as dead weight, \
+                 which is how four tokio features and `dep:time` came to be deleted. \
+                 The block reads:\n{block}"
+            );
+        }
     }
 }
 
