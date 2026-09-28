@@ -14,18 +14,33 @@ set -uo pipefail
 # The second property is newer and cost a release window of blindness: the
 # `--release-type` the run is made with decides which lints run at all, and it
 # used to be the hard-coded word `minor` regardless of the release being cut. On
-# this tree at 0.3.1 that is 196 checks where a `patch` run performs 223. The
-# cases below pin that the type is read out of the version step, that an explicit
-# one is honoured, and that a type more permissive than the step the report turns
-# out to describe fails rather than producing a quietly narrower report.
+# this tree `0.3.0 -> 0.4.0` at `minor` is 196 checks where the same step at
+# `patch` is 223. The cases below pin that the type is read out of the version
+# step, that an explicit one is honoured, and that a type more permissive than the
+# step the report turns out to describe is never the one the kept report was
+# produced with.
+#
+# The third property is what that second one cost once a minor release was cut.
+# The type derived from the tree is a prediction: the baseline is whatever
+# crates.io has published, and the tree reads the same on both sides of a publish.
+# With `0.4.0` in the manifest and `## [0.4.0]` the newest heading, the step reads
+# `0.3.0 -> 0.4.0` in the pull request that cuts the release and goes on reading
+# that in every pull request after it has shipped — where the tool compares 0.4.0
+# against 0.4.0, a patch step. The check that a report must not understate then
+# fired on a derivation nobody had asked for, and every pull request in the open
+# window was red. The cases below pin that a refuted *derivation* is re-run at the
+# narrower type, that an explicit argument is still a failure, and that a baseline
+# moving under the run is not retried for ever.
 #
 # `cargo` is stubbed. Running the real tool here would take a minute and a
 # gigabyte and would prove nothing extra: what these cases exercise is this
 # script's reading of the output, not cargo-semver-checks' analysis. The
-# end-to-end half was done by hand against the real tool on this tree — 0.3.0 ->
-# 0.3.1 derives `patch`, runs 223 checks and reports the one break this release
-# has (`PhantomStream is no longer UnwindSafe`), which the hard-coded `minor` run
-# reached with 27 lints unrun.
+# end-to-end half was done by hand against the real tool on this tree — with the
+# manifest at 0.4.0 and 0.3.0 the newest heading below it, the script derives
+# `minor`, the tool compares v0.3.0 -> v0.4.0 and performs 196 checks, and the
+# same step forced to `patch` performs 223. Both come back clean, which is the
+# whole reason the cases below use a stub: a suite that needed a real finding to
+# assert against would stop asserting the moment the tree had none.
 #
 #     scripts/semver_report_test.sh
 
@@ -38,7 +53,7 @@ outcomes=0
 # Every case reports exactly one outcome, and the total is asserted at the end.
 # A case that is deleted, renamed, or simply never added to the list at the bottom
 # leaves no other trace: the suite still prints only "ok" lines and still exits 0.
-EXPECTED_CASES=16
+EXPECTED_CASES=19
 
 pass() {
     outcomes=$((outcomes + 1))
@@ -85,6 +100,38 @@ make_recording_stub() {
         echo "exit ${exit_code}"
     } > "${dir}/bin/cargo"
     chmod +x "${dir}/bin/cargo"
+}
+
+# A stub whose answer changes between invocations: the Nth call prints the Nth
+# body given, and the last body repeats for any further call. The re-run path
+# cannot be exercised with a fixed answer — its whole subject is a second run
+# seeing something the first did not.
+#
+#     make_sequence_stub <dir> <body> [body ...]
+make_sequence_stub() {
+    local dir="$1" body i=1
+    shift
+    mkdir -p "${dir}/bin"
+    for body in "$@"; do
+        printf '%s\n' "${body}" > "${dir}/body${i}.txt"
+        i=$((i + 1))
+    done
+    printf '%s' "$((i - 1))" > "${dir}/bodies.txt"
+    cat > "${dir}/bin/cargo" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$@" > '${dir}/args.txt'
+printf '%s\n' "\$@" >> '${dir}/args-all.txt'
+n=\$(cat '${dir}/calls.txt' 2>/dev/null || echo 0)
+n=\$((n + 1))
+printf '%s' "\${n}" > '${dir}/calls.txt'
+last=\$(cat '${dir}/bodies.txt')
+[ "\${n}" -le "\${last}" ] || n="\${last}"
+cat '${dir}/body'"\${n}"'.txt'
+exit 0
+EOF
+    chmod +x "${dir}/bin/cargo"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "${dir}/bin/cargo-semver-checks"
+    chmod +x "${dir}/bin/cargo-semver-checks"
 }
 
 # A throwaway tree with just enough in it for the derivation to read: a copy of
@@ -475,6 +522,88 @@ case_an_unknown_option_is_rejected() {
     rm -rf "${dir}"
 }
 
+# The defect this pins, and it is the one the derivation itself introduced. In the
+# open window after a minor or a major release the manifest version is the
+# published one and its own section is already written, so the tree reads a step
+# (`0.3.0 -> 0.4.0`, minor) where the run makes none (`0.4.0 -> 0.4.0`, patch).
+# The understating-report check then fired on the script's own inference and every
+# pull request in that window failed — not with a finding, with "the report
+# understates and is not usable as the record", which reads like a broken tree. A
+# consumer of the check sees a red required job it cannot act on; the temptation is
+# to hard-code the type again, which puts the original defect back. It cannot
+# return unnoticed because the case asserts the exit code, the number of runs and
+# which lint set the kept report was produced with.
+#
+# It took a minor release to become reachable: a patch step derives `patch`, and no
+# step is narrower than that, so the whole 0.3.x line never entered this branch.
+case_an_open_window_after_a_minor_release_re_runs_narrower() {
+    local dir
+    dir="$(mktemp -d)"
+    make_repo "${dir}" 0.4.0 0.4.0 0.3.0
+    make_sequence_stub "${dir}" \
+        "$(clean_verdict_for 0.4.0 0.4.0)" \
+        "$(clean_verdict_for 0.4.0 0.4.0)"
+    run_in_repo "${dir}"
+    if [ "${RC}" -ne 0 ]; then
+        fail "an open window after a minor release was reported as a broken check"
+    elif [ "$(cat "${dir}/calls.txt")" != 2 ]; then
+        fail "the comparison ran $(cat "${dir}/calls.txt") time(s), not twice"
+    elif ! stub_was_given "${dir}" "patch"; then
+        fail "the re-run did not ask for the patch lint set: $(tr '\n' ' ' < "${dir}/args.txt")"
+    elif ! echo "${OUT}" | grep -q "Re-running at patch"; then
+        fail "the correction was silent"
+    else
+        pass "an open window after a minor release re-runs at patch instead of failing"
+    fi
+    rm -rf "${dir}"
+}
+
+# The kept report has to be the re-run's, and has to say so. Appending the second
+# run to the first would leave two verdicts and two `Checking` lines in one file,
+# and `scripts/check_changelog_breaking.py` reads the first baseline line it finds
+# — so a report that carried both would hand it the understating half.
+case_the_kept_report_is_the_re_run_alone() {
+    local dir
+    dir="$(mktemp -d)"
+    make_repo "${dir}" 0.4.0 0.4.0 0.3.0
+    make_sequence_stub "${dir}" \
+        "$(clean_verdict_for 0.4.0 0.4.0)" \
+        "$(clean_verdict_for 0.4.0 0.4.0)"
+    run_in_repo "${dir}"
+    if [ "$(grep -c 'Checking phantom-protocol' "${dir}/report.txt")" -ne 1 ]; then
+        fail "the report carries $(grep -c 'Checking phantom-protocol' "${dir}/report.txt") comparisons, not one"
+    elif ! head -n 1 "${dir}/report.txt" | grep -q 'release type patch (re-derived: the 0.4.0 -> 0.4.0 step'; then
+        fail "the report's first line does not record the re-derived type: $(head -n 1 "${dir}/report.txt")"
+    else
+        pass "the kept report is the re-run's and names the step it was re-derived from"
+    fi
+    rm -rf "${dir}"
+}
+
+# A baseline that moves again between the two runs — a release published while
+# this was going — is the one case where re-running cannot converge, and it has to
+# stop rather than loop. Without this, a correction that always retries would spin
+# on a registry that keeps answering differently.
+case_a_baseline_that_keeps_moving_is_not_retried_for_ever() {
+    local dir
+    dir="$(mktemp -d)"
+    make_repo "${dir}" 1.0.0 1.0.0 0.4.0
+    make_sequence_stub "${dir}" \
+        "$(clean_verdict_for 0.4.0 0.5.0)" \
+        "$(clean_verdict_for 0.5.0 0.5.0)"
+    run_in_repo "${dir}"
+    if [ "${RC}" -eq 0 ]; then
+        fail "a baseline that moved twice produced a report accepted as the record"
+    elif [ "$(cat "${dir}/calls.txt")" != 2 ]; then
+        fail "the comparison ran $(cat "${dir}/calls.txt") time(s), not twice"
+    elif echo "${OUT}" | grep -q "narrower again"; then
+        pass "a baseline that keeps moving fails after one re-run rather than looping"
+    else
+        fail "the moving baseline failed without naming the reason: ${OUT}"
+    fi
+    rm -rf "${dir}"
+}
+
 case_findings_are_not_a_failure
 case_clean_run_passes
 case_no_verdict_is_a_failure
@@ -491,6 +620,9 @@ case_a_stricter_release_type_is_noted_not_rejected
 case_a_report_without_a_checking_line_fails
 case_the_report_records_the_release_type
 case_an_unknown_option_is_rejected
+case_an_open_window_after_a_minor_release_re_runs_narrower
+case_the_kept_report_is_the_re_run_alone
+case_a_baseline_that_keeps_moving_is_not_retried_for_ever
 
 if [ "${outcomes}" -ne "${EXPECTED_CASES}" ]; then
     echo ""

@@ -49,18 +49,36 @@ job summary.
 Which lints run is decided by the release type, and that is read out of the tree
 rather than written into the workflow: `scripts/semver_report.sh` compares
 `core/Cargo.toml`'s version against the newest release heading below it in
-`CHANGELOG.md`, so `0.3.0 → 0.3.1` is checked as the patch release this section
-defines as "bugfix / docs only" and `0.3.1 → 0.4.0` as the minor one it lets break.
+`CHANGELOG.md`, so `0.3.0 → 0.4.0` is checked as the minor release this section lets
+break public API, and a `0.4.0 → 0.4.1` step would be checked as the patch release it
+defines as "bugfix / docs only".
 It matters because the narrower type skips lints rather than relabelling findings: a
 `minor` run of this crate performs 196 checks where a `patch` run performs 223 — counts from
 cargo-semver-checks 0.48.0, against the 0.50.0 CI installs, so treat them as illustrative and
 take the real ones from the `Checked … N checks` line of the run in front of you. Until
-0.3.1 the type was the fixed word `minor`, which was the right assumption before a
-version had been bumped and the wrong one after, and the script now also refuses to
-report at all if the type it used permitted more than the step the tool says it
-compared. Inside an open window, where the manifest version is still the published
-one and there is no step to read, it assumes `patch` — the strictest — because the
-work may ship in either kind of release.
+0.4.0 the type was the fixed word `minor`, which was the right assumption before a
+version had been bumped and the wrong one after.
+
+Reading it out of the tree is a prediction, though, because the baseline is not in the
+tree: it is whatever crates.io has published, and the tree reads the same on both
+sides of a publish. With `0.4.0` in `core/Cargo.toml` and `## [0.4.0]` the newest
+heading, the step reads `0.3.0 → 0.4.0` both in the pull request that cuts the
+release and in every pull request after it has shipped — where the real step is
+`0.4.0 → 0.4.0` and the right type is `patch`. So the prediction is checked against
+the step the tool says it compared, and correcting it is not the same as refusing:
+
+- A type **given** as `--release-type` that permits more than that step fails the
+  script. A caller asked for a particular comparison and did not get it, which is a
+  setup error worth a red check.
+- A type the script **derived** that permits more is re-run once at the narrower one,
+  and that report is the one kept. The tree was guessing and the tool has just
+  supplied what it was guessing about; the second run reads the baseline rustdoc the
+  first cached. A step narrower again on the re-run means a release was published
+  mid-run, and that fails rather than retrying.
+
+Where the manifest version has no release below it in `CHANGELOG.md` at all there is
+no step to read, and the script assumes `patch` — the strictest — because the work
+may ship in either kind of release.
 
 The comparison covers default features plus `telemetry-otel`, `mimicry` and
 `embedded` — the largest set of this crate's features that builds together on one
@@ -98,9 +116,12 @@ The wire format is **one protocol with one pinned version byte**. There is no
 `VersionedPacket` enum, no per-session `wire_version` negotiation, and no
 in-protocol fallback. That is a decision, not an absence of peers: 0.2.x is
 published on crates.io and speaks `WIRE_VERSION` 6 / `PROTOCOL_VERSION` 3, and
-every 0.3.x release (8 / 5) cannot talk to it. Pre-1.0 a wire change ships as a hard cut
-rather than as something to negotiate — a peer on the other side of the cut is
-refused at the handshake, and the two ends of a connection upgrade together.
+every 0.3.x and 0.4.x release (8 / 5) cannot talk to it. Pre-1.0 a wire change ships as a
+hard cut rather than as something to negotiate — a peer on the other side of the cut is
+refused at the handshake, and the two ends of a connection upgrade together. The converse
+does not follow: a minor bump is *allowed* to cut the wire and need not, and 0.4.0 did not
+— it left both constants at 0.3.0's values, so a 0.4.0 peer and a 0.3.0 peer interoperate
+and either end may be upgraded alone (CI's `interop` job proves it in both directions).
 
 Two constants pin the format:
 
@@ -426,7 +447,7 @@ an old citation is `git log --all --grep '<subject>' -F` rather than the hash. T
 documents that carried pre-0.3.0 ids — `../compliance/fips-readiness.md`,
 `../observability/refactor-plan.md`, `../operations/{mobile,wasi}.md`,
 `../compliance/cc-pp-mapping.md` and the three `../security/audit-report-*.md`
-files — were re-pointed that way in 0.3.1; where a citation could not be resolved
+files — were re-pointed that way in 0.4.0; where a citation could not be resolved
 to one commit it was replaced with a path, a tag or a date, which is why most of
 them now name a file beside (or instead of) a hash. Prefer that form in new text:
 a path is checkable by opening it and survives the next rewrite.
