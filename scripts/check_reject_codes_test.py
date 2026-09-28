@@ -24,7 +24,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 UNDER_TEST = HERE / "check_reject_codes.py"
 
-EXPECTED_CASES = 7
+EXPECTED_CASES = 11
 
 SOURCE_REL = Path("core/src/transport/handshake.rs")
 SPEC_REL = Path("docs/protocol/PROTOCOL.md")
@@ -43,13 +43,38 @@ pub const SERVER_REJECT_MARKER: [u8; 4] = *b"PRJ1";
 """
 
 GOOD_SPEC = """\
+| 0 | `marker` | 4 | `= b"PRJ1"` (`SERVER_REJECT_MARKER`) |
 | 4 | `code` | 1 | reject reason; `1 = REJECT_UNSUPPORTED_VERSION`, `2 = REJECT_PROTOCOL_VARIANT`, `3 = REJECT_RETRY_LIMIT` |
 
-The marker is `SERVER_REJECT_MARKER`.
+```rust
+pub struct ServerReject {
+    pub marker:            [u8; 4],   // = b"PRJ1" (SERVER_REJECT_MARKER)
+    pub code:              u8,        // 1 = REJECT_UNSUPPORTED_VERSION
+                                     // 2 = REJECT_PROTOCOL_VARIANT
+                                     // 3 = REJECT_RETRY_LIMIT
+    pub supported_version: u8,
+}
+```
 
 A receiver that does not know a code must not read it as a version refusal: the frame
 carries `supported_version` whatever the reason is.
 """
+
+# The two normative sites as 0.3.0 had them: each naming code 1 alone, while the rest of the
+# document had been brought current.  Each is a whole mutation on its own, because that is
+# the shape the defect actually had -- one site behind, the file as a whole not.
+STALE_TABLE_ROW = (
+    "| 4 | `code` | 1 | reject reason; `1 = REJECT_UNSUPPORTED_VERSION` |"
+)
+CURRENT_STRUCT_CODES = """\
+    pub code:              u8,        // 1 = REJECT_UNSUPPORTED_VERSION
+                                     // 2 = REJECT_PROTOCOL_VARIANT
+                                     // 3 = REJECT_RETRY_LIMIT
+"""
+STALE_STRUCT_CODES = """\
+    pub code:              u8,        // 1 = REJECT_UNSUPPORTED_VERSION
+"""
+
 
 
 def write_tree(root: Path, source: str, spec: str) -> None:
@@ -71,9 +96,14 @@ def run(root: Path) -> subprocess.CompletedProcess[str]:
 # Each case: a name, the fragment the failure must name, and the mutation.
 CASES = [
     (
-        "a code the specification never lists",
+        "a code no site lists",
         "REJECT_RETRY_LIMIT",
-        lambda source, spec: (source, spec.replace(", `3 = REJECT_RETRY_LIMIT`", "")),
+        lambda source, spec: (
+            source,
+            spec.replace(", `3 = REJECT_RETRY_LIMIT`", "").replace(
+                "                                     // 3 = REJECT_RETRY_LIMIT\n", ""
+            ),
+        ),
     ),
     (
         "a code the specification lists under the wrong number",
@@ -93,7 +123,7 @@ CASES = [
     (
         "the reason the rule is needed deleted",
         "does not recognise",
-        lambda source, spec: (source, spec.replace("`supported_version`", "the version field")),
+        lambda source, spec: (source, spec.replace("supported_version", "the version field")),
     ),
     (
         "the constants renamed out from under the pattern",
@@ -104,6 +134,45 @@ CASES = [
         "a new code added to the source alone",
         "never names it",
         lambda source, spec: (source + "\npub const REJECT_TOO_MANY_STREAMS: u8 = 4;\n", spec),
+    ),
+    # The defect this gate was written for, and the two shapes it actually had. Whole-file
+    # checks pass for both: every code is still named somewhere, by the other site and by the
+    # prose. Only reading each site on its own catches them.
+    (
+        "the field table left behind while the rest of the document moved on",
+        "field table",
+        lambda source, spec: (
+            source,
+            spec.replace(
+                "| 4 | `code` | 1 | reject reason; `1 = REJECT_UNSUPPORTED_VERSION`, "
+                "`2 = REJECT_PROTOCOL_VARIANT`, `3 = REJECT_RETRY_LIMIT` |",
+                STALE_TABLE_ROW,
+            ),
+        ),
+    ),
+    (
+        "the struct listing left behind while the rest of the document moved on",
+        "struct listing",
+        lambda source, spec: (source, spec.replace(CURRENT_STRUCT_CODES, STALE_STRUCT_CODES)),
+    ),
+    # A site that cannot be found is a site that cannot be checked, and a gate reporting
+    # success for it is the failure one level up.
+    (
+        "the struct listing deleted outright",
+        "holds 0 copies",
+        lambda source, spec: (
+            source,
+            spec.replace("pub struct ServerReject {", "pub struct ServerRejectFrame {"),
+        ),
+    ),
+    (
+        "two field table rows for the same field",
+        "holds 2 copies",
+        lambda source, spec: (
+            source,
+            spec.replace(STALE_TABLE_ROW, STALE_TABLE_ROW)
+            + "\n| 4 | `code` | 1 | reject reason; `1 = REJECT_UNSUPPORTED_VERSION` |\n",
+        ),
     ),
 ]
 

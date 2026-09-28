@@ -16,14 +16,23 @@ no wire format moves, no frozen vector changes, no signature changes, and the fr
 never sent on the success path, so every test in the tree stays green while the
 specification quietly describes a smaller protocol than the one that ships.
 
-Three checks:
+Four checks:
 
   1. Every `REJECT_*` constant in `core/src/transport/handshake.rs` is named in
      `docs/protocol/PROTOCOL.md`, with the same number beside it in both places.
   2. The specification names no `REJECT_*` constant the source does not define -- a code
      retired from the source has to be retired from the document, or an implementer will
      send one no server understands.
-  3. The document says what a receiver does with a code it does not recognise.  Codes are
+  3. Every code is named in **each** of the specification's normative sites, not merely
+     somewhere in the file.  Check 1 reads the whole document, and the document says the
+     same thing in several places on purpose: a byte-level field table an implementer
+     decodes from, a struct listing they write their own type from, and prose around
+     both.  Restoring either normative site to its 0.3.0 content -- the very lag this
+     release fixed -- left the other two naming all three codes, so check 1 passed and an
+     implementer reading the table still built a decoder that knew one code.  A gate that
+     accepts the defect it was written for is a gate in name only, so each site is read on
+     its own.
+  4. The document says what a receiver does with a code it does not recognise.  Codes are
      additive, so this is the only paragraph that keeps a future value from being read as
      one of today's.
 
@@ -51,6 +60,38 @@ SPEC_ASSIGNMENT_RE = re.compile(r"(\d+)\s*=\s*(?<![A-Z0-9_])(REJECT_[A-Z0-9_]+)"
 # keeps `SERVER_REJECT_MARKER` -- the frame's four-byte marker, not a code -- from reading as
 # a constant named `REJECT_MARKER`.
 SPEC_NAME_RE = re.compile(r"(?<![A-Z0-9_])REJECT_[A-Z0-9_]+")
+
+# The `ServerReject` byte-level field table's row for `code`: `| 4 | `code` | 1 | ... |`.
+FIELD_TABLE_ROW_RE = re.compile(r"^\|[^|\n]*\|\s*`code`\s*\|.*$", re.MULTILINE)
+
+# The struct listing, from its opening line to the closing brace in the first column.
+STRUCT_LISTING_RE = re.compile(r"^pub struct ServerReject \{.*?^\}", re.MULTILINE | re.DOTALL)
+
+
+def field_table_row(spec: str) -> list[str]:
+    return FIELD_TABLE_ROW_RE.findall(spec)
+
+
+def struct_listing(spec: str) -> list[str]:
+    return STRUCT_LISTING_RE.findall(spec)
+
+
+# The places in the specification a second implementation reads the codes *out of*, each
+# checked on its own.  Both were behind the source for two releases while the rest of the
+# document was not, which is what made "the codes are named in the file somewhere" the wrong
+# question to ask.
+NORMATIVE_SITES = (
+    (
+        "the `ServerReject` field table",
+        field_table_row,
+        "the byte-level table an implementer decodes the frame from",
+    ),
+    (
+        "the `ServerReject` struct listing",
+        struct_listing,
+        "the declaration an implementer writes their own type from",
+    ),
+)
 
 # The paragraph that says an unknown code is not a version refusal.  Two fragments, both
 # required: the first is the rule, the second is the reason it is not obvious -- the frame
@@ -116,6 +157,39 @@ def main() -> int:
             "understands."
         )
 
+    for site_name, locate, why in NORMATIVE_SITES:
+        found = locate(spec)
+        if len(found) != 1:
+            problems.append(
+                f"{SPEC} holds {len(found)} copies of {site_name}, and this gate reads one. "
+                f"That site is {why}, so with none of it the gate checks nothing there and "
+                "with two it cannot say which one an implementer reads. Restore the site, or "
+                "fix the pattern in this script rather than deleting it."
+            )
+            continue
+        site = found[0]
+        listed: dict[str, set[int]] = {}
+        for value, name in SPEC_ASSIGNMENT_RE.findall(site):
+            listed.setdefault(name, set()).add(int(value))
+        for name, value in sorted(defined.items(), key=lambda kv: kv[1]):
+            if name not in listed:
+                problems.append(
+                    f"{site_name} in {SPEC} does not name {name} = {value}. It is {why}, and "
+                    "an implementer who reads it renders a code it omits as one it lists -- "
+                    "which is exactly what shipped while the rest of the document was "
+                    "current."
+                )
+            elif value not in listed[name]:
+                seen = ", ".join(str(v) for v in sorted(listed[name]))
+                problems.append(
+                    f"{site_name} in {SPEC} gives {name} as {seen}; the source assigns "
+                    f"{value}."
+                )
+        for name in sorted(set(SPEC_NAME_RE.findall(site)) - set(defined)):
+            problems.append(
+                f"{site_name} in {SPEC} names {name} and {SOURCE} defines no such constant."
+            )
+
     missing_rule = [f for f in UNKNOWN_CODE_FRAGMENTS if f not in spec]
     if missing_rule:
         problems.append(
@@ -130,7 +204,10 @@ def main() -> int:
         return 1
 
     codes = ", ".join(f"{value} = {name}" for name, value in sorted(defined.items(), key=lambda kv: kv[1]))
-    print(f"check-reject-codes: {len(defined)} codes agree ({codes}), and the unknown-code rule is stated")
+    print(
+        f"check-reject-codes: {len(defined)} codes agree ({codes}) in all "
+        f"{len(NORMATIVE_SITES)} normative sites, and the unknown-code rule is stated"
+    )
     return 0
 
 
