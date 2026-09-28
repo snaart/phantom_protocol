@@ -776,8 +776,10 @@ Pointers only: each item is set out in full in the entry named.
   decides — the rule was written out three times, in the loop, at the budget deadline and
   after it, as two different-looking expressions each of which reads correctly on its own. It
   is one function used at all three points now, tested as the integer comparison it is. The
-  second half is what a consumer saw: where an impostor refuses and a later address succeeds,
-  the caller is handed the success, `last_error()` is `None`, and the roster naming every
+  second half is what a consumer saw: where an address answers correctly and an impostor
+  behind it in the resolver's order refuses, that refusal loses to the earlier address and
+  goes nowhere — the caller is handed the success, `last_error()` is `None`, and the roster
+  naming every
   address tried is built only for the error path — so an operator with a poisoned resolver, a
   hostile split-horizon zone or one extra AAAA record in a DNS answer saw a clean connect
   every time, and the one signal Security Invariant 1 exists to produce reached nobody. The
@@ -1250,7 +1252,9 @@ Pointers only: each item is set out in full in the entry named.
   end: the tenth address of a ten-address name is contacted 2.25 s into a ten-second
   deadline, and all ten are reached. Both now describe what ships, with the two ordering
   rules the overlap needed to keep Invariant 1's pin refusal and the one property it
-  narrows against the serial walk. Separately, Invariant 10's "Pinned by" line named
+  narrows against the serial walk — and, since the overlap can hold a refusal and a success
+  at once, which of the two answers and where the losing refusal goes, which is the log and
+  nowhere else. Separately, Invariant 10's "Pinned by" line named
   `the_reject_codes_are_distinct_and_the_version_one_is_unchanged`, a test this tree does
   not contain — the name is `…_and_the_shipped_ones_are_unchanged`. A citation that names
   nothing reads as covered, which is worse than citing nothing, so that file's header now
