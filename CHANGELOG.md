@@ -918,12 +918,15 @@ Pointers only: each item is set out in full in the entry named.
 - **`scripts/required_status_checks.py`**, which derives from the workflow files the
   branch-protection contexts that ought to be required, names the ones that are missing, and
   prints the single command that closes the gap. Nine pull-request jobs currently cannot block
-  a merge, among them `cargo package`, `cargo check (MSRV 1.93)`, the `interop` job above and
-  three gates whose only purpose is to fail. It reports and changes nothing unless run with
-  `--apply`; the derivation is gated in CI, the comparison against the live setting is not,
-  because that needs rights over the repository's settings which `GITHUB_TOKEN` does not have.
-  Making the nine required is a maintainer action this release does not take, and the list is
-  in **Documented** below.
+  a merge: `cargo check (MSRV 1.93)`, `cargo package`, `cargo test + clippy (--features
+  mimicry)`, `testbed compiles + tests`, the `interop with the published release` job above,
+  and the four gates whose whole purpose is to fail — `changelog structure`, `panic-site
+  inventory`, `published memory arithmetic` and `release artifact shape`. It reports and
+  changes nothing unless run with `--apply`; the derivation is gated in CI, the comparison
+  against the live setting is not, because that needs rights over the repository's settings
+  which `GITHUB_TOKEN` does not have. Making the nine required is a maintainer action this
+  release does not take, and `python3 scripts/required_status_checks.py` re-derives the list
+  and prints the `gh api` call that applies it.
 
 ### Documented
 
