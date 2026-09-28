@@ -13,6 +13,13 @@ The rest cover the readings that could go vacuous around it: a runner named only
 is not invoked, a runner reached through a script that nothing runs is not invoked either, and
 a tree the globs no longer match has to be reported rather than called clean.
 
+Two of them are the gate's own defects rather than shapes it might meet.  A runner used to be
+credited to its own mutation harness -- `X_test.sh` names `X.sh`, so `X.sh` read as invoked,
+though nothing ran it against the tree -- and the roots it searched left out `python/`, where
+the wheel gate lives.  Both have a case, and so does the exception list that replaced the
+first: it is refused when the excused runner turns out to be reachable after all, and refused
+when nothing runs the cases it defers to.
+
 Usage:  scripts/check_gate_wiring_test.py
 Exit:   0 when every case behaves, 1 when one does not.
 """
@@ -27,7 +34,7 @@ from pathlib import Path
 
 GATE = Path(__file__).resolve().parent / "check_gate_wiring.py"
 
-EXPECTED_CASES = 8
+EXPECTED_CASES = 15
 
 
 def write(root: Path, rel: str, text: str) -> None:
@@ -68,7 +75,7 @@ def case_wired_tree_passes() -> tuple[Path, int, str]:
     write(root, "scripts/check_one.py", "print('ok')\n")
     write(root, ".github/workflows/ci.yml", WORKFLOW_RUNNING)
     write(root, ".pre-commit-config.yaml", HOOK_EMPTY)
-    return root, 0, "every one invoked"
+    return root, 0, "every one accounted for"
 
 
 def case_orphan_runner() -> tuple[Path, int, str]:
@@ -107,7 +114,7 @@ def case_hook_entry_counts() -> tuple[Path, int, str]:
         "repos:\n  - repo: local\n    hooks:\n      - id: two\n"
         "        entry: scripts/check_two.py\n",
     )
-    return root, 0, "every one invoked"
+    return root, 0, "every one accounted for"
 
 
 def case_relay_through_a_running_script() -> tuple[Path, int, str]:
@@ -123,7 +130,7 @@ def case_relay_through_a_running_script() -> tuple[Path, int, str]:
     write(root, "scripts/check_leaf.sh", "#!/bin/sh\nexit 0\n")
     write(root, ".github/workflows/ci.yml", WORKFLOW_RUNNING)
     write(root, ".pre-commit-config.yaml", HOOK_EMPTY)
-    return root, 0, "every one invoked"
+    return root, 0, "every one accounted for"
 
 
 def case_relay_chain_is_not_itself_run() -> tuple[Path, int, str]:
@@ -165,6 +172,112 @@ def case_no_runners_found() -> tuple[Path, int, str]:
     return root, 1, "asserting nothing"
 
 
+EXCUSED = "tests/bindings/swift/check_xcframework.sh"
+EXCUSED_CASES = "tests/bindings/swift/check_xcframework_test.sh"
+
+HOOK_RUNNING_THE_EXCUSED_CASES = """repos:
+  - repo: local
+    hooks:
+      - id: shape
+        entry: tests/bindings/swift/check_xcframework_test.sh
+"""
+
+
+def case_own_cases_do_not_vouch_for_a_runner() -> tuple[Path, int, str]:
+    # The gate's own defect. `check_leaf_test.sh` runs `check_leaf.sh` against trees it
+    # fabricates, which says nothing about whether anything runs it against this one --
+    # and in the real repository that was the only thing naming `check_xcframework.sh`.
+    root = tree()
+    write(root, "scripts/check_one.py", "print('ok')\n")
+    write(root, "scripts/check_leaf.sh", "#!/bin/sh\nexit 0\n")
+    write(root, "scripts/check_leaf_test.sh", "#!/bin/sh\nexec scripts/check_leaf.sh --fake\n")
+    write(
+        root,
+        ".github/workflows/ci.yml",
+        WORKFLOW_RUNNING + "      - run: scripts/check_leaf_test.sh\n",
+    )
+    write(root, ".pre-commit-config.yaml", HOOK_EMPTY)
+    return root, 1, "scripts/check_leaf.sh"
+
+
+def case_a_harness_still_relays_for_another_runner() -> tuple[Path, int, str]:
+    # The rule is narrow on purpose: a harness does not vouch for its own subject, and
+    # still vouches for anything else it genuinely runs. Banning the whole shape would
+    # orphan runners that are invoked, and an over-wide rule gets deleted rather than fixed.
+    root = tree()
+    write(root, "scripts/check_one.py", "print('ok')\n")
+    write(root, "scripts/check_leaf_test.sh", "#!/bin/sh\nexec scripts/check_other.sh\n")
+    write(root, "scripts/check_other.sh", "#!/bin/sh\nexit 0\n")
+    write(
+        root,
+        ".github/workflows/ci.yml",
+        WORKFLOW_RUNNING + "      - run: scripts/check_leaf_test.sh\n",
+    )
+    write(root, ".pre-commit-config.yaml", HOOK_EMPTY)
+    return root, 0, "every one accounted for"
+
+
+def case_a_runner_under_python_is_inventoried() -> tuple[Path, int, str]:
+    # `python/` was outside every root this script searched, so the wheel gate -- which
+    # exists because a release shipped a wheel that would not import -- was invoked by
+    # nothing and reported by nothing.
+    root = tree()
+    write(root, "scripts/check_one.py", "print('ok')\n")
+    write(root, "python/verify_wheel.sh", "#!/bin/sh\nexit 0\n")
+    write(root, ".github/workflows/ci.yml", WORKFLOW_RUNNING)
+    write(root, ".pre-commit-config.yaml", HOOK_EMPTY)
+    return root, 1, "python/verify_wheel.sh"
+
+
+def case_a_verify_runner_is_inventoried() -> tuple[Path, int, str]:
+    # The other half of the same miss: `verify_*` was not one of the conventions, so the
+    # name alone kept a gate out of the inventory wherever it lived.
+    root = tree()
+    write(root, "scripts/check_one.py", "print('ok')\n")
+    write(root, "scripts/verify_shape.sh", "#!/bin/sh\nexit 0\n")
+    write(root, ".github/workflows/ci.yml", WORKFLOW_RUNNING)
+    write(root, ".pre-commit-config.yaml", HOOK_EMPTY)
+    return root, 1, "scripts/verify_shape.sh"
+
+
+def case_an_excused_runner_passes_when_its_cases_run() -> tuple[Path, int, str]:
+    root = tree()
+    write(root, "scripts/check_one.py", "print('ok')\n")
+    write(root, EXCUSED, "#!/bin/sh\nexit 0\n")
+    write(root, EXCUSED_CASES, "#!/bin/sh\nexit 0\n")
+    write(root, ".github/workflows/ci.yml", WORKFLOW_RUNNING)
+    write(root, ".pre-commit-config.yaml", HOOK_RUNNING_THE_EXCUSED_CASES)
+    return root, 0, "its own cases only"
+
+
+def case_an_excused_runner_whose_cases_nothing_runs() -> tuple[Path, int, str]:
+    # The exception defers to the runner's own cases. With nothing running those either,
+    # it excuses the runner from being run at all, which is the thing it replaced.
+    root = tree()
+    write(root, "scripts/check_one.py", "print('ok')\n")
+    write(root, EXCUSED, "#!/bin/sh\nexit 0\n")
+    write(root, EXCUSED_CASES, "#!/bin/sh\nexit 0\n")
+    write(root, ".github/workflows/ci.yml", WORKFLOW_RUNNING)
+    write(root, ".pre-commit-config.yaml", HOOK_EMPTY)
+    return root, 1, "excuses everything"
+
+
+def case_a_stale_exception_is_refused() -> tuple[Path, int, str]:
+    # Once something does run it, the waiver is a stale note that the next unwired runner
+    # would inherit.
+    root = tree()
+    write(root, "scripts/check_one.py", "print('ok')\n")
+    write(root, EXCUSED, "#!/bin/sh\nexit 0\n")
+    write(root, EXCUSED_CASES, "#!/bin/sh\nexit 0\n")
+    write(
+        root,
+        ".github/workflows/ci.yml",
+        WORKFLOW_RUNNING + f"      - run: {EXCUSED}\n",
+    )
+    write(root, ".pre-commit-config.yaml", HOOK_RUNNING_THE_EXCUSED_CASES)
+    return root, 1, "stale"
+
+
 CASES = [
     ("a wired tree passes", case_wired_tree_passes),
     ("a runner nothing invokes is reported", case_orphan_runner),
@@ -177,6 +290,25 @@ CASES = [
         case_the_check_does_not_vouch_for_itself,
     ),
     ("a tree the globs no longer match is reported", case_no_runners_found),
+    (
+        "a runner vouched for only by its own cases is reported",
+        case_own_cases_do_not_vouch_for_a_runner,
+    ),
+    (
+        "a mutation harness still relays for a runner that is not its subject",
+        case_a_harness_still_relays_for_another_runner,
+    ),
+    ("a runner under python/ is inventoried", case_a_runner_under_python_is_inventoried),
+    ("a verify_* runner is inventoried", case_a_verify_runner_is_inventoried),
+    (
+        "an excused runner passes when its own cases run",
+        case_an_excused_runner_passes_when_its_cases_run,
+    ),
+    (
+        "an exception whose cases nothing runs is refused",
+        case_an_excused_runner_whose_cases_nothing_runs,
+    ),
+    ("an exception for a runner something runs is refused as stale", case_a_stale_exception_is_refused),
 ]
 
 

@@ -12,17 +12,27 @@ only signal would have been a consumer discovering it the way the original defec
 
 A check nobody invokes is indistinguishable from one that always passes, and the difference
 is invisible in review: the file is there, the cases read correctly, and the diff that adds
-it looks complete.  So this script asserts the wiring itself.  Every runner under `scripts/`
-and `tests/` whose name follows one of the conventions below has to be named by a workflow,
-by `.pre-commit-config.yaml`, or by another runner that is itself reachable from one of
-those:
+it looks complete.  So this script asserts the wiring itself.  Every runner under `scripts/`,
+`tests/` and `python/` whose name follows one of the conventions below has to be named by a
+workflow, by `.pre-commit-config.yaml`, or by another runner that is itself reachable from
+one of those:
 
     *_test.sh   *_test.py   check_*.sh   check_*.py   run_*.sh   run_*.py
+    verify_*.sh   verify_*.py
 
 Reachability is transitive because some runners are legitimately invoked by another script
-rather than by CI directly -- `tests/bindings/swift/check_xcframework.sh` runs from
-`build-xcframework.sh`, for one -- and demanding a direct workflow reference would push
-whoever hit that to delete the rule rather than fix the wiring.
+rather than by CI directly, and demanding a direct workflow reference would push whoever hit
+that to delete the rule rather than fix the wiring.
+
+**A runner's own mutation harness does not count as invoking it.**  `X_test.sh` exists to run
+`X.sh` against trees it fabricates; it says nothing about whether anything runs `X.sh` against
+*this* tree, which is the whole question.  Crediting the one to the other is this script's own
+failure mode, one level up, and it had it: `tests/bindings/swift/check_xcframework.sh` was
+reported as invoked because `check_xcframework_test.sh` names it, and nothing else in the
+repository does -- not even `build-xcframework.sh`, which this file used to offer as the
+example of a legitimate relay.  A runner that genuinely cannot be run against the tree is
+listed in `HARNESS_ONLY` with the reason, which is a decision a reader can see and disagree
+with; being quietly vouched for by its own cases is not.
 
 Comment lines are stripped from every file before it is searched, in both YAML and shell, so
 a runner mentioned only in prose about how it *could* be run does not count as invoked.  That
@@ -38,8 +48,21 @@ import argparse
 import sys
 from pathlib import Path
 
-RUNNER_PATTERNS = ("*_test.sh", "*_test.py", "check_*.sh", "check_*.py", "run_*.sh", "run_*.py")
-RUNNER_ROOTS = ("scripts", "tests")
+RUNNER_PATTERNS = (
+    "*_test.sh",
+    "*_test.py",
+    "check_*.sh",
+    "check_*.py",
+    "run_*.sh",
+    "run_*.py",
+    "verify_*.sh",
+    "verify_*.py",
+)
+# `python/` holds the wheel gate. It was outside every root this script looked in, so
+# `python/verify_wheel.sh` -- which builds a wheel, installs it into a throwaway virtualenv
+# and proves it imports, after a release shipped a wheel that did not -- was invoked by
+# nothing and reported by nothing.
+RUNNER_ROOTS = ("scripts", "tests", "python")
 
 # Where an invocation can come from without anything else having to invoke it.
 ENTRY_POINTS = (Path(".github/workflows"), Path(".pre-commit-config.yaml"))
@@ -56,6 +79,18 @@ NEVER_A_RELAY = (
     Path("scripts/check_gate_wiring.py"),
     Path("scripts/check_gate_wiring_test.py"),
 )
+
+# Runners that cannot be run against this tree at all, and why. An entry here is a decision
+# on the record: the runner's own cases still have to be reachable, so something proves the
+# rules it encodes, and the entry is rejected the moment the runner becomes reachable by
+# itself -- an exception nobody can retire is how a waiver outlives its reason.
+HARNESS_ONLY = {
+    Path("tests/bindings/swift/check_xcframework.sh"): (
+        "it takes a built XCFramework as its argument, which only build-xcframework.sh "
+        "produces and which no workflow builds; its mutation cases fabricate the broken "
+        "shapes instead and run from .pre-commit-config.yaml"
+    ),
+}
 
 
 def strip_comments(text: str) -> str:
@@ -107,6 +142,17 @@ def relay_texts(root: Path) -> dict[Path, str]:
             if path.is_file() and path.suffix in RELAY_SUFFIXES and rel not in NEVER_A_RELAY:
                 texts[rel] = read(path)
     return texts
+
+
+def own_harness(rel: Path) -> tuple[Path, ...]:
+    """The files that exist to run `rel` against fabricated trees, and so cannot vouch for it.
+
+    `check_versions.sh` -> `check_versions_test.sh`; `check_reject_codes.py` ->
+    `check_reject_codes_test.py`. Both extensions, because a shell runner's cases are
+    sometimes written in Python and the other way round.
+    """
+    stem = rel.name.rsplit(".", 1)[0]
+    return tuple(rel.with_name(f"{stem}_test{suffix}") for suffix in (".sh", ".py"))
 
 
 def names(rel: Path) -> tuple[str, ...]:
@@ -171,15 +217,55 @@ def main() -> int:
         for rel in inventory:
             if rel in reached:
                 continue
+            harness = own_harness(rel)
             for source, text in relays.items():
-                if source == rel or source not in reached:
+                if source == rel or source not in reached or source in harness:
                     continue
                 if invoked_by(rel, text):
                     reached[rel] = f"{source.as_posix()} (itself run by {reached[source]})"
                     grew = True
                     break
 
-    orphans = [rel for rel in inventory if rel not in reached]
+    problems: list[str] = []
+    for rel, why in HARNESS_ONLY.items():
+        if not (root / rel.parent).is_dir():
+            # The tree being checked does not hold the excused runner's directory at all,
+            # so there is nothing here to excuse and nothing to go stale. A sub-tree is a
+            # legitimate thing to point this script at -- the cases do it for every run --
+            # and an entry cannot be wrong about a file that is not in scope.
+            continue
+        if rel not in inventory:
+            problems.append(
+                f"HARNESS_ONLY names {rel.as_posix()}, which is not a runner under "
+                f"{'/, '.join(RUNNER_ROOTS)}/ although its directory is here. An exception "
+                "for a file this script does not look at hides nothing and explains "
+                "nothing; drop it."
+            )
+            continue
+        if not why.strip():
+            problems.append(f"HARNESS_ONLY names {rel.as_posix()} and gives no reason.")
+        if rel in reached:
+            problems.append(
+                f"HARNESS_ONLY says {rel.as_posix()} cannot be run against this tree, and "
+                f"{reached[rel]} runs it. The exception is stale -- drop it, or the next "
+                "runner that stops being invoked inherits a waiver nobody re-read."
+            )
+        if not any(h in reached for h in own_harness(rel)):
+            problems.append(
+                f"HARNESS_ONLY excuses {rel.as_posix()} from being run against the tree "
+                "because its own cases carry the rules instead, and nothing invokes those "
+                "cases either. Wire the cases in, or the exception excuses everything."
+            )
+    if problems:
+        print(
+            "check-gate-wiring: the exception list does not hold up",
+            file=sys.stderr,
+        )
+        for problem in problems:
+            print(f"  {problem}", file=sys.stderr)
+        return 1
+
+    orphans = [rel for rel in inventory if rel not in reached and rel not in HARNESS_ONLY]
     if orphans:
         print(
             "check-gate-wiring: a check nobody invokes is a check that always passes",
@@ -194,9 +280,12 @@ def main() -> int:
             )
         return 1
 
-    print(f"check-gate-wiring: {len(inventory)} runners, every one invoked")
+    print(f"check-gate-wiring: {len(inventory)} runners, every one accounted for")
     for rel in inventory:
-        print(f"  {rel.as_posix()} <- {reached[rel]}")
+        if rel in HARNESS_ONLY:
+            print(f"  {rel.as_posix()} <- its own cases only: {HARNESS_ONLY[rel]}")
+        else:
+            print(f"  {rel.as_posix()} <- {reached[rel]}")
     return 0
 
 

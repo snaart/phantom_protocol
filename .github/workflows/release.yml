@@ -369,11 +369,19 @@ jobs:
             --features bindings \
             --out ../target/wheels
         working-directory: python
-      - name: Smoke-test wheel
-        run: |
-          python -m venv /tmp/phantom-smoke-venv
-          /tmp/phantom-smoke-venv/bin/pip install --no-index --find-links target/wheels phantom-protocol
-          /tmp/phantom-smoke-venv/bin/python -c "import phantom_protocol; print(getattr(phantom_protocol, '__doc__', None) or 'import OK')"
+      - name: Verify the wheel installs, imports and works
+        # `python/verify_wheel.sh` is the gate: it checks the archive's layout, installs it
+        # into a throwaway virtualenv with nothing else on the path, imports it from a
+        # directory holding no `phantom_protocol/` of its own, and runs a pinned loopback
+        # round-trip through the installed binding. An inline `import phantom_protocol`
+        # was what this step used to be, and it is the weaker half — 0.3.0 shipped a wheel
+        # whose import raised `ImportError: cannot import name '__all__'`, which only an
+        # install and an import from outside the source tree can see.
+        #
+        # `--no-build` because the step above already built the wheel with `--profile dist`;
+        # the script's own build uses `--release`, which produces a wheel with no bindings
+        # in it for the reason that step documents.
+        run: python/verify_wheel.sh --no-build
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: python-wheel-linux-x86_64
