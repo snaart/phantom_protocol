@@ -8,17 +8,69 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ## [Unreleased]
 
-## [0.3.1] - 2026-09-27
+## [0.4.0] - 2026-09-28
 
-**A patch release, and a wire-compatible one.** `WIRE_VERSION` stays 8 and
-`PROTOCOL_VERSION` stays 5, so a 0.3.1 peer and a 0.3.0 peer complete a handshake and
-carry data in both directions, and no AEAD plaintext or header layout moved. No item was
-removed, no signature changed, and no auto trait went away, so there is no Rust API break
-here: everything that compiled against 0.3.0 compiles against this.
+**The wire is unchanged, so either end may be upgraded on its own.** `WIRE_VERSION` stays
+8 and `PROTOCOL_VERSION` stays 5, so a 0.4.0 peer and a 0.3.0 peer complete a handshake
+and carry data in both directions, with either version as the server; no AEAD plaintext
+and no header layout moved. That is this release's lead claim, and it now has an automated
+proof rather than an argument — see **Added**, "`interop with the published release`". It
+needs one, because it is the claim that fails most quietly: a frame whose header version
+does not match is dropped before any flag is read and with no reply, so two incompatible
+peers would complete a handshake, agree keys, and then never deliver a byte, with nothing
+at either end to say why.
 
-**Three things qualify "nothing to change", each with an entry of its own below, and a
+**What this upgrade asks of you, and it is a line in your own manifest rather than a change
+to your code.** This release stops asking `tokio` for `signal`, `process`, `fs` and
+`io-std`, and stops pulling `time` into a default build; nothing in the library calls any of
+them. Cargo unifies features across the whole dependency graph, so a consumer that declares
+`tokio` or `time` itself has been compiling against the union of its own selection and this
+crate's. If your own code calls `tokio::signal::ctrl_c()`, `tokio::io::stdin()`,
+`tokio::fs`, `tokio::process` or `time`'s wall-clock surface, name what you use where you
+declare it — **adding to** the features you already ask for, not replacing them:
+
+```toml
+tokio = { version = "1", features = ["signal", "process", "fs", "io-std"] }
+time  = { version = "0.3", features = ["std"] }
+```
+
+That is safe to do before upgrading, and correct against every version of this crate:
+asking a dependency for the features your own code uses never depended on us. Without it
+the build fails with errors that name neither this crate nor a feature —
+`no function or associated item named 'now_utc'` is the shape of it, with four more like it
+for tokio — and nothing in the tool chain warns first, because the public API is
+byte-identical either way and a dependency's feature set is not part of what
+`cargo-semver-checks` compares. This is why the release is numbered 0.4.0 rather than
+0.3.1: the trim was prepared as a patch, the break was found by compiling an unchanged
+consumer against it rather than by reasoning about it, and a patch release must not do this
+to anyone. The full account, with the crates that leave and the count, is under **Removed**.
+
+**Regenerate the language bindings rather than relinking them.** `uniffi` 0.32 folds each
+exported item's doc comment into its checksum, and eleven of those checksums move here:
+`connect_pinned_udp`, `connect_pinned_udp_with_resumption` and
+`connect_pinned_with_resumption`; `PhantomSession::send`, `recv`, `open_stream`,
+`await_ready`, `migrate` and `supports_migration`; and `PhantomStream::recv` and
+`set_priority`. No exported item is added or removed, so the eleven are the whole of the
+difference. So the generated Python, Swift and Kotlin files in this release differ from
+0.3.0's.
+`UNIFFI_CONTRACT_VERSION` is unchanged at 30, which means the coarse gate passes and a
+stale binding fails at import time in the consumer's process instead. The regenerated
+files ship in `tests/bindings/`. The `SessionBuilder` rustdoc is corrected too and is
+deliberately not in that list: the builders are Rust-only, so no checksum exists for them
+to move.
+
+**The other half of the version number: this release adds public items, which SemVer counts
+as a minor change on its own.** Eleven types are re-exported at the crate root, `ServerReject`
+gained two named reject codes with a constructor each, and two transport types gained a
+method — every one of them named under **Added**. None of that breaks anything that already
+compiled, so no consumer has to act on it; it is simply not what a patch version means. So
+the two halves of the renumbering are different in kind: the additions made `0.3.1` the
+wrong *label*, and the dependency trim made it the wrong *thing to ship*. The one and the
+other are why the trim, withdrawn from 0.3.1 for exactly this reason, is back here.
+
+**Three things qualify "nothing else to change", each with an entry of its own below, and a
 consumer who ignores a `Result` should read them.** A mixed pair has a behavioural limit —
-a 0.3.0 peer counts concurrent streams differently and will take 255 of them where a 0.3.1
+a 0.3.0 peer counts concurrent streams differently and will take 255 of them where a 0.4.0
 peer takes 256 (**Fixed**, "The receive-side stream cap counts the streams the peer has
 open"). And two calls that used to answer `Ok` for work that did not happen now answer
 `Err`, which is the point of the fix and is still a different answer than 0.3.0 gave:
@@ -43,20 +95,6 @@ close the session, resolve `localhost`. That is the reason this release also add
 over the release path, the Swift packaging and the Python wheel — and says under **Added**
 which of them a workflow runs, because a release cannot be its own regression test and
 neither can a script nobody invokes.
-
-**Regenerate the language bindings rather than relinking them.** `uniffi` 0.32 folds each
-exported item's doc comment into its checksum, and eleven of those checksums move here:
-`connect_pinned_udp`, `connect_pinned_udp_with_resumption` and
-`connect_pinned_with_resumption`; `PhantomSession::send`, `recv`, `open_stream`,
-`await_ready`, `migrate` and `supports_migration`; and `PhantomStream::recv` and
-`set_priority`. No exported item is added or removed, so the eleven are the whole of the
-difference. So the generated Python, Swift and Kotlin files in this release differ from
-0.3.0's.
-`UNIFFI_CONTRACT_VERSION` is unchanged at 30, which means the coarse gate passes and a
-stale binding fails at import time in the consumer's process instead. The regenerated
-files ship in `tests/bindings/`. The `SessionBuilder` rustdoc is corrected too and is
-deliberately not in that list: the builders are Rust-only, so no checksum exists for them
-to move.
 
 ### Security
 
@@ -113,7 +151,7 @@ Pointers only: each item is set out in full in the entry named.
   one the other would not take.
 
   **Against a 0.3.0 peer, keep to 255 concurrent streams — and do not expect a dead
-  session to tell you so.** This is the one place where a 0.3.1 and a 0.3.0 peer do not
+  session to tell you so.** This is the one place where a 0.4.0 and a 0.3.0 peer do not
   agree, and nothing on the wire carries the disagreement: a 0.3.0 receiver compares the
   whole table, which already holds the reserved raw-application stream, so it admits 255
   peer streams — and one fewer for each stream it has opened itself — and refuses the 256th.
@@ -138,7 +176,7 @@ Pointers only: each item is set out in full in the entry named.
   arriving. Neither side can detect the other's rule, so there is nothing to work around it
   with. The reverse pair fails the same way for the opposite reason: a 0.3.0 client has no
   local cap at all — its `open_stream()` only ever fails when stream ids run out — so it
-  will go past 256, and the 257th is the one a 0.3.1 server refuses.
+  will go past 256, and the 257th is the one a 0.4.0 server refuses.
 
 - **Letting go of a stream nothing was ever written on retires it on the spot** instead of
   reporting it to the data pump, and a burst of released handles is taken in one pass rather
@@ -471,32 +509,55 @@ Pointers only: each item is set out in full in the entry named.
   `core/Cargo.toml`, a bundle that cannot be named is not built, and both headers ship.
 
 - **The semver gate reports the release actually being cut.** `scripts/semver_report.sh`
-  passed `--release-type minor` as a literal — the right assumption before a version had been
-  bumped and the wrong one after, so the report for this patch release said "assume minor
-  change" on the one line a reader checks to learn what was compared. That word also decides
+  passed `--release-type minor` as a literal — the right assumption while no version had been
+  bumped and the wrong one once one had, so the one line a reader checks to learn what was
+  compared said "assume minor change" whichever release it was about. That word also decides
   which lints run at all: of cargo-semver-checks' 253 lints a `minor` run performs the 196
   major-severity ones, while a `patch` run performs 223, the extra 27 being minor-severity
   checks for changes a minor bump would excuse and `docs/policy/versioning.md` § 2 says a
-  patch release must not make. Those four figures are one tool version's inventory —
-  0.48.0's, which is what this was measured against; CI installs 0.50.0, so read them as the
-  shape of the difference and re-derive them from the `Checked … N checks` line of a run.
-  Nothing the script does depends on them: it reads the release type out of the tree and the
-  step out of the tool's own output, so a changed inventory moves the numbers in this
-  paragraph and not the behaviour. The type is now read out of the tree — `core/Cargo.toml`'s
-  version against the newest release heading below it in `CHANGELOG.md`, falling back to the
-  strictest when there is no step to read — the report's first line records it and where it
-  came from, and after the run the script re-derives the step from the tool's own
-  `Checking … vB -> vC` line and fails if the type it ran with permitted more than that step.
-  So a wrong argument, or a baseline that moved because a release was published mid-window,
-  is a red check rather than a quieter report. Eleven new stubbed-cargo cases pin each of
-  those, the suite asserts its own case count, and it runs as a pre-commit hook when the
-  script or the cases change.
+  patch release must not make. Measured on this tree, `0.3.0 -> 0.4.0` at `minor` performs
+  196 checks and skips 57, and the same step at `patch` performs 223 and skips 30 — and both
+  report no findings, so for *this* release the word costs nothing and the reason to read it
+  out of the tree is the next release rather than this one. Those figures are one tool
+  version's inventory — 0.48.0's, which is what they were measured with; CI installs 0.50.0,
+  so read them as the shape of the difference and take the real ones from the
+  `Checked … N checks` line of the run in front of you. Nothing the script does depends on
+  them: it reads the release type out of the tree and the step out of the tool's own output,
+  so a changed inventory moves the numbers in this paragraph and not the behaviour.
+
+  The type is read out of the tree — `core/Cargo.toml`'s version against the newest release
+  heading below it in `CHANGELOG.md`, falling back to the strictest when there is no step to
+  read — and the report's first line records it and where it came from. **That reading is a
+  prediction, because the one thing it needs is not in the tree.** The baseline is whatever
+  crates.io has published, and the tree looks the same on both sides of a publish: with
+  `0.4.0` in the manifest and `## [0.4.0]` the newest heading, the step reads
+  `0.3.0 -> 0.4.0` in the pull request that cuts the release and goes on reading that in
+  every pull request after it has shipped — where the tool compares 0.4.0 against 0.4.0, a
+  patch step, and `minor` would skip the 27 lints that step must not fail. So after the run
+  the script re-derives the step from the tool's own `Checking … vB -> vC` line, and a type
+  more permissive than that step is not accepted — but what happens then depends on who
+  chose it. A type **given** on the command line fails, because a caller asked for a
+  particular comparison and did not get it. A type the script **derived** is re-run once at
+  the narrower one, and that report is the one kept: the second run reads the baseline
+  rustdoc the first one cached, so it costs the comparison rather than the build (8 s against
+  39 s on this tree). A step narrower again on the re-run means the baseline is moving under
+  the run, and that fails rather than retrying for ever.
+
+  Without that split the open window after this release would have been a red required check
+  on every pull request in it, reading "the report understates and is not usable as the
+  record" — a failure about the script's own inference, with nothing in the pull request to
+  fix and one obvious way out, which is to hard-code the word again. A patch release never
+  reached it, because `0.3.0 -> 0.3.1` derives `patch` and no step is narrower than that; so
+  cutting a minor release is what made it reachable, and it was reachable before it was
+  shipped. Fourteen new stubbed-cargo cases pin all of this, the suite asserts its own case
+  count, and it runs as a pre-commit hook when the script or the cases change.
 
 - **The changelog gate read a baseline only from a cold run.** `check_changelog_breaking.py`
   took the compared-against version from the `Building … (baseline)` line, which a run whose
   baseline rustdoc is already built never prints — it prints `Parsing … (baseline, cached)`.
   With no baseline read, the gate falls back to `[Unreleased]` alone, so a *cut* release
-  whose notes are complete under `## [0.3.1]` was reported as having written nothing down,
+  whose notes are complete under its own `## [x.y.z]` heading was reported as having written
+  nothing down,
   depending on whether the runner's cache happened to be warm. That is the same failure the
   baseline comparison was added to prevent, arriving by the back door; both spellings are
   read now, and a case pins the cached one.
@@ -652,9 +713,9 @@ Pointers only: each item is set out in full in the entry named.
 
 ### Changed
 
-- **Seven dependencies the crate never referenced are no longer declared, and
-  twenty-three crates leave a default build.** The `std` feature carried `tokio-util`,
-  `async-trait`, `env_logger`, `argon2`, `base64`, `once_cell` and `bitflags`, and no source
+- **Seven dependencies the crate never referenced are no longer declared.** The `std`
+  feature carried `tokio-util`, `async-trait`, `env_logger`, `argon2`, `base64`, `once_cell`
+  and `bitflags`, and no source
   file in the crate mentions any of them — not behind a cfg, not behind a feature, never.
   Since `std` is on in the default set, every consumer resolved, downloaded and compiled all
   seven, and `argon2`, a password hash, sat in the direct dependency list of a transport
@@ -666,17 +727,22 @@ Pointers only: each item is set out in full in the entry named.
   `bitflags` of `rustix` under `uniffi`'s `tempfile`, so both are still compiled for a
   default build and always were. What went away for those two is this crate's own
   *declaration* of them, and with it the feature selection it unified into the graph — the
-  same mechanism the two entries below are about. The other five leave outright.
+  same mechanism the entry below and the one under **Removed** are about. The other five
+  leave outright.
 
-  `time` is a separate case and is **not** removed here: the `mimicry` feature names it now,
-  which is where its only reader is — the validity window on the synthetic certificate the
-  TLS-mimicry theater presents — but `std` goes on naming it too for the whole of the 0.3.x
-  line, for exactly the compatibility reason set out in the next entry. It is still in a
-  default build, and 0.4.0 is where that line goes.
+  `time` is an eighth and is recorded separately, under **Removed**, because it is the one
+  the crate does read: the `mimicry` feature names it now, which is where its only reader is
+  — the validity window on the synthetic certificate the TLS-mimicry theater presents — and
+  `std` no longer names it, so it leaves a default build. That change takes `time/std` away
+  from a consumer who had been inheriting it, which is a thing a reader has to act on rather
+  than merely note, so it is not filed here.
 
-  A default consumer build goes from **163 crates to 140**: twenty-three leave, among them
+  A default consumer build goes from **163 crates to 134**: twenty-nine leave, among them
   `regex`, `jiff`, `blake2`, `password-hash` and the whole `anstream`/`anstyle` colour stack,
-  and nothing is added. Re-derive the pair rather than trusting it — each figure is the node
+  and nothing is added. Twenty-three of the twenty-nine follow from the seven declarations
+  above; the other six follow from the trim under **Removed** — `time` with `deranged`,
+  `num-conv`, `powerfmt` and `time-core`, plus `signal-hook-registry`, which `tokio` pulls in
+  for `signal` alone. Re-derive the pair rather than trusting it — each figure is the node
   count of the default normal dependency graph, the crate itself included:
 
   ```bash
@@ -684,30 +750,7 @@ Pointers only: each item is set out in full in the entry named.
     | sed 's/ (\*)$//' | sort -u | wc -l
   ```
 
-  Run at the `v0.3.0` tag it prints 163; run here, 140.
-
-- **`tokio`'s feature list is unchanged, and trimming it is deferred to the next minor.**
-  Four features it asks for on native targets — `signal`, `process`, `fs`, `io-std` — have
-  no call site anywhere in the crate, its tests, its benches or its examples, and dropping
-  them was prepared in this release and then **withdrawn**, because it can break a
-  consumer's build and a patch release must not. Cargo unifies features across the whole
-  dependency graph, so a consumer that declares `tokio` itself has been compiling against
-  the union of the features it asked for and the ones asked for here. A consumer whose own
-  manifest says `features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"]`,
-  and whose code calls `tokio::signal::ctrl_c()`, `tokio::io::stdin()`, `tokio::fs::read` or
-  `tokio::process::Command`, has been compiling against 0.3.0 for no reason of its own and
-  would have stopped compiling on `cargo update -p phantom-protocol`. That was checked
-  rather than reasoned about, for all four, which is how it came to be withdrawn. Nothing in
-  the tool chain would have warned first: the public API is byte-identical, so
-  `cargo-semver-checks` reports nothing, because a dependency's feature set is not part of
-  the surface it compares.
-
-  Keeping the four costs exactly one crate — `signal-hook-registry`, which `tokio` pulls in
-  for `signal` alone — which is why the figure above is 140 rather than 139. The trim itself is a one-line manifest change and belongs
-  in a release a consumer expects to have to react to; when it lands it will be under
-  **Removed**, and the fix on the consumer's side is one line in their own manifest: ask
-  tokio for the features you use. Applying that line now, ahead of the trim, is the way to
-  take the upgrade without ever meeting the break.
+  Run at the `v0.3.0` tag it prints 163; run here, 134.
 
 - **The seven removed crates reach a consumer by the same route as a feature would, and
   much more narrowly.** Rust will not let code name a crate its own manifest does not
@@ -717,13 +760,46 @@ Pointers only: each item is set out in full in the entry named.
   `argon2`, `once_cell`, `bitflags` and `env_logger` with their default features, for
   `base64` with `alloc` only, and for `async-trait`, which has no features — so a consumer
   that declares one of those itself with fewer features was being handed ours and now gets
-  only its own. `time` is in the same position and was withdrawn for the same reason as
-  the `tokio` features: `mimicry` names it, since that leg holds its only reader, but `std`
-  still names it as well, so a consumer that has been handed `time/std` through this crate
-  goes on being handed it until 0.4.0. The remedy is the same line in the same place — name
+  only its own. The remedy is one line in the same place — name
   the crate and the features you use in your own manifest — and it is worth applying
   deliberately rather than waiting to find out, because the missing item can be one an
   `#[cfg(feature)]` in that crate hides rather than one it names.
+
+### Removed
+
+- **Four `tokio` features and `time`'s place in `std` are gone, and a consumer who was
+  inheriting either has to name it in their own manifest.** On native targets this crate
+  asked `tokio` for `signal`, `process`, `fs` and `io-std`; `std` asked for `dep:time`.
+  None of the five has a call site anywhere in the crate, its tests, its benches or its
+  examples — nothing here spawns a process, reads a file, listens for a signal or reads a
+  clock outside the `mimicry` leg, which names `time` itself. By this library's own needs
+  all five were dead weight every default consumer compiled.
+
+  **They are still a consumer-visible removal, because Cargo unifies features across the
+  whole dependency graph.** What this crate asks of a shared dependency is added to what the
+  consumer asked of the same dependency, and the consumer's own code compiles against the
+  union. So a program that declares `tokio = { features = ["rt-multi-thread", "macros"] }`
+  and `time = { default-features = false }`, calls `tokio::signal::ctrl_c()`,
+  `tokio::io::stdin()`, `tokio::fs`, `tokio::process` and `OffsetDateTime::now_utc()`, and
+  never touches this crate's API at all, builds against 0.3.0 and gives five errors against
+  this release — none of which names this crate or a feature. That was reproduced against
+  unchanged consumer source rather than reasoned about, which is how it came to be withdrawn
+  from 0.3.1 and moved here: the same change in a patch release is a consumer's build broken
+  on `cargo update`, and in a minor release it is a line in the release notes they read
+  first. The remedy is in the header above, and it is safe to apply before upgrading — asking
+  tokio and `time` for what your own code uses is correct against every version of this
+  crate.
+
+  Six crates leave with the five features: `time` and its `deranged`, `num-conv`, `powerfmt`
+  and `time-core`, plus `signal-hook-registry` behind tokio's `signal`. They are six of the
+  twenty-nine in the count under **Changed**. `time` itself is still built by a `mimicry`
+  build, which is the only configuration that reads it.
+
+  **Nothing in the tool chain reports this, which is why it is written here at length.** The
+  public API is byte-identical across the change, so `cargo-semver-checks` finds nothing: a
+  dependency's feature set is not part of the surface it compares. There is no lint for it
+  either. A consumer's first notice is a compiler error in their own file about a method
+  they did not know they were borrowing.
 
 ### Added
 
@@ -785,7 +861,31 @@ Pointers only: each item is set out in full in the entry named.
   `AcceptOutcome` are all reachable as `phantom_protocol::<Name>` now; `api` itself gained the
   five it was missing. These are additions and re-exports of the same types, so every path
   that resolved before still resolves, and no UniFFI-exported item is added — which is what
-  keeps the checksum count above the whole of the binding difference.
+  keeps the checksum count above the whole of the binding difference. They are also the
+  reason this release is a minor one rather than a patch: SemVer counts an addition as a
+  minor change even when nothing that compiled stops compiling.
+
+- **The `ServerReject` frame's other two reject codes have names and constructors.**
+  `REJECT_PROTOCOL_VARIANT` (2) and `REJECT_RETRY_LIMIT` (3) join
+  `REJECT_UNSUPPORTED_VERSION` (1) in `transport::handshake`, with
+  `ServerReject::protocol_variant_mismatch()` and `ServerReject::retry_limit()` beside
+  `ServerReject::unsupported_version()`. Both codes are new on the wire here: 0.3.0 assigned
+  only code 1, answered a build-variant mismatch by closing with no reply at all, and
+  abandoned a handshake over the retry bound the same way. Neither is a format change —
+  `ServerReject` keeps its three fields and its byte layout, and the frozen wire vectors pass
+  unregenerated — so a 0.3.0 peer that receives one reads it through its own unknown-code
+  fallback. The two **Fixed** entries that put them on the wire are "A fips peer meeting a
+  non-fips one is now told so" and "A pinned TCP handshake failed about one attempt in twenty
+  under concurrency from a single address"; what a receiver should do with a code it does not
+  recognise is in `docs/protocol/PROTOCOL.md` § 6.10.
+
+- **Two methods on published transport types**, each the smallest surface a fix in this
+  release needed. `StreamDemultiplexer::close_all_streams()` releases every delivery route in
+  one pass, which is what lets a `PhantomStream::recv()` parked on an ended session return
+  instead of waiting for ever (**Fixed**, "`PhantomStream::recv()` now returns when the
+  session ends"). `SessionCache::is_disabled()` reports a cache configured to hold nothing,
+  which is what the zero-capacity 0-RTT path now consults before it looks for a ticket
+  (**Fixed**, "`PhantomConfig::session_cache_capacity = 0` now turns 0-RTT off").
 
 - **`interop with the published release`**, a CI job that builds one peer source twice — once
   against the published `=0.3.0`, once against this tree — and has them exchange data in both
@@ -800,8 +900,8 @@ Pointers only: each item is set out in full in the entry named.
   `core/src/transport/handshake.rs` assigns, and requires the specification to say what a
   receiver does with a code it does not recognise. Nothing else could notice the drift it
   exists for: a code is a `pub const` and a match arm, no wire format moves, no frozen vector
-  changes, and the frame is never sent on the success path, so `2 = REJECT_PROTOCOL_VARIANT`
-  travelled a whole release undocumented with every test green. Seven mutation cases, each
+  changes, and the frame is never sent on the success path, so the two codes this release adds
+  reached a green tree with the specification still naming one. Seven mutation cases, each
   putting one thing wrong and requiring a failure that names it, including the case where the
   constants are renamed out from under the script's own pattern — a gate that matches nothing
   reports the same success as a tree that agrees. It runs in the `panic-site inventory` job
@@ -1012,13 +1112,13 @@ Pointers only: each item is set out in full in the entry named.
   release re-derived (§ 4.4, § 4.5, § 4.11, § 6.10) and carries a date and a release rather
   than a hash, per `docs/policy/versioning.md` § 10.
 
-- **The `ServerReject` frame has had three reject codes for two releases and the spec
-  documented one.** `docs/protocol/PROTOCOL.md`'s § 2 table and its § 6.10 struct listing
-  both named `1 = REJECT_UNSUPPORTED_VERSION` and nothing else, while
-  `2 = REJECT_PROTOCOL_VARIANT` had already shipped and `3 = REJECT_RETRY_LIMIT` arrives
-  here. A second implementation reading that spec would have rendered either of the other
-  two as a version refusal — which is exactly the mistake this release fixes in its own
-  client. Both sites now list all three, § 6.10 says what each means and what a receiver
+- **The `ServerReject` frame carries three reject codes now and the spec documented one.**
+  `docs/protocol/PROTOCOL.md`'s § 2 table and its § 6.10 struct listing both named
+  `1 = REJECT_UNSUPPORTED_VERSION` and nothing else, and went on naming only that while
+  `2 = REJECT_PROTOCOL_VARIANT` and `3 = REJECT_RETRY_LIMIT` were both added to the frame in
+  this same release — the specification lagged the code inside one window rather than across
+  two. A second implementation reading that spec would have rendered either of the new codes
+  as a version refusal — which is exactly the mistake this release fixes in its own client. Both sites now list all three, § 6.10 says what each means and what a receiver
   does with a code it does not recognise (treat it as fatal and non-retryable, and do not
   read it as a version refusal — `supported_version` is present whatever the reason was),
   and the section heading no longer calls the frame an unsupported-version signal, since
@@ -5156,8 +5256,8 @@ dependency changes** — binary- and wire-compatible with 0.2.0
   stalled all further sends. Send accounting now uses the payload length, so
   inflight balances exactly against the ACK and loss paths.
 
-[Unreleased]: https://github.com/snaart/phantom_protocol/compare/v0.3.1...HEAD
-[0.3.1]: https://github.com/snaart/phantom_protocol/compare/v0.3.0...v0.3.1
+[Unreleased]: https://github.com/snaart/phantom_protocol/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/snaart/phantom_protocol/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/snaart/phantom_protocol/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/snaart/phantom_protocol/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/snaart/phantom_protocol/compare/v0.2.0...v0.2.1
