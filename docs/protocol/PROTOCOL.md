@@ -1849,8 +1849,8 @@ reach.
 returns `HandshakeResponse::{Success(ServerHello, Session, Option<Vec<u8>>),
 Retry(HelloRetryRequest), Reject(ServerReject), Fail(HandshakeError)}` — the
 `Option<Vec<u8>>` is the decrypted 0-RTT early-data plaintext, or `None`; the
-`Reject` arm carries the typed unsupported-version signal of §6.10 (the listener
-serialises it back before closing). `process_server_hello` returns `(Session,
+`Reject` arm carries the typed refusal signal of §6.10, whose `code` says which of
+the three reasons it is (the listener serialises it back before closing). `process_server_hello` returns `(Session,
 Option<bool>)` — the second element is the 0-RTT verdict (`None` when the client
 sent no early-data).
 
@@ -2287,7 +2287,7 @@ source its reputation back). A client implementation should therefore solve
 whatever it is handed, up to its own ceiling of 24, rather than assume the 16 in
 this table is the most it can be asked for.
 
-### 6.10 `ServerReject` (borsh) — unsupported-version signal
+### 6.10 `ServerReject` (borsh) — typed refusal signal
 
 ```rust
 pub struct ServerReject {
