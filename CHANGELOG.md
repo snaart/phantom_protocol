@@ -549,7 +549,8 @@ Pointers only: each item is set out in full in the entry named.
   fix and one obvious way out, which is to hard-code the word again. A patch release never
   reached it, because `0.3.0 -> 0.3.1` derives `patch` and no step is narrower than that; so
   cutting a minor release is what made it reachable, and it was reachable before it was
-  shipped. Fourteen new stubbed-cargo cases pin all of this, the suite asserts its own case
+  shipped. Sixteen new stubbed-cargo cases pin all of this, the last two being the empty
+  `--release-type` refusal set out further down this section; the suite asserts its own case
   count, and it runs as a pre-commit hook when the script or the cases change.
 
 - **The changelog gate read a baseline only from a cold run.** `check_changelog_breaking.py`
@@ -708,8 +709,10 @@ Pointers only: each item is set out in full in the entry named.
   reverting that fix would have been green in every job. It runs in `bindings.yml`'s `c` job
   now, and the general form of the mistake is gated too: `scripts/check_gate_wiring.py`
   inventories every check in the tree and fails when one is invoked by no workflow, no hook and
-  no script that itself runs. Eight mutation cases, including the case where its own naming
-  convention stops matching, so a convention change is reported rather than passing silently.
+  no script that itself runs. Fifteen mutation cases, including the case where its own naming
+  convention stops matching, so a convention change is reported rather than passing silently,
+  and the case that fired against the script itself — see the entry below, "A check counted as
+  invoked because its own mutation harness named it".
 
 - **The record of what this release takes away from a consumer named five of the twelve
   selections it takes.** `inherited_dependency_features` in `core/src/lib.rs` holds a row per
@@ -978,10 +981,14 @@ Pointers only: each item is set out in full in the entry named.
   receiver does with a code it does not recognise. Nothing else could notice the drift it
   exists for: a code is a `pub const` and a match arm, no wire format moves, no frozen vector
   changes, and the frame is never sent on the success path, so the two codes this release adds
-  reached a green tree with the specification still naming one. Seven mutation cases, each
-  putting one thing wrong and requiring a failure that names it, including the case where the
-  constants are renamed out from under the script's own pattern — a gate that matches nothing
-  reports the same success as a tree that agrees. It runs in the `panic-site inventory` job
+  reached a green tree with the specification still naming one. Each of the specification's two
+  normative sites — the byte-level field table and the struct listing — is read on its own, so
+  restoring either one to its 0.3.0 content fails even while the rest of the document is
+  current; see **Fixed**, "The reject-code gate read the whole specification where only two
+  sites are normative". Eleven mutation cases, each putting one thing wrong and requiring a
+  failure that names it, including the case where the constants are renamed out from under the
+  script's own pattern — a gate that matches nothing reports the same success as a tree that
+  agrees. It runs in the `panic-site inventory` job
   and as a pre-commit hook, and `scripts/check_gate_wiring.py` now vouches for both.
 
 - **Two of this file's own claims about itself are held to the code in `cargo test --lib`.**
