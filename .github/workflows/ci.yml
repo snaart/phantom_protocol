@@ -404,7 +404,7 @@ jobs:
       - run: python3 scripts/check_changelog_breaking.py --structure-only
 
   interop-published:
-    # The release notes lead with "a 0.3.1 peer and a 0.3.0 peer interoperate in
+    # The release notes lead with "a 0.4.0 peer and a 0.3.0 peer interoperate in
     # both directions" and nothing in the tree tested it. That claim fails in
     # silence: a packet whose `PacketHeader.version` disagrees is DROPPED with no
     # reply and before any flag is read, so two incompatible peers complete a
@@ -413,7 +413,8 @@ jobs:
     # both sides is not the same proof: the wire is also the 47-byte AEAD AAD
     # image, the header-protection mask over all 15 header bytes, the rotating
     # connection id and the payload codec behind each flag, and any of those
-    # moving in a patch breaks interop with both constants unchanged. Verified
+    # moving in a release that leaves both constants alone breaks interop with
+    # nothing in either peer to read it off. Verified
     # by breaking it three ways — `WIRE_VERSION` 8 -> 9, and two field swaps in
     # the AAD image with both constants left alone; the two that change a byte
     # any session actually sends both fail here.

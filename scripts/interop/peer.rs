@@ -4,7 +4,7 @@
 // `phantom-protocol` they link -- and nothing about the exchange can be attributed to one of
 // them being written differently.
 //
-// The release notes lead with the claim that a 0.3.1 peer and a 0.3.0 peer interoperate in
+// The release notes lead with the claim that a 0.4.0 peer and a 0.3.0 peer interoperate in
 // both directions.  Nothing tested it.  `WIRE_VERSION` is 8 in both and a mismatched header
 // version is dropped in silence -- no reply, nothing the sender can observe -- so the way
 // this claim fails is that a handshake completes, keys agree, and then no byte is ever

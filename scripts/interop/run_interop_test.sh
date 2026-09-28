@@ -29,9 +29,10 @@ set -euo pipefail
 #     scripts/interop/run_interop_test.sh udp          # one transport
 #
 # Both peers are built from one source file, `scripts/interop/peer.rs`, included by both
-# crates. Two crates rather than one binary with two dependencies because 0.3.0 and 0.3.1 are
-# semver-compatible for cargo -- 0.x breaks on the minor -- so a single crate asking for both
-# would get one of them twice.
+# crates. Two crates rather than one binary with two dependencies because one
+# `[dependencies]` table cannot name `phantom-protocol` twice: it would have to rename one of
+# them, and then the two peers would differ in their source as well as in the version they
+# link, which is the one thing this pairing has to hold identical.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
