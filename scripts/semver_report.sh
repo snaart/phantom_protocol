@@ -149,10 +149,12 @@ while [ "$#" -gt 0 ]; do
                 exit 2
             fi
             RELEASE_TYPE="$2"
+            RELEASE_TYPE_GIVEN=yes
             shift 2
             ;;
         --release-type=*)
             RELEASE_TYPE="${1#--release-type=}"
+            RELEASE_TYPE_GIVEN=yes
             shift
             ;;
         --*)
@@ -330,13 +332,18 @@ if ! command -v cargo-semver-checks > /dev/null 2>&1; then
     exit 2
 fi
 
-if [ -n "${RELEASE_TYPE}" ]; then
+# Whether the caller passed the flag, not whether the value they passed is
+# non-empty: `--release-type ""` used to read as "not given" and fall through to
+# the derivation, so a caller whose variable had gone empty -- `--release-type
+# "${BUMP}"` in a workflow where `BUMP` was never set -- got a derived type and a
+# report that named it as derived, in the one place they had asked not to guess.
+# An empty value is a caller error and is refused as one below.
+if [ "${RELEASE_TYPE_GIVEN}" = yes ]; then
     if ! release_type_rank "${RELEASE_TYPE}" > /dev/null; then
         echo "semver_report: --release-type must be patch, minor or major; got '${RELEASE_TYPE}'." >&2
         exit 2
     fi
     RELEASE_TYPE_SOURCE="given: --release-type on the command line"
-    RELEASE_TYPE_GIVEN=yes
 else
     derive_release_type || exit 2
 fi

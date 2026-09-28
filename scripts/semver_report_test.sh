@@ -53,7 +53,7 @@ outcomes=0
 # Every case reports exactly one outcome, and the total is asserted at the end.
 # A case that is deleted, renamed, or simply never added to the list at the bottom
 # leaves no other trace: the suite still prints only "ok" lines and still exits 0.
-EXPECTED_CASES=19
+EXPECTED_CASES=21
 
 pass() {
     outcomes=$((outcomes + 1))
@@ -522,6 +522,44 @@ case_an_unknown_option_is_rejected() {
     rm -rf "${dir}"
 }
 
+# An empty value for the flag is a setup error, not an omission. It used to fall
+# through to the derivation: `--release-type ""` set an empty string, the check
+# below asked whether the string was non-empty rather than whether the flag was
+# given, and a caller who had written `--release-type "${BUMP}"` in a workflow
+# where `BUMP` was never set got a derived type -- in the one place they had asked
+# for no guessing -- with the report naming it as derived and nothing failing.
+case_an_empty_release_type_is_rejected() {
+    local dir
+    dir="$(mktemp -d)"
+    make_repo "${dir}" 0.3.1 0.3.1 0.3.0
+    make_recording_stub "${dir}" 0 "$(clean_verdict_for 0.3.0 0.3.1)"
+    run_in_repo "${dir}" --release-type ""
+    if [ "${RC}" -eq 2 ] && ! [ -f "${dir}/args.txt" ] \
+        && printf '%s' "${OUT}" | grep -q "must be patch, minor or major"; then
+        pass "an empty --release-type exits 2 without running a comparison"
+    else
+        fail "an empty --release-type exited ${RC} and may have derived a type instead: ${OUT}"
+    fi
+    rm -rf "${dir}"
+}
+
+# The `=` spelling takes the same path, and it is the easier of the two to write
+# empty by accident: `--release-type=${BUMP}` with an unset variable is a single
+# argument that reads as the flag with nothing after it.
+case_an_empty_joined_release_type_is_rejected() {
+    local dir
+    dir="$(mktemp -d)"
+    make_repo "${dir}" 0.3.1 0.3.1 0.3.0
+    make_recording_stub "${dir}" 0 "$(clean_verdict_for 0.3.0 0.3.1)"
+    run_in_repo "${dir}" "--release-type="
+    if [ "${RC}" -eq 2 ] && ! [ -f "${dir}/args.txt" ]; then
+        pass "an empty --release-type= exits 2 without running a comparison"
+    else
+        fail "an empty --release-type= exited ${RC} and may have derived a type instead: ${OUT}"
+    fi
+    rm -rf "${dir}"
+}
+
 # The defect this pins, and it is the one the derivation itself introduced. In the
 # open window after a minor or a major release the manifest version is the
 # published one and its own section is already written, so the tree reads a step
@@ -620,6 +658,8 @@ case_a_stricter_release_type_is_noted_not_rejected
 case_a_report_without_a_checking_line_fails
 case_the_report_records_the_release_type
 case_an_unknown_option_is_rejected
+case_an_empty_release_type_is_rejected
+case_an_empty_joined_release_type_is_rejected
 case_an_open_window_after_a_minor_release_re_runs_narrower
 case_the_kept_report_is_the_re_run_alone
 case_a_baseline_that_keeps_moving_is_not_retried_for_ever
