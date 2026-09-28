@@ -1,11 +1,11 @@
 # Deferred work
 
 This file is the single, honest record of capabilities that are **consciously
-deferred**, current as of **0.3.1**. Each is either a multi-week sub-project, gated
+deferred**, current as of **0.4.0**. Each is either a multi-week sub-project, gated
 on infrastructure outside the code tree, or limited by a platform API. None blocks a
 release on its own; all are tracked here so the deferral is explicit rather than
 implied by silence. Items 1–4 were first recorded against 0.2.0 and are still open;
-item 5 was added in 0.3.1.
+item 5 was added in 0.4.0.
 
 What the protocol does and does not defend against today is in
 [`security/threat-model.md`](security/threat-model.md); the wire format is frozen
@@ -240,7 +240,7 @@ of infrastructure, and the cost is per platform rather than one-off:
   harness turned from a compile check into something that runs.
 - **A prebuilt artifact per target** is a matrix row in `build-artifacts` plus the
   install-name / symbol-table handling that row already needs (see § 1 and
-  `../CHANGELOG.md` for the 0.3.1 fixes to both), a Windows `.dll` import-library
+  `../CHANGELOG.md` for the 0.4.0 fixes to both), a Windows `.dll` import-library
   question, and a per-target entry in the release's own artifact shape check.
 
 **What would close it.** In the order that buys the most per row: a

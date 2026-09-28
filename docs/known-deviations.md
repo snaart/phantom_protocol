@@ -105,13 +105,13 @@ resume once, with the payload.
 
 **Specified in.** The rustdoc on `connect_pinned_with_resumption`,
 `connect_pinned_udp_with_resumption` and `SessionBuilder::resumption`; release notes
-for 0.3.1 under **Documented**.
+for 0.4.0 under **Documented**.
 
 ---
 
 ## 5. The concurrent-stream cap is per side, is not negotiated, and a 0.3.0 peer counts differently
 
-**Observed.** Against a 0.3.0 peer, a 0.3.1 client's 256th concurrent stream accepts
+**Observed.** Against a 0.3.0 peer, a 0.4.0 client's 256th concurrent stream accepts
 writes that are never delivered. The session does not fail: it oscillates between
 `ConnectionState::Migrating` and `Connected` on the keep-alive tick, `last_error()`
 stays `None`, its other streams keep carrying data, and the one stream stays stuck
@@ -130,7 +130,7 @@ do not know. Neither side can detect the other's rule, and there is no field in
 which to ask.
 
 **Specified in.** [`protocol/PROTOCOL.md`](protocol/PROTOCOL.md) § 4.4; the
-`MAX_STREAMS` rustdoc; release notes for 0.3.1 under **Fixed**.
+`MAX_STREAMS` rustdoc; release notes for 0.4.0 under **Fixed**.
 
 ---
 
@@ -150,7 +150,7 @@ binding must be regenerated rather than relinked.
 the session failed.
 
 **Specified in.** [`architecture/ARCHITECTURE.md`](architecture/ARCHITECTURE.md) §
-9; [`protocol/PROTOCOL.md`](protocol/PROTOCOL.md) § 4.5; release notes for 0.3.1
+9; [`protocol/PROTOCOL.md`](protocol/PROTOCOL.md) § 4.5; release notes for 0.4.0
 under **Documented**.
 
 ---
@@ -169,7 +169,7 @@ the schedule, so a name whose first address works is still the only one contacte
 Each attempt is waited on for at most an even share of the deadline, floored at 2 s;
 at six addresses or more `floor × count` exceeds the deadline, which leaves such a
 name a tail of addresses the walk never reaches. The deadline is the outer authority,
-so the whole call fits inside it — that was not true before 0.3.1, where the walk ran
+so the whole call fits inside it — that was not true before 0.4.0, where the walk ran
 the addresses strictly in turn and could take the deadline plus a share. One property
 is narrower than the serial walk's: an impostor that says nothing at all before a
 later address completes is not reported, where the serial walk would have waited out
@@ -190,7 +190,7 @@ cannot be right for all of them. Pass an IP literal, or a single-address name, i
 you need the single-address contract.
 
 **Specified in.** The rustdoc on `connect_pinned_udp` and on
-`connect_udp_trying_each_address`; release notes for 0.3.1 under **Fixed**.
+`connect_udp_trying_each_address`; release notes for 0.4.0 under **Fixed**.
 
 ---
 
@@ -211,7 +211,7 @@ which refuses rather than corrects. So the asymmetry stays.
 configures; use the transport setter only where you built the transport.
 
 **Specified in.** The `PhantomConfig::write_stall_timeout` rustdoc; release notes
-for 0.3.1 under **Documented**.
+for 0.4.0 under **Documented**.
 
 ---
 
@@ -219,7 +219,7 @@ for 0.3.1 under **Documented**.
 
 **Observed.** On a session handed back by a listener, `supports_migration()` used to
 answer `true` and `migrate()` used to answer `Ok(())` for work the data pump
-discarded. As of 0.3.1 the first answers `false` and the second returns
+discarded. As of 0.4.0 the first answers `false` and the second returns
 `CoreError::Unsupported`.
 
 **The rule.** Both halves of a PhantomUDP session rebind without a re-handshake, so
@@ -232,7 +232,7 @@ consumer cannot migrate a server session at all.
 a binding, migrate the client.
 
 **Specified in.** The rustdoc on `PhantomSession::supports_migration`, `migrate` and
-`migrate_server`, and on each PhantomUDP transport; release notes for 0.3.1 under
+`migrate_server`, and on each PhantomUDP transport; release notes for 0.4.0 under
 **Fixed**.
 
 ---

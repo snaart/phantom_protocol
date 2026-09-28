@@ -26,7 +26,7 @@ Three are pinned elsewhere, because they belong to builds that suite does not
 compile: Invariant 3 rides the off-by-default `mimicry` feature, and
 Invariants 10 and 11 are FIPS-build behaviour gated by the `fips-feature` CI
 job (Invariant 10's default-build half is covered by the handshake unit tests
-and, since 0.3.1, by three cases in that always-on suite). Two are pinned in
+and, since 0.4.0, by three cases in that always-on suite). Two are pinned in
 part, and their entries say which part.
 
 | # | Invariant | Section |
@@ -85,7 +85,7 @@ and returns `CoreError::ServerIdentityMismatch` on a wrong key, and the same err
 is available afterwards from `last_error()` and from `send()` / `recv()` once the
 state is terminal.
 
-When these functions return relative to the handshake is not uniform, and 0.3.1
+When these functions return relative to the handshake is not uniform, and 0.4.0
 changed it for three of them. `connect_pinned`, `connect_pinned_with_config`,
 `connect_pinned_with_resumption` and `connect_pinned_mimic` return as soon as the
 socket is open, before the handshake has run. The three PhantomUDP entry points do
@@ -368,7 +368,7 @@ flight is caught by the client's signature check. A fips and a non-fips peer
 therefore never complete a handshake with each other. Do not drop the field, move
 it from the head of the transcript, or add a field ahead of it.
 
-**Since 0.3.1 the refusal is answered on the wire.** It used to be a
+**Since 0.4.0 the refusal is answered on the wire.** It used to be a
 `HandshakeResponse::Fail`, which the listener answers by closing without a reply, so
 the peer this check exists to inform learned nothing: over TCP a bare connection
 error, and over PhantomUDP — which has no close to observe — a client that

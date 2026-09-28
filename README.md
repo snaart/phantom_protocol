@@ -20,7 +20,7 @@ no_std. (An optional TLS-over-TCP DPI-mimicry transport — `mimicry` feature �
 makes a flow look like HTTPS to passive DPI; anti-DPI obfuscation only, detectable
 by active probing — see [Status & limitations](#status--limitations).)
 
-> **Pre-1.0 (`0.3.1`).** Wire format may break between minors; SemVer kicks in at
+> **Pre-1.0 (`0.4.0`).** Wire format may break between minors; SemVer kicks in at
 > 1.0. 0 workspace warnings, 0 `unsafe` outside two audited opt-ins, MSRV Rust
 > 1.93, every row of the cross-target matrix green. Those rows are
 > `cargo check --lib`; which targets ship a prebuilt artifact and which ones the
@@ -38,7 +38,7 @@ Published on crates.io as [`phantom-protocol`](https://crates.io/crates/phantom-
 
 ```toml
 [dependencies]
-phantom-protocol = "0.3"
+phantom-protocol = "0.4"
 ```
 
 or `cargo add phantom-protocol`. API docs: <https://docs.rs/phantom-protocol>.
@@ -473,11 +473,11 @@ Read these before reusing any of them:
 - **Duplex** — the download half of a transfer running both ways at once,
   against the one-way download of the same run: 81–89% in the morning, 49–63% in
   the afternoon.
-- **No released build is the build measured here** — not 0.3.0 and not 0.3.1. One
+- **No released build is the build measured here** — not 0.3.0 and not 0.4.0. One
   congestion-control change landed after these campaigns — the loss-driven volume
   bound no longer applies during Startup — and it has so far been measured only in
   the in-tree bottleneck model (see [`CHANGELOG.md`](https://github.com/snaart/phantom_protocol/blob/main/CHANGELOG.md)),
-  not on this route. Nothing in 0.3.1 touches the data plane's rate behaviour, so
+  not on this route. Nothing in 0.4.0 touches the data plane's rate behaviour, so
   the gap is the same one change wide as it was at 0.3.0.
 
 **2026-08-17 and 2026-08-22.** Upload only, and against a round-trip echo,
@@ -595,7 +595,7 @@ is OTLP push), signing-key volume at
 and TCP healthcheck.
 
 ```bash
-docker build -t phantom-server:0.3.1 .
+docker build -t phantom-server:0.4.0 .
 docker compose up -d
 ```
 
@@ -603,7 +603,7 @@ docker compose up -d
 
 Production-shape chart at
 [`docs/operations/helm/phantom-protocol/`](https://github.com/snaart/phantom_protocol/tree/main/docs/operations/helm/phantom-protocol/).
-`appVersion: 0.3.1`, ClusterIP service on `4242`, 3 replicas,
+`appVersion: 0.4.0`, ClusterIP service on `4242`, 3 replicas,
 `tcpSocket` liveness / readiness. Raw manifests + walkthrough in
 [`docs/operations/kubernetes.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/operations/kubernetes.md).
 
@@ -830,20 +830,29 @@ of CI. Reaching L3 is a workflow change, not a code change — see
   bare metal compile and never execute; Android is in no workflow. See
   [Platform support](#platform-support) and
   [`docs/DEFERRED_WORK.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/DEFERRED_WORK.md) § 5.
-- **Pre-1.0 (`0.3.1`).** Wire format may break between minors; SemVer applies
+- **Pre-1.0 (`0.4.0`).** Wire format may break between minors; SemVer applies
   once 1.0 ships. The current wire protocol is a single pinned version — the
   former V1/V2/V3 axes were collapsed pre-1.0, with no negotiation and no
-  fallback, so there are no cross-version migration guides. **0.3.x and 0.2.x
-  peers do not interoperate:** this release speaks `WIRE_VERSION` <!--pinned:WIRE_VERSION-->8
-  and `PROTOCOL_VERSION` <!--pinned:PROTOCOL_VERSION-->5, where 0.2.x spoke 6 and
-  3, and the handshake refuses the mismatch with a typed `ServerReject` rather
-  than negotiating down. Upgrade both ends together, and regenerate the language
-  bindings rather than relinking them on **every** upgrade in this series: every
-  UniFFI checksum moved in 0.3.0, and eleven of them move again in 0.3.1, because
-  `uniffi` folds an exported item's doc comment into its checksum and 0.3.1
-  corrects eleven of those comments. `UNIFFI_CONTRACT_VERSION` is unchanged, so the
-  coarse gate passes and a stale binding fails at import time in your process
-  instead. Both lists are in
+  fallback, so there are no cross-version migration guides. **0.4.x and 0.3.x
+  peers do interoperate; 0.2.x peers do not:** this release speaks
+  `WIRE_VERSION` <!--pinned:WIRE_VERSION-->8
+  and `PROTOCOL_VERSION` <!--pinned:PROTOCOL_VERSION-->5, which is what 0.3.0
+  speaks, so either end of a 0.4/0.3 pair may be upgraded on its own and a CI job
+  proves it in both directions with each version as the server. 0.2.x spoke 6 and
+  3, and the handshake refuses that mismatch with a typed `ServerReject` rather
+  than negotiating down. A 0.3 → 0.4 upgrade asks two things of you, both in your
+  own files rather than in your code. **Name the `tokio` and `time` features your
+  own code uses, in your own manifest** — `signal`, `process`, `fs`, `io-std` and
+  `time/std`: this release stops asking for them, and Cargo's feature unification
+  is what had been handing them to you, so code that never mentions this crate can
+  stop compiling. Doing it first is safe and is correct against every version.
+  **And regenerate the language bindings rather than relinking them**, which holds
+  for **every** upgrade in this series: every UniFFI checksum moved in 0.3.0 and
+  eleven move again here, because `uniffi` folds an exported item's doc comment
+  into its checksum and this release corrects eleven of those comments.
+  `UNIFFI_CONTRACT_VERSION` is unchanged, so the coarse gate passes and a stale
+  binding fails at import time in your process instead. The features, the crates
+  that leave and the eleven checksums are each listed in
   [`CHANGELOG.md`](https://github.com/snaart/phantom_protocol/blob/main/CHANGELOG.md).
 - **Native UDP transport (PhantomUDP): handshake + demux + reliability shipped.**
   `PhantomSession` runs an authenticated session over TCP, WebSocket, and raw UDP

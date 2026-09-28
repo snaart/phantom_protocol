@@ -6,9 +6,11 @@ protocol: a single packet shape, a single handshake, and a single pinned
 version byte. The protocol is **not negotiated**: there is no version
 handshake, no fallback, and no protocol-*version* migration path. That is not
 for want of deployed peers — 0.2.x is published and speaks `WIRE_VERSION` 6 /
-`PROTOCOL_VERSION` 3, and every 0.3.x release (8 / 5) cannot talk to it. Pre-1.0 a wire
-change is a hard cut: a peer on the other side of it is refused at the
-handshake (§ 1), and both ends of a connection upgrade together. The one
+`PROTOCOL_VERSION` 3, and every 0.3.x and 0.4.x release (8 / 5) cannot talk to it. Pre-1.0
+a wire change is a hard cut: a peer on the other side of it is refused at the
+handshake (§ 1), and both ends of a connection upgrade together. A minor version bump does
+not imply a cut, and 0.4.0 is one that was not: it left both constants where 0.3.0 put
+them, so those two releases interoperate in both directions. The one
 surviving version byte is a tamper-check anchor and a hook for a future,
 deliberate bump. (*Connection* migration — one session surviving a
 network-path change without re-handshaking — is a separate axis on the
@@ -606,7 +608,7 @@ reliable segment naming a new id past the cap is refused rather than admitted, a
 stalls instead of the table growing without bound.
 
 **A peer that counts differently is handed that stall, and this implementation
-counted differently until 0.3.1.** Before then the whole table was compared against
+counted differently until 0.4.0.** Before then the whole table was compared against
 the cap, so a 0.3.0 receiver admits 255 peer streams — one fewer for every stream it
 has opened itself — and refuses the 256th. The refusal is silent by the rule above and
 the segment stays outstanding, so what the sender sees depends on whether it has other
@@ -2786,13 +2788,13 @@ either.
 
 ## 13. Last verified against the code
 
-The newest stamp is **2026-09-27, the 0.3.1 release**, and it covers four
+The newest stamp is **2026-09-28, the 0.4.0 release**, and it covers four
 sections rather than the whole document: § 4.4, § 4.5, § 4.11 and § 6.10 were
 re-derived from the source in that release and are current as of it. Everything else carries
 the stamp below it. A reader picking this up later should treat the newest stamp
 covering the section they are reading as its expiry date: anything that has moved
 in `core/src/transport/`, `core/src/crypto/` or `core/src/api/session.rs` since
-then has not been re-checked here. The four 0.3.1 items, each named so it can be
+then has not been re-checked here. The four 0.4.0 items, each named so it can be
 checked rather than taken:
 
 - **§ 4.4** — the concurrent-stream cap counts the streams **the peer** holds, not
@@ -2808,11 +2810,11 @@ checked rather than taken:
   where an end-of-stream arrives behind the close; a UART has none, so there the
   draining deadline itself ends the session.
 - **§ 6.10** and the `ServerReject` table in § 2 — the reject `code` field has
-  three assigned values, not one: `2 = REJECT_PROTOCOL_VARIANT` shipped in an
-  earlier release without reaching this document, and `3 = REJECT_RETRY_LIMIT` is
-  new in 0.3.1. The section now also says what a receiver does with a code it does
-  not know, which matters because the message carries `supported_version` whatever
-  the reason is.
+  three assigned values, not one: `2 = REJECT_PROTOCOL_VARIANT` and
+  `3 = REJECT_RETRY_LIMIT` were both added to the frame in 0.4.0, and this document
+  named only code 1 until the same release. The section now also says what a receiver
+  does with a code it does not know, which matters because the message carries
+  `supported_version` whatever the reason is.
 
 Commit ids are deliberately absent from this stamp: the history up to the `v0.3.0`
 tag was rewritten once already, and `../policy/versioning.md` § 10 asks for a tag,
