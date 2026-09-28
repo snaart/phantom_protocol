@@ -149,6 +149,18 @@ completes is not reported. The serial walk did not guarantee that either — an
 impostor silent for longer than its own share was missed there too — but the window
 is now the attempt delay plus the winner's handshake rather than a full share.
 
+Both verdicts can be in hand at once — one address refusing while an earlier one is
+still handshaking, or an address completing while an earlier one is about to refuse
+— and the lower-numbered address is the one whose verdict answers, the resolver's
+order being a preference. So a refusal from an address *behind* the one that
+answered does not reach the caller at all: the earlier session is handed back, the
+session's own error is `None`, and the roster naming every address tried is built
+only for the error path. That is the one path on which a peer answered for this name
+with an identity that is not the pinned one and nothing in the caller's `Result` says
+so, so the walk writes it to `log::warn!`, naming both the address that refused and
+the one handed back. An operator who collects warnings is the only reader this
+invariant has there; a deployment that discards them should pin per address instead.
+
 Enforced in: `core/src/api/session.rs` (`PhantomSession::connect_with_transport`,
 `SessionBuilder::connect`, `spawn_client`, the `connect_pinned*` functions,
 `connect_udp_trying_each_address`),
@@ -159,6 +171,9 @@ Pinned by: `security_invariants::server_identity_mismatch_aborts_handshake`;
 `api::session::tests::session_builder_missing_pinned_key_errors`;
 `api::session_end_tests::an_impostor_answering_first_for_the_name_is_reported_and_stops_the_walk`
 (the candidate-walk rule above, over two live loopback servers);
+`api::session_end_tests::a_hostile_address_after_the_right_one_does_not_end_the_walk`
+(the overruled refusal, including the warning it leaves behind);
+`api::session::tests::the_lower_numbered_address_is_the_one_whose_verdict_answers`;
 `tcp_integration::tcp_integration_wrong_pinned_key_rejected` and the pinned
 round-trips in `tcp_integration` / `udp_integration`.
 
