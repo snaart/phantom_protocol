@@ -255,3 +255,33 @@ cross-build and for running the suite there yourself.
 
 **Specified in.** [`../README.md`](../README.md), "Platform support";
 [`DEFERRED_WORK.md`](DEFERRED_WORK.md) § 5.
+
+---
+
+## 11. `disconnect()` pushes what it can and discards the rest
+
+**Observed.** An application hands half a mebibyte to `send()`, calls
+`disconnect()`, and the peer receives a few kibibytes. Both calls returned `Ok`,
+`last_error()` stays `None`, and nothing at either end reports the loss.
+
+**The rule.** `disconnect()` raises a close signal and returns at once; the work
+happens on the pump afterwards. The pump takes the writes queued ahead of the close
+— so `send(x)` followed by `disconnect()` does push `x` — but only until the socket,
+the congestion window or the peer's flow-control limit refuses the next segment, and
+then it stops. It does not wait for an acknowledgement, so "pushed" means "handed to
+the transport", not "the peer has it"; anything still refused at that point is
+discarded. What gets through is therefore bounded by roughly one congestion window
+rather than by the size of the queue. The announcement is a best-effort `CONTROL`
+frame carrying `ControlSubtype::CLOSE`: unacknowledged, never retransmitted. Dropping
+the handle is the same path with no `await` to hold the process still, so a process
+that exits immediately afterwards can leave before any of it reaches the wire. There
+is no transport-level signal to wait on instead — the thing one would wait for is the
+acknowledgement this frame deliberately does not have.
+
+**Write instead.** If delivery matters, do not ask the transport for it. Have the
+peer say at the application level that it received the data, and call `disconnect()`
+once that answer has arrived.
+
+**Specified in.** [`protocol/PROTOCOL.md`](protocol/PROTOCOL.md) § 4.11, "`CLOSE`
+semantics" and the draining paragraphs; the rustdoc on `PhantomSession::disconnect`,
+under "Nothing here is a delivery guarantee".

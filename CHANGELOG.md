@@ -1041,9 +1041,10 @@ Pointers only: each item is set out in full in the entry named.
   look first.** This release documents several behaviours that are deliberate, specified and
   have still caught a consumer out — the draining window a byte-pipe session does not wait
   out, the resumption ticket a payload-free resume spends, the stream cap a mixed pair
-  counts two ways — and each of them was written down correctly several hundred lines into a
+  counts two ways, the half mebibyte `disconnect()` discards because it does not wait for an
+  acknowledgement — and each of them was written down correctly several hundred lines into a
   release section or a rustdoc. A reader who has just been surprised cannot guess which
-  document to open. The new file is an index of ten such entries, each in the same three
+  document to open. The new file is an index of eleven such entries, each in the same three
   parts: what a consumer observed, what the rule actually is, and what to write instead. It
   is linked from `README.md`'s pre-1.0 notice and from its documentation list, and it is
   explicitly not a defect list (those are here, under the release that fixed them) and not a
