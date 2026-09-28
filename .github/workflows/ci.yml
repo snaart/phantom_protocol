@@ -87,6 +87,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # The WITHDRAWN gate in `core/src/lib.rs` reads the manifest of the
+          # release a row names, so once the version moves past the release in a
+          # row, `cargo test --lib` needs that tag. A shallow checkout carries
+          # none, and this is a required context.
+          fetch-depth: 0
       # Every runner under scripts/ and tests/ has to be named by a workflow, a
       # hook, or a script that runs. `tests/bindings/c/run_c_pinning_test.sh`
       # shipped with this release as the regression test for a pinned-identity
@@ -506,6 +512,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # The WITHDRAWN gate in `core/src/lib.rs` reads the manifest of the
+          # release a row names, so once the version moves past the release in a
+          # row, `cargo test --lib` needs that tag. A shallow checkout carries
+          # none, and this is a required context.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy
@@ -529,6 +541,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # The WITHDRAWN gate in `core/src/lib.rs` reads the manifest of the
+          # release a row names, so once the version moves past the release in a
+          # row, `cargo test --lib` needs that tag. A shallow checkout carries
+          # none, and this is a required context.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy
@@ -553,6 +571,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # The WITHDRAWN gate in `core/src/lib.rs` reads the manifest of the
+          # release a row names, so once the version moves past the release in a
+          # row, `cargo test --lib` needs that tag. A shallow checkout carries
+          # none, and this is a required context.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy
@@ -585,6 +609,12 @@ jobs:
     # but the CI runner of record is ubuntu-latest.
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # The WITHDRAWN gate in `core/src/lib.rs` reads the manifest of the
+          # release a row names, so once the version moves past the release in a
+          # row, `cargo test --lib` needs that tag. A shallow checkout carries
+          # none, and this is a required context.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy
