@@ -7807,6 +7807,79 @@ fn a_refusal_is_the_answer_now(refuser: usize, waiting: &[Option<Attempt>]) -> b
     waiting.iter().take(refuser).all(Option::is_none)
 }
 
+/// Which of the verdicts in hand is the caller's answer.
+///
+/// Both can be in hand at once: an address refuses while an earlier one is still
+/// handshaking, or an address completes while an earlier one is still about to refuse. The
+/// resolver's order is a preference, so the lower-numbered address answers either way — and
+/// getting it the other way round is a denial of service rather than a preference, because
+/// one hostile address *after* the right one refuses in a millisecond while the right one is
+/// still working, and answering with that refusal ends a walk that was about to succeed.
+///
+/// A pure function, and used at all three places the walk decides — inside the loop, at the
+/// budget deadline and after it — because the rule was written out three times and a
+/// divergence between the copies is invisible: each one on its own looks right.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerdictToActOn {
+    /// A completed handshake. Still subject to
+    /// [`an_earlier_address_is_still_answering`] before it is handed over.
+    Win,
+    /// A peer's refusal. Still subject to [`a_refusal_is_the_answer_now`].
+    Refusal,
+    /// Neither has happened yet.
+    Neither,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn verdict_to_act_on(won: Option<usize>, refused: Option<usize>) -> VerdictToActOn {
+    match (won, refused) {
+        // One index produces one verdict, so the two are never equal; `<` and `<=` decide
+        // the same way and the asymmetry is deliberately explicit.
+        (Some(winner), Some(refuser)) => {
+            if winner < refuser {
+                VerdictToActOn::Win
+            } else {
+                VerdictToActOn::Refusal
+            }
+        }
+        (Some(_), None) => VerdictToActOn::Win,
+        (None, Some(_)) => VerdictToActOn::Refusal,
+        (None, None) => VerdictToActOn::Neither,
+    }
+}
+
+/// Log the refusal an earlier address's success overruled.
+///
+/// The walk hands back the earlier address and says nothing, which is right for the caller —
+/// the service they asked for is the one they get — but it is the only moment anybody learns
+/// that something answered for this name and was not the pinned server. That is the signal
+/// Invariant 1 exists to produce, and on the winning path it has nowhere else to go: the
+/// caller's `Result` is `Ok`, `last_error()` is `None`, and the roster in the error message
+/// is never built. An operator with a poisoned resolver or a hostile extra address in a DNS
+/// answer would otherwise see a clean connect every time.
+#[cfg(not(target_arch = "wasm32"))]
+fn note_an_overruled_refusal(
+    addr: &str,
+    candidates: &[std::net::SocketAddr],
+    winner: usize,
+    refused: Option<&(usize, CoreError)>,
+) {
+    if let Some((refuser, e)) = refused {
+        if let Some(server) = candidates.get(*refuser) {
+            log::warn!(
+                "PhantomSession: {server} answered for {addr} and refused the connection \
+                 ({e}); {} answered correctly and comes first in the resolver's order, so \
+                 that is what this connect returns. Something is answering for this name \
+                 that is not the pinned server.",
+                candidates
+                    .get(winner)
+                    .map_or_else(|| "the winning address".to_string(), |w| w.to_string())
+            );
+        }
+    }
+}
+
 /// One address the walk has contacted and is still waiting on.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone)]
@@ -7838,7 +7911,7 @@ struct Attempt {
 /// a happy-eyeballs resolver do, and the first handshake to complete is the one handed back.
 /// The dark-first-address case costs the delay instead of the share.
 ///
-/// Three rules keep that from becoming a race, and each of them is there for a case that
+/// Four rules keep that from becoming a race, and each of them is there for a case that
 /// would otherwise be worse than the serial walk was:
 ///
 /// * **An address that has answered stops the schedule.** Once a candidate's transport has
@@ -7856,6 +7929,12 @@ struct Attempt {
 ///   while a working-but-slow first address was still handshaking, and its refusal would end
 ///   a walk that was about to succeed. The serial walk never had that problem because it
 ///   never reached the later address; held this way, neither does this one.
+/// * **Between two verdicts, the lower-numbered address answers.** Both can be in hand at
+///   once, and the resolver's order is a preference, so it decides: a success ahead of a
+///   refusal is handed back (with the refusal logged, since nothing else on that path says
+///   an impostor answered), and a refusal ahead of a success is the caller's answer. See
+///   [`verdict_to_act_on`], which holds the rule for all three of the places the walk
+///   applies it.
 ///
 /// What that leaves is one narrowing against the serial walk, and it is worth stating
 /// plainly: an impostor that has not said a *word* by the time a later address completes is
@@ -7897,10 +7976,38 @@ pub(crate) async fn connect_udp_trying_each_address<F>(
     addr: &str,
     candidates: &[std::net::SocketAddr],
     budget: std::time::Duration,
-    mut spawn: F,
+    spawn: F,
 ) -> Result<Arc<PhantomSession>, CoreError>
 where
     F: FnMut(crate::api::udp_transport::UdpClientTransport) -> PhantomSession,
+{
+    walk_candidate_addresses(addr, candidates, budget, spawn, |server| {
+        crate::api::udp_transport::UdpClientTransport::connect(server)
+    })
+    .await
+}
+
+/// [`connect_udp_trying_each_address`] with the socket-opening step handed in.
+///
+/// The seam exists for one branch that is otherwise unreachable from a test: a candidate
+/// whose socket cannot be bound at all. `UdpClientTransport::connect` binds `0.0.0.0:0` or
+/// `[::]:0`, which fails only where the host has no such family — the IPv6-disabled machine
+/// this walk is partly written for — and a test cannot arrange that for one address and not
+/// another. Everything else about the walk is exercised through the production entry point.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn walk_candidate_addresses<F, O, Fut>(
+    addr: &str,
+    candidates: &[std::net::SocketAddr],
+    budget: std::time::Duration,
+    mut spawn: F,
+    mut open: O,
+) -> Result<Arc<PhantomSession>, CoreError>
+where
+    F: FnMut(crate::api::udp_transport::UdpClientTransport) -> PhantomSession,
+    O: FnMut(std::net::SocketAddr) -> Fut,
+    Fut: std::future::Future<
+        Output = Result<crate::api::udp_transport::UdpClientTransport, CoreError>,
+    >,
 {
     use futures::StreamExt;
 
@@ -7936,7 +8043,7 @@ where
             )
         {
             let server = candidates[next];
-            match crate::api::udp_transport::UdpClientTransport::connect(server).await {
+            match open(server).await {
                 Ok(transport) => {
                     let answered = transport.peer_answered_flag();
                     let session = Arc::new(spawn(transport));
@@ -7952,28 +8059,35 @@ where
                     running.push(async move {
                         (at, tokio::time::timeout(share, session.await_ready()).await)
                     });
+                    contact_next_at = tokio::time::Instant::now() + CANDIDATE_ATTEMPT_DELAY;
                 }
-                Err(e) => tried.push((server, e)),
+                Err(e) => {
+                    tried.push((server, e));
+                    // No attempt was made, so there is nothing to give a head start to.
+                    // The delay exists to let a contacted address answer before another is
+                    // added to the race; charging it for an address whose socket could not
+                    // be bound is a quarter of a second of latency spent on a candidate
+                    // already known to be hopeless, and a name whose first two addresses
+                    // are of a family this host has not got paid it twice over.
+                    contact_next_at = tokio::time::Instant::now();
+                }
             }
             next += 1;
-            contact_next_at = tokio::time::Instant::now() + CANDIDATE_ATTEMPT_DELAY;
         }
 
-        // Which verdict in hand, if two are, is the one to act on: the lower-numbered
-        // address, because the resolver's order is a preference. Getting this the other way
-        // round is a denial of service rather than a preference — a hostile address *after*
-        // the right one refuses in a millisecond while the right one is still handshaking,
-        // and answering with its refusal ends a walk that was about to succeed.
-        let take_the_win = match (&won, &refused) {
-            (Some((w, _)), Some((r, _))) => w < r,
-            (Some(_), None) => true,
-            _ => false,
-        };
-        if take_the_win {
+        // Which verdict in hand, if two are, is the one to act on — see
+        // [`verdict_to_act_on`], which holds the rule for all three of the places it is
+        // applied.
+        let verdict = verdict_to_act_on(
+            won.as_ref().map(|(i, _)| *i),
+            refused.as_ref().map(|(i, _)| *i),
+        );
+        if verdict == VerdictToActOn::Win {
             // A completed handshake, once no earlier address is still answering — that one
             // may be about to refuse, and a refusal is an answer.
             if let Some((i, session)) = &won {
                 if !an_earlier_address_is_still_answering(*i, &waiting) {
+                    note_an_overruled_refusal(addr, candidates, *i, refused.as_ref());
                     return Ok(Arc::clone(session));
                 }
             }
@@ -8052,9 +8166,10 @@ where
                 // answered and said no, which is the caller's answer and not an address
                 // that did not work — and only then an attempt still running, unawaited, for
                 // the caller to ask about itself.
-                if take_the_win {
-                    if let Some((_, session)) = won {
-                        return Ok(session);
+                if verdict == VerdictToActOn::Win {
+                    if let Some((i, session)) = &won {
+                        note_an_overruled_refusal(addr, candidates, *i, refused.as_ref());
+                        return Ok(Arc::clone(session));
                     }
                 }
                 if let Some((_, e)) = refused {
@@ -8076,19 +8191,23 @@ where
             ) => {}
         }
     }
-    // Same precedence as inside the loop: the lower-numbered verdict answers.
-    if let (Some((w, _)), Some((r, _))) = (&won, &refused) {
-        if w > r {
-            if let Some((_, e)) = refused.take() {
+    // Same rule as inside the loop, from the same function.
+    match verdict_to_act_on(
+        won.as_ref().map(|(i, _)| *i),
+        refused.as_ref().map(|(i, _)| *i),
+    ) {
+        VerdictToActOn::Win => {
+            if let Some((i, session)) = &won {
+                note_an_overruled_refusal(addr, candidates, *i, refused.as_ref());
+                return Ok(Arc::clone(session));
+            }
+        }
+        VerdictToActOn::Refusal => {
+            if let Some((_, e)) = refused {
                 return Err(e);
             }
         }
-    }
-    if let Some((_, session)) = won {
-        return Ok(session);
-    }
-    if let Some((_, e)) = refused {
-        return Err(e);
+        VerdictToActOn::Neither => {}
     }
     // Reaching here means every candidate failed — either before a session existed, a socket
     // that could not be bound to that family at all, or with an answer the walk goes on from.
@@ -19282,6 +19401,45 @@ mod tests {
         // Once they have, it is the answer. An address never contacted counts as finished:
         // it cannot succeed either.
         assert!(a_refusal_is_the_answer_now(2, &[None, None, None]));
+    }
+
+    /// Between two verdicts, the lower-numbered address is the one that answers.
+    ///
+    /// **The defect it exists for.** This is the fourth rule of the overlapped walk and the
+    /// one that had no test. It decides what happens when a completed handshake and a
+    /// peer's refusal are both in hand, which the overlap made possible and the serial walk
+    /// never could: there, a refusal ended the walk before any later address was contacted.
+    ///
+    /// **What a consumer would observe, each way round.** Answering with the *later*
+    /// address's refusal is a denial of service — one hostile address after the right one in
+    /// a name's DNS answer refuses in a millisecond while the right one is still
+    /// handshaking, and a connect that was about to succeed fails instead, for every caller
+    /// of that name. Answering with the *later* address's success when an earlier one
+    /// refused is the opposite mistake: the impostor's refusal is the one signal Invariant 1
+    /// produces, and it is dropped.
+    ///
+    /// **Why it would come back unnoticed.** The rule was written out three times — in the
+    /// loop, at the budget deadline, and after it — as two different-looking expressions,
+    /// and each reads plausibly on its own. The end-to-end test in `session_end_tests`
+    /// reaches one direction of it and only through a timing window; the other direction
+    /// needs an address that answers late and refuses later still, which is three
+    /// simultaneous windows on a loopback path. Read as a function it is a comparison of two
+    /// integers.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_lower_numbered_address_is_the_one_whose_verdict_answers() {
+        // Nothing decided yet.
+        assert_eq!(verdict_to_act_on(None, None), VerdictToActOn::Neither);
+        // One of the two, alone, is the answer.
+        assert_eq!(verdict_to_act_on(Some(3), None), VerdictToActOn::Win);
+        assert_eq!(verdict_to_act_on(None, Some(3)), VerdictToActOn::Refusal);
+        // Both, with the success first: the hostile trailing address does not deny service.
+        assert_eq!(verdict_to_act_on(Some(0), Some(1)), VerdictToActOn::Win);
+        assert_eq!(verdict_to_act_on(Some(2), Some(7)), VerdictToActOn::Win);
+        // Both, with the refusal first: an impostor ahead of the working address is reported
+        // rather than papered over by the address behind it.
+        assert_eq!(verdict_to_act_on(Some(1), Some(0)), VerdictToActOn::Refusal);
+        assert_eq!(verdict_to_act_on(Some(7), Some(2)), VerdictToActOn::Refusal);
     }
 
     /// An answer that came from a peer ends the walk; an answer that came from the path does

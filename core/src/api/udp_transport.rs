@@ -264,6 +264,17 @@ pub struct UdpClientTransport {
     /// has begun answering may be about to refuse the pin, and a refusal is the caller's
     /// answer rather than an address that did not work (Invariant 1).
     ///
+    /// **It is set before anything has been authenticated, and it is not an authentication
+    /// signal.** The first datagram from the tracked address sets it whatever that datagram
+    /// is — a `HelloRetryRequest`, a `ServerHello` this client is about to refuse for a
+    /// pinned key it does not hold, or a forgery from anyone able to reach the socket and
+    /// guess the source address. That is exactly what the walk needs, because it is
+    /// scheduling: "there is something here, do not hand a later address's success over
+    /// until this one has finished". The only statement about *who* is there is the
+    /// handshake's own, and it is read where every other entry path reads it, through
+    /// [`await_ready`](crate::api::PhantomSession::await_ready) and the pin check behind it
+    /// (Invariant 1). Nothing may branch on this flag as though a peer had proved anything.
+    ///
     /// Held behind an `Arc` because the walk keeps a handle on it after the transport has
     /// been moved into its session. Written only during the handshake and only for the
     /// tracked server address, so a stray datagram from elsewhere — or any post-handshake
@@ -310,6 +321,9 @@ impl UdpClientTransport {
 
     /// A handle on [`Self::peer_answered`], readable after this transport has been moved
     /// into a session.
+    ///
+    /// Scheduling only: the flag says an address sent a datagram, never that a peer proved
+    /// who it is. See [`Self::peer_answered`].
     pub(crate) fn peer_answered_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.peer_answered)
     }

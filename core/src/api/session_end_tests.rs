@@ -1749,6 +1749,10 @@ async fn a_hostile_address_after_the_right_one_does_not_end_the_walk() {
     use crate::crypto::hybrid_sign::HybridVerifyingKey;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    // The overruled refusal is reported in the log and nowhere else on this path, so the
+    // sink has to be in place before the walk runs.
+    captured_warnings::capture();
+
     /// One-way delay in front of the *genuine* address. Its first reply therefore takes
     /// 2 × HOP = 700 ms, comfortably past the attempt delay, so the hostile address really is
     /// contacted; the whole handshake takes about 1.4 s. The relay's sleeps can only
@@ -1826,6 +1830,32 @@ async fn a_hostile_address_after_the_right_one_does_not_end_the_walk() {
         "the hostile address was never contacted, so its refusal was never held and this run \
          says nothing about holding one"
     );
+
+    // The caller is handed the genuine session and told nothing, which is right — it is the
+    // service they asked for, and `last_error()` is `None`. But something answered for this
+    // name that was not the pinned server, and that is the one signal Invariant 1 produces.
+    // Before this line existed it was dropped on the floor here: the roster naming every
+    // address tried is built only for the error path, so an operator with a poisoned
+    // resolver, a hostile split-horizon zone or one extra AAAA record in a DNS answer saw a
+    // clean connect every single time. Regression: a walk that returns a win while holding a
+    // refusal has to leave a trace an operator can find.
+    let reported = captured_warnings::holding(&hostile_addr.to_string());
+    assert!(
+        !reported.is_empty(),
+        "an impostor answered for this name, was overruled by the genuine address ahead of \
+         it, and nothing was logged. The caller's Ok is correct and is also the whole of \
+         what they are told, so this line is the only trace the refusal leaves."
+    );
+    assert!(
+        reported
+            .iter()
+            .any(|line| line.contains("refused") && line.contains(&relay_addr.to_string())),
+        "the warning has to name both the address that refused and the one that answered \
+         instead — and the winner here is the candidate the walk was handed, the relay in \
+         front of the genuine listener, not the listener behind it. An operator reads the \
+         resolver's answer, and those are the addresses it holds; got {reported:?}"
+    );
+
     let accepted = timeout(STEP, accepting)
         .await
         .expect("the genuine listener accepted")
@@ -1941,4 +1971,176 @@ async fn an_impostor_answering_first_for_the_name_is_reported_and_stops_the_walk
     impostor_accept.abort();
     impostor.shutdown();
     genuine.shutdown();
+}
+
+/// A capturing `log` sink, so a warning the walk emits can be read back.
+///
+/// One of the walk's answers is a line in the log and nothing else: when an earlier address
+/// refuses the pin and a later one succeeds, the caller is handed the success — correctly,
+/// it is the service they asked for — and the refusal has nowhere else to go. `Ok` is
+/// returned, `last_error()` is `None`, and the roster that names every address tried is only
+/// built for the error path. Asserting on the line is the only way to pin that it is emitted.
+///
+/// Installed once per process and left installed: `log::set_logger` may be called once, and
+/// nothing else in this crate installs a logger. Bounded, because the maximum level is
+/// global and every warning the suite produces lands here.
+#[cfg(not(target_arch = "wasm32"))]
+mod captured_warnings {
+    use std::sync::{Mutex, OnceLock};
+
+    static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static SINK: Sink = Sink;
+
+    struct Sink;
+
+    impl log::Log for Sink {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.level() <= log::Level::Warn
+        }
+
+        fn log(&self, record: &log::Record) {
+            if record.level() > log::Level::Warn {
+                return;
+            }
+            if let Ok(mut lines) = LINES.lock() {
+                if lines.len() < 512 {
+                    lines.push(record.args().to_string());
+                }
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// Start capturing. Idempotent, and a no-op if something else got there first — in which
+    /// case [`holding`] finds nothing and the assertion that reads it says so.
+    pub(super) fn capture() {
+        static ONCE: OnceLock<()> = OnceLock::new();
+        ONCE.get_or_init(|| {
+            if log::set_logger(&SINK).is_ok() {
+                log::set_max_level(log::LevelFilter::Warn);
+            }
+        });
+    }
+
+    /// Every captured warning naming `needle`.
+    pub(super) fn holding(needle: &str) -> Vec<String> {
+        LINES
+            .lock()
+            .map(|lines| {
+                lines
+                    .iter()
+                    .filter(|line| line.contains(needle))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// A candidate whose socket cannot be opened does not cost the inter-attempt delay.
+///
+/// **The defect.** The walk set the next contact time to `now + CANDIDATE_ATTEMPT_DELAY`
+/// after every candidate, including one whose transport could not be constructed at all. The
+/// delay exists to let a contacted address answer before another attempt is added to the
+/// race; where no attempt was made there is nothing to give a head start to, so it was a
+/// quarter of a second spent on a candidate already known to be hopeless.
+///
+/// **What a consumer observes.** `connect_pinned_udp` against a name whose first addresses
+/// are of a family this host cannot bind — the IPv6-disabled machine the walk was partly
+/// written for — pays 250 ms per such address before the first reachable one is contacted.
+/// Nothing fails; the connect is simply slower than it has any reason to be, which is the
+/// kind of latency nobody attributes to the library.
+///
+/// **Why it would come back unnoticed.** Setting the timer once after the `match`, rather
+/// than in the arm that started something, is the tidier-looking of the two shapes and reads
+/// as correct. Every functional test of the walk passes either way, because the delay only
+/// makes it slow.
+#[cfg(not(target_arch = "wasm32"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_candidate_whose_socket_cannot_be_opened_does_not_cost_the_attempt_delay() {
+    use crate::api::session::{
+        walk_candidate_addresses, CANDIDATE_ATTEMPT_DELAY, CLIENT_HANDSHAKE_DEADLINE,
+    };
+    use crate::api::udp_listener::PhantomUdpListener;
+    use crate::api::udp_transport::UdpClientTransport;
+    use crate::crypto::hybrid_sign::HybridVerifyingKey;
+
+    let listener = PhantomUdpListener::builder("127.0.0.1:0")
+        .bind()
+        .await
+        .expect("bind a PhantomUDP listener");
+    let live: std::net::SocketAddr = listener
+        .local_addr()
+        .parse()
+        .expect("the listener's address");
+    let pinned = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes())
+        .expect("the listener's verifying key");
+
+    // Two candidates whose sockets cannot be opened, then the working one. Which addresses
+    // these are does not matter — the opener below refuses them — and they are unroutable
+    // documentation addresses so that a mistake in the opener cannot become a real connect.
+    let unbindable: [std::net::SocketAddr; 2] = [
+        "192.0.2.1:4242".parse().expect("a documentation address"),
+        "192.0.2.2:4242".parse().expect("a documentation address"),
+    ];
+    let candidates = [unbindable[0], unbindable[1], live];
+
+    let accepting = {
+        let listener = listener.clone();
+        tokio::spawn(async move { listener.accept().await })
+    };
+    let started = Instant::now();
+    let session = walk_candidate_addresses(
+        "unbindable-first",
+        &candidates,
+        CLIENT_HANDSHAKE_DEADLINE,
+        {
+            let pinned = pinned.clone();
+            move |transport| {
+                PhantomSession::connect_with_transport(
+                    "unbindable-first",
+                    transport,
+                    pinned.clone(),
+                )
+            }
+        },
+        move |server| async move {
+            if server == live {
+                UdpClientTransport::connect(server).await
+            } else {
+                Err(CoreError::NetworkError(format!(
+                    "udp bind: no socket for {server}"
+                )))
+            }
+        },
+    )
+    .await
+    .expect("the third address opens and is handed back");
+
+    let walked = started.elapsed();
+    assert!(
+        walked < CANDIDATE_ATTEMPT_DELAY,
+        "two candidates that could not be opened cost {walked:?}; the whole walk has to \
+         finish inside one {CANDIDATE_ATTEMPT_DELAY:?} attempt delay, because nothing was \
+         contacted that could need a head start. Charging the delay for them would make \
+         this at least {:?}",
+        CANDIDATE_ATTEMPT_DELAY * 2
+    );
+
+    timeout(STEP, session.await_ready())
+        .await
+        .expect("await_ready returned")
+        .expect("the live address answered");
+    let accepted = timeout(STEP, accepting)
+        .await
+        .expect("the listener accepted")
+        .expect("accept task")
+        .expect("accept");
+    assert_eq!(
+        accepted.session().connection_state(),
+        ConnectionState::Connected
+    );
+    session.disconnect().await.expect("disconnect");
+    listener.shutdown();
 }
