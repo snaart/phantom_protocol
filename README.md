@@ -838,7 +838,13 @@ of CI. Reaching L3 is a workflow change, not a code change — see
   `WIRE_VERSION` <!--pinned:WIRE_VERSION-->8
   and `PROTOCOL_VERSION` <!--pinned:PROTOCOL_VERSION-->5, which is what 0.3.0
   speaks, so either end of a 0.4/0.3 pair may be upgraded on its own and a CI job
-  proves it in both directions with each version as the server. 0.2.x spoke 6 and
+  proves it in both directions with each version as the server. One behaviour in
+  such a pair is still not symmetric, and it is not a wire mismatch: a 0.4.0 client
+  may open a 256th concurrent stream that a 0.3.0 server refuses in silence, because
+  0.3.0 counted the reserved raw-application stream against the same cap. Keep to
+  **255** concurrent streams against a peer whose build you do not know —
+  [`docs/known-deviations.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/known-deviations.md)
+  § 5 has what the stuck stream looks like. 0.2.x spoke 6 and
   3, and the handshake refuses that mismatch with a typed `ServerReject` rather
   than negotiating down. A 0.3 → 0.4 upgrade asks two things of you, both in your
   own files rather than in your code. **Name the `tokio` and `time` features your
