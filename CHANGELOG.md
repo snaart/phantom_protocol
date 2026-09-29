@@ -121,6 +121,20 @@ Pointers only: each item is set out in full in the entry named.
 
 ### Fixed
 
+- **The C blocking helpers did not compile against a strict ISO C consumer on
+  glibc.** `phantom_helpers.h` waits on a future with `nanosleep()`, which is
+  POSIX.1-1993 and not ISO C, and glibc's `<time.h>` withholds the declaration
+  when the translation unit asked for `-std=c11`. The header is documented to be
+  included after `phantom_protocol.h`, which has already fixed glibc's feature
+  macros by then, so requesting the feature from inside the header cannot work.
+  It now states the requirement instead: on glibc without the declaration in
+  scope it stops at an `#error` naming the flag to add
+  (`-D_POSIX_C_SOURCE=199309L`, or `-std=gnu11`), rather than at an implicit
+  declaration forty lines later. The repository's own C check passes the flag,
+  and `tests/bindings/c/README.md` publishes the whole compile line. macOS
+  declares `nanosleep` either way, which is why this surfaced only once the
+  pinning check — added in this release — started running on a Linux runner.
+
 - **`PhantomStream::recv()` now returns when the session ends.** A reader parked on a stream
   was never woken, and a fresh `recv()` on an ended session parked too: still pending
   fifteen seconds after the path died, with `connection_state()` already `Closed` and

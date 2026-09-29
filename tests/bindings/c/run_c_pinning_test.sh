@@ -16,7 +16,7 @@ trap 'rm -rf "${OUT_DIR}"' EXIT
 
 # The source must precede -lphantom_protocol: GNU ld resolves left to right and
 # drops a library whose symbols nothing seen so far needs.
-cc -std=c11 -Wall -Wextra -Werror \
+cc -std=c11 -D_POSIX_C_SOURCE=199309L -Wall -Wextra -Werror \
     -I "${SCRIPT_DIR}" \
     "${SCRIPT_DIR}/pinning_smoke.c" \
     -L "${REPO_ROOT}/target/release" -lphantom_protocol -lpthread \

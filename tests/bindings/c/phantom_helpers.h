@@ -26,13 +26,34 @@
  * refused connection.
  *
  * Threading: the UniFFI future runtime invokes the continuation from its own
- * (tokio) thread, so the wait flag is a C11 `_Atomic`. The wait is a 1 ms poll —
- * fine for a blocking client helper; no `-lpthread` needed.
+ * (tokio) thread, so the wait flag is a C11 `_Atomic`. The wait is a 1 ms
+ * `nanosleep` — fine for a blocking client helper; no `-lpthread` needed, but
+ * it does need POSIX.1-1993 (see the _POSIX_C_SOURCE note below the include
+ * guard).
  *
  * Requires C11 (`<stdatomic.h>`). Link exactly as for `consumer_smoke.c`.
  */
 #ifndef PHANTOM_HELPERS_H
 #define PHANTOM_HELPERS_H
+
+/*
+ * `nanosleep` is POSIX.1-1993, not ISO C. glibc's <time.h> declares it only when
+ * the feature macros say the caller wants that much, and -std=c11 asks for
+ * strict ISO C, so a consumer compiling that way gets no declaration: an error
+ * under -Werror, and on some toolchains a silently wrong return type. macOS
+ * declares it either way, which is why this only shows up on glibc.
+ *
+ * Defining _POSIX_C_SOURCE here would not help: this header is documented to be
+ * included AFTER phantom_protocol.h, which has already pulled in <stdint.h> and
+ * fixed glibc's feature macros by the time we are read. So state the requirement
+ * instead of papering over it, and fail with a sentence that names the fix. The
+ * test is glibc-specific on purpose: __USE_POSIX199309 is what glibc's
+ * features.h sets once the declaration is in scope, so -std=gnu11 (which sets
+ * _DEFAULT_SOURCE) passes without needing the flag at all.
+ */
+#if defined(__GLIBC__) && !defined(__USE_POSIX199309)
+#  error "phantom_helpers.h waits with nanosleep(), which needs POSIX.1-1993. Compile with -D_POSIX_C_SOURCE=199309L, or with -std=gnu11 instead of -std=c11."
+#endif
 
 #include <stdatomic.h>
 #include <stddef.h>
