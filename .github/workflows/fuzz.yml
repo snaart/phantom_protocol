@@ -50,7 +50,7 @@ jobs:
           - fuzz_aead_decrypt
           - fuzz_embedded_framing
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # libFuzzer instrumentation + the ASan runtime require nightly. The
       # x86_64-linux nightly ships `rustc-nightly_rt.asan`, so the default
       # `-Zsanitizer=address` build links here (unlike macOS/aarch64).
@@ -61,7 +61,7 @@ jobs:
           workspaces: "fuzz"
           key: fuzz-${{ matrix.target }}
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
         with:
           tool: cargo-fuzz
       # Copy the committed seeds into the (otherwise empty) corpus dir so the
