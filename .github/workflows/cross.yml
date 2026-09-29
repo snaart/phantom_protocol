@@ -184,6 +184,20 @@ jobs:
   wasi-integration:
     name: wasi-leg integration (wasmtime)
     runs-on: ubuntu-latest
+    env:
+      # The one place the wasmtime version is written down. Moving it is a
+      # visible edit to this line, which is the whole point: this job used to
+      # install whatever was released last under a comment that said "pinned",
+      # so the runtime the WASI tests ran against changed without any change to
+      # the tree. That is how 49 arrived unannounced — it waits for a pending
+      # write when an output stream is dropped where 45 returned immediately,
+      # and the guest fixture hung on the way out. The tests were fixed for it;
+      # the next such difference should arrive in a diff instead.
+      #
+      # v49.0.1 is what the 0.3.0 tests were verified against. Bumping it means
+      # running `cargo test --manifest-path core/Cargo.toml --test
+      # wasi_integration -- --ignored` against the new runtime first.
+      WASMTIME_VERSION: v49.0.1
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install Rust toolchain
@@ -194,12 +208,27 @@ jobs:
         with:
           workspaces: "."
           key: wasi-integration
-      - name: Install wasmtime
-        # Pinned via the official installer script. The wasmtime CLI
-        # provides the Preview 2 socket implementations the
-        # `wasi-guest` fixture calls into.
+      - name: Install wasmtime ${{ env.WASMTIME_VERSION }}
+        # The official installer script, given the pinned version explicitly.
+        # Without `--version` it resolves the GitHub "latest" release, which is
+        # not a pin. The wasmtime CLI provides the Preview 2 socket
+        # implementations the `wasi-guest` fixture calls into.
         run: |
-          curl -sSf https://wasmtime.dev/install.sh | bash
+          curl -sSf https://wasmtime.dev/install.sh | bash -s -- \
+            --version "${WASMTIME_VERSION}"
           echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+      - name: The runtime under test is the pinned one
+        # The installer is fetched over the network and resolves "latest" when
+        # it does not understand its arguments, so the pin above is a request
+        # until something reads it back. This is what turns a silently ignored
+        # flag into a red job rather than a run against an unknown runtime.
+        run: |
+          got="$("${HOME}/.wasmtime/bin/wasmtime" --version | awk '{print $2}')"
+          want="${WASMTIME_VERSION#v}"
+          echo "wasmtime ${got} (pinned ${want})"
+          if [ "${got}" != "${want}" ]; then
+            echo "installed wasmtime ${got}, expected ${want}" >&2
+            exit 1
+          fi
       - name: cargo test --test wasi_integration -- --ignored
         run: cargo test --manifest-path core/Cargo.toml --test wasi_integration -- --ignored

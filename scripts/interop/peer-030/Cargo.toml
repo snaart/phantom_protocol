@@ -1,0 +1,22 @@
+# The interop peer built against the PUBLISHED 0.3.0 crate. Its twin, `peer-head`, builds the
+# same source against this tree; a run pairs the two in both orders over both transports.
+#
+# `=0.3.0` is exact on purpose. `"0.3.0"` is a caret requirement, which 0.x resolves anywhere
+# inside the same minor, so it would follow any later 0.3.x release -- and the baseline this
+# job compares against has to be the one published wire it is about, not whatever 0.3.x is
+# newest when the job next runs.
+#
+# Its own `[workspace]` table, like every other sibling crate here: the root workspace is
+# `core` alone, and a cargo command aimed at core must never reach this.
+[workspace]
+
+[package]
+name = "phantom-interop-peer-030"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+[dependencies]
+phantom-protocol = "=0.3.0"
+tokio = { version = "1", features = ["rt", "macros", "time"] }

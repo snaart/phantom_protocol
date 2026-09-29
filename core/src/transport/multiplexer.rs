@@ -202,6 +202,22 @@ impl StreamDemultiplexer {
         self.streams.remove(&stream_id);
     }
 
+    /// Drop every stream's route, ending the session's whole routing table at once.
+    ///
+    /// Called when the session ends, and it is what releases the readers: a
+    /// `PhantomStream::recv()` waits on the other end of the channel whose sender lives
+    /// here, so while this table holds a route the reader has no way of learning that
+    /// there is nothing left to arrive. Dropping the sender is not a discard — a bounded
+    /// channel hands out what is already in it before it reports its end — so a reader
+    /// with frames still buffered reads all of them and only then sees the session is
+    /// over.
+    ///
+    /// Idempotent, and safe to call from a `Drop`: it takes only the table's own shard
+    /// locks, briefly, and awaits nothing.
+    pub fn close_all_streams(&self) {
+        self.streams.clear();
+    }
+
     /// Route data payload to the appropriate stream.
     ///
     /// Returns `true` if the packet was successfully delivered,
@@ -437,6 +453,45 @@ mod tests {
         assert_ne!(h1.stream_id, h2.stream_id);
         assert_ne!(h2.stream_id, h3.stream_id);
         assert_eq!(demux.active_stream_count(), 3);
+    }
+
+    /// A session that ends drops every route at once, and a reader with frames already in
+    /// its channel still gets them before it learns that the session is over.
+    ///
+    /// The ordering is the whole contract. Ending the channel is how a reader finds out at
+    /// all — nothing else wakes one parked in `recv()` — but a bounded channel hands out
+    /// what it is holding before it reports its end, so "the session ended" can be
+    /// delivered by dropping the sender without costing the reader the bytes that arrived
+    /// just before it.
+    #[tokio::test]
+    async fn closing_every_route_releases_the_readers_behind_the_buffered_frames() {
+        let (demux, _ctrl) = StreamDemultiplexer::new_with_role(16, true);
+        let with_data = demux.open_stream(4).expect("an id is free");
+        let idle = demux.open_stream(4).expect("an id is free");
+        assert!(demux.route_data(with_data.stream_id, Bytes::from_static(b"behind-the-end")));
+        assert_eq!(demux.active_stream_count(), 2);
+
+        demux.close_all_streams();
+        assert_eq!(demux.active_stream_count(), 0);
+        demux.close_all_streams(); // idempotent
+
+        let mut rx = with_data.rx;
+        assert_eq!(
+            rx.recv().await,
+            Some(StreamMessage::Data(Bytes::from_static(b"behind-the-end"))),
+            "a frame already in the channel must survive the route going"
+        );
+        assert_eq!(
+            rx.recv().await,
+            None,
+            "and then the reader learns it is over"
+        );
+        let mut idle_rx = idle.rx;
+        assert_eq!(
+            idle_rx.recv().await,
+            None,
+            "a reader with nothing buffered learns it at once"
+        );
     }
 
     /// Each side hands out its own parity up to the last id the 16-bit header can carry,

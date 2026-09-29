@@ -42,15 +42,32 @@ mod full_duplex_tests;
 #[cfg(test)]
 mod loss_recovery_tests;
 #[cfg(test)]
+mod session_end_tests;
+#[cfg(test)]
 mod stream_close_tests;
 
-// Cross-target re-exports
-pub use session::{ConnectionState, NoTransport, PhantomSession, SessionBuilder, SessionTransport};
+// Cross-target re-exports.
+//
+// Every type a caller has to *name* to use this module belongs here, not only the
+// ones it constructs: `ResumptionHint` is an argument to the resuming connect and
+// the value `resumption_hint()` hands back, and `TrafficShapingConfig` /
+// `PaddingPolicy` are the argument to `set_traffic_shaping`. They were reachable
+// only at their defining modules — one of them in `transport::shaping`, which a
+// caller of an `api` method has no reason to have opened — so the import that
+// matched the method signature did not compile. `PhantomConfig` is the same case
+// from the other side: it was at the crate root and in `config`, but not beside
+// the builders whose `.config()` takes it.
+pub use crate::config::PhantomConfig;
+pub use crate::transport::shaping::PaddingPolicy;
+pub use session::{
+    ConnectionState, NoTransport, PhantomSession, ResumptionHint, SessionBuilder, SessionTransport,
+    TrafficShapingConfig,
+};
 pub use stream::PhantomStream;
 
 // Native-only re-exports
 #[cfg(not(target_arch = "wasm32"))]
-pub use listener::{ListenerBuilder, PhantomListener};
+pub use listener::{AcceptOutcome, ListenerBuilder, PhantomListener};
 #[cfg(not(target_arch = "wasm32"))]
 pub use tcp_transport::TcpSessionTransport;
 #[cfg(not(target_arch = "wasm32"))]

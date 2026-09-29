@@ -91,6 +91,20 @@ jobs:
         uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2
         with:
           tool: cargo-semver-checks@0.50.0
+      # No `--release-type` argument. The script reads the release type out of the
+      # tree — `core/Cargo.toml`'s version against the newest release heading below
+      # it in `CHANGELOG.md` — because a type written here is a type that stays
+      # behind when the version moves, which is what happened: every run said
+      # "assume minor change", so the report for a patch release described a minor
+      # one and skipped the 27 minor-severity lints a patch release must also pass.
+      # The script then checks the type it used against the step the tool says it
+      # compared, and fails if the type permitted more, so a wrong argument or a
+      # baseline that moved mid-window is red rather than quiet.
+      #
+      # The tag path needs no different argument, and passes none: this job is
+      # `if: github.event_name == 'pull_request'`, so a tag push runs no comparison
+      # at all. The pull request that bumps the version is the one run that sees the
+      # exact step.
       - name: Compare the public API against the published release
         run: scripts/semver_report.sh "${GITHUB_WORKSPACE}/semver-report.txt"
       # `always()` on both of the next two steps: a report is most worth having
@@ -182,9 +196,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
-      - name: cargo build --release
+      # `--profile dist`, not `--release`. The two differ in one setting: `dist`
+      # keeps the symbol table. A shipped cdylib is what `uniffi-bindgen
+      # --library` reads to generate the four language bindings, and it finds
+      # the interface by looking up `UNIFFI_META_*` symbols — which
+      # `[profile.release] strip = "symbols"` removes. The 0.3.0 Linux artifacts
+      # were stripped: the metadata strings were still in the binary and the
+      # symbol table naming them was gone, so the generator reported no
+      # namespace and there was nothing in the tarball to say why. See the
+      # profile's comment in the root Cargo.toml for why this does not live in
+      # `release`.
+      - name: cargo build --profile dist
         run: |
-          cargo build --manifest-path core/Cargo.toml --release --target ${{ matrix.target }}
+          cargo build --manifest-path core/Cargo.toml --profile dist --target ${{ matrix.target }}
       - name: Package
         run: |
           mkdir -p dist
@@ -194,14 +218,38 @@ jobs:
           # the cdylib (.so on Linux, .dylib on macOS), which is what every
           # UniFFI / C consumer links against. `core` is the root workspace's
           # only member, so cargo's target dir is the repo-root `target/`, not
-          # `core/target/`. No `|| true` on the library copies: a missing library
-          # must fail the release loudly rather than ship an empty tarball.
-          LIBDIR="target/${{ matrix.target }}/release"
+          # `core/target/`. The directory is named after the profile, so it is
+          # `dist/` here and not `release/`. No `|| true` on the library copies:
+          # a missing library must fail the release loudly rather than ship an
+          # empty tarball.
+          LIBDIR="target/${{ matrix.target }}/dist"
           cp "${LIBDIR}/libphantom_protocol.rlib" "dist/${NAME}/"
           if [ -f "${LIBDIR}/libphantom_protocol.so" ]; then
             cp "${LIBDIR}/libphantom_protocol.so" "dist/${NAME}/"
           else
             cp "${LIBDIR}/libphantom_protocol.dylib" "dist/${NAME}/"
+            # A Mach-O library records the path it expects to be found at, and
+            # rustc writes the absolute path of the build directory into it —
+            # `/Users/runner/work/.../target/.../deps/libphantom_protocol.dylib`,
+            # a directory that exists on no machine but the runner. Every
+            # consumer that links the shipped library then dies at launch with
+            # `dyld: Library not loaded`, before `main`, and the failure names
+            # the runner's path rather than anything the consumer can act on.
+            # 0.3.0 shipped both macOS rows that way. `@rpath` makes the name
+            # relative to whatever the consumer's own `-rpath` says, which is
+            # what a redistributable dylib is supposed to carry.
+            #
+            # This rewrites the copy in the staging directory, so the build tree
+            # is left alone. `install_name_tool` invalidates the ad-hoc
+            # signature arm64 macOS requires and re-signs the file itself; the
+            # check below is what proves the result still loads.
+            install_name_tool -id @rpath/libphantom_protocol.dylib \
+              "dist/${NAME}/libphantom_protocol.dylib"
+            got="$(otool -D "dist/${NAME}/libphantom_protocol.dylib" | tail -n 1)"
+            if [ "${got}" != "@rpath/libphantom_protocol.dylib" ]; then
+              echo "install name is '${got}', expected '@rpath/libphantom_protocol.dylib'" >&2
+              exit 1
+            fi
           fi
           # The license text is not optional either: Apache-2.0 §4(a) requires
           # every redistribution, binaries included, to carry a copy, so a
@@ -216,7 +264,14 @@ jobs:
           # unknown header. COPYFILE_DISABLE stops the `._` members on macOS;
           # --no-xattrs is understood by both bsdtar and GNU tar.
           COPYFILE_DISABLE=1 tar --no-xattrs -czf "dist/${NAME}.tar.gz" -C dist "${NAME}"
-          shasum -a 256 "dist/${NAME}.tar.gz" > "dist/${NAME}.tar.gz.sha256"
+          # Hashed from inside `dist/`, so the digest line names the tarball by
+          # its basename. `shasum -c` re-reads the path written in the file, and
+          # a released pair carrying `dist/phantom_protocol-….tar.gz` verifies
+          # only for someone who happens to have reproduced that directory —
+          # which is nobody who downloaded the two files side by side. 0.3.0
+          # shipped the prefix, so every published checksum failed in place.
+          ( cd dist && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
+          ( cd dist && shasum -a 256 -c "${NAME}.tar.gz.sha256" )
       - name: Generate SLSA build provenance attestation
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -246,10 +301,11 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Compute checksums
-        run: |
-          cd dist
-          ls -la
+      # Named for what it does. It computed nothing — the digests are written
+      # beside each tarball in the job that built it, because that is the only
+      # place the tarball and its name are both known.
+      - name: List the collected artifacts
+        run: ls -la dist
       - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           draft: true
@@ -298,17 +354,34 @@ jobs:
         # The --manifest-path in pyproject.toml is relative to the pyproject dir,
         # so we need to override here with the absolute-from-cwd form; the --out
         # flag lands the wheel in the repo-root target/wheels directory.
+        #
+        # `--profile dist` for the reason step 3 above gives: maturin runs
+        # uniffi-bindgen against the library it just compiled, so a stripped one
+        # ends the build. With `--release` this job does not produce a broken
+        # wheel — it fails, `No UniFFI metadata found in …/libphantom_protocol.so`,
+        # leaving a `.whl` with no `.dist-info` and nothing installable. It is
+        # `workflow_dispatch`-only, which is why nothing said so. maturin's own
+        # `strip = true` in python/pyproject.toml still applies and is harmless:
+        # it runs on the copy it bundles, after the bindings are generated.
         run: |
-          maturin build --release \
+          maturin build --profile dist \
             --manifest-path ../core/Cargo.toml \
             --features bindings \
             --out ../target/wheels
         working-directory: python
-      - name: Smoke-test wheel
-        run: |
-          python -m venv /tmp/phantom-smoke-venv
-          /tmp/phantom-smoke-venv/bin/pip install --no-index --find-links target/wheels phantom-protocol
-          /tmp/phantom-smoke-venv/bin/python -c "import phantom_protocol; print(getattr(phantom_protocol, '__doc__', None) or 'import OK')"
+      - name: Verify the wheel installs, imports and works
+        # `python/verify_wheel.sh` is the gate: it checks the archive's layout, installs it
+        # into a throwaway virtualenv with nothing else on the path, imports it from a
+        # directory holding no `phantom_protocol/` of its own, and runs a pinned loopback
+        # round-trip through the installed binding. An inline `import phantom_protocol`
+        # was what this step used to be, and it is the weaker half — 0.3.0 shipped a wheel
+        # whose import raised `ImportError: cannot import name '__all__'`, which only an
+        # install and an import from outside the source tree can see.
+        #
+        # `--no-build` because the step above already built the wheel with `--profile dist`;
+        # the script's own build uses `--release`, which produces a wheel with no bindings
+        # in it for the reason that step documents.
+        run: python/verify_wheel.sh --no-build
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: python-wheel-linux-x86_64

@@ -109,6 +109,55 @@ pub const SERVER_REJECT_MARKER: [u8; 4] = *b"PRJ1";
 /// does not speak. `supported_version` carries the version it *does* speak.
 pub const REJECT_UNSUPPORTED_VERSION: u8 = 1;
 
+/// [`ServerReject::code`]: the client's `ClientHello.protocol_variant` is not this
+/// build's [`PROTOCOL_VARIANT`] — a fips peer meeting a non-fips one, or the reverse
+/// (Invariant 10). `supported_version` still carries the version this server speaks,
+/// because the version is not what went wrong; the variant tag is, and it does not fit
+/// in this message. The variant is a compile-time property of both builds, so there is
+/// nothing for the client to retry and nothing to negotiate — the code exists so the
+/// refusal reaches the client at all, rather than as a connection that goes quiet.
+///
+/// Before 0.4.0 this mismatch was a `HandshakeResponse::Fail`, which the listener
+/// answers by closing without a reply: over TCP the client saw a bare connection error
+/// and over PhantomUDP, where there is no close to see, it waited out its handshake
+/// deadline and reported `Timeout` — the one shape of failure the typed refusal exists
+/// to avoid.
+pub const REJECT_PROTOCOL_VARIANT: u8 = 2;
+
+/// [`ServerReject::code`]: the peer never satisfied the cookie / proof-of-work gate
+/// within `MAX_HANDSHAKE_RETRY_ROUNDS` rounds, so the server has abandoned this
+/// handshake. (That constant is crate-private and deliberately not linked from here: a
+/// public item's documentation may not link a private one, which `cargo doc`'s
+/// `-D warnings` makes an error rather than a note.) `supported_version` carries the version this server speaks, as every
+/// reject does, because the version is not what went wrong.
+///
+/// It exists so the abandonment is something the peer can read. The server used to
+/// close without a reply, which reached the client as `CoreError::NetworkError("early
+/// eof")` — a byte-pipe error, indistinguishable from the network breaking, for a
+/// decision the server made on purpose. With the difficulty now pinned for the life of
+/// one handshake this is no longer reachable by an honest client at all; the peers that
+/// do reach it are the ones that keep answering the gate wrongly, and telling them so
+/// is cheaper than leaving them to retry.
+pub const REJECT_RETRY_LIMIT: u8 = 3;
+
+/// Cookie / proof-of-work `HelloRetryRequest` rounds one handshake may spend, read by
+/// both sides from here.
+///
+/// The server will emit at most this many retries for one connection and refuse the
+/// next; the client will answer at most this many and give up on the next. One number,
+/// because two numbers disagreed: the server stopped at two while the client was
+/// prepared for three, so a handshake the client was still working on was abandoned
+/// mid-flight and reached it as a bare connection close.
+///
+/// Three, not one, and the slack is for reordering rather than for escalation — a
+/// retried hello and its answer can cross on a datagram path, and the round that
+/// wastes is nobody's fault. Escalation is not a reason to need more rounds, because
+/// [`crate::api::listener::drive_server_handshake`] fixes the difficulty it demands
+/// when the first hello of a connection arrives and re-uses that figure for the rest of
+/// it; a gate whose bar moved between the demand and the verification is what made
+/// three rounds insufficient in the first place.
+pub(crate) const MAX_HANDSHAKE_RETRY_ROUNDS: u32 = 3;
+
 /// Typed handshake rejection the server returns *instead of* silently dropping
 /// the connection when it structurally cannot satisfy a `ClientHello` — today,
 /// an unknown `version`. It gives a forward/backward-incompatible peer an
@@ -138,6 +187,27 @@ impl ServerReject {
         Self {
             marker: SERVER_REJECT_MARKER,
             code: REJECT_UNSUPPORTED_VERSION,
+            supported_version: PROTOCOL_VERSION,
+        }
+    }
+
+    /// Build the protocol-variant-mismatch reject (Invariant 10). Carries this build's
+    /// [`PROTOCOL_VERSION`] like every reject does, since the field is defined as the
+    /// version the server speaks and that is still true here.
+    pub fn protocol_variant_mismatch() -> Self {
+        Self {
+            marker: SERVER_REJECT_MARKER,
+            code: REJECT_PROTOCOL_VARIANT,
+            supported_version: PROTOCOL_VERSION,
+        }
+    }
+
+    /// Build the retry-limit reject ([`REJECT_RETRY_LIMIT`]). Carries this build's
+    /// [`PROTOCOL_VERSION`] like every reject does.
+    pub fn retry_limit() -> Self {
+        Self {
+            marker: SERVER_REJECT_MARKER,
+            code: REJECT_RETRY_LIMIT,
             supported_version: PROTOCOL_VERSION,
         }
     }
@@ -938,17 +1008,22 @@ impl HandshakeServer {
         // reflects attempts (including the rejected ones).
         self.record_handshake();
 
-        // Protocol-variant gate. Fail loud (before any KEM / signature work)
+        // Protocol-variant gate. Refuse loud (before any KEM / signature work)
         // if the client and server disagree on the build-side
         // `PROTOCOL_VARIANT` tag. The transcript also binds this constant, so
         // an MITM rewrite of the cleartext field is caught on the client's
         // signature check; this explicit field gives operators a clean
         // diagnostic instead of "Signature check failed" (Invariant 10).
         if client_hello.protocol_variant != PROTOCOL_VARIANT {
-            return HandshakeResponse::Fail(HandshakeError::ProtocolVariantMismatch {
-                expected: PROTOCOL_VARIANT.to_vec(),
-                received: client_hello.protocol_variant.clone(),
-            });
+            // Answered rather than dropped. A `Fail` here closed the connection without
+            // a reply, so the peer this check exists to inform learned nothing: over TCP
+            // a bare connection error, and over PhantomUDP — which has no close to
+            // observe — a client that retransmitted until its handshake deadline and
+            // reported `Timeout`. The reject carries no variant tag (the wire has no
+            // field for one and a patch may not add one), only the code that says the
+            // variant was the problem; the listener builds the operator-facing
+            // `ProtocolVariantMismatch` from the hello it still holds.
+            return HandshakeResponse::Reject(ServerReject::protocol_variant_mismatch());
         }
 
         // Version pin. The protocol is not negotiated — `version` is a
@@ -1923,10 +1998,12 @@ mod tests {
         );
     }
 
-    /// A `ClientHello` advertising a foreign `PROTOCOL_VARIANT`
-    /// (simulating a fips/non-fips cross-mode connect) is rejected by
-    /// the server with [`HandshakeError::ProtocolVariantMismatch`]
-    /// before any KEM / signature work is done.
+    /// A `ClientHello` advertising a foreign `PROTOCOL_VARIANT` (a fips/non-fips
+    /// cross-mode connect) is refused before any KEM / signature work — and refused with
+    /// a [`HandshakeResponse::Reject`], which the listener puts on the wire, rather than
+    /// a `Fail`, which it answers by closing in silence. Silence is what left the client
+    /// with a `Timeout` over PhantomUDP and a bare connection error over TCP, where the
+    /// documentation promises a typed refusal (Invariant 10).
     #[tokio::test]
     async fn protocol_variant_mismatch_rejected() {
         let server = HandshakeServer::new().expect("HandshakeServer::new");
@@ -1939,15 +2016,92 @@ mod tests {
 
         let response = server.process_client_hello(&hello, 0, client_ip);
         match response {
-            HandshakeResponse::Fail(HandshakeError::ProtocolVariantMismatch {
-                expected,
-                received,
-            }) => {
-                assert_eq!(expected, PROTOCOL_VARIANT);
-                assert_eq!(received, b"phantom-some-other-mode-1");
+            HandshakeResponse::Reject(reject) => {
+                assert!(
+                    reject.has_marker(),
+                    "the reject must carry its integrity tag"
+                );
+                assert_eq!(
+                    reject.code, REJECT_PROTOCOL_VARIANT,
+                    "the code has to distinguish this from an unsupported version, or the \
+                     client cannot tell the operator which of the two went wrong"
+                );
+                assert_eq!(reject.supported_version, PROTOCOL_VERSION);
+                // It has to survive the wire, or the listener cannot send it.
+                let wire = ServerReply::Reject(reject).to_wire().expect("encode");
+                match ServerReply::from_wire(&wire).expect("decode") {
+                    ServerReply::Reject(r) => assert_eq!(r.code, REJECT_PROTOCOL_VARIANT),
+                    other => panic!("a reject must decode as a reject, got {other:?}"),
+                }
             }
-            other => panic!("expected ProtocolVariantMismatch, got {other:?}"),
+            other => panic!("expected a typed Reject, got {other:?}"),
         }
+    }
+
+    /// The reject codes have to be distinct values on the wire, and each one already
+    /// shipped has to keep the number it shipped with — a reader of an older capture
+    /// reads `1` as "unsupported version" and nothing may change that.
+    #[test]
+    fn the_reject_codes_are_distinct_and_the_shipped_ones_are_unchanged() {
+        assert_eq!(REJECT_UNSUPPORTED_VERSION, 1);
+        assert_eq!(REJECT_PROTOCOL_VARIANT, 2);
+        assert_eq!(REJECT_RETRY_LIMIT, 3);
+        let built = [
+            (
+                ServerReject::unsupported_version(),
+                REJECT_UNSUPPORTED_VERSION,
+            ),
+            (
+                ServerReject::protocol_variant_mismatch(),
+                REJECT_PROTOCOL_VARIANT,
+            ),
+            (ServerReject::retry_limit(), REJECT_RETRY_LIMIT),
+        ];
+        for (reject, code) in &built {
+            assert!(reject.has_marker(), "{code}: a reject carries its marker");
+            assert_eq!(reject.code, *code);
+            assert_eq!(reject.supported_version, PROTOCOL_VERSION);
+            // It has to survive the wire, or the listener cannot send it.
+            let wire = ServerReply::Reject(reject.clone())
+                .to_wire()
+                .expect("encode");
+            match ServerReply::from_wire(&wire).expect("decode") {
+                ServerReply::Reject(r) => assert_eq!(r.code, *code),
+                other => panic!("a reject must decode as a reject, got {other:?}"),
+            }
+        }
+        for (i, (a, _)) in built.iter().enumerate() {
+            for (b, _) in built.iter().skip(i + 1) {
+                assert_ne!(a, b, "two rejects must not be the same bytes");
+            }
+        }
+    }
+
+    /// The two sides read one retry-round bound, so they cannot disagree about when a
+    /// handshake has run out of rounds.
+    ///
+    /// They did: the server stopped after two rounds while the client was prepared for
+    /// three, so a handshake the client was still working on was abandoned mid-flight
+    /// and arrived as a bare connection close. Two constants in two files is what let
+    /// that happen, and one number in one place is the fix — this asserts the number is
+    /// usable and leaves "there is only one of it" to there being only one of it.
+    ///
+    /// The assertion is a `const` block rather than a runtime one. Both operands are
+    /// constants, which `clippy::assertions_on_constants` refuses under `-D warnings` —
+    /// and it is right to: as a runtime assertion this said nothing until someone ran
+    /// the test, where in a `const` block a bound below three is a compile error. The
+    /// cost is that the message cannot name the offending value, since formatting is
+    /// not available in a constant.
+    #[test]
+    fn the_retry_round_bound_leaves_room_for_a_reorder() {
+        const {
+            assert!(
+                MAX_HANDSHAKE_RETRY_ROUNDS >= 3,
+                "a legitimate handshake needs one cookie round and one proof-of-work round, \
+                 and a datagram path can waste one to a reorder, so fewer than three rounds \
+                 leaves no slack for the third"
+            )
+        };
     }
 
     /// H9 forward-compat: a `ClientHello` advertising a `version` the server
@@ -2221,6 +2375,74 @@ mod tests {
             }
             HandshakeResponse::Reject(r) => panic!("unexpected reject: {:?}", r),
             HandshakeResponse::Fail(e) => panic!("unexpected failure: {:?}", e),
+        }
+    }
+
+    /// A resume that carries **no** early data still consumes the ticket, and the entry
+    /// points say so.
+    ///
+    /// The one-shot rule is decided the moment the resumption binder verifies, before the
+    /// server looks for a sealed blob, so a resume with an empty `early_data` spends the
+    /// ticket to buy only the cookie / proof-of-work bypass. That is a deliberate choice and
+    /// not an oversight — a hello that names a ticket has already used it, and making the
+    /// consumption conditional on a payload would let the same ticket buy the bypass as
+    /// often as its holder liked — but it is easy to read the other way, because
+    /// `early_data_accepted()` answers `None` for such a connect, which is correct ("no
+    /// early-data on this connect") and looks like "nothing was spent". The rustdoc on
+    /// `connect_pinned_with_resumption`, `connect_pinned_udp_with_resumption` and
+    /// `SessionBuilder::resumption` states the cost; this pins the behaviour those sentences
+    /// describe, so the two cannot drift apart.
+    #[tokio::test]
+    async fn a_resume_without_early_data_still_spends_the_ticket() {
+        let server = HandshakeServer::new().expect("HandshakeServer::new");
+        let client_ip = "127.0.0.1".parse().unwrap();
+
+        // One full handshake to mint a ticket.
+        let first = HandshakeClient::new().unwrap();
+        let first_hello = first.create_client_hello();
+        let cookie = match server.process_client_hello(&first_hello, 0, client_ip) {
+            HandshakeResponse::Retry(r) => r.cookie.unwrap(),
+            other => panic!("expected retry, got {other:?}"),
+        };
+        let mut with_cookie = first_hello.clone();
+        with_cookie.cookie = Some(cookie);
+        let first_session = match server.process_client_hello(&with_cookie, 0, client_ip) {
+            HandshakeResponse::Success(_, s, _) => s,
+            other => panic!("expected success, got {other:?}"),
+        };
+        let (rid, secret) = first_session.resumption_hint().unwrap();
+
+        // A resume with no sealed blob: it resumes (the cookie gate is bypassed, which is
+        // what it bought) and it reports no 0-RTT, because none was offered.
+        let second = HandshakeClient::new().unwrap();
+        let empty_resume = second.create_client_hello_with_resume(rid, &secret, None);
+        assert!(empty_resume.early_data.is_none());
+        match server.process_client_hello(&empty_resume, 0, client_ip) {
+            HandshakeResponse::Success(h, _, early) => {
+                assert!(!h.early_data_accepted, "nothing was offered to accept");
+                assert!(early.is_none(), "no early-data plaintext to deliver");
+            }
+            other => panic!("the resume should have bypassed the cookie gate, got {other:?}"),
+        }
+
+        // The ticket is gone, so a later resume off the same hint — this one carrying a
+        // payload — gets a 1-RTT handshake and no 0-RTT.
+        let third = HandshakeClient::new().unwrap();
+        let payload = b"the-request-that-matters";
+        let real_resume =
+            third.create_client_hello_with_resume(rid, &secret, Some(payload.as_slice()));
+        assert!(real_resume.early_data.is_some());
+        match server.process_client_hello(&real_resume, 0, client_ip) {
+            // The ticket is unknown now, so the id buys no bypass either and the server
+            // answers with the ordinary cookie retry.
+            HandshakeResponse::Retry(_) => {}
+            HandshakeResponse::Success(h, _, early) => {
+                assert!(
+                    !h.early_data_accepted && early.is_none(),
+                    "a spent ticket must not serve 0-RTT a second time"
+                );
+            }
+            other => panic!("expected a 1-RTT fallback, got {other:?}"),
         }
     }
 

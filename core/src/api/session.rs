@@ -23,7 +23,7 @@
 //!
 //! | bound | what it limits | enforced by |
 //! | --- | --- | --- |
-//! | [`MAX_STREAMS`] | concurrent receive streams | `handle_packet` refuses the stream-creating segment past the cap; unrecorded, so it is not SACKed either |
+//! | [`MAX_STREAMS`] | streams the peer has open at once | `handle_packet` refuses the stream-creating segment past the cap; unrecorded, so it is not SACKed either |
 //! | [`MAX_RECV_FRAME`] | one inbound frame, hence one queued item | the pump's reader drops the frame before decrypting it |
 //! | [`MAX_RECV_REORDER`](crate::transport::stream::MAX_RECV_REORDER) entries and `Stream::recv_reorder_byte_limit` | one stream's out-of-order backlog | `Stream::accept_in_order` refuses the segment; the sender retransmits |
 //! | [`SESSION_RECV_WINDOW_GROWTH_BUDGET`](crate::transport::stream::SESSION_RECV_WINDOW_GROWTH_BUDGET) | window growth across all streams of a session | `SharedRecvTuning` hands growth out of one allowance |
@@ -42,6 +42,14 @@
 //! will admit, not an allocation and not a gate — nothing on the receive path
 //! refuses in-order data for exceeding it — so it constrains a compliant sender
 //! and no one else.
+//!
+//! The first row bounds what the *peer* opens, which is what this section is about,
+//! and this side's own [`PhantomSession::open_stream`] is bounded by the same
+//! figure separately — so the session's stream table holds at most
+//! `2 × MAX_STREAMS + 1` entries, the two caps plus the reserved raw-application
+//! stream, and every per-stream row below is multiplied by that rather than by
+//! `MAX_STREAMS` alone. The two halves are counted apart because they are reached
+//! apart: the peer's by the receive path, this side's before an id is allocated.
 //!
 //! Three of the rows above are also qualified, and the qualifications matter.
 //! The reorder bounds cover the *out-of-order* arm only; a segment arriving in
@@ -98,7 +106,10 @@ use crate::observability::attrs::{
 use crate::observability::{Observability, ObservabilityConfig};
 use crate::runtime::{Runtime, TokioRuntime};
 use crate::transport::bandwidth_estimator::DrainOutcome;
-use crate::transport::handshake::{HandshakeClient, ServerReject, ServerReply, EARLY_DATA_MAX_LEN};
+use crate::transport::handshake::{
+    HandshakeClient, ServerReject, ServerReply, EARLY_DATA_MAX_LEN, MAX_HANDSHAKE_RETRY_ROUNDS,
+    REJECT_PROTOCOL_VARIANT, REJECT_RETRY_LIMIT, REJECT_UNSUPPORTED_VERSION,
+};
 use crate::transport::mtu::{MAX_RECV_FRAME, MAX_RECV_PAYLOAD};
 use crate::transport::multiplexer::StreamDemultiplexer;
 use crate::transport::packet_coalescer_codec::unwrap_coalesced_packet;
@@ -729,7 +740,24 @@ pub struct PhantomSession {
     /// `true` only when the session is backed by `UdpClientTransport` /
     /// `UdpServerTransport`; `false` for TCP, WebSocket, WASI, Embedded, and
     /// the in-memory test pipe.
+    ///
+    /// This is the *transport's* answer, and it is what the handshake metric's leg label
+    /// and [`migrate_server`](Self::migrate_server) read. It is deliberately NOT what
+    /// [`supports_migration`](Self::supports_migration) and [`migrate`](Self::migrate)
+    /// read — see `client_migration_capable`.
     migration_capable: bool,
+    /// Whether *this side* can move the connection through [`migrate`](Self::migrate).
+    ///
+    /// Both halves of a PhantomUDP session rebind without a re-handshake, so both answer
+    /// `true` to [`SessionTransport::supports_migration`] — but a client moves through
+    /// `migrate` and an accepted server through `migrate_server`, and neither is reachable
+    /// from the other, deliberately, so that the FFI-exported client `migrate()` cannot
+    /// move a server. One flag for both therefore made an accepted server session report a
+    /// capability nothing a caller can reach provides, and made its `migrate()` answer
+    /// `Ok(())` for a request the pump then discards. `true` only for a client session over
+    /// a migration-capable transport; `false` for every accepted server session and for the
+    /// inert legacy constructor.
+    client_migration_capable: bool,
     /// Balanced `active_streams` gauge for this session (see [`StreamGauge`]).
     /// Shared with the data pump: `open_stream()` counts here, the pump's
     /// receive path counts peer-initiated streams, and both the pump exit and
@@ -829,6 +857,107 @@ pub(crate) struct StreamLink {
     /// nothing disables, so what waits in it is a burst of drops the pump has not reached
     /// yet rather than anything that accumulates.
     pub(crate) released: mpsc::UnboundedSender<u32>,
+    /// The session's own stream bookkeeping, so that a handle to a stream nothing of which
+    /// ever left this machine can take it out itself. See [`StreamRegistry`].
+    pub(crate) registry: StreamRegistry,
+}
+
+/// The session bookkeeping a [`PhantomStream`](crate::api::stream::PhantomStream) needs to
+/// retire its own stream as it is dropped, instead of asking the pump to.
+///
+/// It exists for one case, and only that case is safe to do here: a stream **this side
+/// opened**, on which **no write was ever issued**, and of which therefore **nothing ever
+/// reached the peer** — only a reliable segment opens a stream there, so the peer has never
+/// heard of it and there is nothing to tell it. Such a stream has no FIN to send, no writes
+/// waiting in the command channel to stay ordered behind, and no reader left to hand
+/// anything to, so the whole reason the report travels to the pump does not apply: it is
+/// simply an entry in two tables and a number on a gauge.
+///
+/// Retiring it here rather than there is what makes opening a stream and letting it go a
+/// constant-cost operation. Through the pump it costs a wake-up, and a wake-up costs the
+/// send loop a pass over the entire stream table — so a thousand streams opened and dropped
+/// cost a thousand such passes, and four thousand cost sixteen times that.
+#[derive(Clone)]
+pub(crate) struct StreamRegistry {
+    streams: Arc<DashMap<u32, Arc<Stream>>>,
+    demux: Arc<StreamDemultiplexer>,
+    gauge: Arc<StreamGauge>,
+}
+
+impl StreamRegistry {
+    /// Take `stream_id` out of the session now, if it is one this side opened and nothing
+    /// of it ever went out. Returns whether it did; `false` means the caller has to report
+    /// the drop to the pump in the usual way.
+    ///
+    /// Synchronous and lock-light by construction — it is called from a `Drop`, which can
+    /// neither await nor fail. Racing the pump is safe for the same reason the pump's own
+    /// two retire paths are safe with each other: taking the stream out of the table is a
+    /// single map removal, and only whoever performs it goes on to touch the gauge.
+    pub(crate) fn retire_untouched_local(&self, stream_id: u32) -> bool {
+        if !self.demux.is_local_stream_id(stream_id) {
+            return false;
+        }
+        // Nothing on the wire: the pump has never drawn a reliable segment out of this
+        // stream, so the peer cannot know it exists. Checked in addition to the handle's own
+        // "never wrote" flag because the flag says only that this handle queued nothing —
+        // and these are the two halves of the same claim from either end of the channel.
+        let untouched = self
+            .streams
+            .get(&stream_id)
+            .is_some_and(|s| !s.has_sent_reliable());
+        if !untouched {
+            return false;
+        }
+        retire_released_stream(stream_id, &self.streams, &self.demux, &self.gauge);
+        true
+    }
+}
+
+/// Keeps [`PhantomStream`](crate::api::stream::PhantomStream) usable across a
+/// [`catch_unwind`](std::panic::catch_unwind) boundary.
+///
+/// `DashMap` is `!RefUnwindSafe` — it holds an `UnsafeCell<RawTable<…>>` — so the moment this
+/// registry was added to [`StreamLink`], a handle a consumer could previously move into
+/// `catch_unwind` needed an `AssertUnwindSafe` wrapper it had never needed before. Nothing
+/// about the type had actually become fragile; the auto trait simply stopped being derived,
+/// and `cargo semver-checks` reports that as a major break for a patch release. This asserts
+/// what was true all along, rather than leaving a consumer to assert it.
+///
+/// **Why it is true.** The claim an `UnwindSafe` impl makes is that a value carried out of a
+/// panic cannot then be used to observe state the panic left half-changed. The invariant
+/// that could be half-changed here is the agreement between the three handles — a stream in
+/// the table, a route in the demultiplexer, and a unit on the active-streams gauge. Exactly
+/// one operation on this type changes any of them, [`Self::retire_untouched_local`], and it
+/// is a parity test on an integer, one atomic load, one map removal, one atomic decrement,
+/// one map removal and a trailing log line. Not one of those steps can panic and none of
+/// them awaits, so there is no way to be part-way through the sequence while an unwind is in
+/// progress: an unwind does not interrupt running code, it propagates out of a panic, and
+/// there is no panic here to propagate out of. The `log::debug!` is the one call that can
+/// reach code this crate did not write, and it runs after the sequence has finished.
+///
+/// The maps' own locks do not change the answer either. They are `parking_lot` locks, which
+/// do not poison, and a guard released by an unwind leaves its shard structurally intact; no
+/// caller code runs while one is held, because the keys are `u32` and the removed values are
+/// dropped by the caller after the guard has gone (`Stream`'s own `Drop` is one saturating
+/// subtraction and one atomic add).
+///
+/// This is the whole claim, and deliberately no more: [`std::panic::RefUnwindSafe`] is not
+/// asserted, because nothing needs it — `PhantomStream` was never `RefUnwindSafe`, having a
+/// `tokio::sync::Mutex` of its own — and an impl nothing needs is an obligation nobody
+/// checks.
+impl std::panic::UnwindSafe for StreamRegistry {}
+
+/// A registry belonging to no session: its tables are empty, so nothing is ever retired
+/// through it and a handle built on it always reports its drop to (an absent) pump. For
+/// tests that build a stream handle by hand.
+#[cfg(test)]
+pub(crate) fn detached_stream_registry() -> StreamRegistry {
+    let (demux, _ctrl) = StreamDemultiplexer::new_with_role(1, false);
+    StreamRegistry {
+        streams: Arc::new(DashMap::new()),
+        demux: Arc::new(demux),
+        gauge: StreamGauge::new(Observability::new(ObservabilityConfig::default()), false),
+    }
 }
 
 impl PhantomSession {
@@ -883,11 +1012,14 @@ impl PhantomSession {
     /// Create a [`SessionBuilder`] for constructing a client session.
     ///
     /// The builder collects configuration (pinned key, optional resumption hint,
-    /// optional config / runtime) and then `.transport(t).connect().await` drives the
-    /// handshake and returns the session. This is the ergonomic alternative to the
-    /// `connect_with_transport*` family — every option (runtime, config, resumption,
-    /// mimicry) is an orthogonal `SessionBuilder` setter instead of a positional
-    /// argument or a `_with_*` name suffix.
+    /// optional config / runtime) and then `.transport(t).connect().await` starts the
+    /// session and returns it **before the handshake has run** — the hybrid PQC handshake,
+    /// and with it the pinned-identity check, proceeds on a background task. Call
+    /// [`await_ready`](PhantomSession::await_ready) next to learn whether the pinned key
+    /// matched; see [`SessionBuilder::connect`] for the full contract. This is the
+    /// ergonomic alternative to the `connect_with_transport*` family — every option
+    /// (runtime, config, resumption, mimicry) is an orthogonal `SessionBuilder` setter
+    /// instead of a positional argument or a `_with_*` name suffix.
     pub fn builder(addr: impl Into<String>) -> SessionBuilder {
         SessionBuilder {
             peer_addr: addr.into(),
@@ -935,8 +1067,10 @@ impl PhantomSession {
         // Client sessions have no listener, so they own their observability
         // instance (its `snapshot()` reflects just this connection).
         let observability = Observability::new(ObservabilityConfig::default());
-        // Balanced active-streams gauge, shared with the pump (see StreamGauge).
-        let stream_gauge = StreamGauge::new(observability.clone());
+        // Balanced active-streams gauge, shared with the pump (see StreamGauge). Client
+        // role: this side allocates the odd stream ids, so those are the ones its own
+        // MAX_STREAMS limit counts.
+        let stream_gauge = StreamGauge::new(observability.clone(), true);
         // One receive-window growth budget for the whole connection. It is created here
         // rather than on the negotiated `Session`, which does not exist yet: `open_stream()`
         // is reachable before the handshake completes, and a stream built with a budget of
@@ -978,6 +1112,9 @@ impl PhantomSession {
             ready_tx: ready_tx.clone(),
             ready_rx,
             migration_capable,
+            // A client session: `migrate()` is this side's entry point, so the transport's
+            // answer is also the caller's.
+            client_migration_capable: migration_capable,
             stream_gauge: stream_gauge.clone(),
             recv_tuning: recv_tuning.clone(),
         };
@@ -988,6 +1125,12 @@ impl PhantomSession {
         // and natural shutdown comes via the close request that
         // `disconnect()` and dropping the handle raise.
         let runtime_for_pump = runtime.clone();
+        // Cloned before the spawn call below, whose argument list moves the originals: the
+        // `StreamLink` handed to it is built in the middle of that list, and the stream
+        // handles it builds need the same three tables the pump has (see `StreamRegistry`).
+        let streams_for_link = streams.clone();
+        let demux_for_link = demux.clone();
+        let stream_gauge_for_link = stream_gauge.clone();
         let _detached = runtime.spawn(Box::pin(Self::background_task(
             state,
             send_queue,
@@ -1013,6 +1156,11 @@ impl PhantomSession {
                 commands: cmd_tx,
                 control: control_tx,
                 released: released_tx,
+                registry: StreamRegistry {
+                    streams: streams_for_link,
+                    demux: demux_for_link,
+                    gauge: stream_gauge_for_link,
+                },
             },
             incoming_stream_tx,
             terminal_error,
@@ -1058,6 +1206,55 @@ impl PhantomSession {
         observability: Arc<Observability>,
         leg: LegType,
     ) -> Arc<Self> {
+        Self::install_around_established_session(
+            peer_addr,
+            transport,
+            server_session,
+            runtime,
+            observability,
+            leg,
+            false,
+        )
+    }
+
+    /// Install a pump around an already-established [`Session`] as a **client** handle.
+    ///
+    /// The production client path builds the handle before its handshake and installs the
+    /// negotiated `Session` from inside the pump, so a test that starts from a pair of
+    /// already-agreed `Session`s has no way to reach it. This is the accepted-session
+    /// installer with the one field that distinguishes the two roles set the other way:
+    /// the handle is a client's, so [`migrate`](Self::migrate) is its migration entry
+    /// point rather than [`migrate_server`](Self::migrate_server). Everything else,
+    /// including the even/odd stream-id parity of the demultiplexer, is unchanged — a test
+    /// that cares about parity should say so rather than rely on this.
+    #[cfg(test)]
+    pub(crate) fn from_established_client_session<T: SessionTransport>(
+        peer_addr: String,
+        transport: T,
+        session: Arc<Session>,
+    ) -> Arc<Self> {
+        Self::install_around_established_session(
+            peer_addr,
+            transport,
+            session,
+            Arc::new(TokioRuntime),
+            Observability::new(ObservabilityConfig::default()),
+            LegType::Tcp,
+            true,
+        )
+    }
+
+    /// The shared body of the two installers above. `client_migration_capable` is the one
+    /// thing they disagree about — see the field of the same name.
+    fn install_around_established_session<T: SessionTransport>(
+        peer_addr: String,
+        transport: T,
+        server_session: Arc<Session>,
+        runtime: Arc<dyn Runtime>,
+        observability: Arc<Observability>,
+        leg: LegType,
+        client_migration_capable: bool,
+    ) -> Arc<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (close_request, close_requested) = watch::channel(false);
         let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_DEPTH);
@@ -1083,7 +1280,7 @@ impl PhantomSession {
         // Note the observability handle here is the *listener's* aggregate, so
         // the gauge it feeds is "streams open across every accepted session" —
         // which is why the per-session drain below has to be exact.
-        let stream_gauge = StreamGauge::new(observability.clone());
+        let stream_gauge = StreamGauge::new(observability.clone(), false);
         // One receive-window growth budget for the whole connection: this handle, and only
         // this handle, is what every stream of the session is built from.
         let recv_tuning = Arc::new(SharedRecvTuning::default());
@@ -1131,6 +1328,11 @@ impl PhantomSession {
             ready_tx: Arc::new(ready_tx),
             ready_rx,
             migration_capable,
+            // An accepted server session moves through `migrate_server`, never `migrate` —
+            // the transport refuses the client entry point, so reporting it as available
+            // would promise an operation this side cannot perform. A client handle installed
+            // around an established session (tests only) passes `true`.
+            client_migration_capable,
             stream_gauge: stream_gauge.clone(),
             recv_tuning,
         });
@@ -1151,6 +1353,10 @@ impl PhantomSession {
             observability.clone(),
             leg,
         ));
+        // See the client path: cloned ahead of the argument list that moves the originals.
+        let streams_for_link = streams.clone();
+        let demux_for_link = demux.clone();
+        let stream_gauge_for_link = stream_gauge.clone();
         let _detached = runtime.spawn(Box::pin(run_data_pump(
             server_session,
             session_id,
@@ -1171,6 +1377,11 @@ impl PhantomSession {
                 commands: cmd_tx,
                 control: control_tx,
                 released: released_tx,
+                registry: StreamRegistry {
+                    streams: streams_for_link,
+                    demux: demux_for_link,
+                    gauge: stream_gauge_for_link,
+                },
             },
             incoming_stream_tx,
             stream_gauge,
@@ -1245,11 +1456,22 @@ impl PhantomSession {
                 "PhantomSession: FIPS POST self-test failed; refusing to handshake: {:?}",
                 e
             );
-            let core_err = CoreError::FipsSelfTestFailure(format!("{e:?}"));
-            *terminal_error.lock() = Some(core_err);
-            state.store(ConnectionState::Failed as u8, Ordering::Relaxed);
+            // Through `publish_failure`, not a bare store: the caller can have closed this
+            // session while the connect was in flight, and an end it asked for is not
+            // overwritten by one it did not (see that function).
+            publish_failure(
+                &state,
+                &terminal_error,
+                CoreError::FipsSelfTestFailure(format!("{e:?}")),
+            );
+            // No pump will run, so no delivery task will ever release this session's
+            // routes: release them here, or a stream opened before the connect resolved
+            // leaves its reader parked for good.
+            demux.close_all_streams();
             // Signal awaiting callers (await_ready) that we have reached a terminal state.
-            let _ = ready_tx.send(ConnectionState::Failed as u8);
+            // Read from the state rather than written as a literal `Failed`, so what
+            // resolves is what happened.
+            let _ = ready_tx.send(state.load(Ordering::Relaxed));
             return;
         }
 
@@ -1290,14 +1512,20 @@ impl PhantomSession {
                     AeadAlgorithm::Aes256Gcm,
                     ProtocolVersion::Current,
                 );
-                // Capture the terminal error BEFORE setting state so
-                // await_ready() readers that wake on the state transition always
-                // see the error already in place.
-                *terminal_error.lock() = Some(e);
-                state.store(ConnectionState::Failed as u8, Ordering::Relaxed);
-                // Signal awaiting callers (await_ready) that we have reached a
-                // terminal Failed state.
-                let _ = ready_tx.send(ConnectionState::Failed as u8);
+                // The cause is captured BEFORE the state is published, so `await_ready()`
+                // readers that wake on the state transition always see the error already in
+                // place — and neither is written at all if the caller has already closed
+                // this session, because an end it asked for is not a failure. Both halves
+                // are `publish_failure`'s job.
+                publish_failure(&state, &terminal_error, e);
+                // Same as the POST gate above: the pump never runs on this path, so the
+                // routes of any stream the application opened while the connect was in
+                // flight have to be released here.
+                demux.close_all_streams();
+                // Signal awaiting callers (await_ready) that we have reached a terminal
+                // state — whichever one it is. Published from the state rather than as a
+                // literal `Failed`, for the reason above.
+                let _ = ready_tx.send(state.load(Ordering::Relaxed));
                 return;
             }
         };
@@ -1346,10 +1574,17 @@ impl PhantomSession {
         }
 
         let session_id = *crypto_session.id();
-        state.store(ConnectionState::Connected as u8, Ordering::Relaxed);
-        // Signal readiness — handshake succeeded. The watch fires once;
-        // late `await_ready()` callers see the already-resolved Connected value.
-        let _ = ready_tx.send(ConnectionState::Connected as u8);
+        // `Connected` unless the session has already ended, which it can have: the
+        // handshake is asynchronous, so a `disconnect()` — or dropping the handle — can
+        // land while it is still running, and that publishes `Closed` from the caller's
+        // own thread. Storing over it said the session was up when the caller had already
+        // closed it, and the readiness answer below, published from the state, would then
+        // have been `Ok(())` for a session that was over before it began.
+        publish_unless_ended(&state, ConnectionState::Connected);
+        // Signal readiness. The watch fires once; a late `await_ready()` caller sees the
+        // already-resolved value. Published from the state rather than as a literal
+        // `Connected`, for the same reason: what resolved has to be what happened.
+        let _ = ready_tx.send(state.load(Ordering::Relaxed));
         log::debug!("PhantomSession: fully connected to {}", peer);
 
         // Wrap the (post-handshake) transport so every data-plane send/recv is
@@ -1393,6 +1628,55 @@ impl PhantomSession {
     }
 }
 
+/// Render a believed [`ServerReject`] as the text of a [`CoreError::ProtocolRejected`].
+///
+/// The reject carries a `code`, and reading only `supported_version` is how a refusal that
+/// has nothing to do with the version came out as "client speaks v5, server speaks v5" — a
+/// sentence that names the one field both peers agree on. Each code gets the sentence that
+/// says what the caller can do about it, and an unknown code falls back to the version
+/// wording because that is what code 1 has always meant and a future code is more likely to
+/// be about the version than not.
+fn describe_server_reject(client_version: u8, reject: &ServerReject) -> String {
+    if reject.code == REJECT_PROTOCOL_VARIANT {
+        // Both peers speak the same wire; they were built against different crypto
+        // substrates (`phantom-fips-1` vs `phantom-default-1`). The variant is fixed at
+        // compile time, so there is nothing to retry and nothing to negotiate.
+        return "server rejected the handshake: this build's protocol variant is not one the \
+                server speaks (a fips peer meeting a non-fips one, or the reverse). The \
+                variant is fixed at compile time, so use matching builds."
+            .to_string();
+    }
+    if reject.code == REJECT_RETRY_LIMIT {
+        // The server gave up on the cookie / proof-of-work exchange. Retrying the connect
+        // is the right reaction and the only one available, which is why the sentence says
+        // so: nothing about this client's build is wrong.
+        return format!(
+            "server rejected the handshake: it abandoned the address-validation and \
+             proof-of-work exchange after {MAX_HANDSHAKE_RETRY_ROUNDS} rounds without a \
+             satisfied gate. Nothing is wrong with this build — retry the connect."
+        );
+    }
+    if reject.code != REJECT_UNSUPPORTED_VERSION && reject.supported_version == client_version {
+        // Every code this build knows is handled above, so this one is from a future
+        // server — and it says both peers speak the same version. Falling through to the
+        // version wording is how a refusal with nothing to do with the version came out as
+        // "client speaks v5, server speaks v5", a sentence naming the one field the two
+        // agree on. Where the versions *do* differ the fallback is a reasonable guess and
+        // is kept; where they agree it is known to be wrong.
+        return format!(
+            "server rejected the handshake for a reason this client does not recognise \
+             (reject code {}); both peers speak protocol v{}, so the version is not it. A \
+             newer client may name the reason.",
+            reject.code, reject.supported_version
+        );
+    }
+    format!(
+        "server rejected the handshake: unsupported protocol version (client speaks v{}, \
+         server speaks v{})",
+        client_version, reject.supported_version
+    )
+}
+
 /// Drive the client side of the Phantom Protocol handshake to completion.
 ///
 /// When `resumption` is `Some((resume_id, resume_secret, early_data))` the
@@ -1428,11 +1712,13 @@ async fn run_client_handshake<T: SessionTransport>(
         None => handshake.create_client_hello(),
     };
 
-    // HS-02: cap the number of HelloRetryRequest rounds. The legitimate flow
-    // needs at most one cookie round + one PoW round; a bound of 3 leaves slack
-    // for a benign reorder. Without it, a MITM answering every ClientHello with
-    // a fresh cheap HelloRetryRequest could loop the client forever.
-    const MAX_CLIENT_RETRY_ROUNDS: u32 = 3;
+    // HS-02: cap the number of HelloRetryRequest rounds. Without it, a MITM answering
+    // every ClientHello with a fresh cheap HelloRetryRequest could loop the client
+    // forever. The bound is read from `transport::handshake` because the server reads it
+    // from there too: it used to be a `3` here and a `2` in `api::listener`, so the
+    // server abandoned a handshake the client was still working on and the client was
+    // left with a bare connection close.
+    const MAX_CLIENT_RETRY_ROUNDS: u32 = MAX_HANDSHAKE_RETRY_ROUNDS;
     // Bound how many injected/genuine ServerRejects we read past while still
     // waiting for a ServerHello, so a reject flood can't loop the inner read forever.
     const MAX_CLIENT_REJECT_ROUNDS: u32 = 3;
@@ -1460,10 +1746,9 @@ async fn run_client_handshake<T: SessionTransport>(
                     // No further responses: surface a remembered reject (a genuine version
                     // mismatch) over the raw transport error using the typed variant.
                     return match &remembered_reject {
-                        Some(r) => Err(CoreError::ProtocolRejected(format!(
-                            "server rejected the handshake: unsupported protocol version \
-                             (client speaks v{}, server speaks v{})",
-                            hello.version, r.supported_version
+                        Some(r) => Err(CoreError::ProtocolRejected(describe_server_reject(
+                            hello.version,
+                            r,
                         ))),
                         None => Err(e),
                     };
@@ -1487,10 +1772,9 @@ async fn run_client_handshake<T: SessionTransport>(
                         if reject_rounds > MAX_CLIENT_REJECT_ROUNDS {
                             // Use the typed ProtocolRejected variant so callers can branch
                             // without string-matching ("update your client").
-                            return Err(CoreError::ProtocolRejected(format!(
-                                "server rejected the handshake: unsupported protocol version \
-                                 (client speaks v{}, server speaks v{})",
-                                hello.version, reject.supported_version
+                            return Err(CoreError::ProtocolRejected(describe_server_reject(
+                                hello.version,
+                                &reject,
                             )));
                         }
                         // Keep waiting for a valid ServerHello — read the next
@@ -1588,39 +1872,110 @@ const RAW_APP_STREAM_ID: u32 = 1;
 ///   peer-initiated stream concurrently with the pump's drain.
 /// - [`Self::closed`] never decrements below zero, so a removal racing a drain
 ///   cannot push the gauge negative.
+/// - The count is kept per side — streams this end opened and streams the peer opened —
+///   because each side has its own [`MAX_STREAMS`] limit and the two are enforced in
+///   different places: [`PhantomSession::open_stream`] asks this type before it allocates
+///   an id, and the receive path asks it before it auto-creates a stream for an id the peer
+///   has sent on. The split is derived from the id's parity, which is fixed for the life of
+///   the session by the role, so it needs no separate bookkeeping.
 #[derive(Debug)]
 pub(crate) struct StreamGauge {
-    /// User-visible streams currently reported open by this session.
-    open: AtomicI64,
+    /// User-visible streams *this side* opened that are still in the session's table.
+    local_open: AtomicI64,
+    /// User-visible streams *the peer* opened that are still in the session's table.
+    peer_open: AtomicI64,
+    /// `stream_id % 2` for the ids this side allocates — 1 for a client (odd ids), 0 for a
+    /// server (even ids). Mirrors `StreamDemultiplexer::is_local_stream_id`.
+    local_parity: u32,
     observability: Arc<Observability>,
 }
 
 impl StreamGauge {
-    fn new(observability: Arc<Observability>) -> Arc<Self> {
+    /// `is_client` fixes which parity this side allocates from, exactly as it does for
+    /// [`StreamDemultiplexer::new_with_role`]: a client's ids are odd, a server's even.
+    fn new(observability: Arc<Observability>, is_client: bool) -> Arc<Self> {
         Arc::new(Self {
-            open: AtomicI64::new(0),
+            local_open: AtomicI64::new(0),
+            peer_open: AtomicI64::new(0),
+            local_parity: u32::from(is_client),
             observability,
+        })
+    }
+
+    /// Whether `stream_id` is one this side allocates. The reserved ids 0 and 1 belong to
+    /// neither side and are not counted at all.
+    fn is_local(&self, stream_id: u32) -> bool {
+        stream_id % 2 == self.local_parity
+    }
+
+    /// The side `stream_id` belongs to, or `None` for the reserved internal ids.
+    fn side(&self, stream_id: u32) -> Option<&AtomicI64> {
+        if stream_id <= RAW_APP_STREAM_ID {
+            return None;
+        }
+        Some(if self.is_local(stream_id) {
+            &self.local_open
+        } else {
+            &self.peer_open
         })
     }
 
     /// Count a newly-opened user-visible stream. No-op for the internal ids.
     fn opened(&self, stream_id: u32) {
-        if stream_id <= RAW_APP_STREAM_ID {
+        let Some(side) = self.side(stream_id) else {
             return;
-        }
-        self.open.fetch_add(1, Ordering::AcqRel);
+        };
+        side.fetch_add(1, Ordering::AcqRel);
         self.observability.stream_opened();
+    }
+
+    /// Take one of this side's [`MAX_STREAMS`] slots for a stream it is about to open, or
+    /// report that they are all taken.
+    ///
+    /// The check and the claim are one atomic step, so two callers racing cannot both be
+    /// told they had the last slot. A `false` return has counted nothing: the caller has
+    /// not allocated an id yet, so a refusal leaves no trace at all — no id spent, no route
+    /// registered, no gauge to unwind.
+    fn try_open_local(&self) -> bool {
+        let taken = self
+            .local_open
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                (v < MAX_STREAMS as i64).then_some(v + 1)
+            })
+            .is_ok();
+        if taken {
+            self.observability.stream_opened();
+        }
+        taken
+    }
+
+    /// Hand back a slot [`Self::try_open_local`] took, for a stream that in the end was not
+    /// opened — the id space ran out between the claim and the allocation.
+    fn undo_open_local(&self) {
+        if self
+            .local_open
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                (v > 0).then_some(v - 1)
+            })
+            .is_ok()
+        {
+            self.observability.stream_closed();
+        }
+    }
+
+    /// How many streams the peer currently has open on this session.
+    fn peer_open(&self) -> usize {
+        self.peer_open.load(Ordering::Acquire).max(0) as usize
     }
 
     /// Retire a stream previously counted by [`Self::opened`]. No-op for the
     /// internal ids and for a stream this session never counted (or already
     /// retired via [`Self::drain`]).
     fn closed(&self, stream_id: u32) {
-        if stream_id <= RAW_APP_STREAM_ID {
+        let Some(side) = self.side(stream_id) else {
             return;
-        }
-        if self
-            .open
+        };
+        if side
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
                 (v > 0).then_some(v - 1)
             })
@@ -1632,7 +1987,8 @@ impl StreamGauge {
 
     /// Retire every stream still counted (session teardown). Idempotent.
     fn drain(&self) {
-        let still_open = self.open.swap(0, Ordering::AcqRel);
+        let still_open =
+            self.local_open.swap(0, Ordering::AcqRel) + self.peer_open.swap(0, Ordering::AcqRel);
         for _ in 0..still_open {
             self.observability.stream_closed();
         }
@@ -2362,6 +2718,22 @@ async fn run_data_pump<T: SessionTransport>(
                     }
                 }
             }
+            // The channel closed: the reader task has gone — which is how every session
+            // ends — and this task has just finished handing over everything that reached
+            // it. So this is the moment the session's routes go, and this is the task that
+            // has to be the one to drop them.
+            //
+            // Dropping a route is what tells a `PhantomStream::recv()` that nothing more
+            // will arrive: the sender lives in the demultiplexer, and until it is gone a
+            // reader parked on the other end has no way to learn the session is over — it
+            // simply waits, for as long as the process lives, one task per stream. Doing it
+            // here rather than from the pump's teardown is what keeps it from costing
+            // anything: a route dropped while items for it were still queued in this task
+            // would discard bytes the peer's `send()` had already been told were away,
+            // whereas a route dropped after they have been handed over costs nothing at all
+            // — a bounded channel gives a reader what is already in it before it reports its
+            // end, so the reader drains its frames and only then sees the close.
+            demux_b.close_all_streams();
         }));
     }
 
@@ -2461,6 +2833,13 @@ async fn run_data_pump<T: SessionTransport>(
         // waiter is registered once rather than on every packet.
         let given_up = transport_recv.given_up();
         tokio::pin!(given_up);
+        // Why this loop stopped, when it stopped because the byte pipe underneath it did.
+        // The session ends either way, but not in the same way: a pipe that ended without
+        // the peer having announced its close ended abnormally, and a caller has to be able
+        // to tell that from the orderly departure it is otherwise indistinguishable from.
+        // `None` while the loop is running, and on the two exits that are not the pipe's
+        // doing — the peer's announced close, and this side's own.
+        let mut ended_with: Option<CoreError> = None;
         loop {
             // Flow-control / anti-flood gate: if the app-delivery backlog
             // has blown past the cap, the peer is not honouring the window —
@@ -2472,6 +2851,12 @@ async fn run_data_pump<T: SessionTransport>(
                      control; closing session",
                     undelivered_reader.load(Ordering::Acquire)
                 );
+                // Ended by this side, against a peer that would not stop. Recorded as a
+                // cause so the session does not read as an orderly close, which is what a
+                // caller would otherwise be told about a peer it should stop trusting.
+                ended_with = Some(CoreError::NetworkError(
+                    "peer ignored flow control: the receive backlog passed its cap".into(),
+                ));
                 break;
             }
             // A read abandoned here may be part-way through a frame, which is harmless:
@@ -2479,7 +2864,10 @@ async fn run_data_pump<T: SessionTransport>(
             let data = tokio::select! {
                 received = transport_recv.recv_bytes() => match received {
                     Ok(b) => b,
-                    Err(_) => break,
+                    Err(e) => {
+                        ended_with = Some(e);
+                        break;
+                    }
                 },
                 () = &mut given_up => break,
             };
@@ -2594,9 +2982,23 @@ async fn run_data_pump<T: SessionTransport>(
         // the tick arm's `Draining` follows a peer close, which rules this path out;
         // and `disconnect()`, called from the application's thread, leaves `Dead` and
         // `Failed` in place.
-        if transport_recv.has_given_up() && !crypto_recv.peer_closed() {
-            record_terminal_cause(&terminal_error_recv, CoreError::Timeout);
-            state_recv.store(ConnectionState::Dead as u8, Ordering::Relaxed);
+        if !crypto_recv.peer_closed() {
+            if transport_recv.has_given_up() {
+                record_terminal_cause(&terminal_error_recv, CoreError::Timeout);
+                state_recv.store(ConnectionState::Dead as u8, Ordering::Relaxed);
+            } else if let Some(cause) = ended_with {
+                // The byte pipe ended and the peer never said it was leaving: a stream
+                // transport whose far end vanished, a datagram socket that will not carry
+                // another packet, a peer that ignored the window. `Dead` with the cause
+                // behind it, because the alternative — the `Closed` the teardown would
+                // otherwise publish, with nothing recorded — is the same answer an orderly
+                // departure gives, and the two call for opposite reactions: take the result
+                // and stop, against reconnect. Published without overwriting an end the
+                // session had already reached, so a close this side asked for first stays
+                // this side's close.
+                record_terminal_cause(&terminal_error_recv, cause);
+                publish_end(&state_recv, ConnectionState::Dead);
+            }
         }
         // Reader exiting → drop `deliver_tx` so the delivery task drains any
         // queued items and then sees the channel closed and exits.
@@ -2902,7 +3304,21 @@ async fn run_data_pump<T: SessionTransport>(
             // channel holds nothing. Never gated: a report that waited on the command arm
             // could wait as long as that arm does, and the channel it arrives on grows.
             Some(stream_id) = released_rx.recv() => {
+                // Every report already waiting is taken in this one turn, each with the
+                // command count read at the moment it is taken. Reading it once for the whole
+                // batch instead would be wrong by a hair and lose data for it: a handle
+                // writes and *then* is dropped, so a report that arrives during the drain
+                // below belongs to a write that may have been queued after the count was
+                // read — and a release acted on before that write is admitted puts the
+                // stream's close in front of it, which discards it. `commands_taken` does
+                // not move here and the channel only grows, so the figures stay in
+                // non-decreasing order, which is what `releases` requires. Taking the
+                // reports one pump turn apiece is what made letting go of many handles
+                // quadratic — see `release_due_streams`.
                 releases.push_back((stream_id, commands_taken + cmd_rx.len() as u64));
+                while let Ok(also_released) = released_rx.try_recv() {
+                    releases.push_back((also_released, commands_taken + cmd_rx.len() as u64));
+                }
                 release_due_streams(
                     &mut releases, commands_taken, &mut deferred, &transport, &crypto_session,
                     session_id, &streams, &demux, &stream_gauge, &observability,
@@ -3047,7 +3463,7 @@ async fn run_data_pump<T: SessionTransport>(
     // already published `ConnectionState::Dead`; only a normal teardown (graceful close
     // / transport drop) publishes `Closed`.
     if !died {
-        state.store(ConnectionState::Closed as u8, Ordering::Relaxed);
+        publish_end(&state, ConnectionState::Closed);
     }
     // Retire every stream still open on this session so the active-streams gauge
     // comes back down on EVERY pump exit — graceful close, handle drop, transport
@@ -3315,6 +3731,15 @@ async fn take_control<T: SessionTransport>(
 /// acknowledged FIN is enough to drop it. Then either that is already true and the stream
 /// goes now, or a [`Deferred::Release`] is queued behind the writes still waiting for room
 /// — the handle's own among them — to close the writing half once they are in.
+///
+/// **Every release due is taken in one pass, and the queue is flushed once at the end.**
+/// The per-release flush this used to do, and the wake-up that went with it, made the cost
+/// of letting go of handles quadratic in how many were let go of: each wake-up costs the
+/// send loop a pass over the *whole* stream table, so releasing four times the handles cost
+/// twenty-one times the time, and a peer opening a stream meanwhile waited out the backlog.
+/// Flushing once per pass is the same work in the same FIFO order — the queue is drained
+/// from its head either way, and a buffer that refuses one item stops the pass either way —
+/// with one pass over the table instead of one per handle.
 #[allow(clippy::too_many_arguments)]
 async fn release_due_streams<T: SessionTransport>(
     releases: &mut VecDeque<(u32, u64)>,
@@ -3328,6 +3753,7 @@ async fn release_due_streams<T: SessionTransport>(
     stream_gauge: &Arc<StreamGauge>,
     observability: &Observability,
 ) {
+    let mut queued_any = false;
     while let Some(&(stream_id, due)) = releases.front() {
         if due > commands_taken {
             break;
@@ -3335,7 +3761,8 @@ async fn release_due_streams<T: SessionTransport>(
         releases.pop_front();
         // Clone the Arc out so no table guard is held across the awaits below. A stream
         // already gone was dropped while its handle was on its way out — closed from both
-        // ends, or by the offset-exhaustion fallback behind a `disconnect()`.
+        // ends, by the offset-exhaustion fallback behind a `disconnect()`, or by the
+        // handle itself, for a stream nothing of which ever reached the peer.
         let Some(stream) = streams.get(&stream_id).map(|s| s.clone()) else {
             continue;
         };
@@ -3345,6 +3772,9 @@ async fn release_due_streams<T: SessionTransport>(
             continue;
         }
         deferred.push_back(Deferred::Release { stream_id, stream });
+        queued_any = true;
+    }
+    if queued_any {
         flush_deferred_sends(
             deferred,
             transport,
@@ -3430,17 +3860,62 @@ fn apply_liveness(
     }
 }
 
-/// Publish `next` — a state the session can still leave, `Connected` or `Migrating` —
-/// unless the session has already reached one it cannot: an end (`Closed`, `Failed`,
-/// `Dead`) or the peer's announced close (`Draining`).
+/// Publish `next` — an end the session has just reached — unless it has already reached one,
+/// in which case the first end is the one to report.
+///
+/// The two publishers are a pair, and the difference is which side of the state machine they
+/// are writing from. This one is for the ends — `Closed`, `Failed`, `Dead` — and it defends
+/// the *first* end against the second. [`publish_unless_ended`] is for the states a session
+/// can still leave, and it defends any end against a later `Connected` or `Migrating`.
+/// Between them, an end published once is the end a caller reads.
+///
+/// The ends are not interchangeable, which is why the order matters. `Closed` says the
+/// session finished in the orderly way and nothing is owed an explanation;
+/// [`last_error`](PhantomSession::last_error) stays `None` and `send`/`recv` answer
+/// [`CoreError::ConnectionClosed`]. `Dead` and `Failed` each come with a recorded cause.
+/// Overwriting one with another loses whichever was true: the pump's teardown publishes
+/// `Closed` on the way out however the session ended, so without this it turned a death the
+/// receive task had already diagnosed into an orderly close, and a caller could not tell
+/// "the peer said goodbye" from "the connection broke".
+///
+/// `Draining` is **not** in the guarded set here, and that is the one asymmetry between the
+/// two: the peer's announced close is not an end this side has reached, so an end that
+/// happens afterwards is the truth and replaces it.
+///
+/// A failure that carries a cause has [`publish_failure`] instead — it publishes through
+/// this and records the cause under the same decision, so the pair cannot disagree. Two
+/// deaths deliberately bypass all of it: the transport giving up on a peer that stopped
+/// taking bytes, which `disconnect`'s own documentation says replaces the `Closed` it
+/// published, and the liveness sweep's idle timeout. Both are the session failing on its way
+/// out, and both record a cause.
+fn publish_end(state: &AtomicU8, next: ConnectionState) {
+    let _ = state.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        match ConnectionState::from_u8(current) {
+            ConnectionState::Closed | ConnectionState::Failed | ConnectionState::Dead => None,
+            _ => Some(next as u8),
+        }
+    });
+}
+
+/// Publish `next` — a state the session can still leave, `Connected` or `Migrating` — unless
+/// it has already reached one it cannot: an end (`Closed`, `Failed`, `Dead`) or the peer's
+/// announced close (`Draining`).
+///
+/// The other half of the pair described on [`publish_end`]. Reach for this one when what is
+/// being published is a *stage* the session is passing through, and for `publish_end` when it
+/// is the session stopping.
 ///
 /// The liveness verdict is not the only writer of the state. The receive task publishes
 /// `Dead` when the transport gives up and `Draining` when the peer's close arrives, and
-/// `disconnect()` publishes `Closed` from the caller's thread, each of them possibly
-/// between the moment the send loop read the path's signals and the moment it publishes
-/// what they said. A verdict landing after one of them must not walk it back: a caller
-/// that read `Dead`, then `Connected`, then `Dead` again was told the session recovered.
-/// The check and the write are one atomic step, so no end published in between is lost.
+/// `disconnect()` publishes `Closed` from the caller's thread, each of them possibly between
+/// the moment the send loop read the path's signals and the moment it publishes what they
+/// said. A verdict landing after one of them must not walk it back: a caller that read
+/// `Dead`, then `Connected`, then `Dead` again was told the session recovered. The check and
+/// the write are one atomic step, so no end published in between is lost.
+///
+/// `Draining` is guarded here and not in `publish_end`, for the reason given there: a
+/// session whose peer has said goodbye has not stopped, but it is not going back to
+/// `Connected` either.
 fn publish_unless_ended(state: &AtomicU8, next: ConnectionState) {
     let _ = state.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         match ConnectionState::from_u8(current) {
@@ -3451,6 +3926,54 @@ fn publish_unless_ended(state: &AtomicU8, next: ConnectionState) {
             _ => Some(next as u8),
         }
     });
+}
+
+/// Publish `Failed` with `cause` — unless the session has already ended, in which case
+/// neither the state nor the cause is touched.
+///
+/// The client's handshake runs on a background task, so a `disconnect()` — or a dropped
+/// handle — can publish `Closed` from the caller's own thread while it is still in flight.
+/// A handshake that then fails used to store `Failed` over that `Closed` and record a cause
+/// beside it, so a session the caller had closed itself reported
+/// `state = Failed, last_error = Some(NetworkError("the far end vanished"))`. That is the
+/// opposite of the contract this release states for an orderly end — `Closed` with
+/// [`last_error`](PhantomSession::last_error) answering `None` — and the caller had already
+/// been told the close was carried out. The far end vanishing *after* a session was closed
+/// on purpose is not news, and it is certainly not what happened to the session.
+///
+/// The state and the cause are decided together rather than written one after the other. The
+/// cause goes in first, because a caller polling
+/// [`connection_state`](PhantomSession::connection_state) reads the two in that order and a
+/// `Failed` with nothing recorded against it reads as an orderly close; and it is taken back
+/// out if the publish finds an end already there, so the pair a caller can observe once the
+/// dust settles is either `Failed` with this cause or the end that was already published with
+/// whatever belonged to it. The `terminal_error` lock is held across both steps, so no other
+/// recorder can interleave.
+fn publish_failure(
+    state: &AtomicU8,
+    terminal_error: &parking_lot::Mutex<Option<CoreError>>,
+    cause: CoreError,
+) {
+    let mut slot = terminal_error.lock();
+    // Only this call's own write is taken back below; a cause that was already recorded is
+    // somebody else's and stays whatever the publish decides.
+    let recorded_here = slot.is_none();
+    if recorded_here {
+        *slot = Some(cause);
+    }
+    let published = state
+        .fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| match ConnectionState::from_u8(current) {
+                ConnectionState::Closed | ConnectionState::Failed | ConnectionState::Dead => None,
+                _ => Some(ConnectionState::Failed as u8),
+            },
+        )
+        .is_ok();
+    if !published && recorded_here {
+        *slot = None;
+    }
 }
 
 /// How long an unanswered PATH_CHALLENGE is allowed to stay outstanding before
@@ -4881,18 +5404,37 @@ async fn send_path_validation<T: SessionTransport>(
     true
 }
 
-/// Hard cap on concurrent receive streams a peer can open on one session (H-3).
+/// Hard cap on how many streams **each side** may have open at once on one session (H-3).
 ///
-/// The recv path auto-creates a `Stream` for any of the 2^32 `stream_id`s; without a cap a
-/// peer can spray distinct ids to explode the stream table. Enforced in `handle_packet`,
-/// on the arm that would create the stream: past the cap the segment is refused, and being
-/// unrecorded it is not SACKed either, so the sender retransmits rather than believing the
-/// stream exists. Sized well above QUIC's ~100-stream default so real multiplexing is
-/// unaffected.
+/// Counted per side, and per side is what makes the two halves agree. The receive path
+/// auto-creates a `Stream` for any of the 2^32 `stream_id`s, so without a cap a peer can
+/// spray distinct ids to explode the stream table; and this side can do the same to the
+/// peer, one [`PhantomSession::open_stream`] at a time.
 ///
-/// It is a multiplier on several of the per-stream bounds below, so raising it raises what
-/// one session can be made to hold — see the receive-memory section in this module's
+/// - **The peer's half** is enforced in `handle_packet`, on the arm that would create the
+///   stream: past the cap the segment is refused, and being unrecorded it is not SACKed
+///   either, so the sender retransmits rather than believing the stream exists.
+/// - **This side's half** is enforced in [`PhantomSession::open_stream`], which refuses
+///   with [`CoreError::StreamError`] rather than handing back a stream the peer has no room
+///   for. That refusal is the whole reason the local half exists: the peer's refusal is
+///   *silent* — a segment nobody acknowledges — so a stream opened past the peer's cap
+///   stalls with data outstanding, and inbound silence with data in flight is exactly what
+///   the liveness sweep reads as a dead path. One stream too many used to end the whole
+///   session, and every healthy stream on it, a few seconds later.
+///
+/// Sized well above QUIC's ~100-stream default so real multiplexing is unaffected. The
+/// session's stream table therefore holds at most `2 × MAX_STREAMS + 1` entries — each
+/// side's cap, plus the reserved raw-app stream the pump creates — and the cap is a
+/// multiplier on several of the per-stream bounds below, so raising it raises what one
+/// session can be made to hold. See the receive-memory section in this module's
 /// documentation for which of them it multiplies.
+///
+/// **What it does not promise.** The two caps are local, so they cannot see each other: if
+/// *both* ends open close to `MAX_STREAMS` streams, each end's table has its own streams in
+/// it as well as the peer's, and the peer's cap can still be reached by a stream this side
+/// was allowed to open. Refusing locally removes the case a single side can cause on its
+/// own — which is the one an application reaches by accident — and leaves the symmetric one,
+/// where both ends are deliberately at their limit, behaving as it did.
 pub const MAX_STREAMS: usize = 256;
 
 /// Ceiling on the app-delivery backlog one session may hold, in bytes.
@@ -5725,10 +6267,16 @@ async fn handle_packet<T: SessionTransport>(
                         return;
                     }
                 }
-                if streams_recv.len() >= MAX_STREAMS {
+                // The peer's own streams are what this counts, not the table's size: the
+                // table also holds this side's streams and the reserved raw-app stream,
+                // and charging those against the peer's allowance made the limit a
+                // different number depending on how many streams this side happened to
+                // have open — so the peer could be refused its 256th stream, silently,
+                // while `MAX_STREAMS` said it was owed one.
+                if scratch.stream_gauge.peer_open() >= MAX_STREAMS {
                     log::warn!(
                         "PhantomSession: refusing new receive stream {stream_id}: \
-                         MAX_STREAMS ({MAX_STREAMS}) reached"
+                         MAX_STREAMS ({MAX_STREAMS}) already open from this peer"
                     );
                     return;
                 }
@@ -6238,8 +6786,11 @@ impl PhantomSession {
             ready_rx,
             // Inert constructor has no transport; migration is not possible.
             migration_capable: false,
+            client_migration_capable: false,
             // Inert constructor: no pump, so only `Drop` ever drains this.
-            stream_gauge: StreamGauge::new(observability.clone()),
+            // Server parity, matching the `StreamDemultiplexer::new` above; nothing is ever
+            // opened on this session, so which it is only has to be consistent.
+            stream_gauge: StreamGauge::new(observability.clone(), false),
             observability,
             recv_tuning: Arc::new(SharedRecvTuning::default()),
         })
@@ -6254,17 +6805,44 @@ impl PhantomSession {
     ///
     /// # Errors
     ///
-    /// [`CoreError::StreamError`] once this side has opened 32 767 streams in the
-    /// session. A stream id travels in a 16-bit header field and each side allocates
-    /// from its own half of that space, never reusing an id — even one whose stream
-    /// has long since closed, because the peer may still be holding it or the record
-    /// that it closed, and would fold a new stream's bytes into it. Nothing is opened
-    /// and the session is otherwise unaffected: streams already open carry on, and
-    /// `accept_stream()` still takes the peer's. The limit counts every stream opened,
-    /// not the ones open at once, so a long-lived session that opens a stream per
-    /// request reaches it; open a new session to continue.
+    /// [`CoreError::StreamError`], for either of two limits, with nothing opened and the
+    /// session otherwise unaffected in both cases: streams already open carry on, and
+    /// `accept_stream()` still takes the peer's.
+    ///
+    /// - **[`MAX_STREAMS`] already open on this side.** The peer holds the same limit on
+    ///   how many streams it will accept from us, and it enforces it *silently* — the
+    ///   segment that would open the stream is simply never acknowledged. So a stream
+    ///   handed out past the limit would not fail; it would sit with data outstanding
+    ///   that nothing can retire, and inbound silence with data in flight is what the
+    ///   liveness sweep reads as a dead path. Refusing here is the difference between one
+    ///   stream reporting a limit and the whole session dying a few seconds later. Retry
+    ///   once a stream has closed: the limit counts streams open *at once*, and a stream
+    ///   leaves the count when its close is acknowledged, or immediately if it was let go
+    ///   of without ever having been written on.
+    /// - **32 767 streams opened over the session's life.** A stream id travels in a
+    ///   16-bit header field and each side allocates from its own half of that space,
+    ///   never reusing an id — even one whose stream has long since closed, because the
+    ///   peer may still be holding it or the record that it closed, and would fold a new
+    ///   stream's bytes into it. This limit counts every stream ever opened, so a
+    ///   long-lived session that opens a stream per request reaches it; open a new session
+    ///   to continue.
     pub fn open_stream(&self) -> Result<Arc<crate::api::stream::PhantomStream>, CoreError> {
-        let handle = self.demux.open_stream(STREAM_RECV_CHANNEL_DEPTH)?;
+        // Claimed before an id is allocated, so a refusal leaves nothing behind: no id
+        // spent out of a space that never reuses one, and no half-registered route in the
+        // demultiplexer for a stream that does not exist.
+        if !self.stream_gauge.try_open_local() {
+            return Err(CoreError::StreamError(format!(
+                "this session already has the {MAX_STREAMS} streams it may have open at \
+                 once; close one before opening another"
+            )));
+        }
+        let handle = match self.demux.open_stream(STREAM_RECV_CHANNEL_DEPTH) {
+            Ok(handle) => handle,
+            Err(e) => {
+                self.stream_gauge.undo_open_local();
+                return Err(e);
+            }
+        };
         let stream_id = handle.stream_id;
 
         let transport_stream = Arc::new(Stream::with_recv_tuning(
@@ -6272,14 +6850,14 @@ impl PhantomSession {
             self.recv_tuning.clone(),
         ));
         self.streams.insert(stream_id, transport_stream);
-        // Count the stream on the active-streams gauge. The matching retire is
-        // `retire_stream`, once both halves are closed; `retire_released_stream`,
+        // The stream is already counted on the active-streams gauge — the claim above is
+        // what counted it, so that the limit is checked and taken in one step. The matching
+        // retire is `retire_stream`, once both halves are closed; `retire_released_stream`,
         // once the handle has been dropped and this side's half is closed (at once,
         // for a stream dropped before a reliable byte was written on it); the
         // offset-exhaustion fallback in `flush_deferred_sends`; or — for a stream
         // still open when the session ends (including one opened after the pump
         // already exited) — the drain in `Drop for PhantomSession` / at pump exit.
-        self.stream_gauge.opened(stream_id);
 
         Ok(Arc::new(crate::api::stream::PhantomStream::new(
             handle,
@@ -6287,6 +6865,11 @@ impl PhantomSession {
                 commands: self.cmd_tx.clone(),
                 control: self.control_tx.clone(),
                 released: self.released_tx.clone(),
+                registry: StreamRegistry {
+                    streams: self.streams.clone(),
+                    demux: self.demux.clone(),
+                    gauge: self.stream_gauge.clone(),
+                },
             },
             self.state.clone(),
         )))
@@ -6328,7 +6911,12 @@ impl PhantomSession {
     /// - If the session is `Failed` or `Dead`: returns the captured terminal
     ///   error (from the handshake or the data pump) so the caller gets the
     ///   *specific* cause (e.g. [`CoreError::ServerIdentityMismatch`]) rather
-    ///   than the generic `"Cannot send in state Failed"` message.
+    ///   than a generic message.
+    /// - If the session is `Closed`: returns [`CoreError::ConnectionClosed`]. That is the
+    ///   whole answer — a session closed in the orderly way, by this side or by the peer,
+    ///   has no cause to report and [`last_error`](Self::last_error) stays `None`. It is
+    ///   how a caller tells an orderly end from a failed one: this error with no cause
+    ///   behind it is the first, a cause is the second.
     ///
     /// # ⚠ This is a byte stream, not a message channel
     ///
@@ -6365,16 +6953,21 @@ impl PhantomSession {
             self.cmd_tx
                 .send(SessionCommand::Send(data))
                 .await
-                .map_err(|_| CoreError::NetworkError("Session closed".into()))?;
+                .map_err(|_| CoreError::ConnectionClosed)?;
         } else if state == ConnectionState::Connecting {
             // Still handshaking — queue
             self.send_queue.lock().await.push(data);
         } else {
-            // Surface the captured terminal error (e.g. ServerIdentityMismatch)
-            // instead of the generic "Cannot send in state …" message.
-            return Err(self.terminal_error.lock().clone().unwrap_or_else(|| {
-                CoreError::NetworkError(format!("Cannot send in state {state:?}"))
-            }));
+            // The captured terminal cause when there is one (e.g. ServerIdentityMismatch),
+            // and the typed close when there is not. A session that ended in the orderly
+            // way has no cause, and the answer to "why can I not write?" is that it is
+            // over — which is a fact with a variant of its own, not a state name formatted
+            // into a string a caller would have to match on.
+            return Err(self
+                .terminal_error
+                .lock()
+                .clone()
+                .unwrap_or_else(|| self.end_without_a_cause()));
         }
 
         Ok(())
@@ -6388,17 +6981,26 @@ impl PhantomSession {
     /// refcount the Vec is moved out of the underlying buffer, otherwise
     /// `Bytes::to_vec` copies.
     ///
-    /// When the session is `Failed` or `Dead` and the recv channel has been
-    /// dropped, returns the captured terminal error (if any) rather than the
-    /// generic `"Session closed"` message.
+    /// # The end of the session
+    ///
+    /// Once the session is over and everything it delivered has been read, this returns
+    /// [`CoreError::ConnectionClosed`] for an orderly end — this side's own
+    /// [`disconnect`](Self::disconnect), or the peer's — and the captured terminal cause
+    /// for any other: [`CoreError::Timeout`] for a path the transport gave up on, whatever
+    /// the handshake failed with, and so on. So the two cases a reader has to tell apart —
+    /// "the peer is finished, take the result" and "the connection broke, retry" — differ
+    /// in the value returned rather than only in a message, and agree with
+    /// [`connection_state`](Self::connection_state) (`Closed` against `Dead`) and with
+    /// [`last_error`](Self::last_error) (`None` against the cause).
     pub async fn recv(&self) -> Result<Vec<u8>, CoreError> {
         let mut rx = self.recv_rx.lock().await;
         let bytes = rx.recv().await.ok_or_else(|| {
-            // Surface the captured terminal error on channel-closed.
+            // Surface the captured terminal cause on channel-closed, and the typed close
+            // when there is none to surface: nothing failed, the session is simply over.
             self.terminal_error
                 .lock()
                 .clone()
-                .unwrap_or_else(|| CoreError::NetworkError("Session closed".into()))
+                .unwrap_or_else(|| self.end_without_a_cause())
         })?;
         Ok(bytes.to_vec())
     }
@@ -6439,6 +7041,11 @@ impl PhantomSession {
     /// captured terminal error on failure. This is the preferred alternative
     /// to polling `connection_state()` in a loop.
     ///
+    /// A session that is over rather than failed — closed by this side or by the peer, with
+    /// nothing recorded against it — answers [`CoreError::ConnectionClosed`]. It is not
+    /// ready and never will be, but nothing went wrong, and
+    /// [`last_error`](Self::last_error) still reports `None`.
+    ///
     /// Because the readiness signal is carried on a `watch` channel, a call
     /// made *after* the handshake has already resolved (either direction)
     /// returns immediately — there is no lost-notification race.
@@ -6466,12 +7073,15 @@ impl PhantomSession {
             // the same one, and it is not "failed" either.
             ConnectionState::Draining => Err(CoreError::ConnectionClosed),
             ConnectionState::Failed | ConnectionState::Dead | ConnectionState::Closed => {
-                // Surface the captured terminal error, or a generic fallback.
+                // The captured terminal cause, or the typed close when there is none. A
+                // session the caller closed itself has nothing recorded against it —
+                // `last_error()` says so — and calling that a failure was a statement of
+                // fact that was false.
                 Err(self
                     .terminal_error
                     .lock()
                     .clone()
-                    .unwrap_or(CoreError::NetworkError("session failed".into())))
+                    .unwrap_or_else(|| self.end_without_a_cause()))
             }
             _ => Ok(()),
         }
@@ -6516,7 +7126,7 @@ impl PhantomSession {
             self.cmd_tx
                 .send(SessionCommand::Send(msg))
                 .await
-                .map_err(|_| CoreError::NetworkError("Session closed during flush".into()))?;
+                .map_err(|_| CoreError::ConnectionClosed)?;
         }
         Ok(count)
     }
@@ -6617,15 +7227,20 @@ impl PhantomSession {
             })
     }
 
-    /// Whether this session's transport supports seamless connection migration
-    /// (i.e., [`migrate`](Self::migrate) will succeed for UDP sessions).
+    /// Whether [`migrate`](Self::migrate) can move this session.
     ///
-    /// Returns `true` only when the session is backed by `UdpClientTransport`.
-    /// On TCP, WebSocket, WASI, or Embedded sessions, [`migrate`](Self::migrate)
-    /// returns [`CoreError::Unsupported`] — use reconnection with 0-RTT resumption
-    /// instead.
+    /// Returns `true` only for a **client** session backed by `UdpClientTransport`. On TCP,
+    /// WebSocket, WASI or Embedded sessions, and on a session accepted by a listener,
+    /// [`migrate`](Self::migrate) returns [`CoreError::Unsupported`] — use reconnection
+    /// with 0-RTT resumption instead.
+    ///
+    /// An accepted PhantomUDP session answers `false` here even though its transport does
+    /// migrate: the server side moves through the Rust-only
+    /// [`migrate_server`](Self::migrate_server), and `migrate` is refused there so that the
+    /// FFI-exported client operation cannot move a server. Answering `true` would name a
+    /// capability nothing the caller of this method can reach.
     pub fn supports_migration(&self) -> bool {
-        self.migration_capable
+        self.client_migration_capable
     }
 
     /// Migrate the session to a new local network address (Phase 4 — embedder-
@@ -6654,8 +7269,14 @@ impl PhantomSession {
     /// or Embedded session returns [`CoreError::Unsupported`]. Check
     /// [`supports_migration`](Self::supports_migration) first, or use
     /// `connect_pinned_udp` to ensure UDP backing.
+    ///
+    /// **This is the client's entry point only.** A session handed back by a listener is
+    /// the server end of a PhantomUDP connection, and although its transport does migrate,
+    /// it does so through [`migrate_server`](Self::migrate_server) — calling `migrate()`
+    /// there returns [`CoreError::Unsupported`] rather than accepting a request the pump
+    /// would discard.
     pub async fn migrate(&self, local_addr: String) -> Result<(), CoreError> {
-        if !self.migration_capable {
+        if !self.client_migration_capable {
             return Err(CoreError::Unsupported(
                 "this session does not support connection migration; use a UDP-backed session"
                     .into(),
@@ -6743,6 +7364,24 @@ impl PhantomSession {
 }
 
 impl PhantomSession {
+    /// What a session that cannot carry a call any more reports when nothing was recorded
+    /// against it.
+    ///
+    /// An end this side or the peer asked for is [`CoreError::ConnectionClosed`] and nothing
+    /// else: it is the one fact there is about the session, and [`last_error`](Self::last_error)
+    /// says `None` beside it because nothing failed. `Failed` and `Dead` are the other
+    /// answer, and they always carry a cause — with one exception, the inert `connect()`,
+    /// which starts `Failed` without ever having tried anything. Its generic answer is kept
+    /// as it is rather than dressed up as the close of a session that never opened.
+    fn end_without_a_cause(&self) -> CoreError {
+        match self.connection_state() {
+            ConnectionState::Failed | ConnectionState::Dead => {
+                CoreError::NetworkError("session failed".into())
+            }
+            _ => CoreError::ConnectionClosed,
+        }
+    }
+
     /// Get the stream demultiplexer (internal use, not exposed to UniFFI)
     pub fn demux(&self) -> Arc<StreamDemultiplexer> {
         self.demux.clone()
@@ -6888,6 +7527,15 @@ impl Drop for PhantomSession {
         // never completed, the inert `connect()`) it is a no-op.
         self.close_request
             .send_modify(|requested| *requested = true);
+        // Release every stream's delivery route, so a `PhantomStream::recv()` still parked
+        // on one is told the session is over instead of waiting for the life of the
+        // process. The session's delivery task does this too, in the ordered place — behind
+        // everything it still had to hand over — and that is the normal path; this is the
+        // backstop for the ends it cannot reach: a session whose pump never started because
+        // the handshake failed, the inert `connect()`, and a delivery task still parked on
+        // a stream whose own reader has stopped reading it. Idempotent, and it takes only
+        // the routing table's shard locks.
+        self.demux.close_all_streams();
         // Retire any stream still counted on the active-streams gauge. The pump
         // drains too (that is the normal path, and it fires promptly); this
         // covers the cases the pump cannot — a session whose pump never started
@@ -6899,6 +7547,675 @@ impl Drop for PhantomSession {
 }
 
 // ─── Pinned-Connect Shim (Phase 7.2 mobile bridge) ──────────────────────────
+
+/// Every address `addr` resolves to, in the order the resolver gave them, or a typed error
+/// when the name resolves to nothing at all.
+#[cfg(not(target_arch = "wasm32"))]
+async fn resolve_all(addr: &str) -> Result<Vec<std::net::SocketAddr>, CoreError> {
+    let candidates: Vec<std::net::SocketAddr> = tokio::net::lookup_host(addr)
+        .await
+        .map_err(|e| CoreError::NetworkError(format!("resolve {}: {}", addr, e)))?
+        .collect();
+    if candidates.is_empty() {
+        return Err(CoreError::NetworkError(format!("no address for {}", addr)));
+    }
+    Ok(candidates)
+}
+
+/// How many flights a PhantomUDP client handshake needs before a `Session` exists.
+///
+/// Two, and not one: the listener's stateless-cookie gate
+/// ([`udp_admit`](crate::transport::handshake::HandshakeServer::udp_admit)) answers a first
+/// `ClientHello` from an unproven source with a `HelloRetryRequest` carrying the cookie, and
+/// only the hello that comes back with it is answered with a `ServerHello`. Each flight is a
+/// round trip, so this is how many round trips a handshake that is going to succeed still
+/// has ahead of it at the moment [`connect_udp_trying_each_address`] starts waiting on a
+/// candidate.
+#[cfg(not(target_arch = "wasm32"))]
+const UDP_HANDSHAKE_FLIGHTS: u32 = 2;
+
+/// What a sender with no round-trip measurement of its own waits before treating a flight as
+/// lost.
+///
+/// One second: what RFC 6298 §2.1 asks of TCP before any RTT sample exists, and what RFC
+/// 9002 §6.2.2 arrives at for QUIC by a different route. The property that matters here is
+/// not the provenance, though — it is that this is the interval
+/// [`UdpClientTransport`](crate::api::udp_transport::UdpClientTransport)'s own handshake shim
+/// starts its retransmission schedule from, so it is this implementation's own statement of
+/// how long an answer may take before the answer counts as late. That constant is private to
+/// its module, so `the_candidate_share_floor_is_two_of_the_transports_first_intervals` in
+/// this file's test module holds the two to each other rather than a comment asking the next
+/// editor to.
+#[cfg(not(target_arch = "wasm32"))]
+const NO_SAMPLE_FLIGHT_RTO: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The least [`connect_udp_trying_each_address`] will give a candidate before abandoning it.
+///
+/// A share below this decides nothing. Both flights of the handshake are still outstanding
+/// when the wait starts, and until each of them has been outstanding for
+/// [`NO_SAMPLE_FLIGHT_RTO`] the transport underneath has not itself concluded anything about
+/// the path — so a shorter wait cannot distinguish a candidate that is not answering from
+/// one that is merely on a long path, and abandoning on it throws away working sessions. It
+/// is derived rather than chosen for that reason: the two factors are the number of round
+/// trips that have to happen and the length this implementation already treats as "late" for
+/// one of them.
+///
+/// The failure it exists to stop: a name with eight A/AAAA records — ordinary for a CDN or a
+/// multi-homed host — divided a ten-second budget into 1.25 s shares, which is under the
+/// product above, so the wait could not tell a slow path from a dead one. The correct,
+/// reachable first address was abandoned and the call handed back the last candidate instead.
+/// The two factors above are the whole derivation — a path length is not one of them, and an
+/// earlier draft of this comment wrongly offered one — and
+/// `the_candidate_share_floor_is_two_of_the_transports_first_intervals` holds the constant to
+/// them rather than asking the next editor to.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) const MIN_CANDIDATE_HANDSHAKE_SHARE: std::time::Duration =
+    std::time::Duration::from_millis(
+        NO_SAMPLE_FLIGHT_RTO.as_millis() as u64 * UDP_HANDSHAKE_FLIGHTS as u64,
+    );
+
+/// How long the walk gives a candidate to answer before *also* contacting the next one.
+///
+/// 250 ms: RFC 8305 §5's Connection Attempt Delay, the interval a happy-eyeballs resolver
+/// uses for this exact decision, for the reason that applies here too — an address that has
+/// not answered yet is not evidence that it never will, so the next address is *added* to
+/// the attempt rather than waited for.
+///
+/// The failure it exists to stop: the walk used to try the addresses strictly in turn, so a
+/// name whose first address is dark cost a whole [`candidate_share`] before the second was
+/// contacted at all. On this machine `localhost` resolves `::1` first with nothing behind it,
+/// and `connect_pinned_udp("localhost", …)` took 5.04 s where a working first address takes
+/// milliseconds; a six-address name of the same shape cost about twelve seconds.
+///
+/// A candidate that *has* answered stops the schedule — see
+/// [`connect_udp_trying_each_address`] — so the overlap only ever happens while the addresses
+/// ahead of it are silent, and a name whose first address works is still the only one
+/// contacted.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) const CANDIDATE_ATTEMPT_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(250);
+
+/// The wait each candidate is given from its own start, out of `budget`, when the name
+/// resolved to `count` addresses.
+///
+/// An even division, floored at [`MIN_CANDIDATE_HANDSHAKE_SHARE`] so that a wait means
+/// something, and then capped back at `budget`: when the caller's whole budget is smaller
+/// than one meaningful share there is no share that decides anything, and spending the
+/// budget on the first candidate is the most that can be done without overrunning the bound
+/// the caller set. Split out of the walk because it is the part carrying arithmetic, and
+/// arithmetic is worth checking without sockets.
+///
+/// Since the attempts overlap it is a per-attempt ceiling rather than a slot in a queue: an
+/// even division still bounds how long the walk holds on to an address that is not answering,
+/// which is what lets the attempts still running be narrowed down to one. `budget` bounds the
+/// whole call regardless.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn candidate_share(budget: std::time::Duration, count: usize) -> std::time::Duration {
+    let even = budget
+        .checked_div(u32::try_from(count).unwrap_or(u32::MAX))
+        .unwrap_or(budget);
+    even.max(MIN_CANDIDATE_HANDSHAKE_SHARE).min(budget)
+}
+
+/// Whether `e` — the answer a candidate's [`await_ready`](PhantomSession::await_ready)
+/// gave — ends the address walk instead of moving it on to the next address.
+///
+/// The walk exists because a connected datagram socket cannot tell an address with a server
+/// behind it from an address with nothing, so only the handshake can. That makes every
+/// answer it gets one of two kinds, and treating them as one was the defect:
+///
+/// * **the path's answer** — nothing came back, the socket could not be used for this
+///   family, the reply did not parse, the session ended before it came up. Another address
+///   of the same name need not have that problem, and trying it is the whole point.
+/// * **the peer's answer** — something answered, and what it said was no. The caller has to
+///   hear that. One extra address in a name's DNS answer (an added AAAA record, a poisoned
+///   resolver, a hostile split-horizon zone) is contacted *first* on every
+///   `connect_pinned_udp*`, and receives the client's whole `ClientHello` — on the
+///   resumption entry point, its sealed `early_data` as well. The pin holds and the blob
+///   stays sealed, so nothing is disclosed; but the one signal that an impostor answered for
+///   this name is the error the pin check produces, and discarding it because a later
+///   address answered correctly leaves the caller with `Ok(())` and no way to know. That is
+///   the detection Invariant 1 exists to provide.
+///
+/// A third and much smaller class stops the walk for an unrelated reason: a failure that is
+/// this process's own — a configuration it refused, a power-on self-test it did not pass — is
+/// identical for every candidate, so going on can only reach the same error later.
+///
+/// Everything else continues, including the handful of internal failures that would also be
+/// identical for every candidate (a broken CSPRNG, a failed derivation). They are classified
+/// that way deliberately: none of them is reachable from this path, and mis-classifying a
+/// route-specific error as terminal breaks a connect that would have worked, while
+/// mis-classifying a process-wide one as continuable costs the walk and nothing else — the
+/// roster the walk ends with names what every candidate said.
+///
+/// The match is exhaustive rather than ending in `_ => false`, and that is the point: a
+/// variant added to [`CoreError`] later has to be classified here instead of joining the
+/// class that gets thrown away.
+#[cfg(not(target_arch = "wasm32"))]
+fn refusal_ends_the_walk(e: &CoreError) -> bool {
+    match e {
+        // The peer answered, and it is not the one the caller pinned — the variant this
+        // whole classification exists for. A name whose addresses hold *different*
+        // identities cannot be pinned to one key at all, and used to work only when the
+        // resolver happened to order the matching one after the others, so there is no
+        // working deployment this refuses.
+        CoreError::ServerIdentityMismatch => true,
+        // A Phantom server answered and refused this client: the protocol version or the
+        // build variant is wrong, and both are fixed at compile time. Every address of the
+        // service refuses identically, and the caller needs the typed variant to know that
+        // the fix is a different client and not a retry.
+        CoreError::ProtocolRejected(_) => true,
+        // The two builds cannot agree on a primitive — a statement about the pair of
+        // binaries rather than about the route between them.
+        CoreError::CipherSuiteUnavailable(_) => true,
+        // This process's own arguments were refused, and every candidate is handed the same
+        // ones. Validated before any I/O on these entry points, so what arrives here is
+        // never a value read off the wire.
+        CoreError::ConfigError(_) => true,
+        // This binary's power-on self-tests did not pass, so it has no business completing a
+        // handshake with anybody (Invariant 11).
+        #[cfg(feature = "fips")]
+        CoreError::FipsSelfTestFailure(_) => true,
+        // Nothing answered inside the share, or the socket could not be used, or the byte
+        // pipe broke: the cases the walk exists for.
+        CoreError::Timeout
+        | CoreError::NetworkError(_)
+        // The session ended before it came up, by this side's close or the peer's. There is
+        // nothing to hand back either way, and another address may hold a peer that stays.
+        | CoreError::ConnectionClosed
+        // Produced from values read off the wire as readily as from anything else, so what
+        // reaches here is this peer's bytes and says nothing about the next address.
+        | CoreError::SerializationError(_)
+        | CoreError::ValidationError(_)
+        | CoreError::CryptoError(_)
+        | CoreError::HandshakeError(_)
+        | CoreError::ReplayDetected(_)
+        // Not reachable from a client handshake at all: a stream and an unsupported
+        // operation both need a session first, and the remaining three are internal. See
+        // the note above on why the unreachable ones are classified this way round.
+        | CoreError::StreamError(_)
+        | CoreError::Unsupported(_)
+        | CoreError::KeyDerivationError
+        | CoreError::RngError(_)
+        | CoreError::InternalError(_) => false,
+    }
+}
+
+/// What each address the walk got as far as trying said, for the error it ends with and for
+/// the line it logs when a refusal cuts it short.
+#[cfg(not(target_arch = "wasm32"))]
+fn address_roster(tried: &[(std::net::SocketAddr, CoreError)]) -> String {
+    if tried.is_empty() {
+        return "no address was tried".to_string();
+    }
+    let each: Vec<String> = tried
+        .iter()
+        .map(|(server, e)| format!("{server}: {e}"))
+        .collect();
+    format!("{} address(es) tried — {}", tried.len(), each.join("; "))
+}
+
+/// Whether an address ahead of `winner` in the resolver's order is still being waited on and
+/// has begun answering.
+///
+/// A completed handshake is not handed over while one is: an address that has said something
+/// may be about to refuse the pin, and a refusal is the caller's answer rather than an address
+/// that did not work. An address that has said *nothing* is the case the overlap exists for
+/// and holds nothing up.
+#[cfg(not(target_arch = "wasm32"))]
+fn an_earlier_address_is_still_answering(winner: usize, waiting: &[Option<Attempt>]) -> bool {
+    waiting
+        .iter()
+        .take(winner)
+        .flatten()
+        .any(|attempt| attempt.answered.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Whether the walk may contact the next address yet.
+///
+/// Three reasons not to, and each is a rule the doc on
+/// [`connect_udp_trying_each_address`] states: there is no address left; a verdict is already
+/// in hand; or an address already contacted has begun answering, and until it has finished
+/// there is nothing a further address could settle. Computed once per pass rather than
+/// inline, because the `select!` below has to be guarded by the same answer as the loop that
+/// does the contacting — a timer arm left enabled while the loop refuses to act on it spins.
+#[cfg(not(target_arch = "wasm32"))]
+fn may_contact_the_next_address(
+    next: usize,
+    total: usize,
+    verdict_in_hand: bool,
+    waiting: &[Option<Attempt>],
+) -> bool {
+    next < total
+        && !verdict_in_hand
+        && !waiting
+            .iter()
+            .flatten()
+            .any(|attempt| attempt.answered.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Whether a refusal from `refuser` is the caller's answer yet.
+///
+/// It is, once no address ahead of it in the resolver's order is still being waited on —
+/// including the ones never contacted, which cannot succeed either. Until then the refusal is
+/// held: otherwise one hostile address *after* the right one in a name's DNS answer would
+/// deny service, because it is contacted while a working-but-slow first address is still
+/// handshaking and its refusal would end a walk that was about to succeed. The serial walk
+/// never had that problem, because it never reached the later address.
+#[cfg(not(target_arch = "wasm32"))]
+fn a_refusal_is_the_answer_now(refuser: usize, waiting: &[Option<Attempt>]) -> bool {
+    waiting.iter().take(refuser).all(Option::is_none)
+}
+
+/// Which of the verdicts in hand is the caller's answer.
+///
+/// Both can be in hand at once: an address refuses while an earlier one is still
+/// handshaking, or an address completes while an earlier one is still about to refuse. The
+/// resolver's order is a preference, so the lower-numbered address answers either way — and
+/// getting it the other way round is a denial of service rather than a preference, because
+/// one hostile address *after* the right one refuses in a millisecond while the right one is
+/// still working, and answering with that refusal ends a walk that was about to succeed.
+///
+/// A pure function, and used at all three places the walk decides — inside the loop, at the
+/// budget deadline and after it — because the rule was written out three times and a
+/// divergence between the copies is invisible: each one on its own looks right.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerdictToActOn {
+    /// A completed handshake. Still subject to
+    /// [`an_earlier_address_is_still_answering`] before it is handed over.
+    Win,
+    /// A peer's refusal. Still subject to [`a_refusal_is_the_answer_now`].
+    Refusal,
+    /// Neither has happened yet.
+    Neither,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn verdict_to_act_on(won: Option<usize>, refused: Option<usize>) -> VerdictToActOn {
+    match (won, refused) {
+        // One index produces one verdict, so the two are never equal; `<` and `<=` decide
+        // the same way and the asymmetry is deliberately explicit.
+        (Some(winner), Some(refuser)) => {
+            if winner < refuser {
+                VerdictToActOn::Win
+            } else {
+                VerdictToActOn::Refusal
+            }
+        }
+        (Some(_), None) => VerdictToActOn::Win,
+        (None, Some(_)) => VerdictToActOn::Refusal,
+        (None, None) => VerdictToActOn::Neither,
+    }
+}
+
+/// Log the refusal an earlier address's success overruled.
+///
+/// The walk hands back the earlier address and says nothing, which is right for the caller —
+/// the service they asked for is the one they get — but it is the only moment anybody learns
+/// that something answered for this name and was not the pinned server. That is the signal
+/// Invariant 1 exists to produce, and on the winning path it has nowhere else to go: the
+/// caller's `Result` is `Ok`, `last_error()` is `None`, and the roster in the error message
+/// is never built. An operator with a poisoned resolver or a hostile extra address in a DNS
+/// answer would otherwise see a clean connect every time.
+#[cfg(not(target_arch = "wasm32"))]
+fn note_an_overruled_refusal(
+    addr: &str,
+    candidates: &[std::net::SocketAddr],
+    winner: usize,
+    refused: Option<&(usize, CoreError)>,
+) {
+    if let Some((refuser, e)) = refused {
+        if let Some(server) = candidates.get(*refuser) {
+            log::warn!(
+                "PhantomSession: {server} answered for {addr} and refused the connection \
+                 ({e}); {} answered correctly and comes first in the resolver's order, so \
+                 that is what this connect returns. Something is answering for this name \
+                 that is not the pinned server.",
+                candidates
+                    .get(winner)
+                    .map_or_else(|| "the winning address".to_string(), |w| w.to_string())
+            );
+        }
+    }
+}
+
+/// One address the walk has contacted and is still waiting on.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+struct Attempt {
+    /// The session built on that address, handed to the caller if this attempt wins.
+    session: Arc<PhantomSession>,
+    /// Its transport's "this address has said something" flag — see
+    /// [`an_earlier_address_is_still_answering`].
+    answered: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Open a PhantomUDP session to `addr`, contacting the addresses the name resolves to in the
+/// resolver's order and taking the first that completes its handshake.
+///
+/// **Why this is not simply "take the first address".** It used to be, and the first address
+/// is whichever the resolver felt like putting first: `localhost` commonly resolves to `::1`
+/// ahead of `127.0.0.1`, and a server listening only on IPv4 is then never reached. On TCP
+/// the same name works, because `TcpStream::connect` walks the list — a connect to a port
+/// nothing is listening on is refused, and it moves on. A datagram socket has no such
+/// answer: "connecting" one only records where to send, so it succeeds against an address
+/// with nothing behind it, and the failure surfaces much later as a handshake that timed
+/// out. The only thing that can tell the addresses apart is therefore the handshake itself.
+///
+/// **Why the attempts overlap.** They used to run strictly in turn, each candidate but the
+/// last given a [`candidate_share`] of `budget` to complete before the next was contacted at
+/// all — so the `localhost` case above, the one the walk was written for, *worked* and took
+/// 5.04 s, and a six-address name of that shape took about twelve seconds. The next address
+/// is now contacted [`CANDIDATE_ATTEMPT_DELAY`] after the one before it, as RFC 8305 §5 has
+/// a happy-eyeballs resolver do, and the first handshake to complete is the one handed back.
+/// The dark-first-address case costs the delay instead of the share.
+///
+/// Four rules keep that from becoming a race, and each of them is there for a case that
+/// would otherwise be worse than the serial walk was:
+///
+/// * **An address that has answered stops the schedule.** Once a candidate's transport has
+///   heard anything from it, no further address is contacted until that candidate finishes.
+///   So a name whose first address works is still the only one contacted — including when its
+///   handshake is slow, which is the case the share's floor exists for — and the client's
+///   `ClientHello`, and on the resuming entry point its sealed `early_data`, reaches no more
+///   addresses than the serial walk sent it to.
+/// * **A completed handshake waits for an earlier address that has begun answering.** Such an
+///   address may be about to refuse the pin, and discarding that because a later address
+///   answered correctly is what the refusal classification exists to prevent (see
+///   [`refusal_ends_the_walk`]). An earlier address that has said nothing holds nothing up.
+/// * **A refusal waits for every earlier address to finish.** Otherwise one hostile address
+///   *after* the right one in a name's DNS answer would deny service: it would be contacted
+///   while a working-but-slow first address was still handshaking, and its refusal would end
+///   a walk that was about to succeed. The serial walk never had that problem because it
+///   never reached the later address; held this way, neither does this one.
+/// * **Between two verdicts, the lower-numbered address answers.** Both can be in hand at
+///   once, and the resolver's order is a preference, so it decides: a success ahead of a
+///   refusal is handed back (with the refusal logged, since nothing else on that path says
+///   an impostor answered), and a refusal ahead of a success is the caller's answer. See
+///   [`verdict_to_act_on`], which holds the rule for all three of the places the walk
+///   applies it.
+///
+/// What that leaves is one narrowing against the serial walk, and it is worth stating
+/// plainly: an impostor that has not said a *word* by the time a later address completes is
+/// not reported, where a serial walk would have waited out its whole share for it. The
+/// overlap cannot both be fast and wait for silence — that is the trade — and what bounds the
+/// window is the delay plus the winner's own handshake rather than the share. The serial
+/// walk's guarantee was not unconditional either: an impostor silent for longer than its
+/// share was missed there too.
+///
+/// **What that means for the total.** Each attempt is waited on for at most
+/// [`candidate_share`] from its own start, and the whole call is bounded by `budget` —
+/// [`CLIENT_HANDSHAKE_DEADLINE`] at every call site — rather than by `budget` plus a share as
+/// before. When the budget is spent with attempts still running, the first of them is handed
+/// back unawaited; when all of them have failed, the error carries the whole roster, because
+/// there the roster is the entire content of the answer.
+///
+/// A name with one address is handed back as soon as its socket is bound, with no wait at
+/// all, which is what keeps the contract these entry points document — that they return
+/// before the handshake, and `Ok` says nothing about the peer's identity. That is every
+/// literal address and the overwhelming majority of real names. The same happens once every
+/// candidate has been contacted and one attempt is left running: there is no candidate left
+/// to fall back to, so there is nothing further to decide and the caller's own
+/// [`await_ready`](PhantomSession::await_ready) is the right place to learn the outcome.
+///
+/// **An abandoned attempt is not cut short**, and this is deliberate rather than pending.
+/// Dropping the session raises its close request, but that request is read inside
+/// `run_data_pump`, and a session abandoned during its handshake never reaches the pump — so
+/// each abandoned candidate keeps its socket, its background task and its handshake
+/// retransmissions until its own [`CLIENT_HANDSHAKE_DEADLINE`] expires, which for an
+/// `n`-address name leaves up to `n − 1` of them alive at once. Making the close abandon a
+/// running handshake is not available: the same background task serves
+/// [`connect_with_transport`](PhantomSession::connect_with_transport), whose documented
+/// contract is that a close arriving during the handshake still pushes the writes queued
+/// ahead of it, and that contract needs the handshake to finish. What each abandoned attempt
+/// costs is bounded and known — one socket, one task, and the flight repeats of
+/// `HANDSHAKE_RETRANSMIT_BUDGET` sent into an address that is not answering.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn connect_udp_trying_each_address<F>(
+    addr: &str,
+    candidates: &[std::net::SocketAddr],
+    budget: std::time::Duration,
+    spawn: F,
+) -> Result<Arc<PhantomSession>, CoreError>
+where
+    F: FnMut(crate::api::udp_transport::UdpClientTransport) -> PhantomSession,
+{
+    walk_candidate_addresses(addr, candidates, budget, spawn, |server| {
+        crate::api::udp_transport::UdpClientTransport::connect(server)
+    })
+    .await
+}
+
+/// [`connect_udp_trying_each_address`] with the socket-opening step handed in.
+///
+/// The seam exists for one branch that is otherwise unreachable from a test: a candidate
+/// whose socket cannot be bound at all. `UdpClientTransport::connect` binds `0.0.0.0:0` or
+/// `[::]:0`, which fails only where the host has no such family — the IPv6-disabled machine
+/// this walk is partly written for — and a test cannot arrange that for one address and not
+/// another. Everything else about the walk is exercised through the production entry point.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn walk_candidate_addresses<F, O, Fut>(
+    addr: &str,
+    candidates: &[std::net::SocketAddr],
+    budget: std::time::Duration,
+    mut spawn: F,
+    mut open: O,
+) -> Result<Arc<PhantomSession>, CoreError>
+where
+    F: FnMut(crate::api::udp_transport::UdpClientTransport) -> PhantomSession,
+    O: FnMut(std::net::SocketAddr) -> Fut,
+    Fut: std::future::Future<
+        Output = Result<crate::api::udp_transport::UdpClientTransport, CoreError>,
+    >,
+{
+    use futures::StreamExt;
+
+    if candidates.is_empty() {
+        return Err(CoreError::NetworkError(format!("no address for {}", addr)));
+    }
+    let share = candidate_share(budget, candidates.len());
+    let deadline = tokio::time::Instant::now() + budget;
+    // What every candidate the walk tried said, in order. Kept rather than overwritten: a
+    // caller told only about the last one cannot tell "none of the four answered" from "the
+    // fourth was the only one tried".
+    let mut tried: Vec<(std::net::SocketAddr, CoreError)> = Vec::new();
+    // The attempts still being waited on, by candidate index; `None` once one has finished.
+    let mut waiting: Vec<Option<Attempt>> = vec![None; candidates.len()];
+    let mut running = futures::stream::FuturesUnordered::new();
+    let mut next = 0usize;
+    // When the next candidate may be contacted. The first one goes at once.
+    let mut contact_next_at = tokio::time::Instant::now();
+    // The lowest-numbered candidate whose handshake completed, held while an earlier address
+    // is still answering, and the refusal likewise.
+    let mut won: Option<(usize, Arc<PhantomSession>)> = None;
+    let mut refused: Option<(usize, CoreError)> = None;
+
+    loop {
+        // Contact the next candidate when its turn has come — and not while the address
+        // ahead of it is answering, or while a verdict is already in hand.
+        while tokio::time::Instant::now() >= contact_next_at
+            && may_contact_the_next_address(
+                next,
+                candidates.len(),
+                won.is_some() || refused.is_some(),
+                &waiting,
+            )
+        {
+            let server = candidates[next];
+            match open(server).await {
+                Ok(transport) => {
+                    let answered = transport.peer_answered_flag();
+                    let session = Arc::new(spawn(transport));
+                    // One address: handed back before its handshake, as documented.
+                    if candidates.len() == 1 {
+                        return Ok(session);
+                    }
+                    waiting[next] = Some(Attempt {
+                        session: Arc::clone(&session),
+                        answered,
+                    });
+                    let at = next;
+                    running.push(async move {
+                        (at, tokio::time::timeout(share, session.await_ready()).await)
+                    });
+                    contact_next_at = tokio::time::Instant::now() + CANDIDATE_ATTEMPT_DELAY;
+                }
+                Err(e) => {
+                    tried.push((server, e));
+                    // No attempt was made, so there is nothing to give a head start to.
+                    // The delay exists to let a contacted address answer before another is
+                    // added to the race; charging it for an address whose socket could not
+                    // be bound is a quarter of a second of latency spent on a candidate
+                    // already known to be hopeless, and a name whose first two addresses
+                    // are of a family this host has not got paid it twice over.
+                    contact_next_at = tokio::time::Instant::now();
+                }
+            }
+            next += 1;
+        }
+
+        // Which verdict in hand, if two are, is the one to act on — see
+        // [`verdict_to_act_on`], which holds the rule for all three of the places it is
+        // applied.
+        let verdict = verdict_to_act_on(
+            won.as_ref().map(|(i, _)| *i),
+            refused.as_ref().map(|(i, _)| *i),
+        );
+        if verdict == VerdictToActOn::Win {
+            // A completed handshake, once no earlier address is still answering — that one
+            // may be about to refuse, and a refusal is an answer.
+            if let Some((i, session)) = &won {
+                if !an_earlier_address_is_still_answering(*i, &waiting) {
+                    note_an_overruled_refusal(addr, candidates, *i, refused.as_ref());
+                    return Ok(Arc::clone(session));
+                }
+            }
+        } else if refused
+            .as_ref()
+            .is_some_and(|(i, _)| a_refusal_is_the_answer_now(*i, &waiting))
+        {
+            // A refusal, once no earlier address can still produce a verdict at all.
+            if let Some((i, e)) = refused.take() {
+                log::warn!(
+                    "PhantomSession: {} answered for {addr} and refused the connection ({e}); \
+                     the remaining {} address(es) are not tried, because a refusal is an \
+                     answer and not an address that did not work. Before it: {}",
+                    candidates[i],
+                    candidates.len() - 1 - i,
+                    address_roster(&tried)
+                );
+                return Err(e);
+            }
+        }
+        // Every candidate contacted and one attempt left: nothing to choose between, so it
+        // goes back unawaited, exactly as a single-address name does.
+        if next >= candidates.len() && won.is_none() && refused.is_none() && running.len() == 1 {
+            if let Some(attempt) = waiting.iter().flatten().next() {
+                return Ok(Arc::clone(&attempt.session));
+            }
+        }
+        // Nothing running and nothing left to contact: every attempt failed.
+        if running.is_empty() && next >= candidates.len() {
+            break;
+        }
+
+        tokio::select! {
+            biased;
+            Some((at, outcome)) = running.next(), if !running.is_empty() => {
+                let finished = waiting[at].take();
+                match outcome {
+                    Ok(Ok(())) => {
+                        // The lowest-numbered success is the one kept: the resolver's order
+                        // is a preference, and two addresses of a name that both answer
+                        // correctly are the same service.
+                        if let Some(attempt) = finished {
+                            if won.as_ref().is_none_or(|(held, _)| at < *held) {
+                                won = Some((at, attempt.session));
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        if refusal_ends_the_walk(&e) {
+                            if refused.as_ref().is_none_or(|(held, _)| at < *held) {
+                                refused = Some((at, e));
+                            }
+                        } else {
+                            tried.push((candidates[at], e));
+                            // Nothing more to wait for on this address: bring the next
+                            // candidate forward rather than holding its start.
+                            contact_next_at = tokio::time::Instant::now();
+                        }
+                    }
+                    Err(_) => {
+                        tried.push((candidates[at], CoreError::Timeout));
+                        contact_next_at = tokio::time::Instant::now();
+                    }
+                }
+                log::debug!(
+                    "PhantomSession: {addr} — {} finished. So far: {}",
+                    candidates[at],
+                    address_roster(&tried)
+                );
+            }
+            // Ahead of the contact timer, so nothing new is contacted once the budget is
+            // spent.
+            _ = tokio::time::sleep_until(deadline) => {
+                // `budget` is the outer authority. What is in hand goes back, in the order
+                // of how much it settles: a completed handshake, then a refusal — a peer
+                // answered and said no, which is the caller's answer and not an address
+                // that did not work — and only then an attempt still running, unawaited, for
+                // the caller to ask about itself.
+                if verdict == VerdictToActOn::Win {
+                    if let Some((i, session)) = &won {
+                        note_an_overruled_refusal(addr, candidates, *i, refused.as_ref());
+                        return Ok(Arc::clone(session));
+                    }
+                }
+                if let Some((_, e)) = refused {
+                    return Err(e);
+                }
+                if let Some((_, session)) = won {
+                    return Ok(session);
+                }
+                if let Some(attempt) = waiting.iter().flatten().next() {
+                    return Ok(Arc::clone(&attempt.session));
+                }
+                break;
+            }
+            _ = tokio::time::sleep_until(contact_next_at), if may_contact_the_next_address(
+                next,
+                candidates.len(),
+                won.is_some() || refused.is_some(),
+                &waiting,
+            ) => {}
+        }
+    }
+    // Same rule as inside the loop, from the same function.
+    match verdict_to_act_on(
+        won.as_ref().map(|(i, _)| *i),
+        refused.as_ref().map(|(i, _)| *i),
+    ) {
+        VerdictToActOn::Win => {
+            if let Some((i, session)) = &won {
+                note_an_overruled_refusal(addr, candidates, *i, refused.as_ref());
+                return Ok(Arc::clone(session));
+            }
+        }
+        VerdictToActOn::Refusal => {
+            if let Some((_, e)) = refused {
+                return Err(e);
+            }
+        }
+        VerdictToActOn::Neither => {}
+    }
+    // Reaching here means every candidate failed — either before a session existed, a socket
+    // that could not be bound to that family at all, or with an answer the walk goes on from.
+    Err(CoreError::NetworkError(format!(
+        "no usable address for {addr}: {}",
+        address_roster(&tried)
+    )))
+}
 
 /// Connect to a server over **TCP**, pinning its identity to `pinned_key`.
 ///
@@ -7235,6 +8552,15 @@ async fn connect_mimic(
 /// the default liveness settings and the thirty-second write deadline of
 /// [`connect_pinned`].
 ///
+/// **A resume consumes the ticket, whether or not `early_data` is empty.** The ticket is
+/// one-shot (security invariant 9), and the server consumes it the moment the resumption
+/// binder verifies — before it looks at whether a sealed blob came with it. Resuming with an
+/// empty `early_data` therefore spends the ticket to buy only the cookie / proof-of-work
+/// bypass, and [`PhantomSession::early_data_accepted`] answers `None`, which is correct
+/// ("no early-data on this connect") and easy to read as "nothing was spent". A caller with
+/// nothing to send yet should connect without the hint and keep it for the connect that
+/// does have a payload; a caller that resumes twice off one hint gets 1-RTT the second time.
+///
 /// Native-only, like [`connect_pinned`]: `TcpSessionTransport` lives
 /// behind `cfg(not(target_arch = "wasm32"))`.
 #[cfg(not(target_arch = "wasm32"))]
@@ -7312,7 +8638,10 @@ pub async fn connect_pinned_with_resumption(
 /// datagram socket, involves no exchange with the peer at all. The handshake and
 /// the check that the server holds `pinned_key` run on the background task,
 /// while the session reports [`ConnectionState::Connecting`] and
-/// [`send`](PhantomSession::send) queues bytes rather than refusing them.
+/// [`send`](PhantomSession::send) queues bytes rather than refusing them. (The one
+/// exception is a `host` that resolves to more than one address: telling those apart
+/// takes a handshake, so the candidates before the last one are tried and awaited — see
+/// below.)
 ///
 /// **Call [`await_ready`](PhantomSession::await_ready) before treating the
 /// session as authenticated**; it surfaces
@@ -7327,12 +8656,43 @@ pub async fn connect_pinned_with_resumption(
 /// path validation, and passive NAT-rebind recovery are all live for FFI
 /// consumers.
 ///
-/// `host` is resolved via the system resolver; the **first** returned address is
-/// used. Unlike the TCP [`connect_pinned`] (whose `TcpStream::connect` tries every
-/// resolved address in turn), this does **not** fall back to subsequent addresses
-/// if the first is unreachable — pass an IP literal or a single-family host when
-/// that matters. Server-key pinning is mandatory (security invariant 1).
-/// Native-only, like [`connect_pinned`].
+/// `host` is resolved via the system resolver and **every** address it returns is tried, in
+/// the resolver's order, until one answers or one refuses — like the TCP [`connect_pinned`],
+/// whose `TcpStream::connect` does the same. It matters more here than it looks: `localhost`
+/// commonly resolves to `::1` before `127.0.0.1`, and a datagram socket "connected" to an
+/// address with nothing behind it reports no error at all, so taking only the first address
+/// meant a server listening on IPv4 was simply never reached. Only the handshake can tell
+/// the addresses apart, so each candidate but the last is given a share of the client
+/// handshake deadline to complete one, and the last is handed back without waiting — which
+/// is why a one-address name, every IP literal among them, behaves exactly as it always
+/// did. Two things about the walk are worth knowing before relying on it:
+///
+/// * **A refusal is returned, not walked past.** An address that *answers* and is not the
+///   pinned server ends the walk with [`CoreError::ServerIdentityMismatch`], and one that
+///   answers with a protocol rejection ends it with [`CoreError::ProtocolRejected`]. An
+///   extra address in a name's DNS answer — an added AAAA record, a poisoned resolver, a
+///   hostile split-horizon zone — is contacted first on every one of these calls and gets
+///   the whole `ClientHello`, so being told that something answered for this name and was
+///   not the server you pinned is the point of the pin. The returned
+///   [`CoreError::NetworkError`] carries the roster — every address tried and what each one
+///   said — in one case only: where no candidate's socket could be created at all, so no
+///   session ever existed to hand back. An address that merely fails to *answer* does not
+///   reach it, because the last candidate goes back as `Ok` without being awaited, which is
+///   the contract this entry point documents; what the earlier candidates said goes to the
+///   log, and [`await_ready`](PhantomSession::await_ready) is where the outcome comes from.
+///   A deployment whose addresses genuinely hold *different* identities has to pin per
+///   address; one key cannot be the right answer for all of them.
+/// * **The attempts overlap and the call fits inside the one handshake deadline.** Each
+///   address is contacted 250 ms after the one before it — RFC 8305 § 5's Connection Attempt
+///   Delay — unless an earlier one has answered, and each attempt is waited on for at most an
+///   even share of the 10 s handshake deadline, floored at 2 s, since a wait shorter than a
+///   handshake decides nothing and abandons reachable addresses. The floor can make the
+///   shares add up to past the deadline at six addresses or more, which leaves such a name a
+///   tail the walk never reaches; the deadline is the outer authority either way, so the call
+///   is bounded by it rather than by it plus a share, as the serial walk was.
+///
+/// Server-key pinning is mandatory (security invariant 1). Native-only, like
+/// [`connect_pinned`].
 ///
 /// # Example
 ///
@@ -7369,15 +8729,11 @@ pub async fn connect_pinned_udp(
         .map_err(|e| CoreError::CryptoError(format!("invalid pinned key: {}", e)))?;
 
     let addr = format!("{}:{}", host, port);
-    let server: std::net::SocketAddr = tokio::net::lookup_host(&addr)
-        .await
-        .map_err(|e| CoreError::NetworkError(format!("resolve {}: {}", addr, e)))?
-        .next()
-        .ok_or_else(|| CoreError::NetworkError(format!("no address for {}", addr)))?;
-
-    let transport = crate::api::udp_transport::UdpClientTransport::connect(server).await?;
-    let session = PhantomSession::connect_with_transport(&addr, transport, expected_server_key);
-    Ok(Arc::new(session))
+    let candidates = resolve_all(&addr).await?;
+    connect_udp_trying_each_address(&addr, &candidates, CLIENT_HANDSHAKE_DEADLINE, |transport| {
+        PhantomSession::connect_with_transport(&addr, transport, expected_server_key.clone())
+    })
+    .await
 }
 
 /// Like [`connect_pinned_udp`] but also applies [`PhantomConfig`](crate::config::PhantomConfig)
@@ -7417,22 +8773,19 @@ pub async fn connect_pinned_udp_with_config(
     let expected_server_key = HybridVerifyingKey::from_bytes(&pinned_key)
         .map_err(|e| CoreError::CryptoError(format!("invalid pinned key: {}", e)))?;
     let addr = format!("{}:{}", host, port);
-    let server: std::net::SocketAddr = tokio::net::lookup_host(&addr)
-        .await
-        .map_err(|e| CoreError::NetworkError(format!("resolve {}: {}", addr, e)))?
-        .next()
-        .ok_or_else(|| CoreError::NetworkError(format!("no address for {}", addr)))?;
-    let transport = crate::api::udp_transport::UdpClientTransport::connect(server).await?;
     let liveness = config.liveness();
-    let session = PhantomSession::spawn_client(
-        &addr,
-        transport,
-        expected_server_key,
-        Arc::new(TokioRuntime),
-        None,
-        Some(liveness),
-    );
-    Ok(Arc::new(session))
+    let candidates = resolve_all(&addr).await?;
+    connect_udp_trying_each_address(&addr, &candidates, CLIENT_HANDSHAKE_DEADLINE, |transport| {
+        PhantomSession::spawn_client(
+            &addr,
+            transport,
+            expected_server_key.clone(),
+            Arc::new(TokioRuntime),
+            None,
+            Some(liveness),
+        )
+    })
+    .await
 }
 
 /// 0-RTT resumption analogue of [`connect_pinned_udp`] — the UDP sibling of
@@ -7473,8 +8826,23 @@ pub async fn connect_pinned_udp_with_config(
 /// rejected before the UDP socket is bound. Acceptance is best-effort (security
 /// invariant 9): an unknown/stale ticket completes 1-RTT and the caller checks
 /// [`PhantomSession::early_data_accepted`] and re-sends when it is not `Some(true)`.
-/// Like [`connect_pinned_udp`], the first resolved address is used with no fallback.
-/// Native-only.
+///
+/// **A resume consumes the ticket, whether or not `early_data` is empty.** The ticket is
+/// one-shot (security invariant 9), and the server consumes it the moment the resumption
+/// binder verifies — before it looks at whether a sealed blob came with it. Resuming with an
+/// empty `early_data` therefore spends the ticket to buy only the cookie / proof-of-work
+/// bypass, and [`PhantomSession::early_data_accepted`] answers `None`, which is correct
+/// ("no early-data on this connect") and easy to read as "nothing was spent". A caller with
+/// nothing to send yet should connect without the hint and keep it for the connect that
+/// does have a payload; a caller that resumes twice off one hint gets 1-RTT the second time.
+///
+/// Like [`connect_pinned_udp`], every address the host resolves to is tried in the
+/// resolver's order — including the two qualifications described there: an address that
+/// answers and refuses ends the walk with that refusal, and the per-address share has a
+/// floor, so a name with more than five addresses can take longer than the one client
+/// handshake deadline. On this entry point the first of those is the sharper of the two: the
+/// sealed `early_data` blob goes out in the first flight, so it reaches whatever answers
+/// first at the name, and the refusal is what tells the caller that happened. Native-only.
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg_attr(feature = "bindings", uniffi::export(async_runtime = "tokio"))]
 pub async fn connect_pinned_udp_with_resumption(
@@ -7513,25 +8881,21 @@ pub async fn connect_pinned_udp_with_resumption(
     }
 
     let addr = format!("{}:{}", host, port);
-    let server: std::net::SocketAddr = tokio::net::lookup_host(&addr)
-        .await
-        .map_err(|e| CoreError::NetworkError(format!("resolve {}: {}", addr, e)))?
-        .next()
-        .ok_or_else(|| CoreError::NetworkError(format!("no address for {}", addr)))?;
-
-    let transport = crate::api::udp_transport::UdpClientTransport::connect(server).await?;
     // All validation (key pin, hint size, early-data cap) is done above.
     // Delegates directly to `spawn_client` to keep 0-RTT one-shot /
     // best-effort (security invariant 9).
-    let session = PhantomSession::spawn_client(
-        &addr,
-        transport,
-        expected_server_key,
-        Arc::new(TokioRuntime),
-        Some((session_id, resumption_secret, early_data)),
-        None,
-    );
-    Ok(Arc::new(session))
+    let candidates = resolve_all(&addr).await?;
+    connect_udp_trying_each_address(&addr, &candidates, CLIENT_HANDSHAKE_DEADLINE, |transport| {
+        PhantomSession::spawn_client(
+            &addr,
+            transport,
+            expected_server_key.clone(),
+            Arc::new(TokioRuntime),
+            Some((session_id, resumption_secret, early_data.clone())),
+            None,
+        )
+    })
+    .await
 }
 
 // ─── SessionBuilder ─────────────────────────────────────────────────────────
@@ -7540,7 +8904,9 @@ pub async fn connect_pinned_udp_with_resumption(
 ///
 /// Created via [`PhantomSession::builder`]. Call setters to configure, then
 /// call `.transport(t)` to supply a [`SessionTransport`], then `.connect().await`
-/// to perform the handshake and return a session.
+/// to start the session. `connect()` returns **before the handshake has run** — see
+/// [`SessionBuilder::connect`] for the contract — so `await_ready()` is the call that
+/// settles whether the server is the pinned one, and every example ends with it.
 ///
 /// ```rust,no_run
 /// # use phantom_protocol::api::{PhantomSession, TcpSessionTransport};
@@ -7553,6 +8919,9 @@ pub async fn connect_pinned_udp_with_resumption(
 ///     .transport(transport)
 ///     .connect()
 ///     .await?;
+/// // `connect()` has not checked the pinned key yet; this is where a mismatch surfaces,
+/// // as `CoreError::ServerIdentityMismatch`.
+/// session.await_ready().await?;
 /// # Ok(())
 /// # }
 /// ```
@@ -7577,6 +8946,13 @@ impl<T> SessionBuilder<T> {
     /// Both values behind the hint — `hint.session_id()` and
     /// `hint.resumption_secret()` — must be exactly 32 bytes; oversized
     /// `early_data` (> [`EARLY_DATA_MAX_LEN`]) is rejected at `.connect()` time.
+    ///
+    /// The hint is spent either way: the ticket is one-shot and the server consumes it
+    /// when the resumption binder verifies, before it looks for a sealed blob. Attaching a
+    /// hint with an empty `early_data` therefore buys only the cookie / proof-of-work
+    /// bypass and leaves nothing for the next connect, while
+    /// [`PhantomSession::early_data_accepted`] reads `None` — correct, and easy to mistake
+    /// for "the ticket is still good". Keep the hint until there is a payload to send.
     pub fn resumption(mut self, hint: Arc<ResumptionHint>, early_data: Vec<u8>) -> Self {
         // Stored raw; the exact-32-byte length is validated at `.connect()` time
         // (matching the strict FFI `connect_pinned_*_with_resumption` path), so a
@@ -7771,6 +9147,7 @@ mod tests {
             commands,
             control,
             released,
+            registry: detached_stream_registry(),
         }
     }
 
@@ -7786,7 +9163,7 @@ mod tests {
     fn test_recv_scratch(obs: &Arc<Observability>, ack_capacity: usize) -> RecvScratch {
         RecvScratch::new(
             ack_capacity,
-            StreamGauge::new(obs.clone()),
+            StreamGauge::new(obs.clone(), false),
             Arc::new(PathChallenges::default()),
             Arc::new(SharedRecvTuning::default()),
         )
@@ -7945,6 +9322,156 @@ mod tests {
             "the error must name the versions involved so an operator can act on it, got: \
              {msg}"
         );
+    }
+
+    /// A reject whose `code` says the *variant* did not match must not be described as a
+    /// version mismatch. The server refuses a fips peer meeting a non-fips one before it
+    /// reads anything else, and both peers speak the same `PROTOCOL_VERSION` when it
+    /// happens — so the version wording renders as "client speaks v5, server speaks v5",
+    /// which names the one field they agree on and tells an operator nothing. The typed
+    /// variant is the same either way (`ProtocolRejected`), so the text is the only thing
+    /// carrying the distinction to a human reading a log.
+    #[tokio::test]
+    async fn client_describes_a_variant_reject_as_a_variant_reject() {
+        use crate::transport::handshake::{ServerReject, ServerReply, PROTOCOL_VERSION};
+
+        let (client_transport, server_transport) = ChannelTransport::pair();
+        // The reject path errors before any key verification, so any key works.
+        let (_sk, expected_vk) = crate::crypto::hybrid_sign::HybridSigningKey::generate();
+
+        let server = tokio::spawn(async move {
+            let _hello = server_transport.recv_bytes().await.unwrap();
+            let reject = ServerReply::Reject(ServerReject::protocol_variant_mismatch())
+                .to_wire()
+                .unwrap();
+            server_transport.send_bytes(&reject).await.unwrap();
+        });
+
+        let result = run_client_handshake(&client_transport, &expected_vk, None).await;
+        server.await.unwrap();
+
+        let err = result.expect_err("a variant mismatch must surface as an error");
+        assert!(
+            matches!(err, CoreError::ProtocolRejected(_)),
+            "expected a typed rejection, got: {err:?}"
+        );
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("protocol variant"),
+            "the message must name the variant, got: {msg}"
+        );
+        assert!(
+            !msg.contains("unsupported protocol version"),
+            "the message must not blame the version, got: {msg}"
+        );
+        // The tautology the old wording produced, spelled out so it cannot come back under
+        // different phrasing: both peers speak this version, and saying so is the defect.
+        assert!(
+            !msg.contains(&format!(
+                "client speaks v{PROTOCOL_VERSION}, server speaks v{PROTOCOL_VERSION}"
+            )),
+            "got: {msg}"
+        );
+    }
+
+    /// A server that abandons the cookie / proof-of-work exchange is described as having
+    /// abandoned it, and the caller gets the typed variant it branches on.
+    ///
+    /// **The defect.** The server closed without a reply when it ran out of retry rounds,
+    /// so the client reported `CoreError::NetworkError("early eof")` — a byte-pipe error,
+    /// the same shape as the network breaking, for a decision the server made on purpose.
+    /// A caller cannot tell "retry this connect" from "the link is down" out of that, and a
+    /// reviewer reading a log sees an EOF.
+    ///
+    /// **Why it comes back unnoticed.** With the gate's difficulty now fixed for the life
+    /// of a handshake, an honest client never reaches this path at all, so no functional
+    /// test goes near it; and the failure it produced was indistinguishable from a network
+    /// error, which reads as flakiness rather than as a missing message.
+    #[tokio::test]
+    async fn client_describes_a_retry_limit_reject_as_an_abandoned_gate() {
+        use crate::transport::handshake::{ServerReject, ServerReply, PROTOCOL_VERSION};
+
+        let (client_transport, server_transport) = ChannelTransport::pair();
+        // The reject path errors before any key verification, so any key works.
+        let (_sk, expected_vk) = crate::crypto::hybrid_sign::HybridSigningKey::generate();
+
+        let server = tokio::spawn(async move {
+            let _hello = server_transport.recv_bytes().await.expect("the hello");
+            let reject = ServerReply::Reject(ServerReject::retry_limit())
+                .to_wire()
+                .expect("encode the reject");
+            server_transport
+                .send_bytes(&reject)
+                .await
+                .expect("send the reject");
+        });
+
+        let result = run_client_handshake(&client_transport, &expected_vk, None).await;
+        server.await.expect("the server half");
+
+        let err = result.expect_err("an abandoned gate must surface as an error");
+        assert!(
+            matches!(err, CoreError::ProtocolRejected(_)),
+            "the caller needs the typed variant, not a byte-pipe error; got {err:?}"
+        );
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("proof-of-work"),
+            "the message has to name the gate, or it says no more than the EOF it replaced; \
+             got {msg}"
+        );
+        assert!(
+            !msg.contains("unsupported protocol version"),
+            "the message must not blame the version, got: {msg}"
+        );
+        assert!(
+            !msg.contains(&format!(
+                "client speaks v{PROTOCOL_VERSION}, server speaks v{PROTOCOL_VERSION}"
+            )),
+            "got: {msg}"
+        );
+    }
+
+    /// A reject code this build does not know, from a server that speaks the same version,
+    /// is described as unrecognised rather than as a version mismatch.
+    ///
+    /// The fallback reads `supported_version` and nothing else, which is how a refusal with
+    /// nothing to do with the version came out as "client speaks v5, server speaks v5" —
+    /// twice now, once for the variant code and once for the retry-limit code, each fixed
+    /// only after it shipped. A third code will be added by a future server to a client
+    /// built today, so the fallback itself has to stop producing that sentence. Where the
+    /// versions genuinely differ the old wording is a reasonable guess and is kept.
+    #[test]
+    fn an_unknown_reject_code_from_a_same_version_server_is_not_called_a_version_mismatch() {
+        use crate::transport::handshake::{ServerReject, PROTOCOL_VERSION, SERVER_REJECT_MARKER};
+
+        // A code past every one this build assigns.
+        let future = ServerReject {
+            marker: SERVER_REJECT_MARKER,
+            code: 200,
+            supported_version: PROTOCOL_VERSION,
+        };
+        let msg = describe_server_reject(PROTOCOL_VERSION, &future);
+        assert!(
+            msg.contains("does not recognise") && msg.contains("200"),
+            "the message has to say the reason is unknown and name the code, got: {msg}"
+        );
+        assert!(
+            !msg.contains(&format!(
+                "client speaks v{PROTOCOL_VERSION}, server speaks v{PROTOCOL_VERSION}"
+            )),
+            "got: {msg}"
+        );
+
+        // A future code from a server that really does speak another version keeps the
+        // version wording: there the guess is a useful one and the two figures differ.
+        let elsewhere = ServerReject {
+            marker: SERVER_REJECT_MARKER,
+            code: 200,
+            supported_version: PROTOCOL_VERSION.wrapping_add(9),
+        };
+        let msg = describe_server_reject(PROTOCOL_VERSION, &elsewhere);
+        assert!(msg.contains("unsupported protocol version"), "got: {msg}");
     }
 
     /// A rejection is a definitive answer, so the client must not spend the whole connect
@@ -8492,6 +10019,99 @@ mod tests {
             session.bandwidth_snapshot().await.is_none(),
             "no negotiated session yet, so there is no window to report"
         );
+    }
+
+    /// The client answers every retry round the server is willing to send.
+    ///
+    /// **The defect.** The two sides held their own copy of the bound and the copies
+    /// disagreed: `api::listener` stopped after two rounds while `run_client_handshake`
+    /// was prepared for three. The server therefore abandoned a handshake the client was
+    /// still working on, and because it abandoned it by closing, the client reported
+    /// `NetworkError("early eof")` — a byte-pipe error for a decision the server made on
+    /// purpose. Both now read
+    /// [`MAX_HANDSHAKE_RETRY_ROUNDS`](crate::transport::handshake::MAX_HANDSHAKE_RETRY_ROUNDS),
+    /// and this is the half that says the client goes as far as the server will: the
+    /// server-side half, that it emits that many and then refuses with a typed reject,
+    /// is in `api::listener`'s tests.
+    ///
+    /// **Why it comes back unnoticed.** An honest handshake needs one round, so every
+    /// other test in the tree spends one and neither bound is reached. It takes a server
+    /// that keeps retrying — which a functional test has no reason to build — for the
+    /// difference between three and two to show up at all.
+    ///
+    /// Driven with a hand-written server half rather than the real listener, because what
+    /// is under test is how many rounds the *client* will answer, and a real listener
+    /// would stop at its own bound before asking the question.
+    #[tokio::test]
+    async fn the_client_answers_every_retry_round_the_server_will_send() {
+        use crate::transport::handshake::MAX_HANDSHAKE_RETRY_ROUNDS;
+
+        let (client_transport, server_transport) = ChannelTransport::pair();
+        let server_hs = HandshakeServer::new().expect("HandshakeServer::new");
+        let pinned = server_hs.verifying_key().clone();
+        let session = Arc::new(PhantomSession::connect_with_transport(
+            "test-server:9000",
+            client_transport,
+            pinned,
+        ));
+
+        let server = tokio::spawn(async move {
+            let client_ip = "127.0.0.1".parse().expect("parse IP");
+            let mut rounds = 0u32;
+            loop {
+                let bytes = server_transport.recv_bytes().await.expect("a hello");
+                let hello = borsh::from_slice::<ClientHello>(&bytes).expect("decode hello");
+                // Keep retrying until the bound is spent, then admit. The gate is asked
+                // for its verdict with the hello as it arrives, so the retry the client
+                // answers is a real one and not a fabricated blob.
+                if rounds < MAX_HANDSHAKE_RETRY_ROUNDS {
+                    rounds += 1;
+                    let mut stripped = hello.clone();
+                    // Withhold the cookie, so the gate asks for one again however many
+                    // times it is asked.
+                    stripped.cookie = None;
+                    match server_hs.process_client_hello(&stripped, 0, client_ip) {
+                        HandshakeResponse::Retry(retry) => {
+                            let wire = ServerReply::Retry(retry).to_wire().expect("encode retry");
+                            server_transport
+                                .send_bytes(&wire)
+                                .await
+                                .expect("send retry");
+                        }
+                        other => panic!("round {rounds}: expected a retry, got {other:?}"),
+                    }
+                    continue;
+                }
+                match server_hs.process_client_hello(&hello, 0, client_ip) {
+                    HandshakeResponse::Success(server_hello, session, _) => {
+                        let wire = ServerReply::Hello(server_hello)
+                            .to_wire()
+                            .expect("encode ServerHello");
+                        server_transport
+                            .send_bytes(&wire)
+                            .await
+                            .expect("send hello");
+                        // The transport goes back to the caller with the session. Dropping
+                        // it here would close the pipe the moment the ServerHello was
+                        // sent, and the client's pump would read that as the far end
+                        // vanishing — so the state would be `Dead` by the time
+                        // `await_ready()` looked at it, and the test would fail for a
+                        // reason that has nothing to do with retry rounds.
+                        return (rounds, session, server_transport);
+                    }
+                    other => panic!("after {rounds} rounds: expected success, got {other:?}"),
+                }
+            }
+        });
+
+        let ready = session.await_ready().await;
+        let (rounds, inner, link) = server.await.expect("the server half");
+        ready.expect("the client has to answer every round the server sends");
+        assert_eq!(
+            rounds, MAX_HANDSHAKE_RETRY_ROUNDS,
+            "this test only says something if the server actually spent the whole bound"
+        );
+        drop((inner, link));
     }
 
     /// Integration test: Client handshake via ChannelTransport with a
@@ -9839,7 +11459,7 @@ mod tests {
         let connection_budget = Arc::new(SharedRecvTuning::default());
         let mut scratch = RecvScratch::new(
             256,
-            StreamGauge::new(obs.clone()),
+            StreamGauge::new(obs.clone(), false),
             Arc::new(PathChallenges::default()),
             connection_budget.clone(),
         );
@@ -14481,15 +16101,27 @@ mod tests {
         let (migrating_t, peer_t) = ChannelTransport::pair();
         let cut = Arc::new(AtomicBool::new(false));
         let migrations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let migrating = PhantomSession::from_accepted_server_session(
-            "migrating".into(),
-            CuttableTransport {
-                inner: migrating_t,
-                cut: cut.clone(),
-                migrations: migrations.clone(),
-            },
-            migrating_inner,
-        );
+        let migrating_transport = CuttableTransport {
+            inner: migrating_t,
+            cut: cut.clone(),
+            migrations: migrations.clone(),
+        };
+        // The handle has to carry the role the test is about, because the two entry points
+        // are gated separately: `migrate()` is the client's and `migrate_server()` the
+        // accepted server's, and a handle installed as one refuses the other's.
+        let migrating = if server_side {
+            PhantomSession::from_accepted_server_session(
+                "migrating".into(),
+                migrating_transport,
+                migrating_inner,
+            )
+        } else {
+            PhantomSession::from_established_client_session(
+                "migrating".into(),
+                migrating_transport,
+                migrating_inner,
+            )
+        };
         let peer = PhantomSession::from_accepted_server_session("peer".into(), peer_t, peer_inner);
 
         // The peer reads everything it is sent, so once the path is back nothing but the
@@ -14636,7 +16268,9 @@ mod tests {
             server_inner.set_state(SessionState::Connected);
             let (migrating_t, peer_t) = ChannelTransport::pair();
             let migrations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let migrating = PhantomSession::from_accepted_server_session(
+            // A client handle: `migrate()` below is the client's entry point, and an
+            // accepted server handle refuses it.
+            let migrating = PhantomSession::from_established_client_session(
                 "migrating".into(),
                 CuttableTransport {
                     inner: migrating_t,
@@ -15174,19 +16808,24 @@ mod tests {
             "a peer flooding past the delivery hard cap must get its session torn down"
         );
 
-        // Definitive: the session ends up Closed.
-        let mut closed = false;
+        // Definitive: the session ends up `Dead`, with a cause. Not `Closed` — that is the
+        // answer for a session that ended in the orderly way, by either side's request, and
+        // it is the answer a reader gets `None` from `last_error()` alongside. A peer that
+        // would not stop sending is the opposite of an orderly departure, and a caller has
+        // to be able to tell the two apart: this one is not a result to accept and stop on.
+        let mut dead = false;
         for _ in 0..200 {
-            if server.connection_state() == ConnectionState::Closed {
-                closed = true;
+            if server.connection_state() == ConnectionState::Dead {
+                dead = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         drainer.abort();
+        assert!(dead, "session state must be Dead after the hard cap trips");
         assert!(
-            closed,
-            "session state must be Closed after the hard cap trips"
+            server.last_error().await.is_some(),
+            "a session torn down over the peer's behaviour must report a cause"
         );
     }
 
@@ -16783,7 +18422,7 @@ mod tests {
     #[test]
     fn stream_gauge_is_balanced_and_never_negative() {
         let obs = Observability::new(ObservabilityConfig::default());
-        let gauge = StreamGauge::new(obs.clone());
+        let gauge = StreamGauge::new(obs.clone(), true);
 
         // Internal ids (0 = control, 1 = raw-app) are not user streams.
         gauge.opened(0);
@@ -17562,5 +19201,412 @@ mod tests {
                 PER_PACKET_OVERHEAD
             );
         }
+    }
+
+    // ── The multi-address walk's arithmetic and its classification of answers ─────
+
+    /// The per-candidate share's floor is exactly two of the transport's own first
+    /// retransmission intervals.
+    ///
+    /// **The defect.** `share = budget / n` had no floor, so a name with eight A/AAAA records
+    /// — ordinary for a CDN or a multi-homed host — gave each candidate 1.25 s of a
+    /// ten-second budget, under the two flights × one-second-per-flight this floor is derived
+    /// from, so the wait could not tell a slow path from a dead one. The first address was
+    /// correct and reachable and was abandoned anyway, working session and all, and the call
+    /// handed back the last candidate.
+    ///
+    /// **What a consumer sees.** `connect_pinned_udp` to a multi-homed name fails, or
+    /// succeeds against whichever address happens to be last, on a path that worked at 0.3.0.
+    ///
+    /// **Why it comes back unnoticed.** The floor is derived from a constant that lives in
+    /// another module and is private to it, so the derivation has to be restated here — and a
+    /// restated constant is one that drifts silently. Nothing about a shorter share looks
+    /// wrong; it shows up only as a connect that fails on a path nobody in CI has. This holds
+    /// the floor to the schedule the transport actually walks, so changing
+    /// `HANDSHAKE_INITIAL_RTO` without changing the floor breaks a test instead of a connect.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_candidate_share_floor_is_two_of_the_transports_first_intervals() {
+        let schedule = crate::api::udp_transport::handshake_retransmit_schedule();
+        let first = *schedule
+            .first()
+            .expect("the transport's retransmission schedule has at least one interval");
+        assert_eq!(
+            NO_SAMPLE_FLIGHT_RTO, first,
+            "the walk's idea of how long a flight may be outstanding before it counts as \
+             late ({NO_SAMPLE_FLIGHT_RTO:?}) has drifted from the interval the transport's \
+             handshake shim actually waits first ({first:?})"
+        );
+        assert_eq!(
+            MIN_CANDIDATE_HANDSHAKE_SHARE,
+            first * UDP_HANDSHAKE_FLIGHTS,
+            "the floor must be one of those intervals per handshake flight"
+        );
+    }
+
+    /// The share is an even division, floored, and then capped back at the caller's budget.
+    ///
+    /// **The defect.** See above: no floor. **What a consumer sees:** the same abandoned
+    /// connect. **Why it comes back unnoticed:** the arithmetic has no output of its own — a
+    /// share that is too short is indistinguishable from an address that did not answer, and
+    /// every end-to-end test of the walk uses loopback, where a handshake finishes in
+    /// milliseconds and any share at all is enough. This is the only place the three cases
+    /// are visible.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_candidate_share_is_floored_and_then_capped_at_the_budget() {
+        let budget = CLIENT_HANDSHAKE_DEADLINE;
+
+        // Few enough addresses that the even division is already meaningful: unchanged.
+        assert_eq!(candidate_share(budget, 1), budget);
+        assert_eq!(candidate_share(budget, 2), budget / 2);
+        assert_eq!(candidate_share(budget, 5), budget / 5);
+        assert!(
+            budget / 5 >= MIN_CANDIDATE_HANDSHAKE_SHARE,
+            "five addresses is the last count whose even share clears the floor on the \
+             production budget; if that stops being true the boundary below moves"
+        );
+
+        // Past that, the floor wins — this is the case the defect was in.
+        for count in 6..64usize {
+            assert_eq!(
+                candidate_share(budget, count),
+                MIN_CANDIDATE_HANDSHAKE_SHARE,
+                "{count} addresses got a share below the floor"
+            );
+        }
+
+        // A budget smaller than one meaningful share cannot be made to hold one, and
+        // overrunning the bound the caller set would be the worse answer: the first candidate
+        // gets the whole of it.
+        let tight = MIN_CANDIDATE_HANDSHAKE_SHARE / 4;
+        assert_eq!(candidate_share(tight, 2), tight);
+        assert_eq!(candidate_share(tight, 9), tight);
+
+        // A count of zero never reaches this from the walk, which returns first — but the
+        // division must not be what says so.
+        assert_eq!(candidate_share(budget, 0), budget);
+    }
+
+    /// The three decisions the overlapped address walk makes, read directly.
+    ///
+    /// **The defect they exist for.** The walk tried the addresses strictly in turn, giving
+    /// each but the last a whole [`candidate_share`] before the next was contacted at all. So
+    /// the case it was written for — `localhost` resolving `::1` first with nothing behind it
+    /// — *worked* and cost 5.04 s where a working first address costs milliseconds, and a
+    /// six-address name of the same shape cost about twelve seconds.
+    ///
+    /// **Why they are read here rather than timed.** Overlapping the attempts turns three
+    /// questions into races, and each of the three answers below is what keeps a race from
+    /// being the answer. Two of them are reachable end to end only through a window a few
+    /// tens of milliseconds wide on a loopback path, which is a coin flip dressed as a test;
+    /// read as predicates they are arithmetic over a list, and the wall clock does not come
+    /// into it. The end-to-end tests in `session_end_tests` cover the two cases whose timing
+    /// *can* be separated by a wide margin.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_address_walk_decides_the_three_overlap_questions_by_the_resolver_order() {
+        use std::sync::atomic::AtomicBool;
+
+        /// An attempt that is still being waited on. The session is inert — it is never
+        /// driven here, only held, because every predicate reads the flag beside it.
+        fn attempt(answered: bool) -> Option<Attempt> {
+            Some(Attempt {
+                session: PhantomSession::connect("inert:0".into()),
+                answered: Arc::new(AtomicBool::new(answered)),
+            })
+        }
+        const SILENT: bool = false;
+        const ANSWERING: bool = true;
+
+        // ── Contacting the next address ──
+        // Nothing contacted yet: the first address goes at once.
+        assert!(may_contact_the_next_address(
+            0,
+            3,
+            false,
+            &[None, None, None]
+        ));
+        // A verdict in hand stops the schedule: there is nothing left for a further address
+        // to settle, and contacting one would send it a `ClientHello` for nothing.
+        assert!(!may_contact_the_next_address(
+            1,
+            3,
+            true,
+            &[attempt(SILENT), None, None]
+        ));
+        // The addresses are exhausted.
+        assert!(!may_contact_the_next_address(
+            3,
+            3,
+            false,
+            &[None, None, None]
+        ));
+        // A silent address does not hold the schedule: this is the whole point of the
+        // overlap, and it is what makes the dark-first-address case cost the attempt delay
+        // instead of a share.
+        assert!(may_contact_the_next_address(
+            1,
+            3,
+            false,
+            &[attempt(SILENT), None, None]
+        ));
+        // An address that has begun answering does hold it. So a name whose first address
+        // works is still the only one contacted, including when its handshake is slow — and
+        // the client's hello, with its sealed early-data on the resuming entry point, reaches
+        // no more addresses than the serial walk sent it to.
+        assert!(!may_contact_the_next_address(
+            1,
+            3,
+            false,
+            &[attempt(ANSWERING), None, None]
+        ));
+
+        // ── Handing over a completed handshake ──
+        // The first address winning is never held: there is nothing ahead of it.
+        assert!(!an_earlier_address_is_still_answering(
+            0,
+            &[attempt(ANSWERING), None, None]
+        ));
+        // A later winner is held while an address ahead of it is answering: that one may be
+        // about to refuse the pin, and a refusal is the caller's answer rather than an
+        // address that did not work.
+        assert!(an_earlier_address_is_still_answering(
+            2,
+            &[None, attempt(ANSWERING), None]
+        ));
+        // A silent address ahead of it holds nothing: silence is not an answer that is coming.
+        assert!(!an_earlier_address_is_still_answering(
+            2,
+            &[attempt(SILENT), attempt(SILENT), None]
+        ));
+        // An address ahead of it that has already finished holds nothing either.
+        assert!(!an_earlier_address_is_still_answering(
+            2,
+            &[None, None, None]
+        ));
+
+        // ── Acting on a refusal ──
+        // A refusal from the first address is the answer at once.
+        assert!(a_refusal_is_the_answer_now(0, &[None, attempt(SILENT)]));
+        // A refusal from a later address waits for every earlier one to finish, answering or
+        // not — otherwise one hostile address *after* the right one in a name's DNS answer
+        // would deny service, by refusing while a working-but-slow first address was still
+        // handshaking.
+        assert!(!a_refusal_is_the_answer_now(1, &[attempt(SILENT), None]));
+        assert!(!a_refusal_is_the_answer_now(
+            2,
+            &[None, attempt(ANSWERING), None]
+        ));
+        // Once they have, it is the answer. An address never contacted counts as finished:
+        // it cannot succeed either.
+        assert!(a_refusal_is_the_answer_now(2, &[None, None, None]));
+    }
+
+    /// Between two verdicts, the lower-numbered address is the one that answers.
+    ///
+    /// **The defect it exists for.** This is the fourth rule of the overlapped walk and the
+    /// one that had no test. It decides what happens when a completed handshake and a
+    /// peer's refusal are both in hand, which the overlap made possible and the serial walk
+    /// never could: there, a refusal ended the walk before any later address was contacted.
+    ///
+    /// **What a consumer would observe, each way round.** Answering with the *later*
+    /// address's refusal is a denial of service — one hostile address after the right one in
+    /// a name's DNS answer refuses in a millisecond while the right one is still
+    /// handshaking, and a connect that was about to succeed fails instead, for every caller
+    /// of that name. Answering with the *later* address's success when an earlier one
+    /// refused is the opposite mistake: the impostor's refusal is the one signal Invariant 1
+    /// produces, and it is dropped.
+    ///
+    /// **Why it would come back unnoticed.** The rule was written out three times — in the
+    /// loop, at the budget deadline, and after it — as two different-looking expressions,
+    /// and each reads plausibly on its own. The end-to-end test in `session_end_tests`
+    /// reaches one direction of it and only through a timing window; the other direction
+    /// needs an address that answers late and refuses later still, which is three
+    /// simultaneous windows on a loopback path. Read as a function it is a comparison of two
+    /// integers.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_lower_numbered_address_is_the_one_whose_verdict_answers() {
+        // Nothing decided yet.
+        assert_eq!(verdict_to_act_on(None, None), VerdictToActOn::Neither);
+        // One of the two, alone, is the answer.
+        assert_eq!(verdict_to_act_on(Some(3), None), VerdictToActOn::Win);
+        assert_eq!(verdict_to_act_on(None, Some(3)), VerdictToActOn::Refusal);
+        // Both, with the success first: the hostile trailing address does not deny service.
+        assert_eq!(verdict_to_act_on(Some(0), Some(1)), VerdictToActOn::Win);
+        assert_eq!(verdict_to_act_on(Some(2), Some(7)), VerdictToActOn::Win);
+        // Both, with the refusal first: an impostor ahead of the working address is reported
+        // rather than papered over by the address behind it.
+        assert_eq!(verdict_to_act_on(Some(1), Some(0)), VerdictToActOn::Refusal);
+        assert_eq!(verdict_to_act_on(Some(7), Some(2)), VerdictToActOn::Refusal);
+    }
+
+    /// An answer that came from a peer ends the walk; an answer that came from the path does
+    /// not.
+    ///
+    /// **The defect.** The walk recorded every `await_ready()` error into one `last_error`
+    /// slot and dropped it as soon as a later candidate answered, so
+    /// `CoreError::ServerIdentityMismatch` was handled exactly like "this address did not
+    /// answer" — a `log::debug!` line and nothing else.
+    ///
+    /// **What a consumer sees.** An attacker who gets one extra address into the DNS answer
+    /// for the server's name is contacted first on every `connect_pinned_udp*` and receives
+    /// the whole `ClientHello`, and on the resumption entry point the sealed `early_data`
+    /// blob; the client then reaches the genuine address, returns `Ok`, and `await_ready()`
+    /// answers `Ok(())`. Nothing ever tells the caller an impostor answered — in the one path
+    /// Invariant 1 exists to guarantee.
+    ///
+    /// **Why it comes back unnoticed.** Every functional test of the walk is about reaching a
+    /// working address, and all of them still pass when a refusal is swallowed: swallowing it
+    /// makes the walk *more* likely to find the working one. The only observable difference
+    /// is an error that is not raised, which no passing test notices. Pinned as a table over
+    /// the classification itself so that a variant moved from one class to the other has to
+    /// be moved here too.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_peers_refusal_ends_the_walk_and_a_paths_failure_does_not() {
+        for terminal in [
+            CoreError::ServerIdentityMismatch,
+            CoreError::ProtocolRejected("client speaks v5, server speaks v4".into()),
+            CoreError::CipherSuiteUnavailable("chacha20-poly1305".into()),
+            CoreError::ConfigError("no pinned key".into()),
+        ] {
+            assert!(
+                refusal_ends_the_walk(&terminal),
+                "{terminal:?} is an answer from a peer, or this process's own refusal — \
+                 treating it as an address that did not work is how the detection is lost"
+            );
+        }
+        for keep_walking in [
+            CoreError::Timeout,
+            CoreError::NetworkError("no route to host".into()),
+            CoreError::ConnectionClosed,
+            CoreError::SerializationError("truncated ServerHello".into()),
+            CoreError::ValidationError("bad field".into()),
+            CoreError::CryptoError("aead open failed".into()),
+            CoreError::HandshakeError("invalid server reply".into()),
+            CoreError::ReplayDetected("dup".into()),
+            CoreError::StreamError("no such stream".into()),
+            CoreError::Unsupported("migrate".into()),
+            CoreError::KeyDerivationError,
+            CoreError::RngError("no entropy".into()),
+            CoreError::InternalError("lock".into()),
+        ] {
+            assert!(
+                !refusal_ends_the_walk(&keep_walking),
+                "{keep_walking:?} says something about this address and nothing about the \
+                 next one — refusing to try the next one is what the walk exists to avoid"
+            );
+        }
+    }
+
+    /// The error a walk that reached the end of the list returns names every address it tried
+    /// and what each one said.
+    ///
+    /// **The defect.** The walk kept one `last_error` and returned that, so a name whose four
+    /// addresses failed for four different reasons reported one of them and dropped three.
+    ///
+    /// **What a consumer sees.** "Timeout" for a name where three of the four addresses were
+    /// refused outright by the kernel, with nothing to say which address the surviving error
+    /// even belonged to.
+    ///
+    /// **Why it comes back unnoticed.** The information is only missing, never wrong — the
+    /// call still fails, with a plausible error, and no assertion about a failing connect
+    /// looks at anything but the variant.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_roster_names_every_address_the_walk_tried() {
+        let first: std::net::SocketAddr = "127.0.0.1:1".parse().expect("addr");
+        let second: std::net::SocketAddr = "[::1]:2".parse().expect("addr");
+        let roster = address_roster(&[
+            (first, CoreError::Timeout),
+            (second, CoreError::NetworkError("address family".into())),
+        ]);
+        assert!(roster.contains("2 address(es)"), "got {roster}");
+        for expected in [
+            first.to_string(),
+            second.to_string(),
+            CoreError::Timeout.to_string(),
+            "address family".to_string(),
+        ] {
+            assert!(
+                roster.contains(&expected),
+                "the roster dropped {expected}: {roster}"
+            );
+        }
+        assert_eq!(address_roster(&[]), "no address was tried");
+    }
+
+    /// A close that lands while the handshake is still running, and a handshake failure
+    /// arriving after it, leave the orderly end in place — the state *and* the cause.
+    ///
+    /// **The defect.** The handshake-failure arm stored `Failed` unconditionally and recorded
+    /// a cause beside it, over a `Closed` that `disconnect()` had already published from the
+    /// caller's thread.
+    ///
+    /// **What a consumer sees.** A session it closed itself reporting
+    /// `state = Failed, last_error = Some(NetworkError(..))` — the exact opposite of the
+    /// orderly-end contract this release advertises, and about an event (the far end going
+    /// away) that happened after the caller had finished with the session.
+    ///
+    /// **Why it comes back unnoticed.** The state is an atomic with several writers and no
+    /// one place that owns it, so the next edit to this arm is as likely as not to be another
+    /// bare `store`. Driven here against the two publishers directly, with no sockets and no
+    /// handshake, because that is the level the ordering lives at: an end-to-end test can
+    /// only reach it by winning a race.
+    #[test]
+    fn a_failure_after_an_orderly_close_changes_neither_the_state_nor_the_cause() {
+        let state = AtomicU8::new(ConnectionState::Connecting as u8);
+        let terminal_error = parking_lot::Mutex::new(None);
+
+        // The caller's close, exactly as `disconnect()` publishes it.
+        publish_end(&state, ConnectionState::Closed);
+
+        publish_failure(
+            &state,
+            &terminal_error,
+            CoreError::NetworkError("the far end vanished".into()),
+        );
+        assert_eq!(
+            ConnectionState::from_u8(state.load(Ordering::Relaxed)),
+            ConnectionState::Closed,
+            "a handshake failure arriving after the caller's close overwrote it"
+        );
+        assert!(
+            terminal_error.lock().is_none(),
+            "an orderly end has no cause; got {:?}",
+            terminal_error.lock()
+        );
+
+        // And the ordinary case still works: a failure with nothing before it publishes both.
+        let state = AtomicU8::new(ConnectionState::Connecting as u8);
+        let terminal_error = parking_lot::Mutex::new(None);
+        publish_failure(&state, &terminal_error, CoreError::ServerIdentityMismatch);
+        assert_eq!(
+            ConnectionState::from_u8(state.load(Ordering::Relaxed)),
+            ConnectionState::Failed
+        );
+        assert!(matches!(
+            *terminal_error.lock(),
+            Some(CoreError::ServerIdentityMismatch)
+        ));
+
+        // A cause somebody else recorded is the first one, and stays — `publish_failure`
+        // only ever takes back a write of its own.
+        let state = AtomicU8::new(ConnectionState::Connecting as u8);
+        let terminal_error = parking_lot::Mutex::new(Some(CoreError::Timeout));
+        publish_failure(&state, &terminal_error, CoreError::ServerIdentityMismatch);
+        assert!(matches!(*terminal_error.lock(), Some(CoreError::Timeout)));
+        publish_end(&state, ConnectionState::Closed);
+        let state = AtomicU8::new(ConnectionState::Dead as u8);
+        let terminal_error = parking_lot::Mutex::new(Some(CoreError::Timeout));
+        publish_failure(&state, &terminal_error, CoreError::ServerIdentityMismatch);
+        assert_eq!(
+            ConnectionState::from_u8(state.load(Ordering::Relaxed)),
+            ConnectionState::Dead,
+            "a death already diagnosed is not replaced by a later failure"
+        );
+        assert!(matches!(*terminal_error.lock(), Some(CoreError::Timeout)));
     }
 }

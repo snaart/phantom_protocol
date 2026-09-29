@@ -37,7 +37,7 @@ spec:
       terminationGracePeriodSeconds: 30  # in-flight handshakes have 30 s to complete
       containers:
         - name: phantom-protocol
-          image: phantom-server:0.3.0
+          image: phantom-server:0.4.0
           imagePullPolicy: IfNotPresent
           ports:
             - {name: phantom, containerPort: 4242, protocol: TCP}

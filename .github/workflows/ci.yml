@@ -87,6 +87,38 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # The WITHDRAWN gate in `core/src/lib.rs` reads the manifest of the
+          # release a row names, so once the version moves past the release in a
+          # row, `cargo test --lib` needs that tag. A shallow checkout carries
+          # none, and this is a required context.
+          fetch-depth: 0
+      # Every runner under scripts/ and tests/ has to be named by a workflow, a
+      # hook, or a script that runs. `tests/bindings/c/run_c_pinning_test.sh`
+      # shipped with this release as the regression test for a pinned-identity
+      # defect in the blocking C helpers and was invoked by nothing, so
+      # reverting the fix would have been green everywhere — which is the one
+      # failure mode a check cannot report about itself. Pure text, a few tens of
+      # milliseconds, and it lives here because this is the required context
+      # where the cheap gates with no job of their own belong. Its own cases
+      # first, for the reason the memory-arithmetic job gives.
+      - run: scripts/check_gate_wiring_test.py
+      - run: scripts/check_gate_wiring.py
+      # `scripts/required_status_checks.py` derives the set of contexts that
+      # should block a merge from the workflow files themselves, because a list
+      # written down goes stale the next time a job is added -- which is how the
+      # `release artifact shape` job and seven older ci.yml jobs ended up
+      # advisory. The derivation cannot be checked against the live setting here
+      # (that needs rights over the repository's settings), but it can be checked
+      # for the two ways it goes wrong on its own: missing a job, and inventing a
+      # context name GitHub will never report, which leaves every merge pending.
+      # A venv because the script needs PyYAML and the runner's python is
+      # externally managed.
+      - name: The required-context derivation still reads the workflows
+        run: |
+          python3 -m venv /tmp/required-contexts-venv
+          /tmp/required-contexts-venv/bin/pip install --quiet pyyaml
+          /tmp/required-contexts-venv/bin/python scripts/required_status_checks_test.py
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -279,6 +311,16 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - run: scripts/check_panic_sites.py
+      # `ServerReject`'s codes, in the same job for the same reason the memory
+      # arithmetic is in its own: a text scan needing no toolchain, over a
+      # document that cannot see the constants it describes. Code 2 shipped
+      # undocumented for a release because nothing here could notice — no wire
+      # format moves when a code is added, and the frame is never sent on the
+      # success path, so the whole suite stays green. The cases run first: a
+      # pattern that has stopped matching reports the same success as a tree
+      # that agrees.
+      - run: scripts/check_reject_codes_test.py
+      - run: scripts/check_reject_codes.py
 
   memory-arithmetic:
     # The published receive-window-growth product has two factors in two crates
@@ -297,6 +339,55 @@ jobs:
       # nothing but these cases tells the two apart.
       - run: scripts/check_memory_arithmetic_test.py
       - run: scripts/check_memory_arithmetic.py
+
+  release-artifacts:
+    # Nothing in this repository looked at a release artifact after it was built. The
+    # `build-artifacts` job runs on a tag, once, and what it produced was only ever read by
+    # whoever downloaded it — so 0.3.0 shipped macOS libraries that abort every consumer
+    # before `main` (rustc had written the runner's build directory into the install name),
+    # Linux libraries with no symbol table for `uniffi-bindgen --library` to read, and
+    # `.sha256` files that verify nowhere, all green.
+    #
+    # Two halves. The text scan is the regression test a release path can have: it reads the
+    # files that decide what is shipped and fails when any of the four properties is back to
+    # its 0.3.0 state. Then the second half actually builds the shipped profile and hands the
+    # library to the bindings generator, because that is the consumer whose failure was
+    # silent — `uniffi-bindgen` prints "No UniFFI metadata found" and **exits 0**, so only
+    # looking at what it wrote tells the two outcomes apart.
+    name: release artifact shape
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # The script's own cases first, for the reason given in the two jobs above.
+      - run: scripts/check_release_artifacts_test.py
+      - run: scripts/check_release_artifacts.py
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: "."
+          key: release-artifacts
+      - name: The shipped profile produces a library uniffi-bindgen can read
+        run: |
+          # Default features, exactly as the release job builds it — `uniffi-cli`
+          # belongs to the generator below and never to the shipped library.
+          cargo build --manifest-path core/Cargo.toml --profile dist --lib
+          SO=target/dist/libphantom_protocol.so
+          if ! readelf -S "${SO}" | grep -q '\.symtab'; then
+            echo "${SO} has no .symtab; the shipped profile is stripping symbols again" >&2
+            exit 1
+          fi
+          OUT="${RUNNER_TEMP}/release-artifact-bindings"
+          mkdir -p "${OUT}"
+          cargo run --manifest-path core/Cargo.toml --features uniffi-cli \
+            --bin uniffi-bindgen -- generate \
+            --library "${SO}" --language python --no-format --out-dir "${OUT}"
+          # The exit code says nothing: a stripped library makes the generator report no
+          # metadata and succeed. What it wrote is the only evidence.
+          if [ ! -s "${OUT}/phantom_protocol.py" ]; then
+            echo "uniffi-bindgen read ${SO} and produced no bindings" >&2
+            exit 1
+          fi
+          echo "bindings generated from the dist-profile library: $(wc -l < "${OUT}/phantom_protocol.py") lines"
 
   changelog-structure:
     # `[Unreleased]` had two `### Documented` sections a thousand lines apart.
@@ -317,6 +408,47 @@ jobs:
       # The script's own cases first, for the reason given in the job above.
       - run: scripts/check_changelog_breaking_test.sh
       - run: python3 scripts/check_changelog_breaking.py --structure-only
+
+  interop-published:
+    # The release notes lead with "a 0.4.0 peer and a 0.3.0 peer interoperate in
+    # both directions" and nothing in the tree tested it. That claim fails in
+    # silence: a packet whose `PacketHeader.version` disagrees is DROPPED with no
+    # reply and before any flag is read, so two incompatible peers complete a
+    # handshake, agree keys, and then never deliver a byte — with nothing at
+    # either end to say why. Reading `WIRE_VERSION` and `PROTOCOL_VERSION` off
+    # both sides is not the same proof: the wire is also the 47-byte AEAD AAD
+    # image, the header-protection mask over all 15 header bytes, the rotating
+    # connection id and the payload codec behind each flag, and any of those
+    # moving in a release that leaves both constants alone breaks interop with
+    # nothing in either peer to read it off. Verified
+    # by breaking it three ways — `WIRE_VERSION` 8 -> 9, and two field swaps in
+    # the AAD image with both constants left alone; the two that change a byte
+    # any session actually sends both fail here.
+    #
+    # Four pairings — each version as server and as client, over PhantomUDP and
+    # over TCP — and each pairing is itself bidirectional and sends 4000 bytes
+    # each way, which is more than one `MAX_APP_CHUNK` and so exercises the split
+    # and the reassembly rather than a single packet.
+    #
+    # On every pull request rather than the tag path: a wire change is made in
+    # the branch that makes it, and a gate that only runs on the tag reports it
+    # when the release is already being cut. The published 0.3.0 crate is an
+    # immutable dependency, so its build is a cache hit after the first run.
+    name: interop with the published release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Both peer crates carry their own `[workspace]`, so each is its own
+          # cache root; the tree's own `target/` is shared with nothing here.
+          workspaces: |
+            .
+            scripts/interop/peer-030
+            scripts/interop/peer-head
+          key: interop-published
+      - run: scripts/interop/run_interop_test.sh
 
   deny:
     name: cargo deny
@@ -380,6 +512,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # The WITHDRAWN gate in `core/src/lib.rs` reads the manifest of the
+          # release a row names, so once the version moves past the release in a
+          # row, `cargo test --lib` needs that tag. A shallow checkout carries
+          # none, and this is a required context.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy
@@ -403,6 +541,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # The WITHDRAWN gate in `core/src/lib.rs` reads the manifest of the
+          # release a row names, so once the version moves past the release in a
+          # row, `cargo test --lib` needs that tag. A shallow checkout carries
+          # none, and this is a required context.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy
@@ -427,6 +571,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # The WITHDRAWN gate in `core/src/lib.rs` reads the manifest of the
+          # release a row names, so once the version moves past the release in a
+          # row, `cargo test --lib` needs that tag. A shallow checkout carries
+          # none, and this is a required context.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy
@@ -459,6 +609,12 @@ jobs:
     # but the CI runner of record is ubuntu-latest.
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # The WITHDRAWN gate in `core/src/lib.rs` reads the manifest of the
+          # release a row names, so once the version moves past the release in a
+          # row, `cargo test --lib` needs that tag. A shallow checkout carries
+          # none, and this is a required context.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy

@@ -15,27 +15,71 @@ apps via UniFFI bindings.
 > targets and breaks the `thumbv7em-none-eabihf` row of `cross.yml`. Requesting
 > it per invocation produces the same archive and leaves every other build alone.
 
-```sh
-# Device (arm64), Apple Silicon simulator, Intel simulator
-cargo rustc --release --target aarch64-apple-ios     --manifest-path core/Cargo.toml --crate-type staticlib
-cargo rustc --release --target aarch64-apple-ios-sim --manifest-path core/Cargo.toml --crate-type staticlib
-cargo rustc --release --target x86_64-apple-ios      --manifest-path core/Cargo.toml --crate-type staticlib
+The repository's `tests/bindings/swift/build-xcframework.sh` is the recipe; run
+it and check the result rather than assembling the framework by hand:
 
-# Merge simulator slices; then build the XCFramework
+```sh
+./tests/bindings/swift/build-xcframework.sh   # -> tests/bindings/swift/PhantomProtocol.xcframework
+./tests/bindings/swift/check_xcframework.sh   # slices, header names, declared platforms
+swift build --package-path tests/bindings/swift   # the generated binding, compiled against it
+```
+
+What it does, and the two things that go wrong when it is done by hand:
+
+```sh
+# Device (arm64), Apple-silicon simulator, Intel simulator, and the two macOS
+# architectures — `Package.swift` declares .iOS and .macOS, and a declared
+# platform without a slice resolves fine and then fails to link.
+# `cargo rustc --crate-type staticlib` is what produces the .a — see the note above.
+for triple in aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios \
+              aarch64-apple-darwin x86_64-apple-darwin; do
+    cargo rustc --release --target "$triple" --manifest-path core/Cargo.toml --crate-type staticlib
+done
+
+# Merge the multi-architecture slices into fat libraries
+mkdir -p target/universal-ios-sim/release target/universal-macos/release
 lipo -create \
     target/aarch64-apple-ios-sim/release/libphantom_protocol.a \
     target/x86_64-apple-ios/release/libphantom_protocol.a \
-    -output target/universal-sim/libphantom_protocol.a
+    -output target/universal-ios-sim/release/libphantom_protocol.a
+lipo -create \
+    target/aarch64-apple-darwin/release/libphantom_protocol.a \
+    target/x86_64-apple-darwin/release/libphantom_protocol.a \
+    -output target/universal-macos/release/libphantom_protocol.a
 
+# Stage the headers. The directory handed to -headers is copied WHOLESALE into
+# every slice, so it must hold exactly the FFI header and the modulemap — and the
+# modulemap must be named module.modulemap, which is the only name clang looks
+# for. Passing tests/bindings/swift/ instead fails twice over: the output lands
+# in that same directory, so xcodebuild copies its own half-written framework
+# into itself and dies with `the file name "ios-arm64" is invalid`; and the
+# modulemap arrives under its generated name, so `canImport(phantom_protocolFFI)`
+# is false and the build fails on `cannot find type 'RustBuffer' in scope`.
+rm -rf target/xcframework-headers && mkdir -p target/xcframework-headers
+cp tests/bindings/swift/phantom_protocolFFI.h target/xcframework-headers/
+cp tests/bindings/swift/phantom_protocolFFI.modulemap \
+   target/xcframework-headers/module.modulemap
+
+# Assemble the XCFramework
 xcodebuild -create-xcframework \
-    -library target/aarch64-apple-ios/release/libphantom_protocol.a  -headers tests/bindings/swift/ \
-    -library target/universal-sim/libphantom_protocol.a              -headers tests/bindings/swift/ \
-    -output PhantomProtocol.xcframework
+    -library target/aarch64-apple-ios/release/libphantom_protocol.a \
+        -headers target/xcframework-headers \
+    -library target/universal-ios-sim/release/libphantom_protocol.a \
+        -headers target/xcframework-headers \
+    -library target/universal-macos/release/libphantom_protocol.a \
+        -headers target/xcframework-headers \
+    -output tests/bindings/swift/PhantomProtocol.xcframework
+
+# Check the result before shipping it: the gate catches a misnamed modulemap, a
+# stray file in Headers and a declared platform with no slice.
+./tests/bindings/swift/check_xcframework.sh
 ```
 
 Auto-generated Swift sources in `tests/bindings/swift/`: `phantom_protocol.swift`,
 `phantom_protocolFFI.h`, `phantom_protocolFFI.modulemap`. Regenerate via
-`core/src/bin/uniffi-bindgen.rs` (uniffi 0.32 cli) after any surface change.
+`core/src/bin/uniffi-bindgen.rs` (uniffi 0.32 cli) after any surface change. The
+modulemap is copied into the framework as `module.modulemap`; inside the
+framework that name is not cosmetic — see the staging step above.
 
 **SwiftPM integration.**
 
@@ -56,7 +100,8 @@ let package = Package(
 ```
 
 **Using `PhantomSession` from Swift.** The UniFFI surface exposes
-`connectPinned(host:port:pinnedKey:)` (landed in commit `bfbf808`) which
+`connectPinned(host:port:pinnedKey:)` (`d5b0a56`,
+`core/src/api/session.rs`) which
 internally opens a `TcpSessionTransport`, pins via `HybridVerifyingKey::
 from_bytes`, and delegates to `PhantomSession::connect_with_transport`
 (Security Invariant 1 enforced unconditionally). Use it directly:
@@ -73,9 +118,25 @@ let session = try await PhantomProtocol.connectPinned(
     host: "phantom.example.com", port: 4242,
     pinnedKey: keyData   // from PhantomListener::verifying_key_bytes()
 )
+
+// WAIT FOR THE HANDSHAKE BEFORE TRUSTING THE SESSION. connectPinned returns as
+// soon as the TCP connect completes; the hybrid PQC handshake — and the pinned
+// identity check it carries — runs on a background task. Skip this call and a
+// WRONG pinned key still gives you a session object whose send() returns
+// success, with the mismatch appearing later as a failed read. awaitReady()
+// throws the typed reason instead.
+do {
+    try await session.awaitReady()
+} catch {
+    // CoreError.serverIdentityMismatch — the server is not the pinned one.
+    // CoreError.timeout / .networkError — the path, not the identity.
+    print("handshake failed: \(error)")
+    return
+}
+
 try await session.send(data: "hello".data(using: .utf8)!)
 let reply = try await session.recv()
-await session.disconnect()
+try await session.disconnect()   // `disconnect()` is `async throws`
 ```
 
 **App Transport Security note.** iOS ATS blocks non-TLS connections by default.
@@ -137,7 +198,7 @@ dependencies {
 ```
 
 **Using `PhantomSession` from Kotlin.** `connectPinned` is on the UniFFI
-surface as of `bfbf808` — call it directly:
+surface (`d5b0a56`) — call it directly:
 
 ```kotlin
 import uniffi.phantom_protocol.*
@@ -149,6 +210,19 @@ val session = connectPinned(
     host = "phantom.example.com", port = 4242u,
     pinnedKey = pinnedKeyBytes   // from PhantomListener::verifying_key_bytes()
 )
+
+// WAIT FOR THE HANDSHAKE BEFORE TRUSTING THE SESSION. connectPinned returns as
+// soon as the TCP connect completes; the hybrid PQC handshake — and the pinned
+// identity check it carries — runs on a background task. Skip this call and a
+// WRONG pinned key still gives you a session whose send() succeeds, with the
+// mismatch appearing later as a failed read.
+try {
+    session.awaitReady()
+} catch (e: CoreException.ServerIdentityMismatch) {
+    // The server is not the one this key pins. Do not retry against it.
+    throw e
+}
+
 session.send("hello".encodeToByteArray())
 val reply = session.recv()
 session.disconnect()
@@ -240,6 +314,10 @@ session.resumptionHint()?.use { hint ->
 val session = ResumptionHint(sessionId = sid, resumptionSecret = secret).use { hint ->
     connectPinnedUdpWithResumption(host, port, pinnedKey, hint, earlyData)
 }
+// The early-data blob is already on the wire at this point and the pin is still
+// unchecked. Resolve the handshake before reading earlyDataAccepted(), which says
+// nothing until it has.
+session.awaitReady()
 ```
 
 **Connection migration (Wi-Fi ↔ LTE) — use the UDP transport + `migrate()`.**
@@ -282,9 +360,9 @@ planning. (`perf-tuning.md` covers server-side throughput, not per-session footp
 
 ## Security caveats
 
-**Pinned-connect shim (LANDED).** Commit `bfbf808` adds
+**Pinned-connect shim (LANDED).** `core/src/api/session.rs` exports
 `#[uniffi::export] pub async fn connect_pinned(host, port, pinned_key)
--> Result<Arc<PhantomSession>, CoreError>` to `core/src/api/session.rs`.
+-> Result<Arc<PhantomSession>, CoreError>` (added in `d5b0a56`).
 Internally: parses `pinned_key: Vec<u8>` into a `HybridVerifyingKey`,
 opens a `TcpSessionTransport` via `tokio::net::TcpStream::connect`, and
 delegates to `PhantomSession::connect_with_transport` — Security
@@ -299,8 +377,12 @@ every `send`/`recv` on it errors immediately. Use `connectPinned` /
 accessible to apps sharing the same team ID (iOS) or user ID (Android). Assess
 your threat model; clear tickets on detected compromise.
 
-**Reproducible builds.** Recommended for supply-chain hygiene. SLSA-3 provenance
-(Phase 7.4) covers Rust artifacts — integrate with your mobile CI/CD pipeline.
+**Reproducible builds.** Recommended for supply-chain hygiene. The release
+pipeline attaches a sigstore-backed in-toto build-provenance attestation to every
+Rust artifact (SLSA v1.0 Build L2; `gh attestation verify --owner <org>
+<artifact>`). It covers the tarballs `release.yml` builds, **not** the XCFramework
+or AAR you assemble from them, so attest your own mobile artifacts in your own
+pipeline rather than inheriting a claim from ours.
 
 **Signing key is server-side only.** The bytes baked into the app are the *public*
 `HybridVerifyingKey`. Never bundle a `HybridSigningKey` (private).

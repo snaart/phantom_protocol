@@ -1,6 +1,6 @@
 [package]
 name = "phantom-protocol"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.93"
 description = "Post-quantum-secure L4/L6 universal transport framework — hybrid X25519+ML-KEM-768 / Ed25519+ML-DSA-65, reliable UDP with connection migration, UniFFI bindings"
@@ -23,6 +23,13 @@ categories = ["network-programming", "cryptography", "no-std"]
 features = ["telemetry-otel", "mimicry", "embedded"]
 rustdoc-args = ["--cfg", "docsrs"]
 
+# INHERITED BY CONSUMERS — every list in this table activates dependencies that land in
+# a consumer's own graph, where Cargo unifies our selection with theirs, so a `dep:`
+# here can be what makes somebody else's code compile long after this crate has stopped
+# reading it. `inherited_dependency_features` in `src/lib.rs` records every list below
+# token for token and asserts the two agree, so adding a selection needs a row and
+# taking one away needs a row that says what it cost and which release took it. It is
+# the record 0.3.1 did not have when it removed five selections that looked unused.
 [features]
 # `classical-crypto` (SUPPLY-03) is folded into `default` so the normal
 # (non-FIPS) build pulls the classical AEAD + KEM substrate (`ring` /
@@ -68,23 +75,25 @@ uniffi-cli = ["bindings", "uniffi/cli"]
 #
 # Bare-metal targets pass `--no-default-features --features embedded,no-std` to
 # drop this entirely.
+#
+# INHERITED BY CONSUMERS — every dependency this list activates is one a consumer of
+# the default build gets in their own graph, with the features named here unified into
+# whatever they asked of the same crate. `inherited_dependency_features` in
+# `src/lib.rs` holds this list token for token and fails the build when the two
+# disagree, so a `dep:` may not leave without a row saying which release took it and
+# what a consumer lost. `dep:time` is the one that has: 0.4.0 removed it, because
+# nothing outside the `mimicry` leg had read it for as long as anyone could establish
+# and a consumer was inheriting it anyway.
 std = [
     "dep:tokio",
-    "dep:tokio-util",
     "dep:futures",
-    "dep:async-trait",
     "dep:parking_lot",
     "dep:dashmap",
     "dep:arc-swap",
-    "dep:env_logger",
     "dep:tracing",
-    "dep:time",
-    "dep:argon2",
     "dep:crossbeam-queue",
     "dep:crossbeam-utils",
     "dep:lz4_flex",
-    "dep:base64",
-    "dep:once_cell",
     "dep:anyhow",
     "dep:thiserror",
     # NB: `ring` + `x25519-dalek` are NOT listed here — they live behind the
@@ -97,7 +106,6 @@ std = [
     "dep:hmac",
     "dep:borsh",
     "dep:hex",
-    "dep:bitflags",
     "dep:zeroize",
     "dep:subtle",
     "dep:blake3",
@@ -183,7 +191,15 @@ wasi-leg = ["std", "dep:wasi"]
 # already random-looking; the leg only adds TLS record framing. No `WIRE_VERSION`
 # change (outer, leg-local framing). The outer TLS is anti-DPI obfuscation ONLY,
 # and is DETECTABLE by active probing — see the module head + threat model.
-mimicry = ["std"]
+#
+# It names `dep:time`, which nothing else in the crate reads: the synthetic
+# certificate the theater prelude presents needs a wall-clock validity window in
+# X.509's own calendar form, and that is the crate's only use of a date. Since 0.4.0
+# this is the crate's only activation of it — `std` carried it as well until then, so
+# a default build compiled a date library for a leg it had not enabled, and a consumer
+# who had been inheriting `time`'s default features through us stopped when that went
+# (recorded in `inherited_dependency_features` in `src/lib.rs`).
+mimicry = ["std", "dep:time"]
 
 # OpenTelemetry pipeline (Phase 8). Off by default; the `core` library exposes
 # OTel `Counter` / `Histogram` / `UpDownCounter` instruments to the embedder
@@ -204,15 +220,21 @@ telemetry-otel = [
 # `tokio` is split per target (Phase 3.5 conditional compilation matrix):
 # - Cross-target features: sync primitives, time, io-util, macros, single-thread
 #   runtime. These work on both native and wasm32.
-# - Native-only features (`net`, `rt-multi-thread`, `signal`, `process`, `fs`,
-#   `io-std`) are added in the `[target.'cfg(not(target_arch = "wasm32"))']`
-#   block at the bottom of this file.
+# - Native-only features (`net`, `rt-multi-thread`) are added in the
+#   `[target.'cfg(not(target_arch = "wasm32"))']` block at the bottom of this
+#   file. That block names only what the library calls; an embedder that needs
+#   signals, processes or files asks tokio for them in its own manifest, which
+#   since 0.4.0 it has to — see the note there.
+#
+# INHERITED BY CONSUMERS — a consumer who declares tokio themselves compiles against
+# the union of their selection and this list, so every token below is one their own
+# code may be relying on without naming. All five are what this library itself calls;
+# `inherited_dependency_features` in `src/lib.rs` records them, and taking one away
+# means moving its row there rather than editing this line alone.
 tokio = { version = "1.36", default-features = false, optional = true, features = [
     "sync", "macros", "rt", "time", "io-util",
 ] }
-tokio-util = { version = "0.7", optional = true, features = ["codec"] }
 futures = { version = "0.3", optional = true }
-async-trait = { version = "0.1", optional = true }
 
 # --- Serialization & Utils ---
 # `bytes` and `serde` have first-class no_std modes (`default-features = false`
@@ -241,11 +263,9 @@ serde = { version = "1", default-features = false, features = ["derive", "alloc"
 # the bytes are the same as the ones the published release emits.
 borsh = { version = "=1.8.1", default-features = false, optional = true, features = ["derive"] }
 hex = { version = "0.4", default-features = false, optional = true, features = ["alloc"] }
-base64 = { version = "0.23", default-features = false, optional = true, features = ["alloc"] }
 anyhow = { version = "1", optional = true }
 thiserror = { version = "2", optional = true }
 log = { version = "0.4", optional = true }
-env_logger = { version = "0.11", optional = true }
 # `rand` is NOT a production dependency. The ecosystem skipped `rand_core 0.9`
 # (rand went 0.6 → 0.10), so a clean major-bump target does not exist; instead
 # the production CSPRNG seam is `getrandom` via `crate::crypto::rng::OsRng`
@@ -254,7 +274,6 @@ env_logger = { version = "0.11", optional = true }
 # benches, and fuzz harnesses (cavp.rs, fuzz_handshake.rs,
 # protocol_comparison.rs, syn_flood_bench.rs, the `test_harness` module) still
 # use it for non-production randomness.
-once_cell = { version = "1.18", optional = true }
 subtle = { version = "2.5", default-features = false, optional = true }  # Constant-time equality for secrets (cookies, tokens)
 tracing = { version = "0.1", optional = true }  # Structured spans / events for observability (Phase 4.5)
 
@@ -301,7 +320,6 @@ hkdf = { version = "0.13", optional = true }
 sha2 = { version = "0.11", optional = true }
 blake3 = { version = "1.5", optional = true }
 getrandom = { version = "0.4", optional = true }
-bitflags = { version = "2.13", optional = true }
 parking_lot = { version = "0.12", optional = true }  # Fast mutex for buffer pool
 arc-swap = { version = "1", optional = true }        # Lock-free atomic swap for the CryptoState rekey path (Phase 1.5)
 lz4_flex = { version = "0.14", optional = true }   # Fastest pure-Rust LZ4 (safe, no C bindings); >=0.13.1 floor avoids yanked 0.11.5 (RUSTSEC-2026-0041)
@@ -313,12 +331,20 @@ zstd = { version = "0.14", optional = true }
 # --- Networking ---
 # TCP/UDP-using crates are non-wasm-only (Phase 3.5). Moved to the
 # `[target.'cfg(not(target_arch = "wasm32"))']` block at the bottom.
+
+# Wall-clock dates in X.509 calendar form, for the validity window on the
+# synthetic certificate the TLS-mimicry theater presents — the only reader of this
+# crate anywhere in the tree. Gated by `mimicry` alone since 0.4.0: while `std` named
+# it too, every default build compiled a date library for a leg it had not enabled,
+# and a consumer who declared `time` with `default-features = false` was inheriting
+# `time/std` — and so `OffsetDateTime::now_utc` — from us without asking. Both ended
+# together; `inherited_dependency_features` in `src/lib.rs` is where the second one is
+# written down, because it is the half a consumer feels.
 time = { version = "0.3", optional = true }
 
 # --- FFI ---
 uniffi = { version = "0.32", optional = true, features = ["tokio"] }
 zeroize = { version = "1.8.2", optional = true, features = ["derive"] }
-argon2 = { version = "0.6", optional = true }
 crossbeam-queue = { version = "0.3.12", optional = true }
 crossbeam-utils = { version = "0.8", optional = true }  # CachePadded for observability hot-path atomics
 
@@ -352,9 +378,28 @@ uniffi = { version = "0.32", features = ["build"] }
 # TCP/UDP transport legs and raw sockets live here. wasm32 builds
 # skip these entirely and use the `WebSocketLeg` instead (see below).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { version = "1.36", optional = true, features = [
-    "net", "rt-multi-thread", "signal", "process", "fs", "io-std",
-] }
+# `net` and `rt-multi-thread` are what this library itself calls, and since 0.4.0 they
+# are all it asks for: `signal`, `process`, `fs` and `io-std` were enabled here for
+# years and nothing in this crate spawns a process, reads a file or listens for a
+# signal. An embedder that does — `server/` handles SIGTERM — asks tokio for them in
+# its own manifest, and every such embedder in this tree does.
+#
+# INHERITED BY CONSUMERS — Cargo unifies features across the whole graph, so what this
+# crate asks of tokio is added to what a consumer asked of the same tokio and their own
+# code compiles against the union. A program naming only `rt-multi-thread` and `macros`
+# itself, which called `tokio::signal::ctrl_c()` or `tokio::io::stdin()`, compiled
+# purely because this list carried the feature: removing one therefore breaks such a
+# program, with an error that names neither this crate nor a feature, and nothing else
+# in this repository can see it — `cargo-semver-checks` compares this crate's API and
+# not its dependencies' feature selections, and every consumer in the tree names enough
+# features of its own to paper over the loss. That is why the four went out with a minor
+# version and release notes that say so, after a first attempt in a patch had to be
+# undone. `inherited_dependency_features` in `src/lib.rs` is the record: adding to this
+# list is the safe direction and still needs a row, and taking something away means
+# moving its row into `WITHDRAWN` with the release that took it and what a consumer
+# loses — which is what stops the next removal from being silent, since the release it
+# names has to have a patch number of zero.
+tokio = { version = "1.36", optional = true, features = ["net", "rt-multi-thread"] }
 # socket2 gives portable access to SO_REUSEPORT (Phase 2.9 — Linux
 # multi-accept). Already in the transitive tree via tokio so this is
 # free from a build-size standpoint.
@@ -403,9 +448,9 @@ web-sys = { version = "0.3", features = [
 #     `ml-kem` `getrandom` feature for `generate_keypair`/`encapsulate`), and by
 #     `uniffi → tempfile`. The wasm backend feature is `wasm_js`.
 #   - 0.2 — still pulled by `ring` and by our DIRECT `getrandom02` alias below
-#     (and the rand_core-0.6 ecosystem: `ed25519-dalek`, `x25519-dalek`,
-#     `argon2`). Its wasm backend feature is the older `js`; without this the
-#     0.2 copy emits a `compile_error!` on wasm32-unknown-unknown.
+#     (and the rand_core-0.6 ecosystem: `ed25519-dalek`, `x25519-dalek`). Its
+#     wasm backend feature is the older `js`; without this the 0.2 copy emits a
+#     `compile_error!` on wasm32-unknown-unknown.
 #
 # NB: `rand 0.8` is no longer a production dep (dev-only now) and `ml-kem` is
 # on 0.3 (which routes through getrandom 0.4 via the `kem` crate, not 0.2), so
@@ -429,6 +474,9 @@ wasi = { version = "0.14", optional = true }
 
 [dev-dependencies]
 blake3 = "1.5"
+# `core/examples/loopback_demo.rs` initialises logging; nothing in the library
+# does, so this belongs here rather than behind `std`.
+env_logger = "0.11"
 ed25519-dalek = { version = "3", features = ["rand_core"] }
 rand = { version = "0.10", features = ["sys_rng"] }
 uniffi = { version = "0.32", features = ["bindgen-tests"] }

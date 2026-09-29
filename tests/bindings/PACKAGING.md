@@ -12,9 +12,11 @@ the four FFI bindings:
 
 **Publishing is intentionally manual.** None of the steps below are
 automated in CI — releasing a binding is a deliberate human action.
-SLSA-3 build-provenance attestation is wired up for the Rust crate
-(`.github/workflows/release.yml`); per-binding publish workflows are a
-follow-up beyond the scope of these configs.
+Build-provenance attestation is wired up for the Rust crate
+(`.github/workflows/release.yml` — sigstore-backed in-toto provenance, SLSA v1.0
+Build L2); per-binding publish workflows are a follow-up beyond the scope of these
+configs, so a wheel, XCFramework or AAR built from these files carries no
+attestation of its own.
 
 ---
 
@@ -38,9 +40,10 @@ wheel. The result is installable with a plain `pip install`.
 # Prerequisites
 pip install "maturin>=1.6,<2.0"
 
-# Build a wheel for the current platform (from the repo root):
+# Build a wheel for the current platform. `python/pyproject.toml` already points
+# maturin at ../core/Cargo.toml and enables the bindings feature, so no flags:
 cd python
-maturin build --release --manifest-path ../core/Cargo.toml --features bindings --out ../target/wheels
+maturin build --release --out ../target/wheels
 
 # Install it (no extra steps — cdylib is inside the wheel):
 pip install --no-index --find-links ../target/wheels phantom-protocol
@@ -48,9 +51,20 @@ pip install --no-index --find-links ../target/wheels phantom-protocol
 # Verify:
 python -c "import phantom_protocol; print('ok')"
 
+# Or do all of the above in a throwaway venv, including a loopback round-trip
+# through the installed package:
+./verify_wheel.sh
+
 # Publish to PyPI (manual — needs MATURIN_PYPI_TOKEN):
-maturin publish --manifest-path ../core/Cargo.toml
+maturin publish
 ```
+
+maturin's uniffi mode generates a whole PACKAGE named after the crate, so
+`python/pyproject.toml` deliberately sets no `python-source`: a hand-written
+`python/phantom_protocol/` of the same name made maturin nest the generated
+package inside it, and `import phantom_protocol` then failed with
+`cannot import name '__all__' from 'phantom_protocol.phantom_protocol'`. Run
+`verify_wheel.sh` after touching that file — a broken wheel builds silently.
 
 For a real multi-platform PyPI release (manylinux, macOS, Windows) wrap
 the build with **`cibuildwheel`** targeting the `python/pyproject.toml`. A
@@ -69,7 +83,7 @@ cd tests/bindings
 cargo build --release --manifest-path ../../core/Cargo.toml
 ./generate_python.sh
 cp ../../target/release/libphantom_protocol.{dylib,so} . 2>/dev/null || true
-python -m build --wheel        # produces dist/phantom_protocol-0.3.0-*.whl
+python -m build --wheel        # produces dist/phantom_protocol-0.4.0-*.whl
 twine upload dist/*.whl        # manual — needs PyPI credentials
 ```
 
@@ -81,11 +95,23 @@ Use this flow only for local testing or the `bindings/drift` CI job.
 
 ```sh
 cd tests/bindings/swift
-rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios \
+                  aarch64-apple-darwin x86_64-apple-darwin
 ./build-xcframework.sh         # produces PhantomProtocol.xcframework
+./check_xcframework.sh         # header names + one slice per declared platform
+swift build                    # the generated binding, compiled against it
 # Then commit a tag and host the XCFramework on a GitHub Release;
 # update Package.swift's `.binaryTarget(url:checksum:)` to point at it.
 ```
+
+The framework carries three platform slices — iOS device, iOS simulator and
+macOS — because `Package.swift` declares `.iOS` and `.macOS`. A declared platform
+with no slice resolves fine and then fails to link, which is why
+`check_xcframework.sh` compares the two lists. It also checks that the modulemap
+inside the framework is named `module.modulemap`: under its generated name
+(`phantom_protocolFFI.modulemap`) clang exports no module, so the generated
+Swift's `canImport(phantom_protocolFFI)` is false and compilation dies on
+`cannot find type 'RustBuffer' in scope` with a framework that looks fine.
 
 A *published* SwiftPM package needs a binary target hosted at a stable
 URL with a SHA-256 checksum; the in-tree `Package.swift` declares a
@@ -135,7 +161,7 @@ to a GitHub Release.
 
 ## A note on pre-1.0 versioning
 
-`phantom-protocol` is at version **0.3.0** — every binding artifact carries the
+`phantom-protocol` is at version **0.4.0** — every binding artifact carries the
 same version. The `core/Cargo.toml` version is the single source of truth;
 when it bumps, update every version-locked manifest in lock step:
 
@@ -145,8 +171,11 @@ when it bumps, update every version-locked manifest in lock step:
 - `tests/bindings/c/phantom_protocol.pc.in` (`Version: ...`) — enforced by `check_versions.sh`
 - `server/Cargo.toml` (`version = ...`) — enforced by `check_versions.sh`
 - `cli/Cargo.toml` (`version = ...`) — enforced by `check_versions.sh`
-- `tests/bindings/c/package.sh` (`VERSION=...`) — **not** enforced by
-  `check_versions.sh`; bump it by hand.
+- `testbed/Cargo.toml` (`version = ...`) — enforced by `check_versions.sh`
+- `docker-compose.yml` (`image: phantom-server:<tag>`) — enforced by
+  `check_versions.sh`
+- `tests/bindings/c/package.sh` — nothing to bump: it reads the version out of
+  `core/Cargo.toml` when it names the tarball.
 - `tests/bindings/swift/Package.swift` — no version field, but git-tag
   the release at the same SemVer.
 - `tests/bindings/kotlin/build.gradle.kts` — add a `version =` if you

@@ -398,6 +398,16 @@ inventoried production panic sites are documented in `docs/security/panic-sites.
 and `scripts/check_panic_sites.py` fails CI when the inventory and the code disagree).
 A wrong-key / wrong-AAD / wrong-PN failure all surface as a single opaque "decrypt failed".
 
+One end-of-stream is deliberately **not** an error. `PhantomStream::recv` returns
+`Result<Option<Vec<u8>>, CoreError>`: `Ok(None)` is the peer's clean `FIN`
+(half-closed, PROTOCOL.md § 4.5 — this side may still send), and
+`Err(CoreError::ConnectionClosed)` is an abnormal end. Before 0.3.0 the signature was
+`Result<Vec<u8>, CoreError>` and both arrived as the same error, so a loop could not
+tell a peer that finished from a session that broke. A caller that matches only on
+`Err` now loops forever on `Ok(None)`; one that treated the old error as EOF now
+misses a real failure. Both are compile errors at the `match`, which is the reason the
+type changed rather than a sentinel being documented.
+
 ---
 
 ## 10. Performance landmarks

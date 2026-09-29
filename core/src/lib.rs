@@ -100,10 +100,17 @@
 // ring → aws-lc-rs, blake3 → HKDF-SHA256, drop ChaCha20-Poly1305,
 // CTR_DRBG RNG, POST hook) is **shipped**. `--features fips` now
 // builds and serves a FIPS-substrate Phantom Protocol. The scaffold
-// `compile_error!` from commit `d4d121b` is gone; the only
-// remaining build-time gate enforces mutual exclusion with `no-std`,
-// since `aws-lc-rs` requires libc + dlopen / OpenSSL ABI and cannot
-// run on bare-metal.
+// `compile_error!` that stood here while it was unimplemented is gone
+// (it was removed in 0.2.0; the pre-0.3.0 commit this comment used to
+// cite does not resolve after the history rewrite — see
+// `docs/policy/versioning.md` § 10). The gate below is the first of
+// **four** build-time gates in this file, not the only one: it enforces
+// mutual exclusion with `no-std`, since `aws-lc-rs` requires libc +
+// dlopen / OpenSSL ABI and cannot run on bare-metal. The other three
+// reject `wasi-leg` on the browser target, a feature set with neither
+// `std` nor `no-std`, and a `std` build with neither crypto substrate;
+// the last two were added in 0.4.0 and each replaces a failure that
+// named nothing a consumer could act on.
 #[cfg(all(feature = "fips", feature = "no-std"))]
 compile_error!(
     "Cargo features `fips` and `no-std` are mutually exclusive — \
@@ -125,6 +132,50 @@ compile_error!(
      wasm32-unknown-unknown (browser) builds use the default feature \
      set, which exposes the `WebSocketLeg` + `WasmRuntime` surface \
      instead."
+);
+
+// `--no-default-features` with nothing named enters the bare-metal branch above,
+// because that branch is selected by the *absence* of `std` rather than by any
+// affirmative choice. On a host target the build then fails inside `core` with
+// "no global memory allocator found", "`#[panic_handler]` function required" and
+// "unwinding panics are not supported without std" — three errors that name
+// nothing this crate's consumer can act on, and that a consumer reasonably reads
+// as the library being broken rather than as a feature set that was never
+// selected. The `no-std` feature is the affirmative marker for that branch, so
+// its absence alongside `std`'s is the misconfiguration.
+#[cfg(all(not(feature = "std"), not(feature = "no-std")))]
+compile_error!(
+    "No Phantom Protocol feature set was selected: `--no-default-features` \
+     switched off `std` and nothing turned it, or the bare-metal subset, back \
+     on. Name one. A host build: `--features std,classical-crypto` (add \
+     `bindings` for the UniFFI surface and `compression-zstd` for the zstd \
+     algorithm menu), or drop `--no-default-features` and take the default set. \
+     A FIPS host build: `--features fips,bindings`. Bare metal: \
+     `--features embedded,no-std`."
+);
+
+// A `std` build needs one of the two crypto substrates. `classical-crypto` gives
+// it `ring` + `x25519-dalek`; `fips` gives it `aws-lc-rs` with ECDH-P-256 in
+// place of X25519. Neither is implied by `std` — deliberately, so the `fips`
+// build (which implies `std`) can drop the classical crates entirely — with the
+// result that `--no-default-features --features std` alone compiles a crate whose
+// AEAD and classical KEM have no implementation, and fails with five errors
+// inside `crypto/` whose first line is `unresolved module or unlinked crate
+// `ring``. That reads as a missing dependency rather than as the one-word feature
+// it is.
+#[cfg(all(
+    feature = "std",
+    not(feature = "classical-crypto"),
+    not(feature = "fips")
+))]
+compile_error!(
+    "A `std` build of Phantom Protocol needs a crypto substrate, and `std` \
+     implies neither (so that the FIPS build can drop the classical crates). \
+     Add `classical-crypto` for the default substrate (X25519 + ML-KEM-768, \
+     `ring` AEAD) or `fips` for the FIPS-140-3 one (ECDH-P-256 + ML-KEM-768, \
+     `aws-lc-rs` AEAD, ChaCha20-Poly1305 refused). The two do not interoperate \
+     on the wire — their handshakes advertise different `PROTOCOL_VARIANT` \
+     tags — so this is a deployment-wide choice, not a build detail."
 );
 
 #[cfg(not(feature = "std"))]
@@ -183,14 +234,45 @@ pub mod test_harness;
 pub use config::PhantomConfig;
 pub use errors::CoreError;
 
-// Re-export the one-shot connect helpers at the crate root so callers can write
-// `phantom_protocol::connect_pinned_udp(...)` without qualifying the module path.
-// Native-only: the free functions live behind `cfg(not(target_arch = "wasm32"))`.
+// The types a caller has to name to use the crate-root entry points, re-exported
+// beside them.
+//
+// `CoreError` and `PhantomConfig` were here and the rest were not, which made the
+// import a reader writes from the signature of a crate-root function fail:
+// `connect_pinned_udp` hands back an `Arc<PhantomSession>`, the session answers
+// with a `ConnectionState`, opens a `PhantomStream` and produces a
+// `ResumptionHint` that the resuming entry point takes back — and every one of
+// those lived only at `phantom_protocol::api::…`, so `use
+// phantom_protocol::ConnectionState;` did not compile while
+// `use phantom_protocol::CoreError;` did. Nothing is moved: these are additions,
+// and the `api::` paths keep working.
+#[cfg(feature = "std")]
+pub use api::{
+    ConnectionState, PaddingPolicy, PhantomSession, PhantomStream, ResumptionHint,
+    TrafficShapingConfig,
+};
+/// The pinned server identity every client entry point requires (Invariant 1).
+///
+/// A consumer cannot use the builder without naming it — `.pinned_key()` takes one — and it
+/// lived only at `phantom_protocol::crypto::hybrid_sign`, two modules in from anywhere the
+/// builder is documented.
+#[cfg(feature = "std")]
+pub use crypto::hybrid_sign::HybridVerifyingKey;
+/// The flat metrics record [`PhantomSession::metrics_snapshot`] returns.
+#[cfg(feature = "std")]
+pub use observability::MetricsSnapshotFfi;
+
+// The server-side surface and the one-shot connect helpers. Native-only: the
+// listeners and the free functions all live behind
+// `cfg(not(target_arch = "wasm32"))`, so a browser-wasm build sees neither here
+// nor under `api::`.
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub use api::session::{
     connect_pinned, connect_pinned_udp, connect_pinned_udp_with_config,
     connect_pinned_udp_with_resumption, connect_pinned_with_config, connect_pinned_with_resumption,
 };
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+pub use api::{AcceptOutcome, PhantomListener, PhantomUdpListener};
 
 // UniFFI scaffolding. Gated on the `bindings` feature so the WASI
 // guest build (which sets `--features wasi-leg` without `bindings`)
@@ -1441,5 +1523,2036 @@ mod pinned_version_claims {
         assert!(found[0].contains("is not followed by digits"));
         assert!(found[1].contains("not a constant this gate knows"));
         assert!(found[2].contains("starts its line"), "{}", found[2]);
+    }
+}
+
+/// Two claims this file and its neighbours make *about themselves*, held to the code
+/// they describe.
+///
+/// Neither is a property of the protocol; both are sentences a reader is invited to
+/// act on, and both went wrong in exactly the way an unchecked sentence does. A
+/// comment is not compiled, so nothing moves it when the thing it describes moves —
+/// the two here had been false since 0.2.0 and since this release's own first cut
+/// respectively, in a file that `cargo clippy` and `cargo doc` both read without
+/// complaint.
+#[cfg(test)]
+mod claims_this_crate_makes_about_itself {
+    /// This file. `include_str!` of a relative path stays inside `core/`, which is
+    /// what `packaged_readme` requires of every include site here.
+    const LIB: &str = include_str!("lib.rs");
+
+    /// The two files that carried the retired handshake figure.
+    const SESSION: &str = include_str!("api/session.rs");
+    const SESSION_END_TESTS: &str = include_str!("api/session_end_tests.rs");
+
+    /// The build-time feature gates in this file, and the number the prose above the
+    /// first one claims there are.
+    ///
+    /// **The defect.** The comment introducing the first `compile_error!` said "the
+    /// only remaining build-time gate", which stopped being true when the second was
+    /// added in 0.2.0 and was three behind by 0.4.0. It also cited a commit id that
+    /// the pre-0.3.0 history rewrite dissolved.
+    ///
+    /// **What a consumer observed.** A build refused for a feature set the comment
+    /// says is the one thing checked here — `--no-default-features` with nothing
+    /// named, or a `std` build with no crypto substrate — sends the reader looking
+    /// for a `fips`/`no-std` conflict they do not have, because the comment told
+    /// them that is the only gate in the file.
+    ///
+    /// **Why it would come back unnoticed.** Adding a fifth gate is a five-line
+    /// patch a hundred lines below the sentence that counts them, and nothing in the
+    /// tool chain reads prose. The count is asserted here so that the patch which
+    /// adds a gate is the patch that fails, naming the sentence to fix.
+    #[test]
+    fn the_prose_counts_the_build_time_gates_this_file_holds() {
+        // Split so that this line is not itself one of the occurrences it counts.
+        let gates = LIB.matches(concat!("compile_error", "!(")).count();
+        assert_eq!(
+            gates, 4,
+            "this file holds {gates} `compile_error!` gates, and the comment above the \
+             first one says there are four. Whichever moved, move the other: the comment \
+             is the sentence beginning \"The gate below is the first of\", and the count \
+             here is the tripwire."
+        );
+        // Split for the same reason as the needle above: whole, it would match itself.
+        assert!(
+            LIB.contains(concat!("**four**", " build-time gates in this file")),
+            "the sentence that states the gate count is not where this gate expects it; \
+             if it was reworded, reword the assertion with it rather than deleting either"
+        );
+    }
+
+    /// The per-candidate share floor is derived from two constants, and no comment
+    /// may justify it with the figure that was withdrawn.
+    ///
+    /// **The defect.** Four comments justified the 2 s floor with "a handshake over a
+    /// 600 ms path takes about 1.8 s". Two flights on a 600 ms path is 1.2 s, and the
+    /// floor is `UDP_HANDSHAKE_FLIGHTS × NO_SAMPLE_FLIGHT_RTO` — derived from no path
+    /// length at all. The release notes retired the figure and the comments kept it,
+    /// so the crate and its own changelog disagreed about why a constant has its
+    /// value.
+    ///
+    /// **What a consumer observed.** A reader sizing the floor for their own path —
+    /// the one reason to read that comment — reasoned from a number with nothing
+    /// behind it, and a reader who checked it against
+    /// `the_candidate_share_floor_is_two_of_the_transports_first_intervals` found the
+    /// test and the comment giving different derivations of the same constant.
+    ///
+    /// **Why it would come back unnoticed.** The figure is plausible, it reads like a
+    /// measurement, and it appeared in four places at once because each was copied
+    /// from the last. Nothing compiles a comment. This fails the build for any comment
+    /// that reasserts it, which is the only way a retracted number stays retracted.
+    #[test]
+    fn no_comment_justifies_the_share_floor_with_the_withdrawn_figure() {
+        for (name, text) in [
+            ("core/src/api/session.rs", SESSION),
+            ("core/src/api/session_end_tests.rs", SESSION_END_TESTS),
+        ] {
+            assert!(
+                !text.contains("1.8 s"),
+                "{name} states \"1.8 s\" again. The floor is UDP_HANDSHAKE_FLIGHTS x \
+                 NO_SAMPLE_FLIGHT_RTO and follows from no path length; two flights on a \
+                 600 ms path is 1.2 s. Cite the derivation, not a figure."
+            );
+        }
+    }
+}
+
+/// Everything a consumer's own build inherits from this crate's manifest, and the
+/// record that keeps one of it from being taken away in silence.
+///
+/// Cargo unifies features across the whole dependency graph, so what this crate asks
+/// of a shared dependency is added to what a consumer asked of the same dependency,
+/// and the consumer's own code compiles against the union. A program that declares
+/// `tokio = { version = "1", features = ["rt-multi-thread", "macros"] }` and calls
+/// `tokio::signal::ctrl_c()` compiled for years only because this crate enabled
+/// `signal`, and nothing in its own manifest said so.
+///
+/// **The defect this module exists for.** 0.3.1 removed four such tokio features
+/// (`signal`, `process`, `fs`, `io-std`) and moved `dep:time` out of `std`. By this
+/// crate's own needs all five were dead weight — nothing in `core/src` reads any of
+/// them — so the removal read as cleanup and nothing in the repository disagreed. A
+/// consumer that had been inheriting them got five compile errors on unchanged source,
+/// none of which named this crate or a feature, and the way to reach that consumer was
+/// `cargo update` inside the `= "0.3"` requirement the README recommends. The removal
+/// came back out of the patch release and shipped in 0.4.0 instead, where a consumer
+/// opts in by version and reads notes first.
+///
+/// **Why no other gate sees it.** `cargo-semver-checks` compares this crate's public
+/// API, not its dependencies' feature selections. The cross-target matrix, the
+/// integration suites and every sibling crate in this tree name enough tokio features
+/// of their own to paper the loss over. A test that *used* the features would be worse
+/// than nothing: dev-dependencies are not part of what a consumer inherits, so such a
+/// test stays green for exactly this change.
+///
+/// **What is gated, and what changed at 0.4.0.** The first version of this module
+/// asserted the five selections were *present*. That was right for a patch release
+/// holding them and wrong the moment 0.4.0 took them, and presence was never the
+/// property worth gating: a selection may legitimately go. What may not happen is that
+/// it goes quietly. So [`GUARDED`] is an exact inventory and the gate is set equality
+/// against the manifest in both directions. A token removed from a list fails the
+/// build until its row moves to [`WITHDRAWN`] with the release that took it and what a
+/// consumer loses; a token added without a row fails too, because an unrecorded
+/// selection is one a later removal could take unnoticed. A withdrawal is additionally
+/// held to the rule the episode above settled: the release that takes a selection away
+/// has a patch number of zero.
+///
+/// **Scope.** Every list in the manifest a consumer's build inherits from: each list in
+/// the `[features]` table — which is where this crate decides what enters a consumer's
+/// graph at all — and each dependency's own `features = [...]`, in every target block.
+/// Dev- and build-dependencies are out, because a consumer inherits neither.
+///
+/// The first version of this module recorded the feature lists and the two `tokio`
+/// selections only, and said the other per-dependency lists were safe to leave out
+/// because each was named for something this crate's own code needs, so removing one
+/// would stop this crate compiling and could not be silent. **That was not true**, and
+/// two live selections show why. `bytes`'s `serde` gives a consumer `Serialize` for
+/// `Bytes`, and nothing in `core/src` serializes a `Bytes` through serde — deleting it
+/// compiles here and takes the impl from a consumer who declared `bytes` without it.
+/// `ed25519-dalek`'s `rand_core` is worse, because something *does* appear to need it:
+/// the `[dev-dependencies]` entry names it too, so deleting it from the inherited entry
+/// leaves every test and bench compiling, while a consumer loses `SigningKey::generate`.
+/// A per-dependency list can outlive its last in-crate reader exactly as a `dep:` can,
+/// and one of them can do it while looking used. So every such list is recorded here,
+/// and [`the_record_covers_every_dependency_feature_list_a_consumer_inherits`] holds the
+/// set to the manifest's.
+///
+/// What is still not recorded is a dependency's *default* features where this crate takes
+/// them as they come; that half is [`DEFAULTS_WAIVED`]'s, which records every entry that
+/// turns them off and why.
+///
+/// It reads the manifest as written, which is the copy being guarded. `cargo package`
+/// normalizes the copy it puts in an archive — comments gone, each dependency in a
+/// table of its own — and nothing runs these tests from there: `cargo package
+/// --verify` builds the extracted crate without testing it, and `cargo test` inside one
+/// does not compile at all, because `packaged_readme` and `pinned_version_claims` beside
+/// this module include documents from outside `core/`. The one shape assumption that could
+/// be dropped for free was dropped: a tokio selection is found by its contents rather
+/// than by walking to a table, so either form is read.
+#[cfg(test)]
+mod inherited_dependency_features {
+    /// This crate's manifest, read as text. It sits inside the package, so this
+    /// resolves both here and in an extracted `cargo package` archive.
+    const MANIFEST: &str = include_str!("../Cargo.toml");
+
+    /// How a guarded list is located in [`MANIFEST`].
+    enum Anchor {
+        /// A crate feature's own list in the `[features]` table, found by its name.
+        CrateFeature,
+        /// A dependency's own `features = [...]`, found by the dependency's name.
+        ///
+        /// By name and not by position, because the manifest has two shapes: the inline
+        /// `tokio = { … features = [ … ] }` written here, and the
+        /// `[target.….dependencies.tokio]` table `cargo package` normalizes it into.
+        /// `holding` separates the two lists a dependency declared in more than one target
+        /// block has — `tokio` is the only one — by a token only that list carries, and
+        /// is `None` wherever the name is enough on its own.
+        Dependency {
+            name: &'static str,
+            holding: Option<&'static str>,
+        },
+    }
+
+    /// A list in `core/Cargo.toml` whose contents reach a consumer's own build.
+    struct Guarded {
+        /// The name used in failure messages and referenced by [`Withdrawal::list`].
+        name: &'static str,
+        /// Where to find it.
+        anchor: Anchor,
+        /// What a consumer gets out of this list, said from their side rather than ours.
+        reaches: &'static str,
+        /// Exactly the tokens the list carries. Order does not matter; membership does.
+        recorded: &'static [&'static str],
+    }
+
+    /// A selection this crate used to make and does not any more.
+    struct Withdrawal {
+        /// The [`Guarded::name`] it left.
+        list: &'static str,
+        /// The token, spelled as the list spelled it.
+        token: &'static str,
+        /// The release that took it away. Its patch number is zero, because a patch
+        /// release may not change what a consumer's build inherits.
+        release: &'static str,
+        /// Why this crate stopped naming it.
+        reason: &'static str,
+        /// What a consumer's own code lost with it. This is the half that decides
+        /// whether a removal needs a release of its own, and the half the first
+        /// attempt did not look at.
+        cost: &'static str,
+    }
+
+    /// Every list a consumer's build inherits from, and what each one currently says.
+    ///
+    /// The `[features]` rows are held to be the whole table by
+    /// [`the_record_covers_every_list_in_the_features_table`], so a feature added to
+    /// the manifest lands here or fails the build.
+    const GUARDED: &[Guarded] = &[
+        Guarded {
+            name: "default",
+            anchor: Anchor::CrateFeature,
+            reaches: "the graph of every consumer who does not pass \
+                      `default-features = false`",
+            recorded: &["compression-zstd", "std", "bindings", "classical-crypto"],
+        },
+        Guarded {
+            name: "bindings",
+            anchor: Anchor::CrateFeature,
+            reaches: "`uniffi` in the graph of a consumer who takes the default build",
+            recorded: &["std", "dep:uniffi"],
+        },
+        Guarded {
+            name: "uniffi-cli",
+            anchor: Anchor::CrateFeature,
+            reaches: "uniffi's own `cli` feature, for whoever runs the bindings codegen",
+            recorded: &["bindings", "uniffi/cli"],
+        },
+        Guarded {
+            name: "std",
+            anchor: Anchor::CrateFeature,
+            reaches: "every crate named here, with its default features, in the graph \
+                      of a consumer who takes the default build — including the ones \
+                      this crate stops reading",
+            recorded: &[
+                "dep:tokio",
+                "dep:futures",
+                "dep:parking_lot",
+                "dep:dashmap",
+                "dep:arc-swap",
+                "dep:tracing",
+                "dep:crossbeam-queue",
+                "dep:crossbeam-utils",
+                "dep:lz4_flex",
+                "dep:anyhow",
+                "dep:thiserror",
+                "dep:ed25519-dalek",
+                "dep:ml-kem",
+                "dep:ml-dsa",
+                "dep:log",
+                "dep:hmac",
+                "dep:borsh",
+                "dep:hex",
+                "dep:zeroize",
+                "dep:subtle",
+                "dep:blake3",
+                "dep:hkdf",
+                "dep:sha2",
+                "dep:getrandom",
+                "dep:socket2",
+                "bytes/std",
+                "serde/std",
+                "header-protection",
+            ],
+        },
+        Guarded {
+            name: "classical-crypto",
+            anchor: Anchor::CrateFeature,
+            reaches: "`ring` and `x25519-dalek` in a default (non-fips) consumer's graph",
+            recorded: &["dep:ring", "dep:x25519-dalek"],
+        },
+        Guarded {
+            name: "header-protection",
+            anchor: Anchor::CrateFeature,
+            reaches: "the RustCrypto `aes` / `chacha20` mask primitives, which `std` \
+                      turns on for everyone",
+            recorded: &["dep:aes", "dep:chacha20"],
+        },
+        Guarded {
+            name: "compression-zstd",
+            anchor: Anchor::CrateFeature,
+            reaches: "`zstd` and its C bindings in a default consumer's graph",
+            recorded: &["dep:zstd", "std"],
+        },
+        Guarded {
+            name: "embedded",
+            anchor: Anchor::CrateFeature,
+            reaches: "`embedded-io-async` and `async-lock` for a bare-metal embedder",
+            recorded: &["dep:embedded-io-async", "dep:async-lock"],
+        },
+        Guarded {
+            name: "no-std",
+            anchor: Anchor::CrateFeature,
+            reaches: "nothing — it is a marker, and a `dep:` appearing here would be \
+                      the first thing a bare-metal consumer inherits from it",
+            recorded: &[],
+        },
+        Guarded {
+            name: "fips",
+            anchor: Anchor::CrateFeature,
+            reaches: "`aws-lc-rs` for a consumer who asks for the FIPS substrate",
+            recorded: &["std", "dep:aws-lc-rs"],
+        },
+        Guarded {
+            name: "wasi-leg",
+            anchor: Anchor::CrateFeature,
+            reaches: "the `wasi` crate for a WASI Preview 2 guest",
+            recorded: &["std", "dep:wasi"],
+        },
+        Guarded {
+            name: "mimicry",
+            anchor: Anchor::CrateFeature,
+            reaches: "`time` for a consumer who enables the mimicry leg — since 0.4.0 \
+                      this crate's only activation of it",
+            recorded: &["std", "dep:time"],
+        },
+        Guarded {
+            name: "telemetry-otel",
+            anchor: Anchor::CrateFeature,
+            reaches: "the OpenTelemetry crates for an embedder who wires a pipeline, \
+                      who is near-certain to declare them as well",
+            recorded: &[
+                "std",
+                "dep:opentelemetry",
+                "dep:opentelemetry_sdk",
+                "dep:tracing-opentelemetry",
+            ],
+        },
+        Guarded {
+            name: "cross-target tokio selection",
+            anchor: Anchor::Dependency {
+                name: "tokio",
+                holding: Some("io-util"),
+            },
+            reaches: "these five tokio features in the build of any consumer who \
+                      declares tokio themselves, on every target",
+            recorded: &["sync", "macros", "rt", "time", "io-util"],
+        },
+        Guarded {
+            name: "native tokio selection",
+            anchor: Anchor::Dependency {
+                name: "tokio",
+                holding: Some("net"),
+            },
+            reaches: "these tokio features in the build of any consumer who declares \
+                      tokio themselves, off wasm32",
+            recorded: &["net", "rt-multi-thread"],
+        },
+        Guarded {
+            name: "bytes selection",
+            anchor: Anchor::Dependency {
+                name: "bytes",
+                holding: None,
+            },
+            reaches: "`Bytes`'s `Serialize` / `Deserialize` impls for a consumer who \
+                      declares `bytes` themselves — nothing in this crate reads them, \
+                      so this is a selection that has already outlived its last in-crate \
+                      reader",
+            recorded: &["serde"],
+        },
+        Guarded {
+            name: "serde selection",
+            anchor: Anchor::Dependency {
+                name: "serde",
+                holding: None,
+            },
+            reaches: "`#[derive(Serialize)]` and the `alloc` impls for a consumer who \
+                      declares `serde` with neither",
+            recorded: &["derive", "alloc"],
+        },
+        Guarded {
+            name: "borsh selection",
+            anchor: Anchor::Dependency {
+                name: "borsh",
+                holding: None,
+            },
+            reaches: "`#[derive(BorshSerialize)]` for a consumer who declares `borsh` \
+                      without it",
+            recorded: &["derive"],
+        },
+        Guarded {
+            name: "hex selection",
+            anchor: Anchor::Dependency {
+                name: "hex",
+                holding: None,
+            },
+            reaches: "`hex::encode` and the rest of the allocating surface for a \
+                      consumer who declares `hex` with `default-features = false`",
+            recorded: &["alloc"],
+        },
+        Guarded {
+            name: "x25519-dalek selection",
+            anchor: Anchor::Dependency {
+                name: "x25519-dalek",
+                holding: None,
+            },
+            reaches: "`StaticSecret` and the `Zeroize` impls for a consumer who declares \
+                      `x25519-dalek` without them",
+            recorded: &["static_secrets", "zeroize"],
+        },
+        Guarded {
+            name: "ed25519-dalek selection",
+            anchor: Anchor::Dependency {
+                name: "ed25519-dalek",
+                holding: None,
+            },
+            reaches: "`SigningKey::generate` and the `Zeroize` impls for a consumer who \
+                      declares `ed25519-dalek` without them — and `rand_core` is a \
+                      second selection nothing in `core/src` reads, kept alive here only \
+                      by the dev-dependency, which a consumer does not inherit",
+            recorded: &["zeroize", "rand_core"],
+        },
+        Guarded {
+            name: "chacha20 selection",
+            anchor: Anchor::Dependency {
+                name: "chacha20",
+                holding: None,
+            },
+            reaches: "the `cipher` trait impls for a consumer who declares `chacha20` \
+                      with `default-features = false`",
+            recorded: &["cipher"],
+        },
+        Guarded {
+            name: "ml-kem selection",
+            anchor: Anchor::Dependency {
+                name: "ml-kem",
+                holding: None,
+            },
+            reaches: "the hazmat API, the system-randomness constructors and the \
+                      `Zeroize` impls for a consumer who declares `ml-kem` themselves",
+            recorded: &["hazmat", "getrandom", "zeroize"],
+        },
+        Guarded {
+            name: "uniffi selection",
+            anchor: Anchor::Dependency {
+                name: "uniffi",
+                holding: None,
+            },
+            reaches: "`async_runtime = \"tokio\"` on an exported block, for a consumer \
+                      who declares `uniffi` for bindings of their own",
+            recorded: &["tokio"],
+        },
+        Guarded {
+            name: "zeroize selection",
+            anchor: Anchor::Dependency {
+                name: "zeroize",
+                holding: None,
+            },
+            reaches: "`#[derive(Zeroize)]` / `#[derive(ZeroizeOnDrop)]` for a consumer \
+                      who declares `zeroize` without the derive",
+            recorded: &["derive"],
+        },
+        Guarded {
+            name: "opentelemetry selection",
+            anchor: Anchor::Dependency {
+                name: "opentelemetry",
+                holding: None,
+            },
+            reaches: "the metrics and trace APIs for an embedder who declares \
+                      `opentelemetry` with `default-features = false`",
+            recorded: &["metrics", "trace"],
+        },
+        Guarded {
+            name: "opentelemetry_sdk selection",
+            anchor: Anchor::Dependency {
+                name: "opentelemetry_sdk",
+                holding: None,
+            },
+            reaches: "the metrics and trace SDKs and the tokio runtime binding for an \
+                      embedder who declares the SDK with `default-features = false`",
+            recorded: &["metrics", "trace", "rt-tokio"],
+        },
+        Guarded {
+            name: "tracing-opentelemetry selection",
+            anchor: Anchor::Dependency {
+                name: "tracing-opentelemetry",
+                holding: None,
+            },
+            reaches: "the `tracing-log` bridge for an embedder who declares the crate \
+                      with `default-features = false`",
+            recorded: &["tracing-log"],
+        },
+        Guarded {
+            name: "aws-lc-rs selection",
+            anchor: Anchor::Dependency {
+                name: "aws-lc-rs",
+                holding: None,
+            },
+            reaches: "the FIPS backend rather than the default one, for a consumer who \
+                      declares `aws-lc-rs` themselves — the two are mutually \
+                      exclusive, so this is the rare selection whose *addition* is what a \
+                      consumer feels",
+            recorded: &["fips"],
+        },
+        Guarded {
+            name: "web-sys selection",
+            anchor: Anchor::Dependency {
+                name: "web-sys",
+                holding: None,
+            },
+            reaches: "these eight interface bindings for a browser consumer who declares \
+                      `web-sys` themselves, where every interface is its own feature",
+            recorded: &[
+                "BinaryType",
+                "Blob",
+                "CloseEvent",
+                "console",
+                "ErrorEvent",
+                "Event",
+                "MessageEvent",
+                "WebSocket",
+            ],
+        },
+        Guarded {
+            name: "getrandom selection",
+            anchor: Anchor::Dependency {
+                name: "getrandom",
+                holding: None,
+            },
+            reaches: "getrandom 0.4's browser backend, without which the crate emits a \
+                      `compile_error!` on wasm32-unknown-unknown — so a consumer \
+                      building for the browser inherits a working RNG from this line",
+            recorded: &["wasm_js"],
+        },
+        Guarded {
+            name: "getrandom02 selection",
+            anchor: Anchor::Dependency {
+                name: "getrandom02",
+                holding: None,
+            },
+            reaches: "the same backend for the getrandom 0.2 copy `ring` and the \
+                      rand_core-0.6 ecosystem still pull, under its older feature name",
+            recorded: &["js"],
+        },
+    ];
+
+    /// Selections that have been taken away, with the release that took them.
+    ///
+    /// A row here is the whole point of the module: it is what a removal costs, written
+    /// down at the moment of the removal by whoever could still see why. Restoring a
+    /// selection means moving its row back into [`GUARDED`]; both directions fail the
+    /// build until the record agrees with the manifest.
+    const WITHDRAWN: &[Withdrawal] = &[
+        Withdrawal {
+            list: "std",
+            token: "dep:tokio-util",
+            release: "0.4.0",
+            reason: "nothing in this crate has read `tokio-util` since the byte-pipe \
+                     transports took over their own framing; the 4-byte length prefix in \
+                     `api/tcp_transport.rs` is written by hand over a `BytesMut`",
+            cost: "`tokio_util::codec` — `Framed`, `Decoder`, `Encoder`, \
+                   `LengthDelimitedCodec` — in a consumer that declared `tokio-util` \
+                   without naming `codec`, which is every consumer who took its default \
+                   features, because tokio-util's defaults are empty",
+        },
+        Withdrawal {
+            list: "std",
+            token: "dep:async-trait",
+            release: "0.4.0",
+            reason: "the one trait that needed it, `SessionTransport`, is native \
+                     async-fn-in-trait and has been since the `EmbeddedLeg` work",
+            cost: "nothing a consumer could reach: `async-trait` declares no cargo \
+                   features at all, so unification had nothing to add to what a consumer \
+                   who declares it already gets. Recorded because the list changed, not \
+                   because the change was felt",
+        },
+        Withdrawal {
+            list: "std",
+            token: "dep:env_logger",
+            release: "0.4.0",
+            reason: "a library does not install a logger; the only caller was \
+                     `core/examples/loopback_demo.rs`, and it now takes it from \
+                     `[dev-dependencies]`, which a consumer does not inherit",
+            cost: "env_logger's default features — `humantime`, `auto-color` and \
+                   `regex` — for a consumer with `env_logger = { version = \"0.11\", \
+                   default-features = false }`: `Builder::format_timestamp_*` is behind \
+                   `humantime`, colour behind `auto-color`, and regex filter syntax \
+                   behind `regex`",
+        },
+        Withdrawal {
+            list: "std",
+            token: "dep:argon2",
+            release: "0.4.0",
+            reason: "no password is hashed anywhere in this crate; the proof-of-work \
+                     gate is blake3 and the KDF is blake3 or HKDF-SHA256",
+            cost: "argon2's default features — `alloc`, `getrandom` and `password-hash` \
+                   — for a consumer who declared it with `default-features = false`: the \
+                   `PasswordHasher` impl and `hash_password` live behind them",
+        },
+        Withdrawal {
+            list: "std",
+            token: "dep:base64",
+            release: "0.4.0",
+            reason: "nothing in this crate base64-encodes anything; the wire is binary \
+                     and hex covers the key material a human reads",
+            cost: "`base64/alloc`, which this crate named explicitly, for a consumer with \
+                   `base64 = { version = \"0.23\", default-features = false }`: \
+                   `Engine::encode` and `Engine::decode` are the allocating surface that \
+                   feature turns on",
+        },
+        Withdrawal {
+            list: "std",
+            token: "dep:once_cell",
+            release: "0.4.0",
+            reason: "`std::sync::OnceLock` and `LazyLock` cover what this crate used it \
+                     for, and both are below the 1.93 MSRV",
+            cost: "`once_cell/std` — and with it `once_cell::sync::{Lazy, OnceCell}` — \
+                   for a consumer who declared the crate with `default-features = false`",
+        },
+        Withdrawal {
+            list: "std",
+            token: "dep:bitflags",
+            release: "0.4.0",
+            reason: "`PacketFlags` is a hand-written `u16` newtype and never used the \
+                     macro; the dependency was left over from before the hand-rolled \
+                     codec",
+            cost: "nothing a consumer could reach: the only feature this activated is \
+                   bitflags 2's `std`, whose body is empty, so unification handed a \
+                   consumer no item they could name. Recorded because the list changed, \
+                   and because an empty feature is only empty in the version that is \
+                   checked",
+        },
+        Withdrawal {
+            list: "std",
+            token: "dep:time",
+            release: "0.4.0",
+            reason: "nothing in this crate reads `time` outside the `mimicry` leg, \
+                     which names it itself, so a default build was compiling a date \
+                     library for a leg it had not enabled",
+            cost: "`time`'s default features, `time/std` among them: a consumer with \
+                   `time = { version = \"0.3\", default-features = false }` lost \
+                   `OffsetDateTime::now_utc` and was told `no function or associated \
+                   item named 'now_utc'`, which names neither this crate nor a feature",
+        },
+        Withdrawal {
+            list: "native tokio selection",
+            token: "signal",
+            release: "0.4.0",
+            reason: "nothing in this crate listens for a signal; `server/` does and \
+                     names the feature in its own manifest",
+            cost: "`tokio::signal::ctrl_c()` in a consumer that named fewer tokio \
+                   features than this crate did",
+        },
+        Withdrawal {
+            list: "native tokio selection",
+            token: "process",
+            release: "0.4.0",
+            reason: "nothing in this crate spawns a process",
+            cost: "`tokio::process::Command` in a consumer that named fewer tokio \
+                   features than this crate did",
+        },
+        Withdrawal {
+            list: "native tokio selection",
+            token: "fs",
+            release: "0.4.0",
+            reason: "nothing in this crate reads a file; the signing-key load in \
+                     `server/` is blocking `std::fs`",
+            cost: "`tokio::fs` in a consumer that named fewer tokio features than this \
+                   crate did",
+        },
+        Withdrawal {
+            list: "native tokio selection",
+            token: "io-std",
+            release: "0.4.0",
+            reason: "nothing in this crate touches the process's own standard streams",
+            cost: "`tokio::io::stdin` / `stdout` / `stderr` in a consumer that named \
+                   fewer tokio features than this crate did",
+        },
+    ];
+
+    /// The dependencies declared with `default-features = false`, and why each one is.
+    ///
+    /// This is the second way to take a crate's surface away from a consumer, and it
+    /// leaves the lists above untouched. `dep:time` in `std` activated `time` *with its
+    /// default features*, and `time/std` is where `OffsetDateTime::now_utc` lives —
+    /// writing `default-features = false` on the `time` entry would have cost a consumer
+    /// the same method as deleting the activation did, with nothing in [`GUARDED`]
+    /// changing. So the waivers are a recorded set too, and adding one is a change a
+    /// consumer can feel.
+    ///
+    /// Dev- and build-dependencies are excluded, here and by the search: a consumer
+    /// inherits neither, so a waiver on one costs nobody anything.
+    const DEFAULTS_WAIVED: &[(&str, &str)] = &[
+        (
+            "tokio",
+            "cross-target: its features are named explicitly here",
+        ),
+        (
+            "bytes",
+            "no_std subset; `std` re-adds it through `bytes/std`",
+        ),
+        (
+            "serde",
+            "no_std subset; `std` re-adds it through `serde/std`",
+        ),
+        ("borsh", "no_std subset, `derive` named explicitly"),
+        ("hex", "no_std subset, `alloc` named explicitly"),
+        ("subtle", "no_std subset"),
+        ("aes", "no_std subset"),
+        ("chacha20", "no_std subset, `cipher` named explicitly"),
+        (
+            "opentelemetry",
+            "the embedder picks the exporter; `metrics` + `trace` only",
+        ),
+        ("opentelemetry_sdk", "as above, plus `rt-tokio`"),
+        ("tracing-opentelemetry", "as above, `tracing-log` only"),
+        ("async-lock", "no_std subset for the embedded leg"),
+        (
+            "aws-lc-rs",
+            "`fips` replaces the default substrate, not adds to it",
+        ),
+    ];
+
+    /// [`MANIFEST`] with every comment blanked out to spaces of the same length.
+    ///
+    /// Same length so every offset into the result is also an offset into [`MANIFEST`],
+    /// which is what lets [`comment_block_above`] read the comments back. Blanking them
+    /// first is not cosmetic: a comment in this file contains `]`
+    /// (`[target.'cfg(not(target_arch = "wasm32"))']`), and a search for the end of a
+    /// list would stop there.
+    ///
+    /// The cut is at the first `#` outside a double-quoted string, which is TOML's own
+    /// comment rule for every construct this manifest uses.
+    fn manifest_without_comments() -> String {
+        without_comments(MANIFEST)
+    }
+
+    /// [`manifest_without_comments`] over any manifest text, so a past release's copy —
+    /// read back out of its tag by [`release_evidence`] — goes through the same reader as
+    /// the one being guarded.
+    fn without_comments(manifest: &str) -> String {
+        let mut out = String::with_capacity(manifest.len());
+        for line in manifest.split_inclusive('\n') {
+            let mut quoted = false;
+            let mut comment_from = None;
+            for (i, ch) in line.char_indices() {
+                match ch {
+                    '"' => quoted = !quoted,
+                    '#' if !quoted => {
+                        comment_from = Some(i);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            match comment_from {
+                None => out.push_str(line),
+                Some(i) => {
+                    out.push_str(&line[..i]);
+                    for ch in line[i..].chars() {
+                        out.push(if ch == '\n' { '\n' } else { ' ' });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The `[…]` table header a byte belongs to, or `""` before the first one.
+    fn enclosing_table(stripped: &str, line_start: usize) -> &str {
+        stripped[..line_start]
+            .rsplit('\n')
+            .find(|line| line.starts_with('['))
+            .unwrap_or("")
+    }
+
+    /// Every dependency the manifest declares with `default-features = false`.
+    ///
+    /// Read in both manifest shapes, like the tokio selections: the name comes from the
+    /// `name = { … }` the waiver sits inside, or, when the waiver is on a line of its own,
+    /// from the `[dependencies.name]` table above it. Dev- and build-dependencies are
+    /// skipped, because nothing a consumer compiles comes from them.
+    fn dependencies_with_defaults_waived(stripped: &str) -> Vec<String> {
+        const NEEDLE: &str = "default-features = false";
+        let mut names = Vec::new();
+        let mut from = 0;
+        while let Some(rel) = stripped[from..].find(NEEDLE) {
+            let at = from + rel;
+            from = at + NEEDLE.len();
+            let line_start = stripped[..at].rfind('\n').map_or(0, |i| i + 1);
+            let table = enclosing_table(stripped, line_start);
+            if table.contains("dev-dependencies") || table.contains("build-dependencies") {
+                continue;
+            }
+            let before = stripped[line_start..at].trim_start();
+            if let Some((name, _)) = before.split_once(" = {") {
+                names.push(name.trim().to_string());
+                continue;
+            }
+            let inner = table.trim_start_matches('[').trim_end_matches(']');
+            names.push(inner.rsplit('.').next().unwrap_or(inner).to_string());
+        }
+        names
+    }
+
+    /// One dependency `features = [...]` list, and which dependency it belongs to.
+    struct DependencyList {
+        /// The dependency's name as the manifest spells it — the alias for a renamed
+        /// dependency, since that is what the entry is keyed by.
+        name: String,
+        /// The offset of the list's opening `[` in [`MANIFEST`].
+        offset: usize,
+        /// The text between the brackets.
+        body: String,
+    }
+
+    /// Every dependency feature list in the manifest that a consumer's build inherits.
+    ///
+    /// Read in both manifest shapes, like the waiver search: from the `name = { … }` entry
+    /// a list sits inside, or, when the list is on a line of its own, from the
+    /// `[dependencies.name]` table above it.
+    ///
+    /// Three kinds of `features = [` in this manifest are deliberately not dependency
+    /// lists and are skipped: `[dev-dependencies]` and `[build-dependencies]`, because
+    /// nothing a consumer compiles comes from them; `[package.metadata.docs.rs]`, which
+    /// selects this crate's own features for one documentation build; and the
+    /// `required-features` of a bench or a binary, which is the same nine characters with
+    /// a hyphen in front and which nobody inherits.
+    fn dependency_feature_lists(stripped: &str) -> Vec<DependencyList> {
+        const NEEDLE: &str = "features = [";
+        let mut lists = Vec::new();
+        let mut table = "";
+        let mut entry: Option<&str> = None;
+        let mut depth: i32 = 0;
+        let mut at = 0usize;
+        for line in stripped.split_inclusive('\n') {
+            let line_start = at;
+            at += line.len();
+            let trimmed = line.trim();
+            if depth == 0 {
+                if trimmed.starts_with('[') {
+                    table = trimmed;
+                    entry = None;
+                }
+                if let Some((name, _)) = line.split_once(" = {") {
+                    if !name.is_empty() && !name.starts_with(char::is_whitespace) {
+                        entry = Some(name.trim());
+                    }
+                }
+            }
+            let is_dependency_table = table.contains("dependencies")
+                && !table.contains("dev-dependencies")
+                && !table.contains("build-dependencies");
+            let mut from = 0;
+            while let Some(rel) = line[from..].find(NEEDLE) {
+                let hit = from + rel;
+                from = hit + NEEDLE.len();
+                // `required-features = [` is this needle with a hyphen in front of it.
+                if line[..hit].ends_with('-') {
+                    continue;
+                }
+                if !is_dependency_table {
+                    continue;
+                }
+                let open = line_start + hit + NEEDLE.len() - 1;
+                let Some(close_rel) = stripped[open..].find(']') else {
+                    continue;
+                };
+                let name = match entry {
+                    Some(name) => name.to_string(),
+                    None => {
+                        let inner = table.trim_start_matches('[').trim_end_matches(']');
+                        inner.rsplit('.').next().unwrap_or(inner).to_string()
+                    }
+                };
+                lists.push(DependencyList {
+                    name,
+                    offset: open,
+                    body: stripped[open + 1..open + close_rel].to_string(),
+                });
+            }
+            depth += i32::try_from(line.matches('{').count()).unwrap_or(0);
+            depth -= i32::try_from(line.matches('}').count()).unwrap_or(0);
+            if depth <= 0 {
+                depth = 0;
+                entry = None;
+            }
+        }
+        lists
+    }
+
+    /// Every list body matching a [`Guarded`]'s anchor, as `(offset, body)` pairs where
+    /// the offset is that of the list's opening `[` in [`MANIFEST`].
+    fn locate(guarded: &Guarded, stripped: &str) -> Vec<(usize, String)> {
+        match guarded.anchor {
+            Anchor::CrateFeature => {
+                let opener = format!("\n{} = [", guarded.name);
+                let mut found = Vec::new();
+                let mut from = 0;
+                while let Some(rel) = stripped[from..].find(&opener) {
+                    let open = from + rel + opener.len() - 1;
+                    let Some(close_rel) = stripped[open..].find(']') else {
+                        break;
+                    };
+                    found.push((open, stripped[open + 1..open + close_rel].to_string()));
+                    from = open + close_rel;
+                }
+                found
+            }
+            Anchor::Dependency { name, holding } => dependency_feature_lists(stripped)
+                .into_iter()
+                .filter(|list| list.name == name)
+                .filter(|list| match holding {
+                    None => true,
+                    Some(token) => list.body.contains(&format!("\"{token}\"")),
+                })
+                .map(|list| (list.offset, list.body))
+                .collect(),
+        }
+    }
+
+    /// The quoted tokens of a list body, in the order written.
+    fn tokens(body: &str) -> Vec<String> {
+        body.split('"')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The one list body a [`Guarded`] resolves to, with its offset.
+    fn body_of(guarded: &Guarded, stripped: &str) -> (usize, String) {
+        let found = locate(guarded, stripped);
+        assert_eq!(
+            found.len(),
+            1,
+            "`{}` should resolve to exactly one list in core/Cargo.toml and resolved to \
+             {}. Either the list was renamed or the anchor no longer picks it out; \
+             nothing below can say what it is checking until that is fixed.",
+            guarded.name,
+            found.len()
+        );
+        found
+            .into_iter()
+            .next()
+            .expect("the length was just asserted to be one")
+    }
+
+    /// The contiguous run of comment lines immediately above `offset`.
+    fn comment_block_above(offset: usize) -> String {
+        let head = &MANIFEST[..offset];
+        let mut lines: Vec<&str> = head.split('\n').collect();
+        // The last element is the part of the anchor's own line before `offset`.
+        lines.pop();
+        let mut block = Vec::new();
+        while let Some(line) = lines.pop() {
+            if line.trim_start().starts_with('#') {
+                block.push(line);
+            } else {
+                break;
+            }
+        }
+        block.reverse();
+        block.join("\n")
+    }
+
+    /// This crate's version, as `(major, minor, patch)`.
+    fn crate_version() -> (u64, u64, u64) {
+        let line = MANIFEST
+            .lines()
+            .find(|line| line.starts_with("version = \""))
+            .expect("core/Cargo.toml declares a package version");
+        parse_version(line.split('"').nth(1).expect("the version is quoted"))
+            .expect("core/Cargo.toml's package version is three numbers")
+    }
+
+    /// `major.minor.patch` as numbers, or `None` if it is not that shape.
+    fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
+        let mut parts = text.split('.');
+        let triple = (
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+        );
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(triple)
+    }
+
+    /// The `[features]` table's own list names, read from the manifest.
+    fn feature_names_in_the_manifest(stripped: &str) -> Vec<String> {
+        let table = stripped
+            .split_once("\n[features]\n")
+            .expect("core/Cargo.toml has a `[features]` table")
+            .1;
+        let table = match table.split_once("\n[") {
+            Some((before, _)) => before,
+            None => table,
+        };
+        table
+            .lines()
+            .filter_map(|line| line.split_once(" = ["))
+            .filter(|(name, _)| !name.is_empty() && !name.starts_with(char::is_whitespace))
+            .map(|(name, _)| name.to_string())
+            .collect()
+    }
+
+    /// The record covers the whole `[features]` table, not a chosen part of it.
+    ///
+    /// **The defect.** The gate this replaces named five selections by hand. Anything
+    /// it did not name could be removed without a word, and the reason those five were
+    /// named is that a consumer had already been broken by them — which is the one way
+    /// of finding out that this module exists to make unnecessary. A hand-picked list
+    /// is only ever as complete as the last incident.
+    ///
+    /// **What a consumer would observe.** A feature added to the manifest, its `dep:`
+    /// removed a release later as unused, and a build that stops compiling on `cargo
+    /// update` with an error naming neither this crate nor a feature.
+    ///
+    /// **Why it would come back unnoticed.** Adding a feature to `[features]` is
+    /// routine and has nothing to do with this module; nobody would think to come here.
+    /// This fails the build until they do.
+    #[test]
+    fn the_record_covers_every_list_in_the_features_table() {
+        let stripped = manifest_without_comments();
+        let in_manifest = feature_names_in_the_manifest(&stripped);
+        let recorded: Vec<&str> = GUARDED
+            .iter()
+            .filter(|g| matches!(g.anchor, Anchor::CrateFeature))
+            .map(|g| g.name)
+            .collect();
+        for name in &in_manifest {
+            assert!(
+                recorded.contains(&name.as_str()),
+                "core/Cargo.toml declares the feature `{name}` and GUARDED has no row \
+                 for it. Every list in the `[features]` table activates dependencies a \
+                 consumer inherits, and an unrecorded list is one a later removal can \
+                 empty without anything failing. Add a row naming what it reaches."
+            );
+        }
+        for name in &recorded {
+            assert!(
+                in_manifest.iter().any(|m| m == name),
+                "GUARDED has a row for the feature `{name}`, which core/Cargo.toml no \
+                 longer declares. A row for a list that does not exist guards nothing \
+                 and its tokens cannot be checked; if the feature was renamed, rename \
+                 the row, and if it was dropped, say so in WITHDRAWN."
+            );
+        }
+        assert_eq!(
+            in_manifest.len(),
+            recorded.len(),
+            "the `[features]` table and GUARDED's feature rows must be the same set; \
+             manifest {in_manifest:?} vs record {recorded:?}"
+        );
+    }
+
+    /// The record covers every dependency feature list a consumer inherits.
+    ///
+    /// **The defect.** The list of guarded dependency selections was hand-picked — the two
+    /// `tokio` ones — on the stated grounds that every other per-dependency selection was
+    /// named for something this crate's own code needs, and so could not be removed
+    /// silently. Two of them can: `bytes`'s `serde` has no reader in `core/src` at all, and
+    /// `ed25519-dalek`'s `rand_core` has one only in `[dev-dependencies]`, which a consumer
+    /// does not inherit and which keeps the tests green either way.
+    ///
+    /// **What a consumer would observe.** `the trait bound `Bytes: Serialize` is not
+    /// satisfied`, or `no function or associated item named 'generate'`, on source they had
+    /// not touched — an error naming their own line, a crate they declared themselves, and
+    /// nothing about this one.
+    ///
+    /// **Why it would come back unnoticed.** Narrowing a dependency's feature list is what
+    /// a dependency audit does, and from inside this crate the narrowed list is still
+    /// enough to build. This fails until the row moves to [`WITHDRAWN`].
+    #[test]
+    fn the_record_covers_every_dependency_feature_list_a_consumer_inherits() {
+        let stripped = manifest_without_comments();
+        let in_manifest = dependency_feature_lists(&stripped);
+        let recorded: Vec<&Guarded> = GUARDED
+            .iter()
+            .filter(|g| matches!(g.anchor, Anchor::Dependency { .. }))
+            .collect();
+        for list in &in_manifest {
+            assert!(
+                recorded.iter().any(|g| match g.anchor {
+                    Anchor::Dependency { name, holding } =>
+                        name == list.name
+                            && holding
+                                .is_none_or(|token| list.body.contains(&format!("\"{token}\""))),
+                    Anchor::CrateFeature => false,
+                }),
+                "core/Cargo.toml selects features of `{}` and GUARDED has no row for that \
+                 list. Cargo unifies it with whatever a consumer asked of the same crate, \
+                 so an unrecorded selection is one a later removal takes from their code \
+                 without anything here failing — which is what `bytes/serde` and \
+                 `ed25519-dalek/rand_core` were. The list reads: {}",
+                list.name,
+                list.body.trim()
+            );
+        }
+        for guarded in &recorded {
+            let Anchor::Dependency { name, .. } = guarded.anchor else {
+                continue;
+            };
+            assert!(
+                in_manifest.iter().any(|list| list.name == name),
+                "GUARDED's `{}` names a `features = [...]` on `{name}`, and core/Cargo.toml \
+                 has none. A row for a list that does not exist guards nothing; if the \
+                 selection was dropped, say so in WITHDRAWN.",
+                guarded.name
+            );
+        }
+        assert_eq!(
+            in_manifest.len(),
+            recorded.len(),
+            "core/Cargo.toml holds {} inherited dependency feature list(s) and GUARDED \
+             records {}; the manifest has {:?}",
+            in_manifest.len(),
+            recorded.len(),
+            in_manifest
+                .iter()
+                .map(|list| list.name.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Every guarded list resolves to one list, and no list names a token twice.
+    ///
+    /// **The defect.** The first version of this gate walked to the native target table
+    /// and then to an inline `tokio = { … }` entry, which is the manifest as written
+    /// and not the only manifest there is — `cargo package` normalizes its copy into
+    /// `[target.'cfg(…)'.dependencies.tokio]` with the features on a line of their own,
+    /// and the walk would have found nothing there. It is the same failure in a second
+    /// form if a list is renamed: an anchor that resolves to nothing, or to two things,
+    /// makes every assertion below vacuous while still reporting a passing run.
+    ///
+    /// **What a consumer would observe.** Nothing, directly — and that is the problem.
+    /// A vacuous gate lets the removal it was written to stop through to a release.
+    ///
+    /// **Why it would come back unnoticed.** A resolution failure is silent by nature:
+    /// an empty `Vec` iterated over asserts nothing. This states the count.
+    ///
+    /// The token count is asserted in the same place for a second reason: set equality
+    /// holds for a list that names one of its tokens twice, and a duplicate is how a
+    /// token survives being deleted from one of the two places it is written.
+    #[test]
+    fn every_guarded_list_resolves_to_one_list_holding_no_token_twice() {
+        let stripped = manifest_without_comments();
+        for guarded in GUARDED {
+            let (_, body) = body_of(guarded, &stripped);
+            let present = tokens(&body);
+            assert_eq!(
+                present.len(),
+                guarded.recorded.len(),
+                "`{name}` reads {read} token(s) and the record holds {held}. If the two \
+                 sets agree, one side names something twice. The list reads: {body}",
+                name = guarded.name,
+                read = present.len(),
+                held = guarded.recorded.len()
+            );
+        }
+    }
+
+    /// Each guarded list carries exactly the tokens recorded for it.
+    ///
+    /// This is the gate. Equality in both directions is deliberate: the missing
+    /// direction catches the removal, and the extra direction is what keeps the record
+    /// complete enough for the missing direction to mean anything.
+    ///
+    /// **The defect.** 0.3.1 removed four tokio features and `dep:time` from `std`
+    /// because nothing in `core/src` read them. Nothing in this repository could fail
+    /// for it: the crate compiled, every suite passed, every cross-target row passed,
+    /// and `cargo-semver-checks` does not look at a dependency's feature selection.
+    ///
+    /// **What a consumer would observe.** Five compile errors on source they had not
+    /// touched, after a `cargo update` inside a `= "0.3"` requirement — `no function or
+    /// associated item named 'now_utc'`, `could not find 'signal' in 'tokio'` — none of
+    /// which names this crate or a feature, so the search starts in the wrong crate.
+    ///
+    /// **Why it would come back unnoticed.** A selection nothing in the crate reads
+    /// looks exactly like dead weight, because from inside the crate it is dead weight.
+    /// The only reader who can tell the difference is not present. This turns the
+    /// removal into a build failure that names the cost.
+    #[test]
+    fn every_guarded_list_carries_exactly_the_tokens_recorded_here() {
+        let stripped = manifest_without_comments();
+        for guarded in GUARDED {
+            let (_, body) = body_of(guarded, &stripped);
+            let present = tokens(&body);
+            for recorded in guarded.recorded {
+                assert!(
+                    present.iter().any(|t| t == recorded),
+                    "core/Cargo.toml's `{list}` no longer carries `{recorded}`, and the \
+                     record still says it does. That list reaches {reaches}, so \
+                     dropping the token changes what a consumer's own code compiles \
+                     against — with an error that names neither this crate nor the \
+                     token. If the removal is meant, move it to WITHDRAWN with the \
+                     release that takes it and what it costs, and cut that release with \
+                     a patch number of zero. The list reads: {body}",
+                    list = guarded.name,
+                    reaches = guarded.reaches
+                );
+            }
+            for token in &present {
+                assert!(
+                    guarded.recorded.contains(&token.as_str()),
+                    "core/Cargo.toml's `{list}` carries `{token}`, which the record does \
+                     not mention. An unrecorded selection is one a later removal takes \
+                     without anything failing, which is how {reaches} was lost once \
+                     already. Add it to the row's `recorded` list.",
+                    list = guarded.name,
+                    reaches = guarded.reaches
+                );
+            }
+        }
+    }
+
+    /// Nothing in [`WITHDRAWN`] is still in the list it left.
+    ///
+    /// **The defect.** A withdrawal row is a claim about a past release: this selection
+    /// stopped being made in 0.4.0, and here is what it cost. Restore the token without
+    /// moving the row and the claim goes false — the release notes say a consumer must
+    /// name the feature themselves while the manifest still hands it to them, so the
+    /// next removal looks like it has already been announced.
+    ///
+    /// **What a consumer would observe.** Notes telling them to add four tokio features
+    /// to their own manifest for a change that has not happened, and then the change
+    /// happening later with no notes at all.
+    ///
+    /// **Why it would come back unnoticed.** Restoring a feature fixes somebody's build
+    /// and is the easiest thing in the world to do in a hurry. This makes the record
+    /// move with it.
+    #[test]
+    fn every_withdrawn_selection_is_gone_from_the_list_it_left() {
+        let stripped = manifest_without_comments();
+        for withdrawal in WITHDRAWN {
+            let guarded = GUARDED
+                .iter()
+                .find(|g| g.name == withdrawal.list)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "WITHDRAWN names the list `{}`, which GUARDED does not have. A \
+                         withdrawal from a list nothing locates cannot be checked.",
+                        withdrawal.list
+                    )
+                });
+            let (_, body) = body_of(guarded, &stripped);
+            assert!(
+                !tokens(&body).iter().any(|t| t == withdrawal.token),
+                "core/Cargo.toml's `{list}` carries `{token}` again, and WITHDRAWN says \
+                 {release} took it away. One of the two is wrong: if the restoration is \
+                 meant, move the row back into GUARDED, and if the record is right, the \
+                 token goes. Leaving both is a release note describing a change the \
+                 manifest has not made. It reads: {body}",
+                list = withdrawal.list,
+                token = withdrawal.token,
+                release = withdrawal.release
+            );
+        }
+    }
+
+    /// What this repository can show about the release a withdrawal row names.
+    ///
+    /// A row is a claim about a past release, and the manifest in front of the reader
+    /// cannot settle it: the selection is gone either way. Only two things can — the
+    /// version being cut, for a removal happening now, and the tag of the release a row
+    /// names, for one that already happened.
+    #[derive(Debug, PartialEq, Eq)]
+    enum ReleaseEvidence {
+        /// The row names the version in this manifest, so the removal is this release's.
+        /// The manifest is the proof, and
+        /// [`every_withdrawn_selection_is_gone_from_the_list_it_left`] is what reads it.
+        BeingCut,
+        /// The row names an earlier release, this repository holds its tag, and this is
+        /// whether that release's own manifest still carried the token.
+        Tagged { token_still_there: bool },
+        /// The row names a version this repository never tagged, and which is therefore
+        /// not a release anything was withdrawn in.
+        NeverReleased,
+        /// The row names a list that cannot be located — either [`GUARDED`] has no row
+        /// for it, or that release's manifest had no such list — so there is nothing to
+        /// read the token out of.
+        ListNotFound,
+        /// No repository could be read at all: no `git`, or a checkout carrying no tags.
+        /// Not a verdict, and never a pass.
+        Unreadable,
+    }
+
+    /// Whether a withdrawal row stands, given what [`release_evidence`] could show.
+    ///
+    /// Pure, so the four answers this has to get right are tested against fabricated rows
+    /// rather than against whichever rows the record happens to hold today — see
+    /// [`a_backdated_row_an_unreleased_version_and_a_missing_reason_are_each_refused`].
+    fn judge_withdrawal(
+        withdrawal: &Withdrawal,
+        current: (u64, u64, u64),
+        evidence: &ReleaseEvidence,
+    ) -> Result<(), String> {
+        let Some(release) = parse_version(withdrawal.release) else {
+            return Err(format!(
+                "WITHDRAWN's `{}` names the release `{}`, which is not \
+                 `major.minor.patch`.",
+                withdrawal.token, withdrawal.release
+            ));
+        };
+        if release.2 != 0 {
+            return Err(format!(
+                "WITHDRAWN says `{}` left `{}` in {}, whose patch number is not zero. A \
+                 patch release reaches a consumer through `cargo update` against the `= \
+                 \"0.3\"` requirement the README recommends, so it is the one release \
+                 that may not change what their build inherits — which is how this was \
+                 found. Cut the removal in the next minor release instead.",
+                withdrawal.token, withdrawal.list, withdrawal.release
+            ));
+        }
+        if release > current {
+            return Err(format!(
+                "WITHDRAWN says `{}` left `{}` in {}, and this crate is {}.{}.{}. The \
+                 selection is already gone from the manifest, so it left in a release \
+                 that has been cut or is being cut — a row naming a later one means the \
+                 removal shipped before the release its notes are in.",
+                withdrawal.token,
+                withdrawal.list,
+                withdrawal.release,
+                current.0,
+                current.1,
+                current.2
+            ));
+        }
+        if withdrawal.reason.trim().is_empty() {
+            return Err(format!(
+                "WITHDRAWN's `{}` gives no reason for the removal.",
+                withdrawal.token
+            ));
+        }
+        if withdrawal.cost.trim().is_empty() {
+            return Err(format!(
+                "WITHDRAWN's `{}` says nothing about what a consumer loses, which is the \
+                 half that decides whether the removal needed a release of its own.",
+                withdrawal.token
+            ));
+        }
+        match evidence {
+            ReleaseEvidence::BeingCut => Ok(()),
+            ReleaseEvidence::Tagged {
+                token_still_there: false,
+            } => Ok(()),
+            ReleaseEvidence::Tagged {
+                token_still_there: true,
+            } => Err(format!(
+                "WITHDRAWN says `{token}` left `{list}` in {release}, and the manifest \
+                 tagged v{release} still carries it. So the removal happened after that \
+                 release and the row is backdated — which is the one way the \
+                 patch-number rule above can be satisfied by a removal that is shipping \
+                 in a patch release. Name the release this manifest is cutting, and if \
+                 that release is a patch one, the removal waits.",
+                token = withdrawal.token,
+                list = withdrawal.list,
+                release = withdrawal.release
+            )),
+            ReleaseEvidence::NeverReleased => Err(format!(
+                "WITHDRAWN says `{}` left `{}` in {}, and this repository has no \
+                 v{} tag. A row may only name the release being cut or one that was \
+                 actually made; a version nobody released cannot be where a consumer \
+                 could have read about the removal.",
+                withdrawal.token, withdrawal.list, withdrawal.release, withdrawal.release
+            )),
+            ReleaseEvidence::ListNotFound => Err(format!(
+                "WITHDRAWN says `{}` left `{}` in {}, and that list cannot be located — \
+                 either GUARDED has no row for it, or v{} had no such list. Neither way \
+                 can the claim be checked.",
+                withdrawal.token, withdrawal.list, withdrawal.release, withdrawal.release
+            )),
+            ReleaseEvidence::Unreadable => Err(format!(
+                "WITHDRAWN says `{}` left `{}` in {}, an earlier release, and this \
+                 checkout cannot show what that release's manifest held: `git` did not \
+                 answer, or the checkout carries no tags. Fetch tags (`git fetch \
+                 --tags`, or `fetch-depth: 0` in the workflow) — a row about a past \
+                 release that nothing can read is a claim, not a record.",
+                withdrawal.token, withdrawal.list, withdrawal.release
+            )),
+        }
+    }
+
+    /// `git` in this repository, or `None` when it does not answer.
+    fn git(args: &[&str]) -> Option<String> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(env!("CARGO_MANIFEST_DIR"))
+            .args(args)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8(output.stdout).ok()
+    }
+
+    /// What this repository can show about the release `withdrawal` names.
+    fn release_evidence(withdrawal: &Withdrawal, current: (u64, u64, u64)) -> ReleaseEvidence {
+        if parse_version(withdrawal.release) == Some(current) {
+            return ReleaseEvidence::BeingCut;
+        }
+        let tag = format!("v{}", withdrawal.release);
+        let Some(manifest) = git(&["show", &format!("{tag}:core/Cargo.toml")]) else {
+            // A checkout holding tags is answering that this one is not among them; a
+            // checkout holding none cannot answer at all, and saying so is the point —
+            // treating it as "never released" would turn a shallow clone into a verdict.
+            return match git(&["tag", "--list", "v*"]) {
+                Some(tags) if !tags.trim().is_empty() => ReleaseEvidence::NeverReleased,
+                _ => ReleaseEvidence::Unreadable,
+            };
+        };
+        let Some(guarded) = GUARDED.iter().find(|g| g.name == withdrawal.list) else {
+            return ReleaseEvidence::ListNotFound;
+        };
+        let stripped = without_comments(&manifest);
+        match locate(guarded, &stripped).into_iter().next() {
+            None => ReleaseEvidence::ListNotFound,
+            Some((_, body)) => ReleaseEvidence::Tagged {
+                token_still_there: tokens(&body).iter().any(|t| t == withdrawal.token),
+            },
+        }
+    }
+
+    /// Every withdrawal is provable against the release it names, and says what it cost.
+    ///
+    /// **The defect.** 0.3.1 — a patch release — took four tokio features and `time` away
+    /// from consumers. A patch release is the one slot where a consumer has no opportunity
+    /// to read anything: `= "0.3"` picks it up on the next `cargo update`. The rule that
+    /// came out of it is that a selection may only be withdrawn where the version itself
+    /// says something changed, which for this project's `0.x` line means a patch number of
+    /// zero.
+    ///
+    /// **The second defect, in the gate itself.** The first version of this test read the
+    /// row and nothing else: it asked that the version parse, end in a zero, not be in the
+    /// future, and come with words. Nothing tied the row to the release being cut, so a
+    /// tree cutting 0.4.1 could delete a selection and write `release: "0.4.0"` beside it
+    /// and pass — the removal shipping in exactly the release the rule forbids, with the
+    /// rule's own gate vouching for it. A row is now held against evidence:
+    /// [`ReleaseEvidence::BeingCut`] where it names this manifest's version, and the
+    /// release's own tag where it names an earlier one.
+    ///
+    /// **What a consumer would observe.** Exactly what they did observe: a build that
+    /// stopped compiling on a dependency bump they did not choose, against a version
+    /// requirement that promised compatibility.
+    ///
+    /// **Why it would come back unnoticed.** The removal is correct by the crate's own
+    /// needs, so it lands in whatever release is open, and the release field is a string
+    /// nobody cross-checks. This makes the string checkable.
+    #[test]
+    fn every_withdrawal_is_provable_against_the_release_it_names_and_says_what_it_cost() {
+        let current = crate_version();
+        for withdrawal in WITHDRAWN {
+            let evidence = release_evidence(withdrawal, current);
+            if let Err(why) = judge_withdrawal(withdrawal, current, &evidence) {
+                panic!("{why}");
+            }
+        }
+    }
+
+    /// A backdated row, an unreleased version and a missing reason are each refused, and a
+    /// legitimate row is not.
+    ///
+    /// The rule is a pure function precisely so these can be asked of it directly. Asking
+    /// them of the record as it stands would prove nothing: every row in it today names the
+    /// release being cut, so only one of the five answers below would ever be reached.
+    #[test]
+    fn a_backdated_row_an_unreleased_version_and_a_missing_reason_are_each_refused() {
+        const CURRENT: (u64, u64, u64) = (0, 4, 1);
+        let row = |release: &'static str, reason: &'static str, cost: &'static str| Withdrawal {
+            list: "native tokio selection",
+            token: "signal",
+            release,
+            reason,
+            cost,
+        };
+        let good = row("0.4.0", "nothing here reads it", "tokio::signal::ctrl_c");
+
+        // The defect this exists for: cutting 0.4.1 while claiming the removal happened in
+        // 0.4.0, whose tag still carries the token. Everything else about the row is
+        // impeccable, which is why nothing else caught it.
+        assert!(judge_withdrawal(
+            &good,
+            CURRENT,
+            &ReleaseEvidence::Tagged {
+                token_still_there: true
+            }
+        )
+        .is_err_and(|why| why.contains("backdated")));
+
+        // The same row where the tag shows the token already gone: a genuine record of a
+        // past release, carried forward, and it has to keep passing or the record could
+        // only ever hold the current release's rows.
+        assert!(judge_withdrawal(
+            &good,
+            CURRENT,
+            &ReleaseEvidence::Tagged {
+                token_still_there: false
+            }
+        )
+        .is_ok());
+
+        // The release being cut, which is where a removal is normally recorded.
+        assert!(judge_withdrawal(&good, (0, 4, 0), &ReleaseEvidence::BeingCut).is_ok());
+
+        // A version nobody ever released.
+        assert!(
+            judge_withdrawal(&good, CURRENT, &ReleaseEvidence::NeverReleased)
+                .is_err_and(|why| why.contains("no v0.4.0 tag"))
+        );
+
+        // A checkout that cannot answer is not an answer.
+        assert!(judge_withdrawal(&good, CURRENT, &ReleaseEvidence::Unreadable).is_err());
+
+        // The rules that were already there, kept under the new shape.
+        assert!(judge_withdrawal(
+            &row("0.4.1", "reason", "cost"),
+            CURRENT,
+            &ReleaseEvidence::BeingCut
+        )
+        .is_err_and(|why| why.contains("patch number is not zero")));
+        assert!(judge_withdrawal(
+            &row("0.6.0", "reason", "cost"),
+            CURRENT,
+            &ReleaseEvidence::BeingCut
+        )
+        .is_err());
+        assert!(judge_withdrawal(
+            &row("0.4.0", "   ", "cost"),
+            CURRENT,
+            &ReleaseEvidence::BeingCut
+        )
+        .is_err_and(|why| why.contains("no reason")));
+        assert!(judge_withdrawal(
+            &row("0.4.0", "reason", ""),
+            CURRENT,
+            &ReleaseEvidence::BeingCut
+        )
+        .is_err_and(|why| why.contains("what a consumer loses")));
+        assert!(judge_withdrawal(
+            &row("0.4", "reason", "cost"),
+            CURRENT,
+            &ReleaseEvidence::BeingCut
+        )
+        .is_err_and(|why| why.contains("major.minor.patch")));
+    }
+
+    /// A past release is read out of this repository rather than taken on trust.
+    ///
+    /// [`judge_withdrawal`] is only as good as what it is handed, and the handing is where
+    /// a verdict can quietly become a constant. `v0.3.0`'s manifest carried `signal` in the
+    /// native tokio selection — it is the removal this whole module exists for — so a row
+    /// claiming 0.3.0 took it away must read as backdated against the real tag, not merely
+    /// against a fabricated `ReleaseEvidence`.
+    ///
+    /// Where the tags are not present — a shallow clone, a tarball — this asserts instead
+    /// that nothing in the record depends on reading one. That is the honest answer for a
+    /// checkout that cannot look, and it is not a way for a row to pass unexamined: a row
+    /// naming a past release in such a checkout is refused by
+    /// [`ReleaseEvidence::Unreadable`] in the test above.
+    #[test]
+    fn a_past_release_is_read_from_this_repository_rather_than_taken_on_trust() {
+        let current = crate_version();
+        let backdated = Withdrawal {
+            list: "native tokio selection",
+            token: "signal",
+            release: "0.3.0",
+            reason: "nothing in this crate listens for a signal",
+            cost: "tokio::signal::ctrl_c()",
+        };
+        match release_evidence(&backdated, current) {
+            ReleaseEvidence::Tagged { token_still_there } => {
+                assert!(
+                    token_still_there,
+                    "v0.3.0's core/Cargo.toml has to still carry `signal` in the native \
+                     tokio selection — that release is the one the removal came after. \
+                     Reading it as already gone means the lookup is not finding the list \
+                     it thinks it is, and every backdated row would pass."
+                );
+                assert!(
+                    judge_withdrawal(&backdated, current, &release_evidence(&backdated, current))
+                        .is_err(),
+                    "a row claiming 0.3.0 withdrew `signal` has to be refused against the \
+                     real tag, not only against a fabricated verdict"
+                );
+            }
+            ReleaseEvidence::NeverReleased | ReleaseEvidence::Unreadable => {
+                let current_text = format!("{}.{}.{}", current.0, current.1, current.2);
+                assert!(
+                    WITHDRAWN.iter().all(|w| w.release == current_text),
+                    "this checkout cannot read v0.3.0 (no tags, or no git), and WITHDRAWN \
+                     holds a row naming a past release, which therefore cannot be \
+                     checked. Fetch tags before running this suite."
+                );
+            }
+            other => panic!(
+                "reading v0.3.0's native tokio selection gave {other:?}, which is neither \
+                 a reading of the tag nor an admission that it could not be read"
+            ),
+        }
+    }
+
+    /// Every dependency whose default features this crate waives is recorded.
+    ///
+    /// **The defect.** The gate above watches what the feature lists activate, and a
+    /// crate's surface can be taken from a consumer without touching them. `dep:time` in
+    /// `std` activated `time` with its default features; writing `default-features =
+    /// false` on the `time` entry would have taken `time/std` — and with it
+    /// `OffsetDateTime::now_utc` — from the same consumer, with every list still reading
+    /// exactly as recorded. It is the same loss by the other door, and it looks even more
+    /// like housekeeping, because narrowing a dependency is what a no_std audit does.
+    ///
+    /// **What a consumer would observe.** The same thing they did observe: a method gone
+    /// from a crate they declared themselves, reported against their own source, naming
+    /// neither this crate nor a feature.
+    ///
+    /// **Why it would come back unnoticed.** Twelve entries already carry the waiver for
+    /// good reasons, so a thirteenth reads as consistency rather than as a change. This
+    /// fails the build until the reason is written next to it.
+    #[test]
+    fn every_dependency_with_its_defaults_waived_is_recorded() {
+        let stripped = manifest_without_comments();
+        let waived = dependencies_with_defaults_waived(&stripped);
+        for name in &waived {
+            assert!(
+                DEFAULTS_WAIVED.iter().any(|(recorded, _)| recorded == name),
+                "core/Cargo.toml declares `{name}` with `default-features = false` and \
+                 DEFAULTS_WAIVED has no row for it. A consumer who declares `{name}` \
+                 themselves compiles against the union of their selection and ours, so \
+                 waiving its defaults here can take a method away from their own code — \
+                 which is how a consumer lost `OffsetDateTime::now_utc`. Record it with \
+                 the reason, and cut it in a release whose patch number is zero."
+            );
+        }
+        for (name, why) in DEFAULTS_WAIVED {
+            assert!(
+                waived.iter().any(|w| w == name),
+                "DEFAULTS_WAIVED records `{name}` as declared with `default-features = \
+                 false` ({why}), and core/Cargo.toml no longer does. Handing a consumer \
+                 more than before breaks nothing, but a record that does not match the \
+                 manifest cannot be read to find out what is waived, so drop the row."
+            );
+            assert!(
+                !why.trim().is_empty(),
+                "DEFAULTS_WAIVED's `{name}` gives no reason."
+            );
+        }
+        assert_eq!(
+            waived.len(),
+            DEFAULTS_WAIVED.len(),
+            "the manifest waives defaults on {} dependencies and the record holds {}; \
+             manifest {waived:?}",
+            waived.len(),
+            DEFAULTS_WAIVED.len()
+        );
+    }
+
+    /// The manifest points here from the places a selection is easiest to delete.
+    ///
+    /// **The defect.** The first deletion happened because the manifest said nothing:
+    /// four tokio features and a `dep:` no in-crate code reads, with no comment on
+    /// either, read as leftovers. A gate that fails the build is not the same thing as
+    /// a manifest that explains itself — the gate is read after the edit, and the
+    /// comment before it.
+    ///
+    /// **What a consumer would observe.** Nothing that can be told apart from the
+    /// defect above, which is the point: this is what stops the edit being attempted,
+    /// and the set-equality tests are what stop it landing.
+    ///
+    /// **Why it would come back unnoticed.** Comments drift out during a reflow and
+    /// nothing compiles them. Naming this module is the whole requirement, so a reader
+    /// who reaches either place has somewhere to go.
+    #[test]
+    fn the_manifest_points_here_from_where_a_selection_is_easiest_to_delete() {
+        let stripped = manifest_without_comments();
+        let mut anchors = vec![(
+            "the `[features]` table".to_string(),
+            stripped
+                .find("\n[features]\n")
+                .expect("core/Cargo.toml has a `[features]` table")
+                + 1,
+        )];
+        for name in [
+            "std",
+            "cross-target tokio selection",
+            "native tokio selection",
+        ] {
+            let guarded = GUARDED
+                .iter()
+                .find(|g| g.name == name)
+                .expect("the record holds this list");
+            let (offset, _) = body_of(guarded, &stripped);
+            anchors.push((format!("`{name}`"), offset));
+        }
+        for (what, offset) in anchors {
+            let block = comment_block_above(offset);
+            assert!(
+                block.contains("inherited_dependency_features"),
+                "the comment block above {what} in core/Cargo.toml does not name \
+                 `inherited_dependency_features`. A reader who finds a selection that \
+                 nothing in this crate reads needs to be told, where they are looking, \
+                 that somebody else is reading it — otherwise it reads as dead weight, \
+                 which is how four tokio features and `dep:time` came to be deleted. \
+                 The block reads:\n{block}"
+            );
+        }
+    }
+}
+
+/// The paths a caller writes from the signature of a crate-root entry point.
+///
+/// The crate root exported [`CoreError`] and [`PhantomConfig`] and none of the rest,
+/// which made the obvious import fail: `connect_pinned_udp` hands back an
+/// `Arc<PhantomSession>`, that session answers with a `ConnectionState`, opens a
+/// `PhantomStream`, takes a `TrafficShapingConfig` with a `PaddingPolicy` inside it
+/// and produces a `ResumptionHint` the resuming entry point takes back — and every
+/// one of those could only be named through `phantom_protocol::api::…`, or, for
+/// `PaddingPolicy`, through `phantom_protocol::transport::shaping`, a module a caller
+/// of an `api` method has no reason to have opened. So
+/// `use phantom_protocol::ConnectionState;` did not compile beside a
+/// `use phantom_protocol::CoreError;` that did.
+///
+/// Naming each type is the whole test. A path that does not resolve is a compile
+/// error, so a re-export deleted here cannot report itself as a passing run — which
+/// is the one thing a test asserting a value could not give: there is no value to
+/// read, only a name, and an absent name stops the build.
+#[cfg(test)]
+mod crate_root_paths {
+    use std::sync::Arc;
+
+    #[test]
+    fn every_type_a_caller_must_name_resolves_at_the_crate_root() {
+        let _: Option<Arc<crate::PhantomSession>> = None;
+        let _: Option<Arc<crate::PhantomStream>> = None;
+        let _: Option<Arc<crate::ResumptionHint>> = None;
+        let _: Option<crate::ConnectionState> = None;
+        let _: Option<crate::CoreError> = None;
+        let _: Option<crate::PhantomConfig> = None;
+        let _: Option<crate::TrafficShapingConfig> = None;
+        let _: Option<crate::PaddingPolicy> = None;
+        let _: Option<crate::MetricsSnapshotFfi> = None;
+        let _: Option<crate::HybridVerifyingKey> = None;
+        let _: Option<crate::api::PhantomConfig> = None;
+    }
+
+    /// The server side, which is native-only in both places — so a browser-wasm build
+    /// finds these neither at the crate root nor under `api::`, and this assertion is
+    /// gated exactly as the re-exports are.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_server_types_resolve_at_the_crate_root_on_native_targets() {
+        let _: Option<Arc<crate::PhantomListener>> = None;
+        let _: Option<Arc<crate::PhantomUdpListener>> = None;
+        let _: Option<Arc<crate::AcceptOutcome>> = None;
+    }
+
+    /// The re-export is the type itself and not a second declaration that happens to
+    /// share a name, so a value produced through one path is usable through the other.
+    #[test]
+    fn the_crate_root_name_and_the_module_name_are_one_type() {
+        let through_the_module: crate::api::ConnectionState =
+            crate::api::ConnectionState::Connected;
+        let through_the_root: crate::ConnectionState = through_the_module;
+        assert_eq!(
+            through_the_root,
+            crate::api::session::ConnectionState::Connected
+        );
+    }
+}
+
+/// The crate's runnable examples resolve the handshake before they use the session.
+///
+/// `connect_with_transport` and every `connect_pinned*` return before the handshake
+/// has run: the transport is ready, the peer's identity is not. `send()` then accepts
+/// bytes into the pending queue and answers `Ok` against an impostor exactly as it
+/// does against the right server, and the mismatch surfaces only from a later
+/// [`PhantomSession::await_ready`] or
+/// [`last_error`](api::PhantomSession::last_error). That is why the crate's own note
+/// says an embedder-facing example must call `await_ready()` immediately after
+/// connecting — it is the line that makes Security Invariant 1 observable to the
+/// caller.
+///
+/// An earlier change in this release fixed five such examples in the documentation.
+/// The runnable ones under `core/examples/` were not in that pass and were still
+/// waiting for the handshake the two wrong ways: `loopback_demo` slept for half a
+/// second and then sent, and `embedded_demo` polled `connection_state()` in a timed
+/// loop, which waits for the same handshake and then discards its answer — a wrong
+/// pinned key reaches `Failed` rather than `Connected`, so the loop spent its whole
+/// budget and reported a timeout for a mismatch that was known on the first round
+/// trip.
+///
+/// These are the first files a reader runs, so the pattern they show is the one that
+/// gets copied. The gate is on the source text because nothing else reaches it: CI
+/// compiles the examples and does not run them, and an example that waits the wrong
+/// way still prints the same output on loopback, where the pin always matches.
+#[cfg(test)]
+mod examples_await_the_pin {
+    /// One runnable example, named so deleting it is a build failure here rather than
+    /// a check that quietly stops looking at anything.
+    struct Example {
+        path: &'static str,
+        source: &'static str,
+    }
+
+    /// Every example under `core/examples/`. The two that build no client session are
+    /// listed as well, so the assertion that each file is accounted for can be made
+    /// against the directory rather than against this list.
+    const EXAMPLES: &[Example] = &[
+        Example {
+            path: "examples/bottleneck_sim.rs",
+            source: include_str!("../examples/bottleneck_sim.rs"),
+        },
+        Example {
+            path: "examples/crypto_bench.rs",
+            source: include_str!("../examples/crypto_bench.rs"),
+        },
+        Example {
+            path: "examples/embedded_demo.rs",
+            source: include_str!("../examples/embedded_demo.rs"),
+        },
+        Example {
+            path: "examples/loopback_demo.rs",
+            source: include_str!("../examples/loopback_demo.rs"),
+        },
+    ];
+
+    /// The ways an example can come to hold a client session. Each returns before the
+    /// handshake, which is what makes the following line matter.
+    const CLIENT_CONSTRUCTORS: &[&str] = &[
+        "connect_with_transport",
+        "connect_pinned",
+        "connect_pinned_udp",
+        ".connect()",
+    ];
+
+    /// Waiting for a handshake by any of these instead of by `await_ready()` is the
+    /// defect: the first cannot distinguish a slow path from a refused pin, and the
+    /// second two read a session that is not up yet.
+    const WRONG_WAYS_TO_WAIT: &[&str] = &["sleep", "connection_state", "is_data_ready"];
+
+    /// `source` with its comments removed and its string literals kept.
+    ///
+    /// Comments have to go, because this module's own explanation of the defect names
+    /// the tokens the defect is made of, and so does the comment beside the fix in
+    /// each example — a gate that read those would fire on the very text that says
+    /// why it exists. String literals stay: they are code, a payload spelled
+    /// `"sleep"` would be worth a second look, and dropping them would mean deciding
+    /// what a quoted token means.
+    ///
+    /// Block comments nest, as Rust says they do, and a `//` inside a string literal
+    /// is not a comment. Both are in the cases below rather than assumed: a stripper
+    /// that handled only `//` would be fooled by `/* */`, and one that ignored
+    /// strings would truncate a line at a URL.
+    fn without_comments(source: &str) -> String {
+        // Over characters rather than bytes, so a multi-byte character inside a string
+        // literal is copied as itself. Copying it byte by byte produced mojibake, which
+        // is only a cosmetic fault in the stripped text and a real one in the byte
+        // offsets the ordering checks below compare.
+        let chars: Vec<char> = source.chars().collect();
+        let at = |i: usize| chars.get(i).copied();
+        let opens = |i: usize, a: char, b: char| at(i) == Some(a) && at(i + 1) == Some(b);
+        let mut out = String::with_capacity(source.len());
+        let mut i = 0usize;
+        let mut block_depth = 0usize;
+        while let Some(ch) = at(i) {
+            if block_depth > 0 {
+                if opens(i, '/', '*') {
+                    block_depth += 1;
+                    i += 2;
+                } else if opens(i, '*', '/') {
+                    block_depth -= 1;
+                    i += 2;
+                } else {
+                    // Newlines are kept so the stripped text still has the shape of a
+                    // file; everything else inside a comment becomes nothing.
+                    if ch == '\n' {
+                        out.push('\n');
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            if opens(i, '/', '*') {
+                block_depth = 1;
+                i += 2;
+                continue;
+            }
+            if opens(i, '/', '/') {
+                while at(i).is_some_and(|c| c != '\n') {
+                    i += 1;
+                }
+                continue;
+            }
+            if ch == '"' {
+                // A string literal, copied whole, so a `//` or `/*` inside it is not
+                // read as the start of a comment. Escapes are honoured, so a literal
+                // ending in `\"` does not leave the string open.
+                out.push('"');
+                i += 1;
+                while let Some(c) = at(i) {
+                    out.push(c);
+                    i += 1;
+                    if c == '\\' {
+                        if let Some(escaped) = at(i) {
+                            out.push(escaped);
+                            i += 1;
+                        }
+                    } else if c == '"' {
+                        break;
+                    }
+                }
+                continue;
+            }
+            out.push(ch);
+            i += 1;
+        }
+        out
+    }
+
+    /// Every example listed above is a file that exists, and every file that exists is
+    /// listed.
+    ///
+    /// `include_str!` already fails the build for a listed file that is gone; this
+    /// covers the other direction, which nothing else would notice: an example added
+    /// later and not listed here would be exempt from the rule for as long as nobody
+    /// looked.
+    #[test]
+    fn the_list_and_the_directory_agree() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|why| panic!("cannot read {}: {why}", dir.display()))
+            .map(|entry| entry.expect("a readable directory entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+            .map(|path| {
+                format!(
+                    "examples/{}",
+                    path.file_name()
+                        .expect("a file with an extension has a name")
+                        .to_string_lossy()
+                )
+            })
+            .collect();
+        on_disk.sort();
+        let mut listed: Vec<String> = EXAMPLES.iter().map(|e| e.path.to_string()).collect();
+        listed.sort();
+        assert_eq!(
+            listed, on_disk,
+            "core/examples/ and the list in this module disagree. An example missing \
+             from the list is exempt from the rule below without anything saying so."
+        );
+    }
+
+    /// An example that builds a client session calls `await_ready()`, and does it
+    /// before it waits any other way.
+    #[test]
+    fn every_example_with_a_client_session_awaits_the_pin_first() {
+        for example in EXAMPLES {
+            let code = without_comments(example.source);
+            let Some(constructor) = CLIENT_CONSTRUCTORS
+                .iter()
+                .filter_map(|name| code.find(name))
+                .min()
+            else {
+                continue; // No client session in this example, so nothing to await.
+            };
+            let awaited = code.find("await_ready").unwrap_or_else(|| {
+                panic!(
+                    "core/{} builds a client session and never calls await_ready(). The \
+                     connect returns before the handshake, so every use of the session \
+                     below it — including send(), which answers Ok by queueing — is \
+                     made against a peer whose identity has not been checked \
+                     (Invariant 1).",
+                    example.path
+                )
+            });
+            assert!(
+                awaited > constructor,
+                "core/{} calls await_ready() before it has a session to await.",
+                example.path
+            );
+            // Between the two, not merely at the first occurrence in the file: a
+            // `sleep` in the example's *server* half, which comes earlier, made the
+            // narrower check pass with the defect restored.
+            let between = code
+                .get(constructor..awaited)
+                .expect("both offsets came from `find` on this string");
+            for wrong in WRONG_WAYS_TO_WAIT {
+                assert!(
+                    !between.contains(wrong),
+                    "core/{} waits for its handshake with `{wrong}` before calling \
+                     await_ready(). Both of the ways that reads — sleeping for a while, \
+                     or polling the state in a loop — wait for the same handshake and \
+                     then throw away what it concluded: a wrong pinned key ends at \
+                     `Failed`, so the wait runs to its budget and reports a timeout for \
+                     a mismatch the first round trip already settled.",
+                    example.path
+                );
+            }
+        }
+    }
+
+    /// The stripper does what the rule above depends on, including the two things a
+    /// simpler one gets wrong.
+    #[test]
+    fn the_comment_stripper_keeps_code_and_drops_every_kind_of_comment() {
+        assert_eq!(without_comments("a // sleep\nb"), "a \nb");
+        assert_eq!(without_comments("a /* sleep */ b"), "a  b");
+        assert_eq!(
+            without_comments("a /* outer /* inner sleep */ still */ b"),
+            "a  b"
+        );
+        // A `//` inside a string literal is not a comment, and neither is a `/*`.
+        assert_eq!(
+            without_comments(r#"let u = "https://x/*y*/z"; // sleep"#),
+            r#"let u = "https://x/*y*/z"; "#
+        );
+        // An escaped quote does not end the literal, so what follows stays code.
+        assert_eq!(without_comments(r#"f("a\"b"); g()"#), r#"f("a\"b"); g()"#);
+        // A comment that runs to the end of the file, with no newline after it.
+        assert_eq!(without_comments("code // trailing"), "code ");
+        // Non-ASCII outside a comment survives, so an example's own output strings are
+        // not mangled into a shorter file with different offsets.
+        assert_eq!(without_comments("p(\"▶ x\"); // y"), "p(\"▶ x\"); ");
     }
 }

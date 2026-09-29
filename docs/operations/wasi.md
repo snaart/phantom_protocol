@@ -1,6 +1,9 @@
 # wasm32-wasi (Preview 2) — shipped
 
-`wasm32-wasip2` is a hard CI gate (since commits `f6c0c0a`..`255be95`). This page
+`wasm32-wasip2` is a hard CI gate — the `wasm32-wasip2` row of
+`.github/workflows/cross.yml` plus the `wasi-integration` job that runs
+`core/tests/wasi_integration.rs` under `wasmtime` (it landed across `af1662a`..
+`5187d28`, and `95e266a` is where `allow_failure` came off). This page
 is the quickstart for embedders running Phantom Protocol inside a WASI
 Preview 2 host (Wasmtime, WasmEdge, Spin, wasmCloud, Cloudflare
 Workers WASI sandbox).
@@ -15,7 +18,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-phantom-protocol = { version = "0.3", default-features = false, features = ["std", "wasi-leg", "classical-crypto"] }
+phantom-protocol = { version = "0.4", default-features = false, features = ["std", "wasi-leg", "classical-crypto"] }
 futures = { version = "0.3", default-features = false, features = ["executor"] }
 
 [[bin]]

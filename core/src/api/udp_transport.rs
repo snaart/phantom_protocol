@@ -252,6 +252,34 @@ pub struct UdpClientTransport {
     /// blocked on the OLD socket's `recv_from` wakes up and re-enters the loop on the new one
     /// rather than staying stuck indefinitely.
     migrate_notify: Arc<Notify>,
+    /// Set the first time a datagram arrives from `server_addr` while the handshake is
+    /// still running — "this address has something behind it", and nothing more.
+    ///
+    /// A connected datagram socket cannot tell an address with a server behind it from an
+    /// address with nothing, which is why the multi-address walk in
+    /// [`crate::api::session`] exists at all. That walk contacts several addresses of one
+    /// name at once and takes the first handshake to complete, and this flag is how it tells
+    /// apart the two reasons an earlier address has not answered yet: an address that has
+    /// said nothing has nothing to say, and a later success may be taken; an address that
+    /// has begun answering may be about to refuse the pin, and a refusal is the caller's
+    /// answer rather than an address that did not work (Invariant 1).
+    ///
+    /// **It is set before anything has been authenticated, and it is not an authentication
+    /// signal.** The first datagram from the tracked address sets it whatever that datagram
+    /// is — a `HelloRetryRequest`, a `ServerHello` this client is about to refuse for a
+    /// pinned key it does not hold, or a forgery from anyone able to reach the socket and
+    /// guess the source address. That is exactly what the walk needs, because it is
+    /// scheduling: "there is something here, do not hand a later address's success over
+    /// until this one has finished". The only statement about *who* is there is the
+    /// handshake's own, and it is read where every other entry path reads it, through
+    /// [`await_ready`](crate::api::PhantomSession::await_ready) and the pin check behind it
+    /// (Invariant 1). Nothing may branch on this flag as though a peer had proved anything.
+    ///
+    /// Held behind an `Arc` because the walk keeps a handle on it after the transport has
+    /// been moved into its session. Written only during the handshake and only for the
+    /// tracked server address, so a stray datagram from elsewhere — or any post-handshake
+    /// traffic — costs nothing.
+    peer_answered: Arc<AtomicBool>,
 }
 
 impl UdpClientTransport {
@@ -287,7 +315,17 @@ impl UdpClientTransport {
             last_recv_src: ArcSwap::from_pointee(None),
             last_frame_len: AtomicU64::new(0),
             migrate_notify: Arc::new(Notify::new()),
+            peer_answered: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// A handle on [`Self::peer_answered`], readable after this transport has been moved
+    /// into a session.
+    ///
+    /// Scheduling only: the flag says an address sent a datagram, never that a peer proved
+    /// who it is. See [`Self::peer_answered`].
+    pub(crate) fn peer_answered_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.peer_answered)
     }
 
     /// Rebind to a fresh local socket and route subsequent traffic through it
@@ -442,7 +480,16 @@ impl SessionTransport for UdpClientTransport {
                     // data makes the RTO fire only when recv is genuinely pending.
                     biased;
                     r = active.recv_from(&mut buf) => match classify_recv(r) {
-                        RecvAction::Got(n, src) => (n, false, src),
+                        RecvAction::Got(n, src) => {
+                            if src == server {
+                                // Something is behind this address. Recorded here rather than
+                                // after reassembly, because what the address walk needs to know
+                                // is whether an answer is coming at all, and a fragment whose
+                                // siblings were lost is still an answer.
+                                self.peer_answered.store(true, Ordering::Relaxed);
+                            }
+                            (n, false, src)
+                        }
                         RecvAction::Retry => {
                             log::debug!("PhantomUDP: advisory recv error (ignored, RFC 8085 §5.5)");
                             continue;
@@ -601,6 +648,16 @@ impl SessionTransport for UdpClientTransport {
         }
     }
 
+    /// `true`: this transport is address-aware and rebinds without a re-handshake.
+    ///
+    /// Which entry point that means is not symmetric between the two sides, and the
+    /// answer here is about [`migrate`](SessionTransport::migrate) — the client's
+    /// operation, and the one the FFI surface exposes. The mirror on
+    /// [`UdpServerTransport`] answers the same `true` about
+    /// [`migrate_server`](SessionTransport::migrate_server) instead, and calling
+    /// `migrate` there is [`CoreError::Unsupported`]. A caller that holds one of these
+    /// transports knows which it built; a caller holding a `PhantomSession` does not,
+    /// which is why `PhantomSession::migrate` is documented as the client's.
     fn supports_migration(&self) -> bool {
         true
     }
@@ -615,6 +672,21 @@ impl SessionTransport for UdpClientTransport {
 
     fn set_outbound_cid(&self, cid: [u8; 8]) {
         self.established_cid.store(Arc::new(Some(cid)));
+    }
+
+    /// Refused: the client half migrates through [`migrate`](Self::migrate), and this
+    /// is the *server's* entry point. Kept distinct so neither side's request can be
+    /// carried out by the other's machinery — the client's rebind moves the c2s source
+    /// and the server's moves the s2c one, and they rotate different connection-ID
+    /// chains. The error names the method to call, because the trait default's wording
+    /// ("use a UDP-backed session") is advice for a TCP session and misleading on a
+    /// transport that is UDP-backed and does migrate.
+    async fn migrate_server(&self, _local_addr: String) -> Result<(), CoreError> {
+        Err(CoreError::Unsupported(
+            "this is the client half of a PhantomUDP session; it migrates through \
+             migrate(), and migrate_server() belongs to an accepted server session"
+                .into(),
+        ))
     }
 
     /// SocketAddr-free trait entry for connection migration (Phase 4 / P4.2c). Parses
@@ -1099,6 +1171,18 @@ impl SessionTransport for UdpServerTransport {
         }
     }
 
+    /// `true`: this transport is address-aware and rebinds without a re-handshake.
+    ///
+    /// The entry point that does it here is
+    /// [`migrate_server`](SessionTransport::migrate_server), not
+    /// [`migrate`](SessionTransport::migrate), which is refused — the two are
+    /// deliberately distinct, so that the FFI-exported client `migrate()` cannot move a
+    /// server. An accepted server session therefore reports `true` for a capability its
+    /// `migrate()` does not provide, and a caller reading that through
+    /// `PhantomSession::supports_migration()` has no way to tell the two sides apart.
+    /// Server migration is a Rust-only operation (`PhantomSession::migrate_server`), so
+    /// on a foreign binding the honest reading of `true` on an accepted session is "this
+    /// transport can migrate, but not by anything you can call".
     fn supports_migration(&self) -> bool {
         true
     }
@@ -1113,6 +1197,20 @@ impl SessionTransport for UdpServerTransport {
 
     fn set_outbound_cid(&self, cid: [u8; 8]) {
         self.established_cid.store(Arc::new(Some(cid)));
+    }
+
+    /// Refused: an accepted server session migrates through
+    /// [`migrate_server`](Self::migrate_server), and this is the *client's* entry point.
+    /// Kept distinct so the FFI-exported client `migrate()` cannot trigger a server
+    /// migration. The error names the method to call: the trait default's wording ("use
+    /// a UDP-backed session") is advice for a TCP session, and on this transport — which
+    /// is UDP-backed and does migrate — it sends the reader looking for the wrong thing.
+    async fn migrate(&self, _local_addr: String) -> Result<(), CoreError> {
+        Err(CoreError::Unsupported(
+            "this is an accepted server-side PhantomUDP session; it migrates through \
+             migrate_server(), and migrate() belongs to the connecting client"
+                .into(),
+        ))
     }
 
     /// SocketAddr-free trait entry for server-side migration. Parses the new local bind
@@ -2562,5 +2660,99 @@ mod tests {
             .expect("recv task joined")
             .expect("recv ok");
         assert_eq!(&got[..], b"finally");
+    }
+
+    /// Each side of a PhantomUDP session migrates through its own entry point, and the
+    /// other one is refused there.
+    ///
+    /// `supports_migration()` is `true` on both, and on its own that answer does not say
+    /// which method it is about — the client's `migrate` or the server's `migrate_server`.
+    /// The four-way table is the contract: a client migrates and cannot `migrate_server`,
+    /// an accepted server migrates its own send socket and cannot be moved by `migrate`.
+    /// Keeping them distinct is what stops the FFI-exported client `migrate()` from
+    /// moving a server, so the refusals are load-bearing rather than gaps. Both refuse
+    /// with `Unsupported`, and the message has to name the method that does work: the
+    /// trait default says "use a UDP-backed session", which is advice for a TCP session
+    /// and sends the reader of a UDP one looking for the wrong thing.
+    #[tokio::test]
+    async fn each_side_migrates_through_its_own_entry_point_and_refuses_the_other() {
+        use crate::errors::CoreError;
+        use tokio::sync::mpsc;
+
+        // ── client half ──────────────────────────────────────────────────────────
+        let peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_sock.local_addr().unwrap();
+        let client = UdpClientTransport::connect(peer_addr).await.unwrap();
+        assert!(
+            client.supports_migration(),
+            "the client half is address-aware and migrates"
+        );
+        client
+            .migrate("127.0.0.1:0".to_string())
+            .await
+            .expect("the client's own entry point rebinds it");
+        match client.migrate_server("127.0.0.1:0".to_string()).await {
+            Err(CoreError::Unsupported(msg)) => {
+                assert!(
+                    msg.contains("migrate()"),
+                    "the refusal must name the method that does work, got: {msg}"
+                );
+            }
+            other => panic!("migrate_server on a client half must be Unsupported: {other:?}"),
+        }
+
+        // ── server half ──────────────────────────────────────────────────────────
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (tx, rx) = mpsc::channel(8);
+        let server = UdpServerTransport::new(sock, peer_addr, [5u8; 8], tx, rx);
+        assert!(
+            server.supports_migration(),
+            "the accepted server half is address-aware and migrates too"
+        );
+        server
+            .migrate_server("127.0.0.1:0".to_string())
+            .await
+            .expect("the server's own entry point rebinds its send socket");
+        match server.migrate("127.0.0.1:0".to_string()).await {
+            Err(CoreError::Unsupported(msg)) => {
+                assert!(
+                    msg.contains("migrate_server()"),
+                    "the refusal must name the method that does work, got: {msg}"
+                );
+                assert!(
+                    !msg.contains("use a UDP-backed session"),
+                    "this transport IS UDP-backed; the trait default's advice is wrong here"
+                );
+            }
+            other => panic!("migrate on an accepted server half must be Unsupported: {other:?}"),
+        }
+    }
+
+    /// The stream transport answers `false` and refuses both, which is the baseline the
+    /// `true` above is meaningful against.
+    #[tokio::test]
+    async fn a_stream_transport_reports_no_migration_and_refuses_both_entry_points() {
+        use crate::api::tcp_transport::TcpSessionTransport;
+        use crate::errors::CoreError;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _far = accept.await.unwrap();
+        let tcp = TcpSessionTransport::new(stream);
+
+        assert!(
+            !tcp.supports_migration(),
+            "a stream connection cannot change its addresses under the session"
+        );
+        assert!(matches!(
+            tcp.migrate("127.0.0.1:0".to_string()).await,
+            Err(CoreError::Unsupported(_))
+        ));
+        assert!(matches!(
+            tcp.migrate_server("127.0.0.1:0".to_string()).await,
+            Err(CoreError::Unsupported(_))
+        ));
     }
 }

@@ -6,9 +6,11 @@ protocol: a single packet shape, a single handshake, and a single pinned
 version byte. The protocol is **not negotiated**: there is no version
 handshake, no fallback, and no protocol-*version* migration path. That is not
 for want of deployed peers — 0.2.x is published and speaks `WIRE_VERSION` 6 /
-`PROTOCOL_VERSION` 3, and 0.3.0 (8 / 5) cannot talk to it. Pre-1.0 a wire
-change is a hard cut: a peer on the other side of it is refused at the
-handshake (§ 1), and both ends of a connection upgrade together. The one
+`PROTOCOL_VERSION` 3, and every 0.3.x and 0.4.x release (8 / 5) cannot talk to it. Pre-1.0
+a wire change is a hard cut: a peer on the other side of it is refused at the
+handshake (§ 1), and both ends of a connection upgrade together. A minor version bump does
+not imply a cut, and 0.4.0 is one that was not: it left both constants where 0.3.0 put
+them, so those two releases interoperate in both directions. The one
 surviving version byte is a tamper-check anchor and a hook for a future,
 deliberate bump. (*Connection* migration — one session surviving a
 network-path change without re-handshaking — is a separate axis on the
@@ -108,14 +110,17 @@ They exist so that:
 - a future protocol revision can deliberately increment one or both, gated by
   a code change rather than runtime negotiation.
 
-**Unsupported-version signal (`ServerReject`).** When a `ClientHello.version`
-is not `PROTOCOL_VERSION`, the server does not drop silently — it replies with a
-small typed `ServerReject` frame *before* any KEM / signature work:
+**Typed refusal signal (`ServerReject`).** Where the server can say *why* it is
+refusing, it does not drop silently — it replies with a small typed
+`ServerReject` frame. Two of its three reasons are settled *before* any KEM /
+signature work (a `ClientHello.version` that is not `PROTOCOL_VERSION`, and a
+`protocol_variant` that is not this build's); the third is reached only after the
+address-validation exchange has run its rounds without satisfying the gate:
 
 | Offset | Field | Size | Notes |
 |---|---|---|---|
 | 0 | `marker` | 4 | `= b"PRJ1"` (`SERVER_REJECT_MARKER`); an extra sanity check on top of the T4.4 discriminant byte (`kind = 2`) that frames the reply |
-| 4 | `code` | 1 | reject reason; `1 = REJECT_UNSUPPORTED_VERSION` |
+| 4 | `code` | 1 | reject reason; `1 = REJECT_UNSUPPORTED_VERSION`, `2 = REJECT_PROTOCOL_VARIANT`, `3 = REJECT_RETRY_LIMIT` |
 | 5 | `supported_version` | 1 | the `PROTOCOL_VERSION` this server speaks |
 
 The client surfaces this as a hard error reporting both versions and **does not
@@ -595,9 +600,32 @@ an id its peer has since dropped is acknowledged and discarded. Get this wrong
 and every byte-level vector in `INTEROP.md` still passes.
 
 Concurrent *receive* streams are capped at `MAX_STREAMS = 256` per session
-(`api/session.rs`); a reliable segment naming a new id past that cap is refused
-rather than admitted, and — being unrecorded — is not acknowledged, so the peer
-retransmits and that stream stalls instead of the table growing without bound.
+(`api/session.rs`), counted over the streams **the peer** holds open: this side's
+own streams and the reserved raw-application stream live in the same table but not
+in the same allowance, so a peer may open the number this paragraph names. A
+reliable segment naming a new id past the cap is refused rather than admitted, and
+— being unrecorded — is not acknowledged, so the peer retransmits and that stream
+stalls instead of the table growing without bound.
+
+**A peer that counts differently is handed that stall, and this implementation
+counted differently until 0.4.0.** Before then the whole table was compared against
+the cap, so a 0.3.0 receiver admits 255 peer streams — one fewer for every stream it
+has opened itself — and refuses the 256th. The refusal is silent by the rule above and
+the segment stays outstanding, so what the sender sees depends on whether it has other
+traffic, and the two outcomes look nothing alike. **A session whose only outstanding
+data is the refused stream** is ended by the sender's own liveness sweep, which reads
+the silence as a dead path: measured, a few seconds later, `Dead` with `Timeout`.
+**A session that keeps carrying other streams** is not ended at all: measured over
+300 s, it oscillates between `Migrating` and `Connected` on the keep-alive tick — the
+refused stream's silence looks like a dead path, the other streams' acknowledgements
+look like a recovered one — never reaches `Dead`, reports `last_error()` as `None`
+throughout, serves its other streams normally, and leaves that one stream stuck for as
+long as the session lives. An operator diagnosing the second case by looking for a
+failed session will not find one. Nothing on the wire states which rule a peer applies
+and there is no field in which to ask, so a sender that does not know its peer's build
+should keep to **255** concurrent streams. A second implementation should count the peer's streams alone:
+it is the only rule under which the number named here is the number a peer may
+actually use.
 
 ### 4.5 AEAD-plaintext payload codecs (SACK / reliable frame / COALESCED / WINDOW_UPDATE)
 
@@ -742,7 +770,12 @@ from truncating the data behind it. A FIN closes one direction and nothing more:
 side that sent it keeps receiving until the peer's own FIN, and each side drops the
 stream only once both have happened — its own FIN acknowledged, the peer's half
 ended (released in order, or carried outside the reliable stream as in § 4.3,
-steps 8 and 12). Frames that arrive for it after that are answered as § 4.4
+steps 8 and 12). In this implementation that release is what `PhantomStream::recv`
+returns as `Ok(None)`, distinct from the `Err(CoreError::ConnectionClosed)` an abnormal
+end gives — a second implementation is free to surface it any way its language prefers,
+but it has to be able to surface the two separately, because the wire distinguishes
+them and a reader that conflates them cannot tell a finished peer from a broken
+session. Frames that arrive for it after that are answered as § 4.4
 describes, not taken for a new stream. Note the near-collision with the persist probe
 described below, and that the flag is the whole difference: a `RELIABLE` frame
 with an empty payload and **no** `FIN` is a window probe, delivers nothing, and
@@ -1405,6 +1438,41 @@ it. Against the timer-driven alternative of § 12.4 — over two minutes for the
 and for a server's demux routes no reclaim at all until traffic happens to trigger one
 — either bound is the same order of magnitude of improvement.
 
+**On an ordered byte-pipe transport there is nothing to drain, so the window need not be
+waited out.** Every sentence above is about a datagram transport, where the `CLOSE` and
+the data behind it are separate messages the path may reorder. Of this implementation's
+six transports, five are ordered byte pipes — TCP, the TLS-mimicry leg on top of it, a
+browser WebSocket, a WASI socket, and an embedded UART / USB-CDC link — and one, PhantomUDP,
+is a datagram transport. On the five, the transport itself guarantees in-order delivery, so
+the close cannot overtake anything: by the time it is parsed, every byte the sender wrote
+before it has already been handed over. The floor is a property of the displacement it
+exists to absorb, and on an ordered transport that displacement is zero, so a receiver may
+conclude at once.
+
+**What then ends the session differs across those five, and on one of them nothing arrives
+behind the frame at all.** On the four that are stream *connections* — TCP, TLS-mimicry, a
+WebSocket, a WASI socket — the peer's own end-of-stream follows its close and is a stronger
+signal than the close is; this implementation publishes `Draining` and tears down on the
+read side's end-of-stream, typically tens of microseconds later, rather than holding the
+floor. A UART has **no end-of-stream at all**: a serial line carries no close and no EOF,
+its reader simply never completes another frame, which is exactly why `EmbeddedLeg` has no
+clock of its own and leaves a write deadline to its writer to report. There the `CLOSE`
+frame is the only departure signal that exists, and what ends the session is the draining
+deadline itself, run off the send loop's own tick rather than by anything arriving — the
+same mechanism a datagram transport relies on. So read the rule as "an ordered transport
+need not wait for displacement", not as "an ordered transport is told of the departure
+twice".
+
+Two consequences worth stating, because both have been read the wrong way. An
+implementation that *does* wait the full window out on any ordered transport is conformant —
+it waits for something that cannot arrive, which costs a bounded delay and loses nothing.
+And `ConnectionState::Draining` is not a state an application can poll for on a stream
+connection: a consumer sampling `connection_state()` even every millisecond will see
+`Connected` and then `Closed`. Code that must react to a peer's departure should read the
+error from `recv()` — `CoreError::ConnectionClosed` for an orderly one — rather than watch
+for a state that on four of this implementation's six transports is transient by
+construction.
+
 **If it is lost entirely**, nothing breaks and nothing is retried: the receiver falls
 back to concluding the same thing from silence, on the liveness timer of § 12.4,
 exactly as it did before v8. That is the whole compatibility story of the frame — it
@@ -1781,8 +1849,8 @@ reach.
 returns `HandshakeResponse::{Success(ServerHello, Session, Option<Vec<u8>>),
 Retry(HelloRetryRequest), Reject(ServerReject), Fail(HandshakeError)}` — the
 `Option<Vec<u8>>` is the decrypted 0-RTT early-data plaintext, or `None`; the
-`Reject` arm carries the typed unsupported-version signal of §6.10 (the listener
-serialises it back before closing). `process_server_hello` returns `(Session,
+`Reject` arm carries the typed refusal signal of §6.10, whose `code` says which of
+the three reasons it is (the listener serialises it back before closing). `process_server_hello` returns `(Session,
 Option<bool>)` — the second element is the 0-RTT verdict (`None` when the client
 sent no early-data).
 
@@ -2036,12 +2104,17 @@ regardless of the 0-RTT path.
 
 **API surface.** Client (Rust):
 ```rust
-PhantomSession::builder(addr)
+let session = PhantomSession::builder(addr)
     .pinned_key(expected_server_key)
     .resumption(resumption_hint, early_data)
     .transport(transport)
     .connect()
-    .await?
+    .await?;
+
+// `connect()` returns before the handshake has run, so the line above proves
+// nothing about the server's identity and `early_data_accepted()` means nothing
+// yet. Both are settled here (Invariant 1):
+session.await_ready().await?;
 ```
 Client (native FFI): `connect_pinned_with_resumption` / `connect_pinned_udp_with_resumption`.
 The `resumption_hint` comes from a prior session's
@@ -2214,26 +2287,42 @@ source its reputation back). A client implementation should therefore solve
 whatever it is handed, up to its own ceiling of 24, rather than assume the 16 in
 this table is the most it can be asked for.
 
-### 6.10 `ServerReject` (borsh) — unsupported-version signal
+### 6.10 `ServerReject` (borsh) — typed refusal signal
 
 ```rust
 pub struct ServerReject {
     pub marker:            [u8; 4],   // = b"PRJ1" (SERVER_REJECT_MARKER)
     pub code:              u8,        // 1 = REJECT_UNSUPPORTED_VERSION
+                                     // 2 = REJECT_PROTOCOL_VARIANT
+                                     // 3 = REJECT_RETRY_LIMIT
     pub supported_version: u8,        // the PROTOCOL_VERSION the server speaks
 }
 ```
 
 Source: `core/src/transport/handshake.rs`. A fixed 6 bytes. Returned by
-`process_client_hello` as `HandshakeResponse::Reject(..)` when
-`ClientHello.version != PROTOCOL_VERSION`, and serialised back to the client by
+`process_client_hello` as `HandshakeResponse::Reject(..)` for any of the three
+codes, and serialised back to the client by
 the listener (and the UDP demo path) *before* the connection closes — the one
 case where the server speaks after an unacceptable hello instead of dropping
 silently.
 
-The client identifies it by the T4.4 discriminant byte (`kind = 2`, with the
-`b"PRJ1"` marker as an extra check) and surfaces a hard error naming both
-versions. It deliberately does **not**
+**The three codes.** `1 = REJECT_UNSUPPORTED_VERSION` — the hello's `version` is
+not the one this server speaks; `supported_version` names the server's.
+`2 = REJECT_PROTOCOL_VARIANT` — the hello's `protocol_variant` is not this
+build's, so a default peer met a FIPS one or the reverse (Invariant 10); the two
+cannot interoperate and no retry helps. `3 = REJECT_RETRY_LIMIT` — the server
+abandoned the address-validation / proof-of-work exchange (§ 8) after
+`MAX_HANDSHAKE_RETRY_ROUNDS` rounds without a satisfied gate; nothing about the
+client's build is wrong and retrying the connect is the correct reaction. A
+receiver that does not know a code must not read it as a version refusal: where
+`supported_version` equals the version the client sent, the refusal is by
+construction about something else. Codes are additive, so a second
+implementation treats an unknown one as a fatal, non-retryable refusal it cannot
+name.
+
+The client identifies the frame by the T4.4 discriminant byte (`kind = 2`, with
+the `b"PRJ1"` marker as an extra check) and surfaces a hard error. For code 1 it
+names both versions. It deliberately does **not**
 auto-downgrade to `supported_version`: the version is bound into the signed
 transcript (§6.5, Invariant 7), so honouring an attacker-injected reject would
 be a downgrade oracle. The frame is purely diagnostic. Because it is an
@@ -2699,12 +2788,41 @@ either.
 
 ## 13. Last verified against the code
 
-Every constant, byte offset, field order and decode rule above was re-derived
-from the source on **2026-08-15**, against commit `41183f49`. A reader picking
-this up later should treat that pair as the document's expiry stamp: anything
-that has moved in `core/src/transport/`,
-`core/src/crypto/` or `core/src/api/session.rs` since then has not been
-re-checked here.
+The newest stamp is **2026-09-28, the 0.4.0 release**, and it covers four
+sections rather than the whole document: § 4.4, § 4.5, § 4.11 and § 6.10 were
+re-derived from the source in that release and are current as of it. Everything else carries
+the stamp below it. A reader picking this up later should treat the newest stamp
+covering the section they are reading as its expiry date: anything that has moved
+in `core/src/transport/`, `core/src/crypto/` or `core/src/api/session.rs` since
+then has not been re-checked here. The four 0.4.0 items, each named so it can be
+checked rather than taken:
+
+- **§ 4.4** — the concurrent-stream cap counts the streams **the peer** holds, not
+  every entry in the stream table; the paragraph on what a peer counting the other
+  way is handed now states the two measured outcomes, which are a `Dead` session
+  and an indefinite `Migrating` ↔ `Connected` oscillation that never fails.
+- **§ 4.5** — the typed end-of-stream a reader sees: `Ok(None)` for a clean
+  in-order `FIN` against `Err(CoreError::ConnectionClosed)` for an abnormal end,
+  marked as this implementation's surfacing of the rule rather than a wire
+  requirement.
+- **§ 4.11** — the ordered-byte-pipe paragraphs. The transport inventory is six,
+  five of them ordered, and the four that are stream *connections* are the ones
+  where an end-of-stream arrives behind the close; a UART has none, so there the
+  draining deadline itself ends the session.
+- **§ 6.10** and the `ServerReject` table in § 2 — the reject `code` field has
+  three assigned values, not one: `2 = REJECT_PROTOCOL_VARIANT` and
+  `3 = REJECT_RETRY_LIMIT` were both added to the frame in 0.4.0, and this document
+  named only code 1 until the same release. The section now also says what a receiver
+  does with a code it does not know, which matters because the message carries
+  `supported_version` whatever the reason is.
+
+Commit ids are deliberately absent from this stamp: the history up to the `v0.3.0`
+tag was rewritten once already, and `../policy/versioning.md` § 10 asks for a tag,
+a path or a date in new text rather than a hash. Earlier stamps keep the ids they
+were written with, and those ids do resolve.
+
+Before that, every constant, byte offset, field order and decode rule above was
+re-derived from the source on **2026-08-15**, against commit `41183f49`.
 
 Two changes have landed since that pass and are reflected above. `WIRE_VERSION 6 → 7`
 and `PROTOCOL_VERSION 3 → 4` replaced the `WINDOW_UPDATE` relative credit with a

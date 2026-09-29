@@ -1376,6 +1376,11 @@ public protocol PhantomSessionProtocol: AnyObject, Sendable {
      * captured terminal error on failure. This is the preferred alternative
      * to polling `connection_state()` in a loop.
      *
+     * A session that is over rather than failed — closed by this side or by the peer, with
+     * nothing recorded against it — answers [`CoreError::ConnectionClosed`]. It is not
+     * ready and never will be, but nothing went wrong, and
+     * [`last_error`](Self::last_error) still reports `None`.
+     *
      * Because the readiness signal is carried on a `watch` channel, a call
      * made *after* the handshake has already resolved (either direction)
      * returns immediately — there is no lost-notification race.
@@ -1553,6 +1558,12 @@ public protocol PhantomSessionProtocol: AnyObject, Sendable {
      * or Embedded session returns [`CoreError::Unsupported`]. Check
      * [`supports_migration`](Self::supports_migration) first, or use
      * `connect_pinned_udp` to ensure UDP backing.
+     *
+     * **This is the client's entry point only.** A session handed back by a listener is
+     * the server end of a PhantomUDP connection, and although its transport does migrate,
+     * it does so through [`migrate_server`](Self::migrate_server) — calling `migrate()`
+     * there returns [`CoreError::Unsupported`] rather than accepting a request the pump
+     * would discard.
      */
     func migrate(localAddr: String) async throws 
     
@@ -1566,15 +1577,27 @@ public protocol PhantomSessionProtocol: AnyObject, Sendable {
      *
      * # Errors
      *
-     * [`CoreError::StreamError`] once this side has opened 32 767 streams in the
-     * session. A stream id travels in a 16-bit header field and each side allocates
-     * from its own half of that space, never reusing an id — even one whose stream
-     * has long since closed, because the peer may still be holding it or the record
-     * that it closed, and would fold a new stream's bytes into it. Nothing is opened
-     * and the session is otherwise unaffected: streams already open carry on, and
-     * `accept_stream()` still takes the peer's. The limit counts every stream opened,
-     * not the ones open at once, so a long-lived session that opens a stream per
-     * request reaches it; open a new session to continue.
+     * [`CoreError::StreamError`], for either of two limits, with nothing opened and the
+     * session otherwise unaffected in both cases: streams already open carry on, and
+     * `accept_stream()` still takes the peer's.
+     *
+     * - **[`MAX_STREAMS`] already open on this side.** The peer holds the same limit on
+     * how many streams it will accept from us, and it enforces it *silently* — the
+     * segment that would open the stream is simply never acknowledged. So a stream
+     * handed out past the limit would not fail; it would sit with data outstanding
+     * that nothing can retire, and inbound silence with data in flight is what the
+     * liveness sweep reads as a dead path. Refusing here is the difference between one
+     * stream reporting a limit and the whole session dying a few seconds later. Retry
+     * once a stream has closed: the limit counts streams open *at once*, and a stream
+     * leaves the count when its close is acknowledged, or immediately if it was let go
+     * of without ever having been written on.
+     * - **32 767 streams opened over the session's life.** A stream id travels in a
+     * 16-bit header field and each side allocates from its own half of that space,
+     * never reusing an id — even one whose stream has long since closed, because the
+     * peer may still be holding it or the record that it closed, and would fold a new
+     * stream's bytes into it. This limit counts every stream ever opened, so a
+     * long-lived session that opens a stream per request reaches it; open a new session
+     * to continue.
      */
     func openStream() throws  -> PhantomStream
     
@@ -1603,9 +1626,17 @@ public protocol PhantomSessionProtocol: AnyObject, Sendable {
      * refcount the Vec is moved out of the underlying buffer, otherwise
      * `Bytes::to_vec` copies.
      *
-     * When the session is `Failed` or `Dead` and the recv channel has been
-     * dropped, returns the captured terminal error (if any) rather than the
-     * generic `"Session closed"` message.
+     * # The end of the session
+     *
+     * Once the session is over and everything it delivered has been read, this returns
+     * [`CoreError::ConnectionClosed`] for an orderly end — this side's own
+     * [`disconnect`](Self::disconnect), or the peer's — and the captured terminal cause
+     * for any other: [`CoreError::Timeout`] for a path the transport gave up on, whatever
+     * the handshake failed with, and so on. So the two cases a reader has to tell apart —
+     * "the peer is finished, take the result" and "the connection broke, retry" — differ
+     * in the value returned rather than only in a message, and agree with
+     * [`connection_state`](Self::connection_state) (`Closed` against `Dead`) and with
+     * [`last_error`](Self::last_error) (`None` against the cause).
      */
     func recv() async throws  -> Data
     
@@ -1637,7 +1668,12 @@ public protocol PhantomSessionProtocol: AnyObject, Sendable {
      * - If the session is `Failed` or `Dead`: returns the captured terminal
      * error (from the handshake or the data pump) so the caller gets the
      * *specific* cause (e.g. [`CoreError::ServerIdentityMismatch`]) rather
-     * than the generic `"Cannot send in state Failed"` message.
+     * than a generic message.
+     * - If the session is `Closed`: returns [`CoreError::ConnectionClosed`]. That is the
+     * whole answer — a session closed in the orderly way, by this side or by the peer,
+     * has no cause to report and [`last_error`](Self::last_error) stays `None`. It is
+     * how a caller tells an orderly end from a failed one: this error with no cause
+     * behind it is the first, a cause is the second.
      *
      * # ⚠ This is a byte stream, not a message channel
      *
@@ -1682,13 +1718,18 @@ public protocol PhantomSessionProtocol: AnyObject, Sendable {
     func setTrafficShaping(config: TrafficShapingConfig) async  -> Bool
     
     /**
-     * Whether this session's transport supports seamless connection migration
-     * (i.e., [`migrate`](Self::migrate) will succeed for UDP sessions).
+     * Whether [`migrate`](Self::migrate) can move this session.
      *
-     * Returns `true` only when the session is backed by `UdpClientTransport`.
-     * On TCP, WebSocket, WASI, or Embedded sessions, [`migrate`](Self::migrate)
-     * returns [`CoreError::Unsupported`] — use reconnection with 0-RTT resumption
-     * instead.
+     * Returns `true` only for a **client** session backed by `UdpClientTransport`. On TCP,
+     * WebSocket, WASI or Embedded sessions, and on a session accepted by a listener,
+     * [`migrate`](Self::migrate) returns [`CoreError::Unsupported`] — use reconnection
+     * with 0-RTT resumption instead.
+     *
+     * An accepted PhantomUDP session answers `false` here even though its transport does
+     * migrate: the server side moves through the Rust-only
+     * [`migrate_server`](Self::migrate_server), and `migrate` is refused there so that the
+     * FFI-exported client operation cannot move a server. Answering `true` would name a
+     * capability nothing the caller of this method can reach.
      */
     func supportsMigration()  -> Bool
     
@@ -1913,6 +1954,11 @@ open func acceptStream()async throws  -> PhantomStream  {
      * Returns `Ok(())` on successful connection, or `Err(cause)` with the
      * captured terminal error on failure. This is the preferred alternative
      * to polling `connection_state()` in a loop.
+     *
+     * A session that is over rather than failed — closed by this side or by the peer, with
+     * nothing recorded against it — answers [`CoreError::ConnectionClosed`]. It is not
+     * ready and never will be, but nothing went wrong, and
+     * [`last_error`](Self::last_error) still reports `None`.
      *
      * Because the readiness signal is carried on a `watch` channel, a call
      * made *after* the handshake has already resolved (either direction)
@@ -2191,6 +2237,12 @@ open func metricsSnapshot() -> MetricsSnapshotFfi  {
      * or Embedded session returns [`CoreError::Unsupported`]. Check
      * [`supports_migration`](Self::supports_migration) first, or use
      * `connect_pinned_udp` to ensure UDP backing.
+     *
+     * **This is the client's entry point only.** A session handed back by a listener is
+     * the server end of a PhantomUDP connection, and although its transport does migrate,
+     * it does so through [`migrate_server`](Self::migrate_server) — calling `migrate()`
+     * there returns [`CoreError::Unsupported`] rather than accepting a request the pump
+     * would discard.
      */
 open func migrate(localAddr: String)async throws   {
     return
@@ -2218,15 +2270,27 @@ open func migrate(localAddr: String)async throws   {
      *
      * # Errors
      *
-     * [`CoreError::StreamError`] once this side has opened 32 767 streams in the
-     * session. A stream id travels in a 16-bit header field and each side allocates
-     * from its own half of that space, never reusing an id — even one whose stream
-     * has long since closed, because the peer may still be holding it or the record
-     * that it closed, and would fold a new stream's bytes into it. Nothing is opened
-     * and the session is otherwise unaffected: streams already open carry on, and
-     * `accept_stream()` still takes the peer's. The limit counts every stream opened,
-     * not the ones open at once, so a long-lived session that opens a stream per
-     * request reaches it; open a new session to continue.
+     * [`CoreError::StreamError`], for either of two limits, with nothing opened and the
+     * session otherwise unaffected in both cases: streams already open carry on, and
+     * `accept_stream()` still takes the peer's.
+     *
+     * - **[`MAX_STREAMS`] already open on this side.** The peer holds the same limit on
+     * how many streams it will accept from us, and it enforces it *silently* — the
+     * segment that would open the stream is simply never acknowledged. So a stream
+     * handed out past the limit would not fail; it would sit with data outstanding
+     * that nothing can retire, and inbound silence with data in flight is what the
+     * liveness sweep reads as a dead path. Refusing here is the difference between one
+     * stream reporting a limit and the whole session dying a few seconds later. Retry
+     * once a stream has closed: the limit counts streams open *at once*, and a stream
+     * leaves the count when its close is acknowledged, or immediately if it was let go
+     * of without ever having been written on.
+     * - **32 767 streams opened over the session's life.** A stream id travels in a
+     * 16-bit header field and each side allocates from its own half of that space,
+     * never reusing an id — even one whose stream has long since closed, because the
+     * peer may still be holding it or the record that it closed, and would fold a new
+     * stream's bytes into it. This limit counts every stream ever opened, so a
+     * long-lived session that opens a stream per request reaches it; open a new session
+     * to continue.
      */
 open func openStream()throws  -> PhantomStream  {
     return try  FfiConverterTypePhantomStream_lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
@@ -2284,9 +2348,17 @@ open func queuedCount()async  -> UInt32  {
      * refcount the Vec is moved out of the underlying buffer, otherwise
      * `Bytes::to_vec` copies.
      *
-     * When the session is `Failed` or `Dead` and the recv channel has been
-     * dropped, returns the captured terminal error (if any) rather than the
-     * generic `"Session closed"` message.
+     * # The end of the session
+     *
+     * Once the session is over and everything it delivered has been read, this returns
+     * [`CoreError::ConnectionClosed`] for an orderly end — this side's own
+     * [`disconnect`](Self::disconnect), or the peer's — and the captured terminal cause
+     * for any other: [`CoreError::Timeout`] for a path the transport gave up on, whatever
+     * the handshake failed with, and so on. So the two cases a reader has to tell apart —
+     * "the peer is finished, take the result" and "the connection broke, retry" — differ
+     * in the value returned rather than only in a message, and agree with
+     * [`connection_state`](Self::connection_state) (`Closed` against `Dead`) and with
+     * [`last_error`](Self::last_error) (`None` against the cause).
      */
 open func recv()async throws  -> Data  {
     return
@@ -2347,7 +2419,12 @@ open func resumptionHint()async  -> ResumptionHint?  {
      * - If the session is `Failed` or `Dead`: returns the captured terminal
      * error (from the handshake or the data pump) so the caller gets the
      * *specific* cause (e.g. [`CoreError::ServerIdentityMismatch`]) rather
-     * than the generic `"Cannot send in state Failed"` message.
+     * than a generic message.
+     * - If the session is `Closed`: returns [`CoreError::ConnectionClosed`]. That is the
+     * whole answer — a session closed in the orderly way, by this side or by the peer,
+     * has no cause to report and [`last_error`](Self::last_error) stays `None`. It is
+     * how a caller tells an orderly end from a failed one: this error with no cause
+     * behind it is the first, a cause is the second.
      *
      * # ⚠ This is a byte stream, not a message channel
      *
@@ -2421,13 +2498,18 @@ open func setTrafficShaping(config: TrafficShapingConfig)async  -> Bool  {
 }
     
     /**
-     * Whether this session's transport supports seamless connection migration
-     * (i.e., [`migrate`](Self::migrate) will succeed for UDP sessions).
+     * Whether [`migrate`](Self::migrate) can move this session.
      *
-     * Returns `true` only when the session is backed by `UdpClientTransport`.
-     * On TCP, WebSocket, WASI, or Embedded sessions, [`migrate`](Self::migrate)
-     * returns [`CoreError::Unsupported`] — use reconnection with 0-RTT resumption
-     * instead.
+     * Returns `true` only for a **client** session backed by `UdpClientTransport`. On TCP,
+     * WebSocket, WASI or Embedded sessions, and on a session accepted by a listener,
+     * [`migrate`](Self::migrate) returns [`CoreError::Unsupported`] — use reconnection
+     * with 0-RTT resumption instead.
+     *
+     * An accepted PhantomUDP session answers `false` here even though its transport does
+     * migrate: the server side moves through the Rust-only
+     * [`migrate_server`](Self::migrate_server), and `migrate` is refused there so that the
+     * FFI-exported client operation cannot move a server. Answering `true` would name a
+     * capability nothing the caller of this method can reach.
      */
 open func supportsMigration() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -2578,10 +2660,22 @@ public protocol PhantomStreamProtocol: AnyObject, Sendable {
      * Returns:
      * - `Ok(Some(bytes))` — a data payload arrived.
      * - `Ok(None)` — the peer sent a clean FIN; the stream is half-closed
-     * for reading. No more data will arrive on this stream.
-     * - `Err(CoreError::ConnectionClosed)` — the underlying session ended
-     * (the mpsc channel was dropped) before a clean EOF was signalled.
-     * This indicates an abnormal termination rather than a graceful close.
+     * for reading. No more data will arrive on this stream. Exactly once: a further
+     * call on a stream whose FIN has already been reported gets the `Err` below.
+     * - `Err(CoreError::ConnectionClosed)` — the session ended before a FIN arrived on
+     * this stream.
+     *
+     * **The session ending is an `Err` here, not `Ok(None)`, even when it ended in the
+     * orderly way.** `Ok(None)` is a statement about *this stream*: the peer closed its
+     * writing half, so everything it meant to send has been read. The end of the session
+     * says nothing of the kind — the peer may have been half-way through writing on this
+     * stream — so reporting it as a clean end of stream would tell the caller it had
+     * everything when the truth is that nobody can now say. The distinction survives in
+     * both directions: a stream whose FIN did arrive reports `Ok(None)` first and the
+     * error only afterwards, so a reader that reads to EOF never sees the error at all.
+     *
+     * Either way the call resolves. Whatever was already delivered into this stream is
+     * handed over first, in order, and the end is reported after it.
      */
     func recv() async throws  -> Data?
     
@@ -2643,6 +2737,23 @@ public protocol PhantomStreamProtocol: AnyObject, Sendable {
      * The request does not wait behind writes queued on the session, so it
      * applies to whatever the stream holds at that pass — writes made before
      * this call included, even if they are still waiting for room.
+     *
+     * Returns [`CoreError::ConnectionClosed`] when the session is over, which is the same
+     * answer [`send_reliable`](Self::send_reliable), [`send_unreliable`](Self::send_unreliable)
+     * and [`disconnect`](Self::disconnect) give. It used to be a
+     * `NetworkError("Session closed")` here alone, so three of this type's four outbound
+     * calls reported an ended session as a typed close and the fourth reported it as a
+     * network fault — which is worse for a caller matching on the error than either answer
+     * consistently would be: the one arm that has to be written as a string comparison is
+     * the one nobody writes, and a session that ended in the orderly way was reported as a
+     * failure.
+     *
+     * Unlike the three of them it is not refused while the session is
+     * [`Draining`](crate::api::session::ConnectionState::Draining). Those carry a payload
+     * the pump would throw away, and returning `Ok` for bytes that never reach the wire is
+     * the defect that refusal exists to stop; a priority is not a payload — it is applied
+     * to the stream's own scheduling for as long as the stream still has one, and asks
+     * nothing of the peer.
      */
     func setPriority(priority: UInt32) async throws 
     
@@ -2781,10 +2892,22 @@ open func disconnect()async throws   {
      * Returns:
      * - `Ok(Some(bytes))` — a data payload arrived.
      * - `Ok(None)` — the peer sent a clean FIN; the stream is half-closed
-     * for reading. No more data will arrive on this stream.
-     * - `Err(CoreError::ConnectionClosed)` — the underlying session ended
-     * (the mpsc channel was dropped) before a clean EOF was signalled.
-     * This indicates an abnormal termination rather than a graceful close.
+     * for reading. No more data will arrive on this stream. Exactly once: a further
+     * call on a stream whose FIN has already been reported gets the `Err` below.
+     * - `Err(CoreError::ConnectionClosed)` — the session ended before a FIN arrived on
+     * this stream.
+     *
+     * **The session ending is an `Err` here, not `Ok(None)`, even when it ended in the
+     * orderly way.** `Ok(None)` is a statement about *this stream*: the peer closed its
+     * writing half, so everything it meant to send has been read. The end of the session
+     * says nothing of the kind — the peer may have been half-way through writing on this
+     * stream — so reporting it as a clean end of stream would tell the caller it had
+     * everything when the truth is that nobody can now say. The distinction survives in
+     * both directions: a stream whose FIN did arrive reports `Ok(None)` first and the
+     * error only afterwards, so a reader that reads to EOF never sees the error at all.
+     *
+     * Either way the call resolves. Whatever was already delivered into this stream is
+     * handed over first, in order, and the end is reported after it.
      */
 open func recv()async throws  -> Data?  {
     return
@@ -2888,6 +3011,23 @@ open func sendUnreliable(data: Data)async throws   {
      * The request does not wait behind writes queued on the session, so it
      * applies to whatever the stream holds at that pass — writes made before
      * this call included, even if they are still waiting for room.
+     *
+     * Returns [`CoreError::ConnectionClosed`] when the session is over, which is the same
+     * answer [`send_reliable`](Self::send_reliable), [`send_unreliable`](Self::send_unreliable)
+     * and [`disconnect`](Self::disconnect) give. It used to be a
+     * `NetworkError("Session closed")` here alone, so three of this type's four outbound
+     * calls reported an ended session as a typed close and the fourth reported it as a
+     * network fault — which is worse for a caller matching on the error than either answer
+     * consistently would be: the one arm that has to be written as a string comparison is
+     * the one nobody writes, and a session that ended in the orderly way was reported as a
+     * failure.
+     *
+     * Unlike the three of them it is not refused while the session is
+     * [`Draining`](crate::api::session::ConnectionState::Draining). Those carry a payload
+     * the pump would throw away, and returning `Ok` for bytes that never reach the wire is
+     * the defect that refusal exists to stop; a priority is not a payload — it is applied
+     * to the stream's own scheduling for as long as the stream still has one, and asks
+     * nothing of the peer.
      */
 open func setPriority(priority: UInt32)async throws   {
     return
@@ -4032,6 +4172,15 @@ public struct PhantomConfig: Equatable, Hashable {
      *
      * Maps to [`SessionCache`] capacity; excess entries are evicted LRU.
      *
+     * **Zero turns 0-RTT off.** A listener configured with `0` stores no tickets,
+     * so every resuming `ClientHello` finds nothing and completes as an ordinary
+     * 1-RTT handshake with `early_data_accepted == false`. That is the same
+     * posture `PhantomListener::set_early_data_enabled(false)` gives, reached from
+     * a config record instead of a method call — which is the only route a foreign
+     * binding has when it builds this record field by field. Until 0.4.0 the value
+     * was read as a bound to evict against rather than as a capacity, so a cache
+     * configured to hold nothing held one ticket and served 0-RTT out of it.
+     *
      * Defaults: 32 (`mobile`), 1024 (`server`), 4 (`iot`). Consumed by both
      * listeners, not only the TCP one.
      *
@@ -4080,6 +4229,16 @@ public struct PhantomConfig: Equatable, Hashable {
      * once, which on a busy connection is almost every write — and the entry points
      * that use it refuse a shorter one with `CoreError::ConfigError` before any I/O.
      *
+     * That floor belongs to this field rather than to the deadline itself. A Rust
+     * caller who builds a transport of their own sets the deadline with
+     * `with_write_stall_timeout`, which takes any duration and hands back the
+     * transport rather than a `Result`, so the same sub-second value is refused
+     * here and accepted there. The difference is deliberate: a value in this record
+     * is one an operator supplied for connections the library builds on their
+     * behalf, out of their sight, while a duration handed straight to a transport is
+     * a choice its author made about that one transport — and making it is how the
+     * in-crate stall tests reach a stall in 250 ms instead of a second.
+     *
      * Read by the TCP and TLS-mimicry listeners and by `connect_pinned_with_config`
      * (and the mimicry connect that takes a config); ignored over PhantomUDP, whose
      * sends never wait on the peer. An entry point that takes no `PhantomConfig` uses
@@ -4122,6 +4281,15 @@ public struct PhantomConfig: Equatable, Hashable {
          * is silently ignored — the client does not own a session cache.
          *
          * Maps to [`SessionCache`] capacity; excess entries are evicted LRU.
+         *
+         * **Zero turns 0-RTT off.** A listener configured with `0` stores no tickets,
+         * so every resuming `ClientHello` finds nothing and completes as an ordinary
+         * 1-RTT handshake with `early_data_accepted == false`. That is the same
+         * posture `PhantomListener::set_early_data_enabled(false)` gives, reached from
+         * a config record instead of a method call — which is the only route a foreign
+         * binding has when it builds this record field by field. Until 0.4.0 the value
+         * was read as a bound to evict against rather than as a capacity, so a cache
+         * configured to hold nothing held one ticket and served 0-RTT out of it.
          *
          * Defaults: 32 (`mobile`), 1024 (`server`), 4 (`iot`). Consumed by both
          * listeners, not only the TCP one.
@@ -4168,6 +4336,16 @@ public struct PhantomConfig: Equatable, Hashable {
          * anything shorter gives up on nearly every write the socket could not take at
          * once, which on a busy connection is almost every write — and the entry points
          * that use it refuse a shorter one with `CoreError::ConfigError` before any I/O.
+         *
+         * That floor belongs to this field rather than to the deadline itself. A Rust
+         * caller who builds a transport of their own sets the deadline with
+         * `with_write_stall_timeout`, which takes any duration and hands back the
+         * transport rather than a `Result`, so the same sub-second value is refused
+         * here and accepted there. The difference is deliberate: a value in this record
+         * is one an operator supplied for connections the library builds on their
+         * behalf, out of their sight, while a duration handed straight to a transport is
+         * a choice its author made about that one transport — and making it is how the
+         * in-crate stall tests reach a stall in 250 ms instead of a second.
          *
          * Read by the TCP and TLS-mimicry listeners and by `connect_pinned_with_config`
          * (and the mimicry connect that takes a config); ignored over PhantomUDP, whose
@@ -5159,7 +5337,10 @@ public func connectPinned(host: String, port: UInt16, pinnedKey: Data)async thro
  * datagram socket, involves no exchange with the peer at all. The handshake and
  * the check that the server holds `pinned_key` run on the background task,
  * while the session reports [`ConnectionState::Connecting`] and
- * [`send`](PhantomSession::send) queues bytes rather than refusing them.
+ * [`send`](PhantomSession::send) queues bytes rather than refusing them. (The one
+ * exception is a `host` that resolves to more than one address: telling those apart
+ * takes a handshake, so the candidates before the last one are tried and awaited — see
+ * below.)
  *
  * **Call [`await_ready`](PhantomSession::await_ready) before treating the
  * session as authenticated**; it surfaces
@@ -5174,12 +5355,43 @@ public func connectPinned(host: String, port: UInt16, pinnedKey: Data)async thro
  * path validation, and passive NAT-rebind recovery are all live for FFI
  * consumers.
  *
- * `host` is resolved via the system resolver; the **first** returned address is
- * used. Unlike the TCP [`connect_pinned`] (whose `TcpStream::connect` tries every
- * resolved address in turn), this does **not** fall back to subsequent addresses
- * if the first is unreachable — pass an IP literal or a single-family host when
- * that matters. Server-key pinning is mandatory (security invariant 1).
- * Native-only, like [`connect_pinned`].
+ * `host` is resolved via the system resolver and **every** address it returns is tried, in
+ * the resolver's order, until one answers or one refuses — like the TCP [`connect_pinned`],
+ * whose `TcpStream::connect` does the same. It matters more here than it looks: `localhost`
+ * commonly resolves to `::1` before `127.0.0.1`, and a datagram socket "connected" to an
+ * address with nothing behind it reports no error at all, so taking only the first address
+ * meant a server listening on IPv4 was simply never reached. Only the handshake can tell
+ * the addresses apart, so each candidate but the last is given a share of the client
+ * handshake deadline to complete one, and the last is handed back without waiting — which
+ * is why a one-address name, every IP literal among them, behaves exactly as it always
+ * did. Two things about the walk are worth knowing before relying on it:
+ *
+ * * **A refusal is returned, not walked past.** An address that *answers* and is not the
+ * pinned server ends the walk with [`CoreError::ServerIdentityMismatch`], and one that
+ * answers with a protocol rejection ends it with [`CoreError::ProtocolRejected`]. An
+ * extra address in a name's DNS answer — an added AAAA record, a poisoned resolver, a
+ * hostile split-horizon zone — is contacted first on every one of these calls and gets
+ * the whole `ClientHello`, so being told that something answered for this name and was
+ * not the server you pinned is the point of the pin. The returned
+ * [`CoreError::NetworkError`] carries the roster — every address tried and what each one
+ * said — in one case only: where no candidate's socket could be created at all, so no
+ * session ever existed to hand back. An address that merely fails to *answer* does not
+ * reach it, because the last candidate goes back as `Ok` without being awaited, which is
+ * the contract this entry point documents; what the earlier candidates said goes to the
+ * log, and [`await_ready`](PhantomSession::await_ready) is where the outcome comes from.
+ * A deployment whose addresses genuinely hold *different* identities has to pin per
+ * address; one key cannot be the right answer for all of them.
+ * * **The attempts overlap and the call fits inside the one handshake deadline.** Each
+ * address is contacted 250 ms after the one before it — RFC 8305 § 5's Connection Attempt
+ * Delay — unless an earlier one has answered, and each attempt is waited on for at most an
+ * even share of the 10 s handshake deadline, floored at 2 s, since a wait shorter than a
+ * handshake decides nothing and abandons reachable addresses. The floor can make the
+ * shares add up to past the deadline at six addresses or more, which leaves such a name a
+ * tail the walk never reaches; the deadline is the outer authority either way, so the call
+ * is bounded by it rather than by it plus a share, as the serial walk was.
+ *
+ * Server-key pinning is mandatory (security invariant 1). Native-only, like
+ * [`connect_pinned`].
  *
  * # Example
  *
@@ -5294,8 +5506,23 @@ public func connectPinnedUdpWithConfig(host: String, port: UInt16, pinnedKey: Da
  * rejected before the UDP socket is bound. Acceptance is best-effort (security
  * invariant 9): an unknown/stale ticket completes 1-RTT and the caller checks
  * [`PhantomSession::early_data_accepted`] and re-sends when it is not `Some(true)`.
- * Like [`connect_pinned_udp`], the first resolved address is used with no fallback.
- * Native-only.
+ *
+ * **A resume consumes the ticket, whether or not `early_data` is empty.** The ticket is
+ * one-shot (security invariant 9), and the server consumes it the moment the resumption
+ * binder verifies — before it looks at whether a sealed blob came with it. Resuming with an
+ * empty `early_data` therefore spends the ticket to buy only the cookie / proof-of-work
+ * bypass, and [`PhantomSession::early_data_accepted`] answers `None`, which is correct
+ * ("no early-data on this connect") and easy to read as "nothing was spent". A caller with
+ * nothing to send yet should connect without the hint and keep it for the connect that
+ * does have a payload; a caller that resumes twice off one hint gets 1-RTT the second time.
+ *
+ * Like [`connect_pinned_udp`], every address the host resolves to is tried in the
+ * resolver's order — including the two qualifications described there: an address that
+ * answers and refuses ends the walk with that refusal, and the per-address share has a
+ * floor, so a name with more than five addresses can take longer than the one client
+ * handshake deadline. On this entry point the first of those is the sharper of the two: the
+ * sealed `early_data` blob goes out in the first flight, so it reaches whatever answers
+ * first at the name, and the refusal is what tells the caller that happened. Native-only.
  */
 public func connectPinnedUdpWithResumption(host: String, port: UInt16, pinnedKey: Data, hint: ResumptionHint, earlyData: Data)async throws  -> PhantomSession  {
     return
@@ -5401,6 +5628,15 @@ public func connectPinnedWithConfig(host: String, port: UInt16, pinnedKey: Data,
  * the default liveness settings and the thirty-second write deadline of
  * [`connect_pinned`].
  *
+ * **A resume consumes the ticket, whether or not `early_data` is empty.** The ticket is
+ * one-shot (security invariant 9), and the server consumes it the moment the resumption
+ * binder verifies — before it looks at whether a sealed blob came with it. Resuming with an
+ * empty `early_data` therefore spends the ticket to buy only the cookie / proof-of-work
+ * bypass, and [`PhantomSession::early_data_accepted`] answers `None`, which is correct
+ * ("no early-data on this connect") and easy to read as "nothing was spent". A caller with
+ * nothing to send yet should connect without the hint and keep it for the connect that
+ * does have a payload; a caller that resumes twice off one hint gets 1-RTT the second time.
+ *
  * Native-only, like [`connect_pinned`]: `TcpSessionTransport` lives
  * behind `cfg(not(target_arch = "wasm32"))`.
  */
@@ -5443,19 +5679,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_func_connect_pinned() != 13736) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp() != 56169) {
+    if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp() != 40975) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_config() != 35502) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption() != 52312) {
+    if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption() != 38681) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_func_connect_pinned_with_config() != 36966) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 56380) {
+    if (uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 43340) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_acceptoutcome_has_early_data() != 35020) {
@@ -5494,7 +5730,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_method_phantomsession_accept_stream() != 18738) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_await_ready() != 29445) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_await_ready() != 43401) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomsession_connection_state() != 5175) {
@@ -5521,10 +5757,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_method_phantomsession_metrics_snapshot() != 13889) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_migrate() != 13926) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_migrate() != 52007) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_open_stream() != 61871) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_open_stream() != 16360) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomsession_peer_addr() != 8519) {
@@ -5533,19 +5769,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_method_phantomsession_queued_count() != 33659) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_recv() != 6660) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_recv() != 33455) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomsession_resumption_hint() != 62628) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_send() != 6054) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_send() != 52397) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 13691) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_supports_migration() != 35412) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_supports_migration() != 24184) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping() != 8496) {
@@ -5560,7 +5796,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 57646) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomstream_recv() != 45283) {
+    if (uniffi_phantom_protocol_checksum_method_phantomstream_recv() != 11746) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomstream_send_reliable() != 35264) {
@@ -5569,7 +5805,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable() != 18144) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomstream_set_priority() != 63660) {
+    if (uniffi_phantom_protocol_checksum_method_phantomstream_set_priority() != 8714) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomstream_stream_id() != 46486) {

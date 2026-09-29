@@ -26,7 +26,7 @@ replace the `tcpSocket` probes, which have nothing to connect to on a UDP port.
 | Docker | `docs/operations/docker.md` | Distroless / alpine variants; multi-arch builds. |
 | systemd | `docs/operations/systemd.md` | Hardening profile, sysctl tuning, multi-instance template. |
 | Kubernetes | [`kubernetes.md`](kubernetes.md) | Deployment + Service + probes + Secrets + PDB + HPA + NetworkPolicy. Operator remains a follow-up. |
-| Helm | [`helm/phantom-protocol/`](helm/phantom-protocol/README.md) | Production chart (appVersion 0.3.0) implementing every pattern in `kubernetes.md`. |
+| Helm | [`helm/phantom-protocol/`](helm/phantom-protocol/README.md) | Production chart (appVersion 0.4.0) implementing every pattern in `kubernetes.md`. |
 | AWS EC2 / bare metal | use `systemd` guide | Same unit file applies. |
 
 ## Client-side

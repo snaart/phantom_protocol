@@ -16,24 +16,29 @@ entry. The remaining FIPS work (`fips-security-policy.md`,
 `key-management.md`, etc.) is documentation + the eventual CMVP
 submission, not code.
 
+> **Commit ids in this file were re-derived after the pre-0.3.0 history
+> rewrite** — see `../policy/versioning.md` § 10, "Commit ids before 0.3.0". Each
+> citation now names the implementing path as well, because a path survives a
+> rewrite and a hash does not.
+
 ---
 
 ## 1. Current primitive inventory vs. FIPS-approved set
 
 | Operation | Default build | `--features fips` build | Status |
 | --- | --- | --- | --- |
-| Classical KEM | X25519 (`x25519-dalek`) | ECDH P-256 via `aws-lc-rs::agreement` | ✅ A4 (commit `67ef976`). Wire-incompatible across modes; gated by `PROTOCOL_VARIANT`. |
-| Post-quantum KEM | ML-KEM-768 (`ml-kem = 0.3`, FIPS 203 RustCrypto pure-Rust) | identical | ✅ Phase 5.1, commit `7c7bde7`. CAVP vectors in `core/tests/cavp.rs`. |
+| Classical KEM | X25519 (`x25519-dalek`) | ECDH P-256 via `aws-lc-rs::agreement` | ✅ A4 (`6c120ae`, `core/src/crypto/hybrid_kem.rs`). Wire-incompatible across modes; gated by `PROTOCOL_VARIANT`. |
+| Post-quantum KEM | ML-KEM-768 (`ml-kem = 0.3`, FIPS 203 RustCrypto pure-Rust) | identical | ✅ Phase 5.1 (`a91b2c9`, `core/src/crypto/hybrid_kem.rs`). CAVP vectors in `core/tests/cavp.rs`. |
 | Classical signature | Ed25519 (`ed25519-dalek`) | identical | ✅ FIPS 186-5 approves EdDSA(Ed25519) out of the box. |
-| Post-quantum signature | ML-DSA-65 (`ml-dsa = 0.1.1`, FIPS 204 RustCrypto pure-Rust) | identical | ✅ Phase 5.1, commit `7c7bde7`. CAVP vectors in `core/tests/cavp.rs`. |
-| Symmetric AEAD | AES-256-GCM via `ring` | AES-256-GCM via `aws-lc-rs::aead` (AWS-LC-FIPS) | ✅ A2 (commit `d691573`). Identical API surface; backend swap only. |
-| Symmetric AEAD (alt) | ChaCha20-Poly1305 | rejected at handshake with `CoreError::CipherSuiteUnavailable` | ✅ A3 (commit `cd79cbd`). Enum variant stays for wire-format stability. |
+| Post-quantum signature | ML-DSA-65 (`ml-dsa = 0.1.1`, FIPS 204 RustCrypto pure-Rust) | identical | ✅ Phase 5.1 (`a91b2c9`, `core/src/crypto/hybrid_sign.rs`). CAVP vectors in `core/tests/cavp.rs`. |
+| Symmetric AEAD | AES-256-GCM via `ring` | AES-256-GCM via `aws-lc-rs::aead` (AWS-LC-FIPS) | ✅ A2 (`2a657e3`, `core/src/crypto/adaptive_crypto.rs`). Identical API surface; backend swap only. |
+| Symmetric AEAD (alt) | ChaCha20-Poly1305 | rejected at handshake with `CoreError::CipherSuiteUnavailable` | ✅ A3 (`aabdb84`, `core/src/crypto/adaptive_crypto.rs`). Enum variant stays for wire-format stability. |
 | Hash | SHA-256 (`sha2`) | identical | ✅ FIPS 180-4. |
-| Hash (KDF context) | `blake3::derive_key` | `HKDF-SHA-256.expand(label.as_bytes())` | ✅ A5 (commit `c2fa013`). Every KDF call site (12 today) is swapped via `crypto::kdf::derive_key_32`. PoW `blake3` stays (not KDF). |
+| Hash (KDF context) | `blake3::derive_key` | `HKDF-SHA-256.expand(label.as_bytes())` | ✅ A5 (`7389ef4`, `core/src/crypto/kdf.rs`). Every KDF call site (12 today) is swapped via `crypto::kdf::derive_key_32`. PoW `blake3` stays (not KDF). |
 | KDF (HKDF) | HKDF-SHA-256 (`hkdf`) | identical | ✅ NIST SP 800-56C. |
 | HMAC | HMAC-SHA-256 (`hmac`) | identical | ✅ FIPS 198-1. |
-| RNG | `getrandom` → OS DRBG | `aws-lc-rs::rand::SystemRandom` (CTR_DRBG inside AWS-LC-FIPS module, SP 800-90A § 10.2.1) | ✅ A6 (commit `2ec02b7`). Routed through the `RngProvider for OsRng` impl so production call sites pick up the swap automatically. |
-| Power-on self-test | not invoked | `crypto::self_tests::run_post` wired into `PhantomListener::bind*`, `PhantomUdpListener::bind_udp*`, `SessionBuilder::connect`, the seven `connect_pinned*` free functions and the shared client background task via `ensure_post_passed` (cached `OnceLock`) | ✅ A7 (commit `782ea3d`). Failure returns `CoreError::FipsSelfTestFailure`. |
+| RNG | `getrandom` → OS DRBG | `aws-lc-rs::rand::SystemRandom` (CTR_DRBG inside AWS-LC-FIPS module, SP 800-90A § 10.2.1) | ✅ A6 (`3a0833b`, `core/src/crypto/rng.rs`). Routed through the `RngProvider for OsRng` impl so production call sites pick up the swap automatically. |
+| Power-on self-test | not invoked | `crypto::self_tests::run_post` wired into `PhantomListener::bind*`, `PhantomUdpListener::bind_udp*`, `SessionBuilder::connect`, the seven `connect_pinned*` free functions and the shared client background task via `ensure_post_passed` (cached `OnceLock`) | ✅ A7 (`45589c5`, `core/src/api/{listener,udp_listener,session}.rs`). Failure returns `CoreError::FipsSelfTestFailure`. |
 
 Bottom line: under `--features fips`, **all primitive-level gaps from
 the original gap analysis are closed**. The build is FIPS-substrate
@@ -48,8 +53,8 @@ bootstrap.
 The `fips` Cargo feature pulls in `aws-lc-rs` (AWS-LC-FIPS via the
 `fips` aws-lc-rs sub-feature) and cfg-gates every non-FIPS-approved
 primitive call site. The flag implies `std` and is mutually exclusive
-with `no-std` (enforced by a `compile_error!` in `core/src/lib.rs`,
-A8 commit `3fae01d`).
+with `no-std` (enforced by the first `compile_error!` in `core/src/lib.rs`,
+A8 — `16aeac0`).
 
 | Decision | Choice | Source |
 | --- | --- | --- |
@@ -97,8 +102,8 @@ Mechanics, by item:
 A FIPS-validated module must run **power-on self-tests (POST)** at
 initialization and **conditional self-tests** at key-generation
 boundaries. **Implemented** in `core/src/crypto/self_tests.rs`
-(Phase 5.5 commit `2dbe1cd` for the test battery; A7 commit `782ea3d`
-for the bind/connect wiring).
+(Phase 5.5 — `4743e16` — for the test battery; A7 — `45589c5` — for the
+bind/connect wiring).
 
 POST coverage (`run_post`):
 - AEAD round-trip per active cipher suite — AES-256-GCM
@@ -217,7 +222,7 @@ already isolates the two at the handshake, and a deliberate `WIRE_VERSION` /
 ## 8. Current readiness percentage
 
 Rough scoring against FIPS 140-3 Level 1 requirements after the
-`fips` primitive swap rollout (commits `613473a`..`5dd39c7`):
+`fips` primitive swap rollout (`824aca6`..`ce44c3f`):
 
 | Category | Status | Notes |
 | --- | --- | --- |

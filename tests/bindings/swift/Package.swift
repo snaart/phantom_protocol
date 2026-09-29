@@ -1,16 +1,23 @@
 // swift-tools-version:5.7
 // Package.swift — SwiftPM manifest for the phantom_protocol UniFFI binding.
 //
-// Consumes a `PhantomProtocol.xcframework` built by build-xcframework.sh.
-// The XCFramework holds the per-iOS-target static `libphantom_protocol.a`
-// slices; this package wires it together with the generated Swift
-// source (`phantom_protocol.swift`). `phantom_protocolFFI.h` and
-// `phantom_protocolFFI.modulemap` are embedded inside the XCFramework by
-// `xcodebuild -create-xcframework -headers ...`, so SwiftPM consumers
-// do not see them as loose files.
+// Consumes a `PhantomProtocol.xcframework` built by build-xcframework.sh. The
+// XCFramework holds the static `libphantom_protocol.a` slices for the three
+// platforms declared below — iOS device, iOS simulator and macOS — together
+// with `phantom_protocolFFI.h` and a `module.modulemap` that names the
+// `phantom_protocolFFI` module the generated Swift imports. The header and the
+// modulemap are staged into the framework by the build script, so SwiftPM
+// consumers never see them as loose files.
+//
+// `platforms:` and the slice list in build-xcframework.sh are one decision in
+// two places: a platform declared here without a slice in the framework
+// resolves fine and then fails to link, so change them together.
 //
 // Building the XCFramework:
 //     ./build-xcframework.sh
+//
+// Checking that the binding compiles against it (macOS host):
+//     swift build
 //
 // Using in an app:
 //     dependencies: [ .package(path: "path/to/tests/bindings/swift") ],

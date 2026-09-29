@@ -46,6 +46,40 @@ each reported symbol, and its owner, to appear there. The report itself is attac
 to every pull-request run as the `semver-checks-report` artifact and printed to the
 job summary.
 
+Which lints run is decided by the release type, and that is read out of the tree
+rather than written into the workflow: `scripts/semver_report.sh` compares
+`core/Cargo.toml`'s version against the newest release heading below it in
+`CHANGELOG.md`, so `0.3.0 → 0.4.0` is checked as the minor release this section lets
+break public API, and a `0.4.0 → 0.4.1` step would be checked as the patch release it
+defines as "bugfix / docs only".
+It matters because the narrower type skips lints rather than relabelling findings: a
+`minor` run of this crate performs 196 checks where a `patch` run performs 223 — counts from
+cargo-semver-checks 0.48.0, against the 0.50.0 CI installs, so treat them as illustrative and
+take the real ones from the `Checked … N checks` line of the run in front of you. Until
+0.4.0 the type was the fixed word `minor`, which was the right assumption before a
+version had been bumped and the wrong one after.
+
+Reading it out of the tree is a prediction, though, because the baseline is not in the
+tree: it is whatever crates.io has published, and the tree reads the same on both
+sides of a publish. With `0.4.0` in `core/Cargo.toml` and `## [0.4.0]` the newest
+heading, the step reads `0.3.0 → 0.4.0` both in the pull request that cuts the
+release and in every pull request after it has shipped — where the real step is
+`0.4.0 → 0.4.0` and the right type is `patch`. So the prediction is checked against
+the step the tool says it compared, and correcting it is not the same as refusing:
+
+- A type **given** as `--release-type` that permits more than that step fails the
+  script. A caller asked for a particular comparison and did not get it, which is a
+  setup error worth a red check.
+- A type the script **derived** that permits more is re-run once at the narrower one,
+  and that report is the one kept. The tree was guessing and the tool has just
+  supplied what it was guessing about; the second run reads the baseline rustdoc the
+  first cached. A step narrower again on the re-run means a release was published
+  mid-run, and that fails rather than retrying.
+
+Where the manifest version has no release below it in `CHANGELOG.md` at all there is
+no step to read, and the script assumes `patch` — the strictest — because the work
+may ship in either kind of release.
+
 The comparison covers default features plus `telemetry-otel`, `mimicry` and
 `embedded` — the largest set of this crate's features that builds together on one
 host, and the same set docs.rs uses. `fips`, `wasi-leg` and `no-std` are compared
@@ -82,9 +116,12 @@ The wire format is **one protocol with one pinned version byte**. There is no
 `VersionedPacket` enum, no per-session `wire_version` negotiation, and no
 in-protocol fallback. That is a decision, not an absence of peers: 0.2.x is
 published on crates.io and speaks `WIRE_VERSION` 6 / `PROTOCOL_VERSION` 3, and
-0.3.0 (8 / 5) cannot talk to it. Pre-1.0 a wire change ships as a hard cut
-rather than as something to negotiate — a peer on the other side of the cut is
-refused at the handshake, and the two ends of a connection upgrade together.
+every 0.3.x and 0.4.x release (8 / 5) cannot talk to it. Pre-1.0 a wire change ships as a
+hard cut rather than as something to negotiate — a peer on the other side of the cut is
+refused at the handshake, and the two ends of a connection upgrade together. The converse
+does not follow: a minor bump is *allowed* to cut the wire and need not, and 0.4.0 did not
+— it left both constants at 0.3.0's values, so a 0.4.0 peer and a 0.3.0 peer interoperate
+and either end may be upgraded alone (CI's `interop` job proves it in both directions).
 
 Two constants pin the format:
 
@@ -165,27 +202,62 @@ Both are **tamper-check anchors**, not negotiated sets:
 
 ### Adding bytes without a version bump
 
-The single `PhantomPacket { header, payload, extensions }` carries an
-`extensions: Vec<u8>` TLV field as forward-compatible headroom — reserved and
-empty for 1.0. As of WIRE v6 it no longer rides on the data-plane wire (it was
-always empty), but the AEAD AAD still binds an empty extensions slice. New TLV
-records can ride inside `extensions` without touching `WIRE_VERSION` — a peer
-that does not know a record deserialises it as an empty/ignored `Vec` (the
-ignored-on-read case is a documented contract).
+**There is no such mechanism on the data plane, and this section used to promise
+one.** It said new TLV records could ride inside `PhantomPacket::extensions`
+without touching `WIRE_VERSION`, and that latitude extended to the "reserved"
+flag bits `0x1000 .. 0x8000`. Neither holds against the code:
 
-`extensions` **is** covered by the AEAD AAD (T4.1 — the AAD is the reconstructed
-47-byte header image followed by the `extensions` TLV; see `PROTOCOL.md` § 4.1 /
-§ 5), so its bytes are integrity-protected, not attacker-malleable. Even so,
-security-sensitive amendments — anything that steers protocol behaviour, e.g.
+- `extensions` has not been on the data-plane wire since **WIRE v6**.
+  `PhantomPacket::to_wire` emits `header ‖ payload` and nothing else, and
+  `from_wire` hands back an empty `Vec` unconditionally
+  (`core/src/transport/types.rs`). A record written into that field is not
+  ignored by an old peer — it is not transmitted to any peer. The field survives
+  because the AEAD AAD still binds the (empty) slice after the 47-byte header
+  image, which is a formality of the AAD construction, not a carrier.
+- Three of the four bits the section called reserved were spent: `KEEPALIVE`
+  `0x1000` inside v5, then `PADDED` `0x2000` and `COVER` `0x4000` with the v6
+  bump. `0x8000` is the **sole remaining spare**, and `PacketFlags::CONTROL`'s
+  documentation explains why WIRE v8 did not take it: a flag is a 16-entry
+  namespace that runs out, so in-session control frames were given a one-byte
+  subtype under the existing `CONTROL` bit instead. The next amendment should do
+  the same rather than spend the last bit.
+
+  Those three also record when a new bit does and does not need a bump, which is
+  narrower than "reserved, help yourself". The test is whether an unaware
+  receiver's **existing** rules discard the packet the bit marks without
+  misreading it. `KEEPALIVE` marks a packet with an empty plaintext and cleared
+  it. `PADDED` could not: its trailer sits inside the AEAD plaintext, so a
+  receiver that does not strip it hands the padding to the application as data —
+  which is why it rode v6 rather than a spare-bit no-op.
+
+So the honest rule for the data plane is the one § "Bumping the pinned version"
+states: a change to what goes on the wire moves both constants. Three kinds of
+change still need no bump, and they are the only three:
+
+- **A new `ENCRYPTED | CONTROL` subtype.** The subtype is one byte, `0x00` is
+  deliberately unassigned so a zeroed buffer is not a valid control frame, `CLOSE
+  = 0x01` is the only assignment, and the receiver rule is that **every** dispatch
+  arm consumes the packet including the unknown one (`PROTOCOL.md` § 4.11). A peer
+  on this wire version that does not know a later subtype therefore drops it
+  without misrouting it or delivering it as stream bytes — which is what "ignored
+  on read" has to mean to be safe, and what the `extensions` field was imagined to
+  provide and never did.
+- **A new `PacketFlags` bit that passes the test above**, i.e. one whose packet an
+  unaware receiver already discards intact. `0x8000` is the only bit left to spend
+  this way, and the `CONTROL` subtype byte exists so it does not have to be.
+- **Changes that leave the on-wire bytes byte-identical** — a refactor, a
+  different internal representation, a new `pub fn` that emits nothing new.
+
+Anything else — a new header byte, a new AEAD-plaintext codec, a changed KDF
+label, or a flag bit that fails the test — is a wire change and takes both
+constants with it, for the reason § 3 gives: the packet-level version check drops
+a mismatched frame silently, so a data-plane change without a handshake bump turns
+a diagnosable refusal into a session that agrees keys and then moves nothing.
+
+Security-sensitive fields — anything that steers protocol behaviour, e.g.
 **packet-number / SACK / ACK-range fields** for retransmission and congestion
-control — belong in the structured header (a deliberate `WIRE_VERSION` bump),
-not in the unstructured TLV slot, so the codec validates them as first-class
-fields. Do not overload `extensions` for them.
-
-The same no-bump latitude applies to new `PacketFlags` bits (`0x1000 .. 0x8000`
-are reserved) — but note the flags **are** AAD-covered (they live in the header),
-so unlike `extensions` they are integrity-protected — and to implementation
-changes that leave the on-wire bytes byte-identical.
+control — belong in the structured codecs the parser validates as first-class
+fields, never in a free-form slot. That part of the old text was right and stands.
 
 ### Bumping the pinned version (a deliberate, breaking change)
 
@@ -231,7 +303,17 @@ API:
 
 Practice:
 
-- Every UniFFI-affecting change carries a CHANGELOG entry with an `FFI:` prefix.
+- Every UniFFI-affecting change carries a CHANGELOG entry that **says what a
+  binding consumer has to change**, in the Keep-a-Changelog section the change
+  belongs to — not under a marker of its own. An earlier version of this page
+  prescribed an `FFI:` prefix; no entry has ever carried one, and the convention
+  the CHANGELOG actually follows is better: the FFI consequence is stated in the
+  entry's own prose, with a before/after table per language where the call shape
+  moved, because a prefix tells a reader that something changed and a table tells
+  them what to type. `0.3.0`'s `ResumptionHint` and `ConnectionState` entries are
+  the worked examples. What is not negotiable is that the entry exists: the FFI
+  ABI is a second compatibility axis `cargo-semver-checks` cannot see, so nothing
+  but the entry records it.
 - Regenerate bindings as part of the same commit that changes a UniFFI-exported
   item, via the per-language scripts under `tests/bindings/`
   (`generate_python.sh`, `generate_swift.sh`, `generate_kotlin.sh`,
@@ -307,10 +389,10 @@ Public items marked `#[deprecated]`:
 - Are scheduled for removal in a `// REMOVE-IN: 0.X.0` comment so a release-time
   sweep can find them.
 
-The same applies to FFI exports (the deprecation is called out in the CHANGELOG
-`FFI:` entry). The wire format has no deprecation window — it is a single pinned
-version, so a wire change is a hard cut (§3) rather than a coexist-then-remove
-migration.
+The same applies to FFI exports (the deprecation is called out in that item's own
+CHANGELOG entry, naming the replacement call in each binding language). The wire
+format has no deprecation window — it is a single pinned version, so a wire change
+is a hard cut (§3) rather than a coexist-then-remove migration.
 
 ---
 
@@ -321,7 +403,9 @@ migration.
 | Refactor with no API change | patch | — | — | optional |
 | New `pub fn` / `pub struct` | minor | — | possibly minor | `Added:` |
 | Breaking `pub fn` signature | major (post-1.0) / minor (pre-1.0) | — | major-break | `Changed (breaking):` |
-| Wire amendment via a **forge-safe** `extensions` TLV / reserved flag bit | patch | — | — | `Added:` |
+| New `ENCRYPTED \| CONTROL` subtype (the one open-ended no-bump extension point) | patch | — | — | `Added:` |
+| New `PacketFlags` bit an unaware receiver already discards intact | patch | — | — | `Added:` |
+| New `PacketFlags` bit an unaware receiver would misread, new AEAD-plaintext codec, or any header change | major | `WIRE_VERSION` **and** `PROTOCOL_VERSION` +1 | — | `Changed (wire-breaking):` |
 | Security-sensitive wire field (packet-number / SACK / ACK-range) | major | `WIRE_VERSION` +1 | — | `Changed (wire-breaking):` |
 | Wire-format change (header / nonce / KDF label / handshake layout) | major | `WIRE_VERSION` / `PROTOCOL_VERSION` +1 | possibly | `Changed (wire-breaking):` |
 | Feature added | minor | — | possibly | `Added:` |
@@ -344,7 +428,29 @@ migration.
   `scripts/check_changelog_breaking_test.sh` for the gate's own cases.
 - `git tag` policy: `vX.Y.Z` on the commit that produced the corresponding
   `Cargo.toml` version; the tag-triggered release pipeline builds cross-target
-  artifacts with SLSA-3 build-provenance attestation.
+  artifacts and attaches a sigstore-backed in-toto build-provenance attestation to
+  each (SLSA v1.0 Build L2 — see `DEFERRED_WORK.md` §1 for what L3 would take).
+
+### Commit ids before 0.3.0
+
+**The history up to and including the `v0.3.0` tag was rewritten, so every commit
+id minted before that tag changed.** A seven-character hash copied out of an older
+document, an old branch name, a stale PR comment or a local clone will not resolve
+against this repository; `git cat-file -t <sha>` answering `fatal: Not a valid
+object name` means the object never existed under that name here, not that the work
+is missing. The `v0.1.0`, `v0.1.1`, `v0.2.0`, `v0.2.1`, `v0.2.2` and `v0.3.0` tags
+were re-pointed at the rewritten commits and are the durable handles for those
+releases.
+
+What survived the rewrite is the commit **subjects**, so the reliable lookup for
+an old citation is `git log --all --grep '<subject>' -F` rather than the hash. The
+documents that carried pre-0.3.0 ids — `../compliance/fips-readiness.md`,
+`../observability/refactor-plan.md`, `../operations/{mobile,wasi}.md`,
+`../compliance/cc-pp-mapping.md` and the three `../security/audit-report-*.md`
+files — were re-pointed that way in 0.4.0; where a citation could not be resolved
+to one commit it was replaced with a path, a tag or a date, which is why most of
+them now name a file beside (or instead of) a hash. Prefer that form in new text:
+a path is checkable by opening it and survives the next rewrite.
 
 ---
 

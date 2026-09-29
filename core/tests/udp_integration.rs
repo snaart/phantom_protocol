@@ -2609,3 +2609,111 @@ async fn udp_integration_disconnect_pushes_a_queued_write_before_announcing() {
         "a write queued immediately before disconnect() must still reach the peer"
     );
 }
+
+/// `session_cache_capacity = 0` turns 0-RTT off on the PhantomUDP listener too.
+///
+/// Both listeners build their ticket cache from the same `PhantomConfig`, and the cache kept
+/// one ticket when it was told to keep none — so a server configured with 0-RTT off went on
+/// accepting it. What the test demands is one-sided on purpose: over PhantomUDP a resume that
+/// the server *would* accept can still be declined for reasons of its own (the cookie round
+/// has to complete first), so "accepted" is not something a test may demand here, while
+/// "declined" is exactly what the configuration promises. Declined is asserted as a resolved
+/// `Some(false)` rather than as "anything but acceptance", so that a handshake which never
+/// produces a verdict fails the test instead of satisfying it. The payload still has to
+/// arrive — declining early data may never lose it (Invariant 9).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_zero_session_cache_capacity_refuses_zero_rtt() {
+    use phantom_protocol::api::identity::generate_signing_key;
+    use phantom_protocol::api::session::{connect_pinned_udp, connect_pinned_udp_with_resumption};
+    use phantom_protocol::PhantomConfig;
+
+    const PAYLOAD: &[u8] = b"early-data-under-a-disabled-udp-cache";
+
+    let seed = generate_signing_key().expect("generate_signing_key");
+    // `PhantomConfig` is `#[non_exhaustive]`, so an outside consumer reaches this field the
+    // same way this test does: take a preset and assign.
+    let mut config = PhantomConfig::server();
+    config.session_cache_capacity = 0;
+    let listener =
+        PhantomUdpListener::bind_udp_with_config_bytes("127.0.0.1:0".to_string(), seed, config)
+            .await
+            .expect("bind_udp_with_config_bytes");
+    let local: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key_bytes = listener.verifying_key_bytes();
+
+    let server = tokio::spawn(async move {
+        let first = listener.clone().accept().await.expect("accept 1").session();
+        assert_eq!(first.recv().await.expect("recv 1"), b"warmup");
+        let outcome = listener.accept().await.expect("accept 2");
+        let taken = outcome.take_early_data();
+        let session = outcome.session();
+        assert!(
+            taken.is_none(),
+            "a listener that keeps no tickets cannot take early-data as 0-RTT"
+        );
+        let mut buf = Vec::with_capacity(PAYLOAD.len());
+        while buf.len() < PAYLOAD.len() {
+            buf.extend(session.recv().await.expect("re-sent early-data"));
+        }
+        assert_eq!(buf, PAYLOAD, "a declined payload is re-sent, not dropped");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(first);
+    });
+
+    let c1 = connect_pinned_udp("127.0.0.1".to_string(), local.port(), key_bytes.clone())
+        .await
+        .expect("connect_pinned_udp c1");
+    c1.send(b"warmup".to_vec()).await.expect("c1 send");
+    let hint = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(h) = c1.resumption_hint().await {
+                return h;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("resumption hint did not arrive");
+
+    let c2 = connect_pinned_udp_with_resumption(
+        "127.0.0.1".to_string(),
+        local.port(),
+        key_bytes,
+        hint,
+        PAYLOAD.to_vec(),
+    )
+    .await
+    .expect("connect_pinned_udp_with_resumption");
+    timeout(Duration::from_secs(15), c2.await_ready())
+        .await
+        .expect("handshake resolved in time")
+        .expect("a declined early-data payload must never fail the handshake");
+
+    let mut verdict = None;
+    for _ in 0..500 {
+        verdict = c2.early_data_accepted().await;
+        if verdict.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // `assert_eq!(Some(false))`, not `assert_ne!(Some(true))`: the loop above gives up after
+    // ten seconds and leaves `verdict` at `None`, and `None` satisfies "not accepted" while
+    // meaning "the handshake never resolved a verdict at all" — so the weaker form passed
+    // whether the configuration worked or the connect broke. The client sent early-data, so
+    // a resolved verdict is `Some(_)` by construction (`process_server_hello` maps the
+    // server's signed `early_data_accepted` through `ClientHello.early_data.is_some()`), and
+    // a server keeping no tickets makes it `Some(false)`. Its TCP twin in
+    // `tcp_integration.rs` already asserts exactly this.
+    assert_eq!(
+        verdict,
+        Some(false),
+        "session_cache_capacity = 0 must leave no ticket for a resume to find"
+    );
+
+    timeout(Duration::from_secs(20), server)
+        .await
+        .expect("server task finished")
+        .expect("server task");
+}

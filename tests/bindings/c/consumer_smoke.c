@@ -82,19 +82,31 @@ int main(void) {
     }
 
     /* phantom_helpers.h — drive the ASYNC future ABI through a BLOCKING call.
-     * A pinned connect to a dead loopback port (nothing listening on :1) fails
-     * fast (connection refused) and the helper returns NULL — proving the
-     * future-poll / complete / free machinery works end-to-end without the
-     * caller hand-rolling a poll loop. */
+     * A 64-byte stub is not a HybridVerifyingKey, so the connect fails while
+     * decoding the pin — before any socket is opened — and the helper returns
+     * NULL with the lowered CoreError discriminant in the out-parameter. That
+     * proves the future-poll / complete / free machinery works end-to-end and
+     * that a failure reaches the caller as a reason rather than a bare NULL.
+     * The two-sided pinning contract (right key, wrong key against a live
+     * listener) is pinning_smoke.c's job. */
     uint8_t dummy_key[64] = {0};
-    void *pinned = phantom_blocking_connect_pinned("127.0.0.1", 1, dummy_key,
-                                                   sizeof dummy_key);
+    int32_t connect_err = PHANTOM_ERR_UNKNOWN;
+    void *pinned = phantom_blocking_connect_pinned_checked("127.0.0.1", 1, dummy_key,
+                                                          sizeof dummy_key, &connect_err);
     if (pinned != NULL) {
-        fprintf(stderr, "FAIL: blocking_connect_pinned to a dead port should be NULL\n");
+        fprintf(stderr, "FAIL: blocking_connect_pinned with a stub key should be NULL\n");
         uniffi_phantom_protocol_fn_free_phantomsession(pinned, &status);
         return 1;
     }
+    if (connect_err != PHANTOM_ERR_CRYPTO) {
+        fprintf(stderr, "FAIL: a malformed pinned key should report PHANTOM_ERR_CRYPTO, got %d\n",
+                connect_err);
+        return 1;
+    }
     /* Compile-link the rest of the blocking client surface. */
+    (void)&phantom_blocking_connect_pinned;
+    (void)&phantom_blocking_await_ready;
+    (void)&phantom_blocking_last_error;
     (void)&phantom_blocking_send;
     (void)&phantom_blocking_recv;
     (void)&phantom_blocking_disconnect;

@@ -6,13 +6,16 @@
 # directly — so `pip install phantom-protocol-<platform>.whl` works without
 # any extra steps.
 #
-# Build a wheel (from the repo root):
+# Build a wheel (from this directory — manifest-path is set below):
 #   pip install maturin
-#   maturin build --release --manifest-path core/Cargo.toml
+#   cd python && maturin build --release
 #
-# The produced wheel lands in target/wheels/.
+# The produced wheel lands in target/wheels/. Check it end to end with
+#   python/verify_wheel.sh
+# which builds, installs into a fresh venv and exercises the imported package.
+#
 # To install directly from source (development):
-#   maturin develop --release --manifest-path core/Cargo.toml
+#   cd python && maturin develop --release
 #
 # Publishing (manual — see tests/bindings/PACKAGING.md):
 #   maturin publish --manifest-path core/Cargo.toml
@@ -26,7 +29,7 @@ build-backend = "maturin"
 name = "phantom-protocol"
 # Version is read from core/Cargo.toml by maturin; keep in sync manually if
 # overriding here. Remove the line below to have maturin derive it from Cargo.
-version = "0.3.0"
+version = "0.4.0"
 description = "Post-quantum-secure L4/L6 transport SDK (Python binding)"
 readme = "../README.md"
 requires-python = ">=3.8"
@@ -68,10 +71,25 @@ manifest-path = "../core/Cargo.toml"
 # bindings = "uniffi".
 features = ["bindings"]
 
-# python-source: the directory that contains the Python package to include in
-# the wheel. Relative to this pyproject.toml (i.e., the python/ directory
-# itself). maturin looks for `phantom_protocol/` here.
-python-source = "."
+# NO `python-source` HERE, deliberately. In uniffi bindings mode maturin does not
+# generate a single module — it generates a PACKAGE directory named after the
+# crate, holding `phantom_protocol.py`, an `__init__.py` that star-imports it,
+# and the cdylib. Setting `python-source = "."` made maturin merge that package
+# into the hand-written `python/phantom_protocol/` of the same name, so the wheel
+# shipped `phantom_protocol/__init__.py` alongside a nested
+# `phantom_protocol/phantom_protocol/` — and `import phantom_protocol` then died
+# on `cannot import name '__all__' from 'phantom_protocol.phantom_protocol'`,
+# because the name it reached was the generated sub-PACKAGE (whose `__init__.py`
+# only star-imports and so re-exports no `__all__`) rather than the generated
+# module. Letting maturin own the package outright gives the layout its own
+# `__init__.py` is written for:
+#
+#     phantom_protocol/__init__.py            from .phantom_protocol import *
+#     phantom_protocol/phantom_protocol.py    the generated glue
+#     phantom_protocol/libphantom_protocol.*  the cdylib, loaded by the glue
+#
+# `python/verify_wheel.sh` builds a wheel from this file and imports it in a
+# throwaway venv, which is what keeps that claim honest.
 
 # Strip debug symbols in release mode to keep the wheel size reasonable.
 # The workspace release profile already strips symbols; this is a belt-and-

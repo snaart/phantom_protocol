@@ -1,0 +1,3 @@
+# Built by build-xcframework.sh and swift build — per-machine artifacts, never committed.
+PhantomProtocol.xcframework/
+.build/

@@ -7,7 +7,8 @@ use crate::observability::{Observability, ObservabilityConfig};
 use crate::runtime::{Runtime, SpawnHandle, TokioRuntime};
 use crate::transport::handshake::{
     client_hello_lengths_within_bounds, ClientHello, HandshakeError, HandshakeResponse,
-    HandshakeServer, ServerReply,
+    HandshakeServer, ServerReject, ServerReply, MAX_HANDSHAKE_RETRY_ROUNDS, PROTOCOL_VARIANT,
+    PROTOCOL_VERSION, REJECT_PROTOCOL_VARIANT,
 };
 use crate::transport::types::LegType;
 use crate::transport::write_stall::DEFAULT_WRITE_STALL_TIMEOUT;
@@ -26,12 +27,6 @@ use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
 /// round while still bounding a slowloris. Routed through the `Runtime` clock so
 /// a custom `bind_with_runtime` runtime (incl. tests) is honored.
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
-
-/// Max cookie/PoW `Retry` rounds the server drives for one connection (DOS-4).
-/// One cookie round + one PoW round is the legitimate maximum; a peer that keeps
-/// triggering `Retry` without ever satisfying the gate is dropped rather than
-/// allowed to occupy the handshake indefinitely.
-const MAX_SERVER_RETRY_ROUNDS: u32 = 2;
 
 /// Max concurrent in-flight (accepted-but-not-yet-established) handshakes the
 /// listener drives at once (H4 decouple) — a dedicated bound distinct from any
@@ -577,6 +572,10 @@ pub(crate) async fn drive_server_handshake<T: SessionTransport>(
     client_ip: IpAddr,
 ) -> Result<(crate::transport::session::Session, Option<Vec<u8>>), CoreError> {
     let mut retry_rounds: u32 = 0;
+    // The cookie/PoW difficulty this connection is held to, decided on its first hello and
+    // re-used for every round after it. See where it is computed below for why it is fixed
+    // rather than re-derived.
+    let mut demanded_difficulty: Option<u8> = None;
     loop {
         let hello_bytes = transport.recv_bytes().await?;
         // M-7: structurally bound the ClientHello's variable fields before borsh, so a forged
@@ -598,21 +597,65 @@ pub(crate) async fn drive_server_handshake<T: SessionTransport>(
         // M-5: gate the PoW-difficulty reduction on a *valid* resume (cached ticket + verified
         // binder), not mere presence of a `resume_session_id` — else a flagged abuser attaches
         // 32 random bytes and pays zero PoW, nullifying the per-IP reputation escalation.
-        let has_ticket = hs.has_valid_resume(&client_hello);
-        let difficulty = hs
-            .adaptive_difficulty()
-            .max(hs.reputation_difficulty(client_ip, has_ticket));
+        //
+        // Computed ONCE per connection and re-used for its retries, which is what
+        // `demanded_difficulty` holds. Both inputs move while a handshake is in flight — the
+        // load tier steps at 100, 500, 2000 and 10000 handshakes a minute, and the per-IP
+        // escalation jumps to 9 on this address's first recorded violation — and re-deriving
+        // the figure on each round verified the client's answer against a bar that had moved
+        // since it was set. The solution was then invalid through no fault of the client, the
+        // server demanded another round, and three such steps exhausted the round budget: a
+        // pinned TCP connect failed about one time in twenty under concurrency from a single
+        // address, with the untyped `NetworkError("early eof")` a server that closes without
+        // a reply produces. It was self-amplifying, too, since the abandonment recorded a
+        // violation against the address, which raised the difficulty for every other
+        // handshake in flight from it.
+        //
+        // Fixing it costs nothing a rising bar was buying. The gate's purpose is to price a
+        // *new* connection attempt, and this connection's price was set when it arrived; the
+        // work is paid at that price either way, and an attempt cannot be started before the
+        // load that would have raised it. What one connection can hold on to is one inflight
+        // slot at the figure in force when it began, and `MAX_INFLIGHT_HANDSHAKES` together
+        // with `HANDSHAKE_DEADLINE` is what bounds that.
+        let difficulty = match demanded_difficulty {
+            Some(fixed) => fixed,
+            None => {
+                let has_ticket = hs.has_valid_resume(&client_hello);
+                let first = hs
+                    .adaptive_difficulty()
+                    .max(hs.reputation_difficulty(client_ip, has_ticket));
+                demanded_difficulty = Some(first);
+                first
+            }
+        };
         match hs.process_client_hello(&client_hello, difficulty, client_ip) {
             HandshakeResponse::Retry(retry) => {
                 // DOS-4: bound the Retry rounds so a peer that keeps triggering
                 // Retry without satisfying the cookie/PoW gate can't occupy the
                 // handshake indefinitely.
                 retry_rounds += 1;
-                if retry_rounds > MAX_SERVER_RETRY_ROUNDS {
-                    // A peer that never satisfies the gate is a genuine violation.
-                    hs.record_violation(client_ip);
+                if retry_rounds > MAX_HANDSHAKE_RETRY_ROUNDS {
+                    // Say so before closing. Closing without a reply reached the client as
+                    // `NetworkError("early eof")` — a byte-pipe error, indistinguishable from
+                    // the network breaking, for a decision made here on purpose. The typed
+                    // reject makes it `CoreError::ProtocolRejected` with a sentence naming
+                    // the gate. Best-effort: a failed send leaves the peer with the close,
+                    // which is what it used to get.
+                    if let Ok(bytes) = ServerReply::Reject(ServerReject::retry_limit()).to_wire() {
+                        let _ = transport.send_bytes(&bytes).await;
+                    }
+                    // No reputation violation, and this is the M-4 shape rather than a
+                    // separate judgement: the escalation is meant for proof of abuse, and
+                    // running out of rounds is not proof of anything now that the bar this
+                    // peer was asked to clear no longer moves under it. It was also the
+                    // amplifier — one abandonment raised the difficulty for every other
+                    // handshake in flight from the same address, which produced more
+                    // abandonments. What bounds the cost of a peer that will not answer the
+                    // gate is this abandonment itself: the connection goes, the inflight
+                    // permit is released, and each further attempt pays the global load tier
+                    // again from the start.
                     return Err(CoreError::HandshakeError(format!(
-                        "client exceeded {MAX_SERVER_RETRY_ROUNDS} cookie/PoW retry rounds"
+                        "client exceeded {MAX_HANDSHAKE_RETRY_ROUNDS} cookie/PoW retry rounds"
                     )));
                 }
                 // T4.4: frame with the explicit discriminant byte (`[kind] ‖ borsh`).
@@ -633,28 +676,46 @@ pub(crate) async fn drive_server_handshake<T: SessionTransport>(
                 return Ok((session, early_data));
             }
             HandshakeResponse::Reject(reject) => {
-                // Forward-compat (H9): the client spoke a version we can't
-                // satisfy. Hand back a typed reject so it gets an actionable
-                // signal — the version we DO speak — instead of a silent drop,
-                // then close. Best-effort: if the send fails the client just
-                // sees the close, same as before.
+                // Forward-compat (H9) and the cross-variant guard (Invariant 10): the
+                // hello is one this build structurally cannot satisfy. Hand back a typed
+                // reject so the peer gets an actionable signal instead of a silent drop,
+                // then close. Best-effort: if the send fails the client just sees the
+                // close, same as before.
                 // T4.4: frame with the explicit discriminant byte (`[kind] ‖ borsh`).
-                if let Ok(bytes) = ServerReply::Reject(reject.clone()).to_wire() {
+                let code = reject.code;
+                if let Ok(bytes) = ServerReply::Reject(reject).to_wire() {
                     let _ = transport.send_bytes(&bytes).await;
                 }
-                // M-4: a version mismatch is detected BEFORE the address-validation cookie gate,
-                // so charging a reputation violation here could poison a spoofed / on-path-
-                // captured source IP. It is a forward-compat / misconfiguration signal, not
-                // proof of abuse → no reputation escalation.
-                return Err(CoreError::InternalError(format!(
-                    "handshake rejected: unsupported client version (server speaks v{})",
-                    reject.supported_version
-                )));
+                // M-4: both reject reasons are detected BEFORE the address-validation
+                // cookie gate, so charging a reputation violation here could poison a
+                // spoofed / on-path-captured source IP. They are forward-compat /
+                // misconfiguration signals, not proof of abuse → no reputation escalation.
+                //
+                // The server-side error names the actual reason. The reject on the wire
+                // carries only a code — it has no field for a variant tag and a patch
+                // release may not add one — so the variant bytes are taken from the hello
+                // this function still holds, which is also what keeps
+                // `HandshakeError::ProtocolVariantMismatch` the typed form of this failure
+                // on the accepting side.
+                return Err(match code {
+                    REJECT_PROTOCOL_VARIANT => {
+                        CoreError::from(HandshakeError::ProtocolVariantMismatch {
+                            expected: PROTOCOL_VARIANT.to_vec(),
+                            received: client_hello.protocol_variant.clone(),
+                        })
+                    }
+                    _ => CoreError::InternalError(format!(
+                        "handshake rejected: unsupported client version (server speaks v{})",
+                        PROTOCOL_VERSION
+                    )),
+                });
             }
             HandshakeResponse::Fail(e) => {
-                // M-4: the protocol-variant mismatch is also a pre-cookie check, so (like the
-                // version Reject above) it must not escalate a possibly-spoofed IP's reputation.
-                // Every other Fail is reached only after the cookie/PoW gate, i.e. from an
+                // M-4: a variant mismatch used to arrive here as a `Fail`; it is a
+                // `Reject` now, and the arm above is where it does not escalate. The match
+                // stays as a guard, so a future pre-cookie `Fail` of that shape cannot
+                // quietly start poisoning a possibly-spoofed IP's reputation. Every other
+                // `Fail` is reached only after the cookie/PoW gate, i.e. from an
                 // address-validated source, so it remains a genuine violation.
                 if !matches!(e, HandshakeError::ProtocolVariantMismatch { .. }) {
                     hs.record_violation(client_ip);
@@ -936,6 +997,227 @@ impl ListenerBuilder {
 mod tests {
     use super::*;
     use crate::crypto::hybrid_sign::HybridSigningKey;
+    use crate::transport::handshake::{HandshakeClient, REJECT_RETRY_LIMIT};
+    use bytes::Bytes;
+    use tokio::sync::mpsc;
+
+    /// An in-memory byte pipe, so the server handshake can be driven against a client
+    /// half the test writes by hand — which is what makes the escalation below land
+    /// between two known rounds instead of whenever a timer says.
+    ///
+    /// It wraps nothing, so it forwards nothing: the control surface every real wrapper
+    /// has to forward has no inner transport to reach here.
+    struct Wire {
+        out: mpsc::Sender<Vec<u8>>,
+        inbox: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
+    }
+
+    impl Wire {
+        fn pair() -> (Self, Self) {
+            let (a_tx, b_rx) = mpsc::channel(16);
+            let (b_tx, a_rx) = mpsc::channel(16);
+            (
+                Self {
+                    out: a_tx,
+                    inbox: tokio::sync::Mutex::new(a_rx),
+                },
+                Self {
+                    out: b_tx,
+                    inbox: tokio::sync::Mutex::new(b_rx),
+                },
+            )
+        }
+
+        async fn send(&self, bytes: &[u8]) {
+            self.out
+                .send(bytes.to_vec())
+                .await
+                .expect("the pipe is open");
+        }
+
+        async fn recv(&self) -> Option<Vec<u8>> {
+            self.inbox.lock().await.recv().await
+        }
+    }
+
+    impl SessionTransport for Wire {
+        async fn send_bytes(&self, data: &[u8]) -> Result<(), CoreError> {
+            self.out
+                .send(data.to_vec())
+                .await
+                .map_err(|_| CoreError::ConnectionClosed)
+        }
+
+        async fn recv_bytes(&self) -> Result<Bytes, CoreError> {
+            self.recv()
+                .await
+                .map(Bytes::from)
+                .ok_or(CoreError::ConnectionClosed)
+        }
+    }
+
+    /// The reply the server sent, decoded.
+    async fn next_reply(wire: &Wire) -> Option<ServerReply> {
+        let bytes = wire.recv().await?;
+        Some(ServerReply::from_wire(&bytes).expect("the server's reply decodes"))
+    }
+
+    /// A handshake whose gate difficulty would have risen between two of its rounds is
+    /// not asked to pay the new figure, and completes.
+    ///
+    /// **The defect.** `drive_server_handshake` re-derived
+    /// `max(adaptive_difficulty(), reputation_difficulty(ip))` on every round of one
+    /// connection, and both inputs move while a handshake is in flight: the load tier
+    /// steps at 100 handshakes a minute and the per-IP escalation jumps to 9 on that
+    /// address's first recorded violation. The client's proof-of-work, solved for the
+    /// figure it was handed, was then verified against a higher one, failed through no
+    /// fault of its own, and bought another round.
+    ///
+    /// **What a consumer saw.** A pinned TCP connect failed in about one attempt in
+    /// twenty under concurrency from a single address — 6, 10 and 8 failures out of 150
+    /// on three release runs of the same harness — with
+    /// `CoreError::NetworkError("early eof")`, which is what a server that closes
+    /// without a reply leaves behind and is indistinguishable from the network breaking.
+    /// Three escalation steps exhausted the round budget, and the abandonment then
+    /// recorded a violation against the address, which raised the difficulty for every
+    /// other handshake in flight from it — so one failure produced the next.
+    ///
+    /// **Why it comes back unnoticed.** Every functional handshake test drives one
+    /// connection at a time, where the load tier is 0 and the address has no history, so
+    /// the re-derived figure equals the pinned one and the two implementations are
+    /// indistinguishable. It takes a hundred handshakes in a minute, or a violation
+    /// recorded mid-flight, for them to differ — and the latter is what this test does
+    /// directly, in one round, with no concurrency and no clock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_difficulty_that_rises_mid_handshake_is_not_charged_to_the_handshake() {
+        let hs = Arc::new(HandshakeServer::new().expect("HandshakeServer::new"));
+        let ip: IpAddr = "203.0.113.7".parse().expect("parse IP");
+        let (client, server) = Wire::pair();
+        let driving = {
+            let hs = hs.clone();
+            tokio::spawn(async move { drive_server_handshake(&server, &hs, ip).await.map(|_| ()) })
+        };
+
+        let handshake = HandshakeClient::new().expect("HandshakeClient::new");
+        let mut hello = handshake.create_client_hello();
+        client
+            .send(&borsh::to_vec(&hello).expect("encode hello"))
+            .await;
+
+        // Round one: the address is clean and the server is idle, so the gate asks for a
+        // cookie and no proof of work.
+        match next_reply(&client).await.expect("a first reply") {
+            ServerReply::Retry(retry) => {
+                assert!(
+                    retry.challenge.is_none(),
+                    "precondition: an idle server asks a clean address for no proof of work"
+                );
+                hello.cookie = retry.cookie;
+            }
+            other => panic!("expected the cookie retry, got {other:?}"),
+        }
+
+        // The escalation, landing between the demand and the answer: one violation takes
+        // this address's difficulty from 0 to 9. Anything that raises either input does
+        // the same; this one is immediate and needs no clock.
+        hs.record_violation(ip);
+        assert!(
+            hs.reputation_difficulty(ip, false) > 0,
+            "precondition: a recorded violation raises this address's difficulty"
+        );
+
+        client
+            .send(&borsh::to_vec(&hello).expect("encode hello"))
+            .await;
+        match next_reply(&client).await.expect("a second reply") {
+            ServerReply::Hello(_) => {}
+            ServerReply::Retry(retry) => panic!(
+                "the server demanded another round at difficulty {:?} because its own bar \
+                 moved while this handshake was in flight",
+                retry.challenge.map(|c| c.difficulty)
+            ),
+            other => panic!("expected the ServerHello, got {other:?}"),
+        }
+        driving
+            .await
+            .expect("the driving task")
+            .expect("the handshake completes");
+    }
+
+    /// A peer that never satisfies the gate is told the handshake was abandoned, and the
+    /// abandonment costs its address nothing.
+    ///
+    /// **The defect, in two halves.** The server stopped after two retry rounds while the
+    /// client was prepared for three, so a handshake still being worked on was abandoned
+    /// mid-flight; and it abandoned it by closing, which reaches the client as
+    /// `NetworkError("early eof")` — a byte-pipe error for a decision made on purpose.
+    /// It also recorded a reputation violation, which is the M-4 shape: the escalation is
+    /// for proof of abuse, and running out of rounds is not proof of anything once the
+    /// bar the peer was asked to clear no longer moves under it. That charge was also the
+    /// amplifier, since it raised the difficulty for every other handshake in flight from
+    /// the same address.
+    ///
+    /// **Why it comes back unnoticed.** Nothing else looks at what the server does on the
+    /// round it gives up on: a client that keeps failing the gate is the case no
+    /// functional test drives, and the untyped error it produced is the same shape as a
+    /// genuine network failure — so a regression reads as flakiness rather than as a
+    /// defect.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handshake_the_server_abandons_is_typed_and_charges_the_address_nothing() {
+        let hs = Arc::new(HandshakeServer::new().expect("HandshakeServer::new"));
+        let ip: IpAddr = "203.0.113.9".parse().expect("parse IP");
+        let (client, server) = Wire::pair();
+        let driving = {
+            let hs = hs.clone();
+            tokio::spawn(async move { drive_server_handshake(&server, &hs, ip).await.map(|_| ()) })
+        };
+
+        let handshake = HandshakeClient::new().expect("HandshakeClient::new");
+        let hello = handshake.create_client_hello();
+        let encoded = borsh::to_vec(&hello).expect("encode hello");
+
+        // Never echo the cookie, so every round is a retry the gate is still waiting on.
+        // The server answers the first `MAX_HANDSHAKE_RETRY_ROUNDS` of them and refuses
+        // the next — which is exactly as many as the client is prepared to answer, and
+        // was one fewer before.
+        for round in 1..=MAX_HANDSHAKE_RETRY_ROUNDS {
+            client.send(&encoded).await;
+            match next_reply(&client).await.expect("a reply") {
+                ServerReply::Retry(_) => {}
+                other => panic!(
+                    "round {round} of {MAX_HANDSHAKE_RETRY_ROUNDS}: the server \
+                                 stopped early with {other:?}"
+                ),
+            }
+        }
+        client.send(&encoded).await;
+        match next_reply(&client)
+            .await
+            .expect("the refusal is sent, not withheld")
+        {
+            ServerReply::Reject(reject) => {
+                assert!(reject.has_marker(), "the reject carries its integrity tag");
+                assert_eq!(
+                    reject.code, REJECT_RETRY_LIMIT,
+                    "the code has to say the gate was what went wrong, or the client cannot \
+                     tell this from an unsupported version"
+                );
+            }
+            other => panic!("expected the typed retry-limit reject, got {other:?}"),
+        }
+
+        driving
+            .await
+            .expect("the driving task")
+            .expect_err("the server abandoned this handshake");
+        assert_eq!(
+            hs.reputation_difficulty(ip, false),
+            0,
+            "the server charged a reputation violation to an address for a handshake it \
+             abandoned itself, which raises the difficulty for every other handshake in \
+             flight from that address"
+        );
+    }
 
     /// `bind_with_signing_key` pins the listener's verifying identity to
     /// the supplied long-lived signing key — exactly the contract

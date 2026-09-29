@@ -8,6 +8,1291 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-28
+
+**The wire is unchanged, so either end may be upgraded on its own.** `WIRE_VERSION` stays
+8 and `PROTOCOL_VERSION` stays 5, so a 0.4.0 peer and a 0.3.0 peer complete a handshake
+and carry data in both directions, with either version as the server; no AEAD plaintext
+and no header layout moved. That is this release's lead claim, and it now has an automated
+proof rather than an argument — see **Added**, "`interop with the published release`". It
+needs one, because it is the claim that fails most quietly: a frame whose header version
+does not match is dropped before any flag is read and with no reply, so two incompatible
+peers would complete a handshake, agree keys, and then never deliver a byte, with nothing
+at either end to say why.
+
+**What this upgrade asks of you, and it is a line in your own manifest rather than a change
+to your code.** This release stops asking `tokio` for `signal`, `process`, `fs` and
+`io-std`, and stops pulling `time` into a default build; nothing in the library calls any of
+them. Cargo unifies features across the whole dependency graph, so a consumer that declares
+`tokio` or `time` itself has been compiling against the union of its own selection and this
+crate's. If your own code calls `tokio::signal::ctrl_c()`, `tokio::io::stdin()`,
+`tokio::fs`, `tokio::process` or `time`'s wall-clock surface, name what you use where you
+declare it — **adding to** the features you already ask for, not replacing them:
+
+```toml
+tokio = { version = "1", features = ["signal", "process", "fs", "io-std"] }
+time  = { version = "0.3", features = ["std"] }
+```
+
+That is safe to do before upgrading, and correct against every version of this crate:
+asking a dependency for the features your own code uses never depended on us. Without it
+the build fails with errors that name neither this crate nor a feature —
+`no function or associated item named 'now_utc'` is the shape of it, with four more like it
+for tokio — and nothing in the tool chain warns first, because the public API is
+byte-identical either way and a dependency's feature set is not part of what
+`cargo-semver-checks` compares. This is why the release is numbered 0.4.0 rather than
+0.3.1: the trim was prepared as a patch, the break was found by compiling an unchanged
+consumer against it rather than by reasoning about it, and a patch release must not do this
+to anyone. The full account, with the crates that leave and the count, is under **Removed**.
+
+**Regenerate the language bindings rather than relinking them.** `uniffi` 0.32 folds each
+exported item's doc comment into its checksum, and eleven of those checksums move here:
+`connect_pinned_udp`, `connect_pinned_udp_with_resumption` and
+`connect_pinned_with_resumption`; `PhantomSession::send`, `recv`, `open_stream`,
+`await_ready`, `migrate` and `supports_migration`; and `PhantomStream::recv` and
+`set_priority`. No exported item is added or removed, so the eleven are the whole of the
+difference. So the generated Python, Swift and Kotlin files in this release differ from
+0.3.0's.
+`UNIFFI_CONTRACT_VERSION` is unchanged at 30, which means the coarse gate passes and a
+stale binding fails at import time in the consumer's process instead. The regenerated
+files ship in `tests/bindings/`. The `SessionBuilder` rustdoc is corrected too and is
+deliberately not in that list: the builders are Rust-only, so no checksum exists for them
+to move.
+
+**The other half of the version number: this release adds public items, which SemVer counts
+as a minor change on its own.** Eleven types are re-exported at the crate root, `ServerReject`
+gained two named reject codes with a constructor each, and two transport types gained a
+method — every one of them named under **Added**. None of that breaks anything that already
+compiled, so no consumer has to act on it; it is simply not what a patch version means. So
+the two halves of the renumbering are different in kind: the additions made `0.3.1` the
+wrong *label*, and the dependency trim made it the wrong *thing to ship*. The one and the
+other are why the trim, withdrawn from 0.3.1 for exactly this reason, is back here.
+
+**Three things qualify "nothing else to change", each with an entry of its own below, and a
+consumer who ignores a `Result` should read them.** A mixed pair has a behavioural limit —
+a 0.3.0 peer counts concurrent streams differently and will take 255 of them where a 0.4.0
+peer takes 256 (**Fixed**, "The receive-side stream cap counts the streams the peer has
+open"). And two calls that used to answer `Ok` for work that did not happen now answer
+`Err`, which is the point of the fix and is still a different answer than 0.3.0 gave:
+`PhantomSession::migrate()` on a session a listener handed back returns
+`CoreError::Unsupported` where it returned `Ok(())` (**Fixed**, "An accepted session
+reported a migration it could not perform"), and `open_stream()` past `MAX_STREAMS`
+returns `CoreError::StreamError` where it used to hand back a stream the peer would not
+take and end the session seconds later (**Fixed**, "`PhantomSession::open_stream()`
+refuses past `MAX_STREAMS` streams open at once"). Code that matched on either `Ok`
+compiles unchanged and takes the other branch. What else
+did change is behaviour that
+contradicted its own documentation — a reader parked forever on a stream the session had
+already ended, a `supports_migration()` that answered for a method the caller could not
+reach, a ticket cache configured to hold nothing that held one — plus the release
+artifacts themselves, which in 0.3.0 were published in a state no consumer could use.
+
+**Almost everything here was found by using the published crate rather than by reading
+it.** Every defect below was green in CI at the 0.3.0 tag. The artifact ones were found
+by downloading the tarball; the API ones by writing a project that depends on the
+crates.io release and then doing ordinary things with it — open a stream, read from it,
+close the session, resolve `localhost`. That is the reason this release also adds checks
+over the release path, the Swift packaging and the Python wheel — and says under **Added**
+which of them a workflow runs, because a release cannot be its own regression test and
+neither can a script nobody invokes.
+
+### Security
+
+Pointers only: each item is set out in full in the entry named.
+
+- The blocking C connect helper returned a session for a server whose pinned identity had
+  not been checked, so a C caller could not tell a mispinned server from a network fault —
+  **Fixed**, "A C caller could not tell a mispinned server from a network fault".
+- The iOS and Android samples, and the connect snippets in `docs/operations/mobile.md`,
+  announced a connection and read `earlyDataAccepted()` without awaiting the handshake, so
+  a sample given the wrong pinned key reported success — **Fixed**, "The mobile samples
+  reported a connection before the pinned key had been checked".
+- A server configured with `session_cache_capacity = 0` kept one resumption ticket and
+  served 0-RTT early data out of it, so an operator who set the field to zero to stop
+  accepting early data went on accepting it — **Fixed**,
+  "`PhantomConfig::session_cache_capacity = 0` now turns 0-RTT off".
+- `PhantomSession::migrate()` on a session handed back by a listener returned `Ok(())` for a
+  request the data pump then discarded, and `supports_migration()` reported that capability
+  as available — a success for work that did not happen — **Fixed**, "An accepted session
+  reported a migration it could not perform".
+- The published macOS libraries carried an install name pointing into the build tree, so
+  the first consumer to link one died before `main` — **Fixed**, "The published macOS
+  libraries no longer abort every consumer at launch".
+
+### Fixed
+
+- **The C blocking helpers did not compile against a strict ISO C consumer on
+  glibc.** `phantom_helpers.h` waits on a future with `nanosleep()`, which is
+  POSIX.1-1993 and not ISO C, and glibc's `<time.h>` withholds the declaration
+  when the translation unit asked for `-std=c11`. The header is documented to be
+  included after `phantom_protocol.h`, which has already fixed glibc's feature
+  macros by then, so requesting the feature from inside the header cannot work.
+  It now states the requirement instead: on glibc without the declaration in
+  scope it stops at an `#error` naming the flag to add
+  (`-D_POSIX_C_SOURCE=199309L`, or `-std=gnu11`), rather than at an implicit
+  declaration forty lines later. The repository's own C check passes the flag,
+  and `tests/bindings/c/README.md` publishes the whole compile line. macOS
+  declares `nanosleep` either way, which is why this surfaced only once the
+  pinning check — added in this release — started running on a Linux runner.
+
+- **`PhantomStream::recv()` now returns when the session ends.** A reader parked on a stream
+  was never woken, and a fresh `recv()` on an ended session parked too: still pending
+  fifteen seconds after the path died, with `connection_state()` already `Closed` and
+  `PhantomSession::recv()` already erroring. The delivery route whose sender the read waits
+  on was only ever dropped when the stream itself was retired, so a session that ended took
+  one task per stream with it. Every end of a session now releases the routes — the delivery
+  task does it as it finishes, so a reader with frames still buffered reads all of them
+  first, and `Drop for PhantomSession` and the handshake-failure paths cover the ends that
+  task cannot reach. A session that ends without a `FIN` on the stream reads as
+  `CoreError::ConnectionClosed`, as the method has always documented; a peer's `FIN` still
+  reads as `Ok(None)`, exactly once.
+
+- **`PhantomSession::open_stream()` refuses past `MAX_STREAMS` streams open at once**, with
+  `CoreError::StreamError`, instead of handing back a stream the peer has no room for.
+  Opening and writing on one stream past the cap used to kill the whole session about four
+  and a half seconds later, with `last_error() == Some(Timeout)`, taking the 255 healthy
+  streams with it: the peer refuses such a stream silently, so its data stayed outstanding
+  and the liveness sweep read the silence as a dead path. What the same refusal looks like
+  when the session is *also* carrying other streams' data is not this, and is set out in the
+  entry below — there it does not end the session at all. The refusal
+  spends no stream id and registers no route. The cap is enforced per side and the two ends
+  cannot see each other's count, which is stated in the `MAX_STREAMS` rustdoc.
+
+- **The receive-side stream cap counts the streams the peer has open** rather than every
+  entry in the stream table, so a peer may open the `MAX_STREAMS` the constant documents.
+  The session's own reserved raw-application stream, and this side's own streams, were
+  charged against the peer's allowance, so the last stream each side was allowed to open was
+  one the other would not take.
+
+  **Against a 0.3.0 peer, keep to 255 concurrent streams — and do not expect a dead
+  session to tell you so.** This is the one place where a 0.4.0 and a 0.3.0 peer do not
+  agree, and nothing on the wire carries the disagreement: a 0.3.0 receiver compares the
+  whole table, which already holds the reserved raw-application stream, so it admits 255
+  peer streams — and one fewer for each stream it has opened itself — and refuses the 256th.
+  It refuses it the way this cap has always refused: the stream-creating segment is dropped
+  unrecorded, so it is not acknowledged either, and the sender retransmits into silence.
+
+  What the sender then observes depends on whether the session carries anything else, and
+  the two outcomes look nothing alike — an earlier draft of this entry described only the
+  first and gave an operator the wrong landmark to look for. **With nothing else
+  outstanding**, the sender's liveness sweep reads the silence as a dead path and ends the
+  session: `ConnectionState::Dead`, `last_error() == Some(Timeout)`, a few seconds later.
+  That is the failure the first two entries above describe, arriving from the other end of a
+  mixed pair. **With other streams still carrying data** — the ordinary case for anything
+  multiplexed — the session does not end at all. Measured over 300 s: it oscillates between
+  `ConnectionState::Migrating` and `Connected` on the keep-alive tick, because the refused
+  stream's silence reads as a dead path while the other streams' acknowledgements read as a
+  recovered one; it **never reaches `Dead`**; `last_error()` stays `None` throughout,
+  because nothing has gone wrong as far as either end can tell; every other stream is served
+  normally; and the one stream stays stuck for as long as the session lives, with its writes
+  accepted and never delivered. An operator debugging that by looking for a failed session
+  will not find one — the signal is the `Migrating` flapping and a stream whose bytes stop
+  arriving. Neither side can detect the other's rule, so there is nothing to work around it
+  with. The reverse pair fails the same way for the opposite reason: a 0.3.0 client has no
+  local cap at all — its `open_stream()` only ever fails when stream ids run out — so it
+  will go past 256, and the 257th is the one a 0.4.0 server refuses.
+
+- **Letting go of a stream nothing was ever written on retires it on the spot** instead of
+  reporting it to the data pump, and a burst of released handles is taken in one pass rather
+  than one apiece. Releasing four times the handles cost 21.7 times the time — 1 000 took
+  470 ms, 4 000 took 10.2 s — and while the backlog drained the peer's `open_stream()` was
+  refused for about fifteen seconds, because each report cost the send loop a walk over
+  every stream the session held.
+
+  Doing it on the spot means the handle carries a private field holding the session's stream
+  bookkeeping, and that bookkeeping reaches a `DashMap`, which is not `RefUnwindSafe`. An
+  auto trait is derived from every field, so that field silently took
+  `std::panic::UnwindSafe` off `PhantomStream` — a break a compiler stops a consumer over,
+  invisible in every signature, in a release that has no other. It is asserted back, with
+  the argument for why it holds written beside the impl: one operation on that bookkeeping
+  changes anything, and it is a parity test, two map removals and an atomic decrement, none
+  of which can panic or await, so no unwind can carry a reference to a half-applied change.
+  `std::panic::RefUnwindSafe` is deliberately not asserted — `PhantomStream` never had it.
+  A `--lib` test moves a stream into a generic function bounded on `UnwindSafe`, so a future
+  field that takes the trait away again fails a required check rather than
+  `cargo semver-checks`, which runs only on the release path and under
+  `continue-on-error`.
+
+- **An orderly close and a broken connection are told apart at the surface.** A session that
+  ended in the orderly way — this side's `disconnect()` or the peer's — reports
+  `ConnectionState::Closed`, `last_error() == None`, and `CoreError::ConnectionClosed` from
+  `send()`, `recv()` and `await_ready()`; one whose transport ended without a close reports
+  `ConnectionState::Dead` and the cause it failed with. Through `recv()` and
+  `await_ready()` the two used to be one answer to the byte — `NetworkError("Session
+  closed")` and `NetworkError("session failed")` respectively, whichever way the session had
+  ended — and through `send()` they differed only by the state name formatted into a message
+  (`Cannot send in state Closed` against `… Dead`), which is a difference a caller can act on
+  only by matching on a string. They call for opposite reactions: take the result and stop,
+  against reconnect. A session torn down because the peer ignored the receive window is
+  likewise no longer reported as an orderly departure, and an end already reached is no
+  longer overwritten by the pump's teardown.
+
+- **`PhantomStream::set_priority` reports an ended session as
+  `CoreError::ConnectionClosed`**, which is what `send_reliable`, `send_unreliable`,
+  `disconnect` and `recv` answer, instead of `CoreError::NetworkError("Session closed")`. It
+  was the one of the type's five calls left behind when the others were retyped, and three
+  of four is worse for a caller than either answer applied consistently would be: the single
+  arm that has to be written as a string comparison is the one nobody writes, so an orderly
+  end arrived through it as a network fault. It is still not refused during the peer's
+  draining window, unlike the three that carry a payload — returning `Ok` for bytes the pump
+  will discard is what that refusal exists to stop, and a priority is not a payload.
+
+- **`disconnect()` during the handshake is no longer walked back by the handshake
+  completing**, so `await_ready()` answers `CoreError::ConnectionClosed` for a session the
+  caller had already closed instead of `Ok(())` or a generic error. **A handshake that then
+  *fails* no longer overwrites that close either** — the failing exit is the twin of the
+  succeeding one and had the same defect, which the first fix's covering test did not reach
+  because it drove only the arm where the reply arrives. A session the caller had closed
+  itself reported `ConnectionState::Failed` with
+  `last_error() == Some(NetworkError("the far end vanished"))`: a cause recorded against an
+  event that happened after the caller was finished, for a close the call had already
+  reported as carried out, and the exact opposite of the orderly end the entry above
+  advertises. It now reports `Closed` with `last_error() == None`. Both exits go through one
+  publisher that decides the state and the cause together — the cause is stored first, so a
+  caller polling the state and then `last_error()` never sees a `Failed` with nothing
+  recorded against it, and it is taken back out when an end is already published — and the
+  readiness answer is read back out of the state instead of being asserted as a literal
+  `Failed`. The FIPS power-on-self-test exit shared the shape and is covered with them.
+
+- **`connect_pinned_udp`, `connect_pinned_udp_with_config` and
+  `connect_pinned_udp_with_resumption` try every address the host resolves to**, in the
+  resolver's order, instead of only the first. A name that resolves `::1` ahead of
+  `127.0.0.1` — plain `localhost` on many machines — failed with `Timeout` against a server
+  listening on IPv4, where the TCP helper on the same name connects: only the handshake can
+  tell UDP candidates apart, because "connecting" a datagram socket succeeds against an
+  address with nothing behind it. A name with one address — every IP literal among them —
+  still returns before the handshake as documented.
+
+  **A refusal from an address that answered ends the walk and is returned as itself.** As
+  first written the walk recorded each candidate's failure into one slot and dropped it the
+  moment a later candidate answered, so `CoreError::ServerIdentityMismatch` was handled
+  exactly like "this address timed out": a debug line, and nothing returned. One extra
+  address in a name's DNS answer — an added AAAA record, a poisoned resolver, a hostile
+  split-horizon zone — is contacted *first* on every one of these calls and receives the
+  whole `ClientHello`, and on the resumption entry point the sealed `early_data` blob; the
+  client then reached the genuine address and `await_ready()` answered `Ok(())`. The pin
+  held and the blob stayed sealed, so nothing was disclosed, but the one signal that an
+  impostor answered for this name reached nobody — in the path Security Invariant 1 exists
+  to provide it, and it had reached the caller when the name had one address. An answer that
+  came from a peer (`ServerIdentityMismatch`, `ProtocolRejected`, a cipher suite the two
+  builds cannot agree on) now ends the walk and is returned unchanged, because matching on
+  the typed variant is how a caller tells "update your pinned key" from "the network is
+  down"; a failure that came from the path still moves on to the next address. The
+  classification is an exhaustive match, so a `CoreError` variant added later has to be
+  placed rather than joining the discarded class by default. The refusing address and what
+  the earlier candidates said go to `log::warn!` rather than into the error, since these
+  variants carry no payload and must stay matchable. **The roster reaches the caller in one
+  case only**, and it is narrower than the first draft of this entry said: the returned
+  `CoreError::NetworkError` naming every address tried and what each one said is produced
+  where **no candidate's socket could be created at all** — no session ever existed, so
+  there is nothing to hand back and the roster is the whole content of the answer.
+  Addresses that merely fail to *answer* do not reach it, because the last candidate is
+  handed back as `Ok` without being awaited, which is the contract these entry points
+  document; what the earlier candidates said goes to the log, and `await_ready()` is where
+  the outcome comes from. A name whose addresses genuinely hold different
+  identities no longer connects through a later one — pin per address for that deployment.
+
+  **The attempts overlap rather than running strictly in turn**, because trying them in
+  turn made the very case the walk was written for cost a share. On a machine where
+  `localhost` resolves `::1` first with nothing behind it, `connect_pinned_udp("localhost",
+  …)` *worked* and took **5.04 s**, where a working first address takes milliseconds; a
+  six-address name of that shape cost about twelve seconds. Each address is now contacted
+  `CANDIDATE_ATTEMPT_DELAY` — 250 ms, RFC 8305 § 5's Connection Attempt Delay, the interval a
+  happy-eyeballs resolver uses for this same decision — after the one before it, and the
+  first handshake to complete is the one handed back. Four rules keep that from becoming a
+  race, and each exists for a case that would otherwise be worse than the serial walk:
+  **an address that has answered stops the schedule**, so a name whose first address works is
+  still the only one contacted and the `ClientHello` — with its sealed `early_data` on the
+  resuming entry point — reaches no more addresses than before; **a completed handshake waits
+  for an earlier address that has begun answering**, since that one may be about to refuse the
+  pin and discarding it is what the classification above exists to prevent; **a refusal
+  waits for every earlier address to finish**, or one hostile address *after* the right one in
+  a name's DNS answer would deny service by refusing in a millisecond while the right one was
+  still handshaking; and **between two verdicts in hand, the lower-numbered address answers**,
+  the resolver's order being a preference — which is the rule the entry below, "Between two
+  verdicts the address walk had no test for which one answers", is about. One property is narrower than the serial walk's, and it is in the
+  function's own documentation: an impostor that has not said a *word* by the time a later
+  address completes is no longer reported, where a serial walk would have waited out its whole
+  share for it. The overlap cannot be both fast and patient with silence; what bounds that
+  window now is the attempt delay plus the winner's own handshake rather than the share, and
+  the serial walk's guarantee was not unconditional either — an impostor silent past its share
+  was missed there too. An impostor that answers at all still ends the walk.
+
+  **The per-address share of the handshake deadline has a floor of 2 s**, and it is derived
+  rather than chosen: `UDP_HANDSHAKE_FLIGHTS` (2 — the stateless-cookie round, then the
+  hello that carries the cookie back and is answered with a `ServerHello`) ×
+  `NO_SAMPLE_FLIGHT_RTO` (1 s — what the UDP transport's own handshake shim waits before
+  treating a flight as lost, with no round-trip sample of its own). Below that product a
+  wait decides nothing: until each of the two flights has been outstanding for one such
+  interval, the transport underneath has not itself concluded anything about the path, so a
+  shorter wait cannot tell a candidate that is not answering from one that is merely on a
+  long path. An even division gave a name with eight A/AAAA records — ordinary for a CDN or
+  a multi-homed host — 1.25 s each, which is under the product, so the correct, reachable
+  first address was abandoned mid-handshake, working session and all, and the call handed
+  back the last candidate. (An earlier draft of this entry justified the floor with "a
+  handshake on a 600 ms path takes about 1.8 s". That figure follows from nothing in the
+  crate: two flights on a 600 ms path is 1.2 s, and the floor is not derived from a path
+  length at all. A test holds the constant to the transport's own interval, so the
+  derivation above is checked rather than asserted.) With the attempts
+  overlapping the share is a per-attempt ceiling rather than a slot in a queue: it still
+  bounds how long the walk holds on to an address that is not answering, which is what lets
+  the attempts still running be narrowed to one.
+
+  **Consequence for the total:** the whole call is bounded by one client handshake deadline —
+  10 s — and no longer by the deadline plus a share as the serial walk was, at any number of
+  addresses. When the deadline is spent with attempts still running, what is in hand goes back
+  in the order of how much it settles: a completed handshake, then a refusal, then an attempt
+  still running, handed back unawaited. That last is the contract a single-address name always
+  had: `Ok` says a socket was opened and nothing more, and `await_ready()` is what says who
+  answered. A name with six or more addresses can still leave the walk a tail it never
+  reaches, since the floor makes the shares add up to more than the budget; what changed is
+  that the tail costs the caller nothing beyond the deadline.
+
+- **An accepted session reported a migration it could not perform, and accepted the
+  request.** `PhantomSession::supports_migration()` and `migrate()` both read one flag taken
+  from the transport, and both halves of a PhantomUDP session answer `true` there —
+  correctly, about the transport, which rebinds without a re-handshake either way. But
+  `migrate()` is the client's entry point and an accepted server session moves through the
+  Rust-only `migrate_server()`; `UdpServerTransport` refuses `migrate` deliberately, so that
+  the FFI-exported client operation cannot move a server. So a server session advertised a
+  capability nothing its caller could reach and, worse, answered `Ok(())` to a `migrate()`
+  the pump then discarded. On a foreign binding, where `migrate_server` is not exported at
+  all, `supports_migration() == true` named an operation that existed nowhere in the
+  caller's reach. The transport's answer and this side's answer are now separate:
+  `supports_migration()` is `true` only for a client session, `migrate()` returns
+  `CoreError::Unsupported` on an accepted one, and `migrate_server()` and the handshake
+  metric's leg label keep reading the transport. Calling the wrong entry point on a
+  transport directly is also refused by name now, rather than through the trait default's
+  "use a UDP-backed session" — advice that sent the reader of a UDP transport that does
+  migrate looking for one they already had.
+
+- **`PhantomConfig::session_cache_capacity = 0` now turns 0-RTT off, where it used to keep
+  one ticket and serve early data out of it.** The field is documented as the maximum number
+  of resumption tickets a server keeps, so zero reads as "keep none" — and it is the only
+  route a foreign binding has to that posture, since the record has no presets and
+  `set_early_data_enabled(false)` is a separate call. The cache evicted before it inserted,
+  the eviction pass found nothing to evict, and the insert went through anyway, so a server
+  configured to keep no tickets kept exactly one and the next resuming client was served
+  0-RTT from it. `SessionCache::store` and the restore path a failed resume takes now both
+  return before writing when the capacity is zero, so every read path finds nothing, no
+  ticket is consumed, no proof-of-work reduction is granted, and the connection completes as
+  an ordinary 1-RTT handshake with `early_data_accepted == false`. Both listeners build
+  their cache from this field and both are covered. Refusing the value with a `ConfigError`
+  was the alternative and is the worse one: it would turn a config that plainly reads as
+  "off" into an error.
+
+- **A fips peer meeting a non-fips one is now told so, instead of being left to time out.**
+  `ClientHello.protocol_variant` carries the build's variant tag and the server checks it at
+  the first field it reads, before any KEM or signature work — that part worked. What it did
+  with the answer did not: the refusal was a `HandshakeResponse::Fail`, and the listener
+  answers a `Fail` by closing without a reply. Over TCP the client saw a bare connection
+  error; over PhantomUDP, which has no close to observe, it retransmitted its hello on the
+  handshake schedule and then reported `Timeout` — a peer did not answer, said of a peer that
+  had decided it never would, and the one shape of failure a typed refusal exists to
+  replace. The mismatch is now a typed `ServerReject` under a new reject code (2), which
+  both transports already put on the wire, and the client surfaces it as
+  `CoreError::ProtocolRejected` promptly rather than after its ten-second deadline. **No
+  wire format moves:** `ServerReject` keeps its three fields and its byte layout, code 1
+  still means "unsupported version" in every older capture, and the frozen wire vectors pass
+  unregenerated. Over PhantomUDP the reply goes only to a source that has already echoed an
+  IP-bound cookie, since address validation runs ahead of the variant check, and a
+  seven-byte reject against a six-kilobyte hello amplifies nothing. The message the client
+  builds names the variant rather than the version, which it previously did not — a variant
+  mismatch rendered as "client speaks v5, server speaks v5", a sentence naming the one field
+  both peers agree on.
+
+- **A build that names no features, and a `std` build that names no crypto substrate, now
+  fail with a message naming what to enable.** `--no-default-features` on its own switched
+  `std` off, and the bare-metal branch is selected by the absence of `std` rather than by any
+  affirmative choice, so the build entered it on a host target and failed inside `core` with
+  "no global memory allocator found", "`#[panic_handler]` function required" and "unwinding
+  panics are not supported without std" — three errors that name no feature and read as a
+  broken library rather than as a feature set nobody selected. `--no-default-features
+  --features std` compiled a crate whose AEAD and classical KEM have no implementation and
+  led with "unresolved module or unlinked crate `ring`", which reads as a missing dependency
+  rather than as the one word it is. Two `compile_error!`s now catch both and land first in
+  the error list: one names the recipe for a host build, a FIPS host build and bare metal,
+  the other says which substrate `classical-crypto` and `fips` each give and that the two
+  cannot speak to each other on the wire.
+
+- **A C caller could not tell a mispinned server from a network fault.**
+  `phantom_helpers.h` documented `phantom_blocking_connect_pinned` as returning NULL on a
+  handshake failure, and against a live listener with the **wrong** pinned key it returned an
+  ordinary session handle instead: `send` reported success and only a later `recv` returned
+  -1 — the same -1 a flaky path gives. The exported `connect_pinned` future resolves when
+  the socket is connected, and the hybrid PQC handshake carrying the pinned-identity check
+  runs after it, so the helper returned at the first point and described the second. It now
+  drives `await_ready` before handing a handle back. `phantom_blocking_connect_pinned_checked`
+  is the same call with an `int32_t` out-parameter carrying the lowered `CoreError`
+  discriminant, which is what separates `ServerIdentityMismatch` (15) from `NetworkError`
+  (1), `CryptoError` (4) for a malformed pin and `Timeout` (12); `PhantomErrorCode` names all
+  seventeen, and `phantom_blocking_await_ready` / `phantom_blocking_last_error` expose the
+  same machinery on an existing session. `tests/bindings/c/pinning_smoke.c` drives a real
+  in-process listener with the right key, a wrong key, a malformed key and a dead port, and
+  asserts the reason in each case.
+
+- **The mobile samples reported a connection before the pinned key had been checked.** The
+  iOS and Android samples, and the snippets in `docs/operations/mobile.md`, announced a
+  connection and read `earlyDataAccepted()` without ever calling `awaitReady` — the exact
+  footgun the crate documents about its own entry points, since `connectPinned*` returns
+  before the handshake has run and therefore before the pinned key has been checked. A
+  sample given a wrong pinned key reported success and failed later, on a read. Both samples
+  now await the handshake inside the same error path that already reports a connect failure,
+  so a mismatch arrives as the typed reason it is, and the Swift snippet in the guide
+  compiles, which it did not (`disconnect()` is `async throws` and the snippet wrote
+  `await session.disconnect()`).
+
+- **`tests/bindings/swift/build-xcframework.sh` could not produce an XCFramework.** It
+  passed `-headers` the directory it was writing its output into, so `xcodebuild` copied the
+  half-written framework into itself and gave up with `The item couldn't be saved because the
+  file name "ios-arm64" is invalid` after building every slice; the same directory also
+  carried `Package.swift`, `LoopbackTest.swift` and both build scripts into each slice. The
+  recipes in `docs/operations/mobile.md` and `examples/mobile/ios/README.md` did produce a
+  framework, and the generated Swift then failed against it with `cannot find type
+  'RustBuffer' in scope`, because inside a framework clang looks for `module.modulemap` and
+  nothing else — under its generated name `phantom_protocolFFI.modulemap` the framework
+  exported no module, so `#if canImport(phantom_protocolFFI)` was false and the FFI types
+  were simply absent. `Package.swift` also declared `.macOS(.v13)` with no macOS slice ever
+  built, which resolves cleanly and fails at link time on that platform only. The script now
+  stages a headers directory holding exactly the FFI header and `module.modulemap`, writes
+  the framework outside it, and builds a macOS slice as well; both documented recipes are
+  that same sequence.
+
+- **A wheel built from `python/pyproject.toml` could not be imported**: `import
+  phantom_protocol` raised `ImportError: cannot import name '__all__' from
+  'phantom_protocol.phantom_protocol'`, and the `try/except NameError` written around that
+  import could not catch it. maturin's uniffi mode generates a whole package named after the
+  crate, so `python-source = "."` made it merge that package into the hand-written
+  `python/phantom_protocol/` of the same name and the import reached the generated
+  sub-package, whose `__init__.py` only star-imports and so re-exports no `__all__`. The
+  documented command worked only because passing `--manifest-path` changed how
+  `python-source` resolved, so the published recipe never exercised the config. maturin now
+  owns the package outright.
+
+- **`examples/mobile/ios` did not compile even with both artifacts staged** as its README
+  instructs: `PhantomServerConfig.swift` used `Bundle.module` as the default argument of two
+  `public` functions, and SwiftPM generates it as `internal`. Both take `Bundle?` now and
+  resolve it in the body, leaving call sites unchanged; `swift build` and `swift test` both
+  complete on a macOS host against the framework's macOS slice, which the README now says.
+
+- **The published macOS libraries no longer abort every consumer at launch.** A Mach-O
+  library carries the path it expects to be found at, and rustc writes the absolute path of
+  the build tree into it, so both macOS rows of 0.3.0 shipped with an install name of
+  `/Users/runner/work/phantom_protocol/phantom_protocol/target/<target>/release/deps/libphantom_protocol.dylib`
+  — a directory that exists on no machine but the runner. The first consumer to link the
+  library died before `main` with `dyld: Library not loaded`, naming a path they had never
+  seen. The release now rewrites the staged copy's name to
+  `@rpath/libphantom_protocol.dylib`, which the loader resolves against whatever `-rpath` the
+  consumer linked with, and reads the name back before the tarball is produced, because a
+  rewrite that quietly did nothing yields exactly the artifact this entry is about. The C
+  bundle assembled by `tests/bindings/c/package.sh` had the identical defect and is fixed
+  with it, and its pkg-config template now emits `-Wl,-rpath,${libdir}` — without an rpath
+  entry `@rpath` resolves to nothing, so a consumer who links through `pkg-config --libs`
+  would still have failed at launch, differently.
+
+- **The published Linux libraries carry a symbol table again, so `uniffi-bindgen --library`
+  can read them.** The generator finds a crate's interface by looking up the `UNIFFI_META_*`
+  symbols the scaffolding exports, and the release artifacts were built with
+  `[profile.release]`, which sets `strip = "symbols"`. The shipped `.so` reached consumers
+  with no `.symtab` at all: the 75 metadata strings still sat in `.rodata` and the symbol
+  table naming them was gone. Nothing about the file looks empty, and the generator reports
+  `No UniFFI metadata found`, writes nothing, and **exits 0** — so a consumer's generate
+  script reports success over an empty directory. The release path now builds with
+  `[profile.dist]`, which inherits every optimisation setting from `release` and keeps the
+  table; an ordinary `cargo build --release` is unchanged and stays the size it was. The C
+  bundle and the Python wheel are built the same way.
+
+- **The published `.sha256` files verify where they are downloaded.** `shasum` writes the
+  path it is given and `shasum -c` re-reads it, so digests computed as `shasum -a 256
+  dist/…tar.gz` produced files naming `dist/phantom_protocol-….tar.gz`. Verifying the pair
+  as published failed on a missing file for everyone: the only person it worked for is one
+  who happened to reproduce a `dist/` directory. The digest now names the tarball by its
+  basename, and the release verifies the digest it just wrote.
+
+- **The Python wheel job builds a wheel.** maturin generates the wheel's Python module by
+  running `uniffi-bindgen` against the library it has just compiled, so with `--release` it
+  read a stripped `.so`, reported `No UniFFI metadata found` and stopped, leaving a `.whl`
+  with no `.dist-info` that pip rejects as invalid — the job's own `import phantom_protocol`
+  smoke step could never have run. It is `workflow_dispatch`-only, which is why nothing said
+  so. It now builds with the same unstripped profile as the rest of the release.
+
+- **The C bundle is named after the version in the manifest, and ships both headers.**
+  `package.sh` restated the crate version as a literal, and `tests/bindings/check_versions.sh`
+  does not enforce that file, so after a bump the bundle kept the old name and the published
+  tarball was the only place that said the wrong number. It also omitted
+  `phantom_helpers.h`, although the C README's quick-start and `consumer_smoke.c` both
+  include it, so the bundle did not build what it documented. The version is read out of
+  `core/Cargo.toml`, a bundle that cannot be named is not built, and both headers ship.
+
+- **The semver gate reports the release actually being cut.** `scripts/semver_report.sh`
+  passed `--release-type minor` as a literal — the right assumption while no version had been
+  bumped and the wrong one once one had, so the one line a reader checks to learn what was
+  compared said "assume minor change" whichever release it was about. That word also decides
+  which lints run at all: of cargo-semver-checks' 253 lints a `minor` run performs the 196
+  major-severity ones, while a `patch` run performs 223, the extra 27 being minor-severity
+  checks for changes a minor bump would excuse and `docs/policy/versioning.md` § 2 says a
+  patch release must not make. Measured on this tree, `0.3.0 -> 0.4.0` at `minor` performs
+  196 checks and skips 57, and the same step at `patch` performs 223 and skips 30 — and both
+  report no findings, so for *this* release the word costs nothing and the reason to read it
+  out of the tree is the next release rather than this one. Those figures are one tool
+  version's inventory — 0.48.0's, which is what they were measured with; CI installs 0.50.0,
+  so read them as the shape of the difference and take the real ones from the
+  `Checked … N checks` line of the run in front of you. Nothing the script does depends on
+  them: it reads the release type out of the tree and the step out of the tool's own output,
+  so a changed inventory moves the numbers in this paragraph and not the behaviour.
+
+  The type is read out of the tree — `core/Cargo.toml`'s version against the newest release
+  heading below it in `CHANGELOG.md`, falling back to the strictest when there is no step to
+  read — and the report's first line records it and where it came from. **That reading is a
+  prediction, because the one thing it needs is not in the tree.** The baseline is whatever
+  crates.io has published, and the tree looks the same on both sides of a publish: with
+  `0.4.0` in the manifest and `## [0.4.0]` the newest heading, the step reads
+  `0.3.0 -> 0.4.0` in the pull request that cuts the release and goes on reading that in
+  every pull request after it has shipped — where the tool compares 0.4.0 against 0.4.0, a
+  patch step, and `minor` would skip the 27 lints that step must not fail. So after the run
+  the script re-derives the step from the tool's own `Checking … vB -> vC` line, and a type
+  more permissive than that step is not accepted — but what happens then depends on who
+  chose it. A type **given** on the command line fails, because a caller asked for a
+  particular comparison and did not get it. A type the script **derived** is re-run once at
+  the narrower one, and that report is the one kept: the second run reads the baseline
+  rustdoc the first one cached, so it costs the comparison rather than the build (8 s against
+  39 s on this tree). A step narrower again on the re-run means the baseline is moving under
+  the run, and that fails rather than retrying for ever.
+
+  Without that split the open window after this release would have been a red required check
+  on every pull request in it, reading "the report understates and is not usable as the
+  record" — a failure about the script's own inference, with nothing in the pull request to
+  fix and one obvious way out, which is to hard-code the word again. A patch release never
+  reached it, because `0.3.0 -> 0.3.1` derives `patch` and no step is narrower than that; so
+  cutting a minor release is what made it reachable, and it was reachable before it was
+  shipped. Sixteen new stubbed-cargo cases pin all of this, the last two being the empty
+  `--release-type` refusal set out further down this section; the suite asserts its own case
+  count, and it runs as a pre-commit hook when the script or the cases change.
+
+- **The changelog gate read a baseline only from a cold run.** `check_changelog_breaking.py`
+  took the compared-against version from the `Building … (baseline)` line, which a run whose
+  baseline rustdoc is already built never prints — it prints `Parsing … (baseline, cached)`.
+  With no baseline read, the gate falls back to `[Unreleased]` alone, so a *cut* release
+  whose notes are complete under its own `## [x.y.z]` heading was reported as having written
+  nothing down,
+  depending on whether the runner's cache happened to be warm. That is the same failure the
+  baseline comparison was added to prevent, arriving by the back door; both spellings are
+  read now, and a case pins the cached one.
+
+- **The WASI integration job installs the wasmtime version the tree names.** The step read
+  `curl -sSf https://wasmtime.dev/install.sh | bash` beneath the words "Pinned via the
+  official installer script"; without `--version` that installer resolves the GitHub
+  `latest` release, so the runtime the tests ran against changed whenever wasmtime cut one,
+  with nothing in this repository to show it. That is how wasmtime 49 — which waits for a
+  pending write when an output stream is dropped, where 45 returned immediately — arrived in
+  the middle of the 0.3.0 release and hung the guest fixture. The version is now one `env:`
+  line passed to the installer explicitly, and the job reads `wasmtime --version` back and
+  fails on a mismatch, since the installer falls back to `latest` for an argument it does not
+  understand and an ignored pin otherwise leaves the job green against an unknown runtime.
+
+- **Release artifacts were documented as carrying SLSA-3 build provenance; they carry SLSA
+  v1.0 Build Level 2.** `actions/attest-build-provenance` gives Build L2 on its own. L3
+  additionally requires the build to run in a reusable workflow that is the sole holder of
+  the provenance signing identity, and `release.yml` attests inline in the `build-artifacts`
+  job — the same job that runs `cargo build` and that restores a `Swatinem/rust-cache` shared
+  with the rest of CI. Corrected in `README.md`, `docs/policy/versioning.md`,
+  `docs/operations/mobile.md`, `tests/bindings/PACKAGING.md` and
+  `docs/compliance/cc-pp-mapping.md`, where the overstatement was offered as ALC_CMC.1
+  evidence to a lab that can read the workflow file. `docs/DEFERRED_WORK.md` § 1, which had
+  called L3 shipped and "the top of the track", now states what ships, what L3 needs here,
+  and that both obstacles are a workflow refactor rather than a code change. Nothing about
+  verifying an artifact changed: every corrected site still names the action and gives the
+  `gh attestation verify` and `cosign verify-blob-attestation` invocations.
+
+- **The README claimed the crypto path has no C bindings and that the crate compiles for
+  `wasm32` without them.** `ring` compiles 11 architecture-independent `.c` files on every
+  target it supports, `blake3` compiles `blake3_neon.c` on aarch64 and assembly on x86-64,
+  and `zstd-sys` builds the zstd C library; on the `wasm32-unknown-unknown` row CI checks,
+  `ring` emits 12 objects and `zstd-sys` 36. Replaced with a "What needs a C compiler"
+  section that names each dependency, the feature that reaches it, and the commands that
+  re-derive the figures — and with the one genuinely C-free build, `--no-default-features
+  --features embedded,no-std`, which is also the row without the handshake. `--features fips`
+  is not the C-free route: it swaps `ring` for `aws-lc-rs`, which builds AWS-LC through
+  `cmake`.
+
+- **`docs/policy/versioning.md` had drifted from the wire.** It listed `0x1000 .. 0x8000` as
+  reserved `PacketFlags` bits when `KEEPALIVE`, `PADDED` and `COVER` hold three of them and
+  only `0x8000` is left; it promised that new TLV records could ride in
+  `PhantomPacket::extensions` without a `WIRE_VERSION` bump, when `extensions` has not been
+  on the data-plane wire since v6 and `from_wire` returns an empty `Vec` unconditionally, so
+  such a record reaches no peer; and it prescribed an `FFI:` CHANGELOG prefix that has never
+  appeared in this file. The section now names the three changes that genuinely need no bump
+  — a new `ENCRYPTED | CONTROL` subtype, a flag bit an unaware receiver already discards
+  intact, and a change that leaves the bytes identical — and the § 9 table rows match. The
+  rule that `WIRE_VERSION` and `PROTOCOL_VERSION` move together is kept, and is now the
+  default rather than the exception.
+
+- **Five embedder-facing documentation examples connected and then sent without awaiting the
+  pin.** `connect_pinned*` and `SessionBuilder::connect` return before the handshake has run,
+  so `send()` succeeds by queueing even against the wrong server and only `await_ready()`
+  settles Security Invariant 1. The Swift and Kotlin quickstarts in
+  `docs/operations/mobile.md`, its Kotlin resumption example, `docs/operations/wasm.md`'s
+  resumption example and `docs/protocol/PROTOCOL.md` § 0-RTT now call `awaitReady()` /
+  `await_ready()` immediately, naming the error a wrong key produces. The crate's own
+  `SessionBuilder` rustdoc had the same gap and is corrected with them — its doc example, the
+  one a reader copies, now ends with `await_ready()`, and the two sentences that said
+  `.connect().await` performs the handshake say what it actually does.
+
+- **Forty-five commit ids cited across `docs/` no longer resolved** — 36 distinct ids across
+  nine documents, counted as citations because several are cited more than once. Re-derive
+  the figure rather than trusting it: take every 7-to-40-character hex token on a removed
+  line of `git diff v0.3.0..HEAD -- docs/`, drop the ones `git cat-file -e <id>^{commit}`
+  accepts, and count what is left. The history up to the `v0.3.0` tag was rewritten and
+  nothing recorded it, so the two 2026-06 audit reports, the remediation plan, the 20-row
+  rollout table in `docs/observability/refactor-plan.md`, the FIPS inventory in
+  `docs/compliance/fips-readiness.md`, `docs/operations/{mobile,wasi}.md`,
+  `docs/security/panic-sites.md` and the ALC_CMC.1 evidence row in
+  `docs/compliance/cc-pp-mapping.md` all pointed at objects this repository does not
+  contain. **No citation was left behind, and the check for that is the one to run rather
+  than the sentence to believe:** every hex token in `docs/` that is a commit id resolves —
+  42 of them, confirmed with
+  `grep -rhoE '[0-9a-f]{7,40}' docs/ --include='*.md' | sort -u`, feeding each token to
+  `git cat-file -e <id>^{commit}`. The ten that do not resolve are not commit ids: four
+  decimal sysctl and NDK values (`16777216`, `4194304`, `1048576`, `10909125`), two hex byte
+  strings from a wire table (`00000000`, `01000000`), a run label's date (`20260822`), the
+  algorithm name `ed25519`, and two that the scan matches inside ordinary English words
+  (`feedbac` in "feedback", `cceeded` in "succeeded"). An earlier draft of this entry said
+  "every hex token still in `docs/` is a decimal sysctl value", which was true of none of
+  those three classes. Commit *subjects*
+  survived the rewrite, so most were re-derived with `git log --all --grep`; the rest were
+  replaced with a path, a tag or a date. Each re-pointed citation now names the implementing
+  file as well. `docs/policy/versioning.md` § 10 gains "Commit ids before 0.3.0", which
+  records that the rewrite happened, that the six release tags are the durable handles, and
+  that a path should be preferred to a hash in new text.
+
+- **The README claimed 683 library unit tests where the tree has more.** The sentence now
+  names `cargo test --manifest-path core/Cargo.toml --lib` instead of a number, so it cannot
+  go stale again.
+
+- **A pinned TCP handshake failed about one attempt in twenty under concurrency from a single
+  address.** Three faults compounded. The server re-derived its cookie / proof-of-work
+  difficulty on *every* round of one handshake, so its own load tier — or a reputation
+  escalation recorded while that handshake was in flight — invalidated a proof the client had
+  already been asked to produce and was still working on. The two sides then disagreed about
+  how many retry rounds a handshake may spend, two against three, so the server abandoned
+  handshakes the client had not finished. And it abandoned them by closing the connection,
+  which reached the caller as `CoreError::NetworkError("early eof")` — a transport fault for a
+  decision the server had made deliberately. Measured over 150 concurrent `connect_pinned`
+  calls from one source address: 6, 10 and 8 failures in three runs before, 150 of 150 after.
+  The difficulty is now fixed for the life of one connection, both sides read one round bound,
+  and the abandonment is announced with a typed `ServerReject` the client surfaces as
+  `CoreError::ProtocolRejected`. It also no longer charges a reputation violation to the
+  source, which was the amplifier that turned one failure into the next.
+
+  The announcement is a new **code value** on the existing `ServerReject` message —
+  `REJECT_RETRY_LIMIT = 3`, beside `1 = REJECT_UNSUPPORTED_VERSION` and
+  `2 = REJECT_PROTOCOL_VARIANT` — and not a format change: no field moved, and `WIRE_VERSION`
+  and `PROTOCOL_VERSION` are untouched. A 0.3.0 client that receives it renders it through its
+  own unknown-code fallback as "unsupported protocol version (client speaks v5, server speaks
+  v5)", which is wrong where "early eof" was merely uninformative; with the difficulty now
+  pinned for the life of a connection an honest client does not reach this path at all, and
+  the fallback is corrected here for codes added later.
+
+  Fixing the difficulty for the life of a handshake means a connection admitted while the
+  server was idle keeps the idle price if load rises while it is in flight. That is the right
+  way round: the gate prices a *new* attempt, this attempt's price was set when it arrived,
+  and an attempt cannot be started before the load that would have raised it — so what one
+  connection can hold is one in-flight slot at the old figure, which
+  `MAX_INFLIGHT_HANDSHAKES` and the handshake deadline already bound.
+
+- **The crate's own runnable examples waited for the handshake the two wrong ways**, which
+  matters more than an example usually does, because the entry points they demonstrate all
+  return before the handshake has run. `loopback_demo` slept and then sent. `embedded_demo`
+  polled `connection_state()` in a timed loop — which waits for the same handshake and then
+  throws its answer away: a wrong pinned key reaches `Failed`, not `Connected`, so the loop
+  spent its whole budget and reported a timeout for a mismatch the first round trip had
+  already settled. Both now call `await_ready()` on the line after the connect, which is what
+  every entry point's own documentation asks for.
+
+- **The release-artifact gate asserted the vocabulary of its four properties rather than their
+  shape**, so three of the four could be put back to their 0.3.0 state while it reported all
+  four satisfied. Deleting `exit 1` from the macOS install-name read-back, or from the
+  wasmtime version read-back, leaves every string the scan looked for exactly where it was —
+  the check becomes a log line. Assigning a tarball path to a shell variable before hashing it
+  reproduces the published-digest defect with no literal left to find. Read-backs are now
+  judged as *blocks* — a comparison followed by a non-zero exit — and shell assignments are
+  resolved before a digest argument is judged. The mutation harness grew from sixteen cases to
+  **26**, one per way a property can be put back, and still asserts its own case count, so an
+  early exit in it cannot read as a clean sweep.
+
+- **`tests/bindings/c/run_c_pinning_test.sh` was invoked by nothing.** It is the regression
+  test for this release's C-helpers pinning fix — the one listed first under **Security** — so
+  reverting that fix would have been green in every job. It runs in `bindings.yml`'s `c` job
+  now, and the general form of the mistake is gated too: `scripts/check_gate_wiring.py`
+  inventories every check in the tree and fails when one is invoked by no workflow, no hook and
+  no script that itself runs. Fifteen mutation cases, including the case where its own naming
+  convention stops matching, so a convention change is reported rather than passing silently,
+  and the case that fired against the script itself — see the entry below, "A check counted as
+  invoked because its own mutation harness named it".
+
+- **The record of what this release takes away from a consumer named five of the twelve
+  selections it takes.** `inherited_dependency_features` in `core/src/lib.rs` holds a row per
+  withdrawn selection, saying what a consumer's own code loses with it, and it recorded
+  `dep:time` and the four tokio features and read as though that were all of them.
+  `dep:tokio-util`, `dep:env_logger`, `dep:argon2`, `dep:base64`, `dep:once_cell`,
+  `dep:async-trait` and `dep:bitflags` had no row at all, so the seven crates the entry under
+  **Changed** is about were withdrawn with nothing written down about their cost. Five of the
+  seven are a real loss to a consumer who declared the same crate more narrowly —
+  `tokio-util`'s `codec` above all, since that crate's default feature set is empty, so every
+  consumer who took its defaults was inheriting `Framed`, `Decoder`, `Encoder` and
+  `LengthDelimitedCodec` from here — and two are not: `async-trait` declares no features, and
+  the only one `bitflags` gained was bitflags 2's `std`, whose body is empty. Each row now
+  says which of the two it is and why. The record's stated reason for leaving per-dependency
+  feature lists out of the guarded set was also false — it held that every such list had an
+  in-crate reader, when nothing in `core/src` reads `bytes/serde` and `ed25519-dalek`'s
+  `rand_core` is kept compiling by a dev-dependency a consumer does not inherit — so every
+  inherited dependency feature list is recorded and held to the manifest now, those two
+  included.
+
+- **A backdated withdrawal row passed the rule it was written to enforce.** A row names the
+  release that took the selection away, and its patch number has to be zero, because a patch
+  release may not change what a consumer's build inherits. The check read the string: that it
+  parsed, that it ended in a zero, that it was not in the future, and that words came with it.
+  A tree cutting 0.4.1 could therefore delete a selection, write `release: "0.4.0"` beside it
+  and pass — shipping in exactly the release the rule forbids, with the record saying it
+  happened in the one before. A row is now proved against the release it claims: against the
+  manifest's own version where it names the release being cut, and against that release's git
+  tag where it names an earlier one, by reading whether the selection is still there. A
+  checkout with no tags says so and refuses the row rather than passing it.
+
+- **The reject-code gate read the whole specification where only two sites are normative.**
+  `scripts/check_reject_codes.py` asked whether each `REJECT_*` constant is named in
+  `docs/protocol/PROTOCOL.md` anywhere, and the document names them in several places on
+  purpose: a byte-level field table an implementer decodes from, a struct listing they write
+  their own type from, and prose around both. Restoring either of the first two to its 0.3.0
+  content — the exact lag this release fixes — left the other and the prose naming all three
+  codes, so the gate stayed green while an implementer reading the table still built a decoder
+  that knew one code. Each normative site is read on its own now, and a site the script cannot
+  locate is a failure rather than a site with nothing in it to check.
+
+- **A check counted as invoked because its own mutation harness named it.**
+  `scripts/check_gate_wiring.py` fails when a runner in the tree is invoked by no workflow, no
+  hook and no script that is itself reachable — and it credited `X_test.sh` with invoking
+  `X.sh`, which is its own failure mode one level up: a harness runs a gate against trees it
+  fabricates and says nothing about whether anything runs it against *this* tree.
+  `tests/bindings/swift/check_xcframework.sh` was reported as wired on that basis and by
+  nothing else in the repository, including `build-xcframework.sh`, which this script's own
+  prose offered as the example of a legitimate relay. A runner's own cases no longer vouch for
+  it; a runner that genuinely cannot be run against the tree is a named exception carrying its
+  reason, and the exception is refused as stale the moment something does run it. The
+  inventory also reaches `python/` now, where `python/verify_wheel.sh` had been invoked by
+  nothing — it runs in `release.yml`'s `build-python-wheel` job, in place of the inline
+  `import phantom_protocol` that job used to do.
+
+- **Between two verdicts the address walk had no test for which one answers, and a pin refusal
+  an earlier address's success overruled was written to no log at all.** The overlapped walk
+  can hold a completed handshake and a peer's refusal at once, and the lower-numbered address
+  decides — the rule was written out three times, in the loop, at the budget deadline and
+  after it, as two different-looking expressions each of which reads correctly on its own. It
+  is one function used at all three points now, tested as the integer comparison it is. The
+  second half is what a consumer saw: where an address answers correctly and an impostor
+  behind it in the resolver's order refuses, that refusal loses to the earlier address and
+  goes nowhere — the caller is handed the success, `last_error()` is `None`, and the roster
+  naming every
+  address tried is built only for the error path — so an operator with a poisoned resolver, a
+  hostile split-horizon zone or one extra AAAA record in a DNS answer saw a clean connect
+  every time, and the one signal Security Invariant 1 exists to produce reached nobody. The
+  overruled refusal is logged at `warn` naming both addresses. A candidate whose socket cannot
+  be opened at all also no longer costs the 250 ms inter-attempt delay before the next address
+  is tried: the delay exists to give a contacted address a head start, and nothing was
+  contacted.
+
+- **`scripts/semver_report.sh` took an empty `--release-type` for no release type at all.** It
+  asked whether the variable held a non-empty string rather than whether the flag had been
+  given, so `--release-type "${BUMP}"` in a caller where `BUMP` was never set fell through to
+  the derivation and produced a report naming the type as derived — in the one place a caller
+  had asked it not to guess. An empty value is a caller error and exits 2 without running a
+  comparison, in both the separated and the joined spelling.
+
+### Changed
+
+- **Seven dependencies the crate never referenced are no longer declared.** The `std`
+  feature carried `tokio-util`, `async-trait`, `env_logger`, `argon2`, `base64`, `once_cell`
+  and `bitflags`, and no source
+  file in the crate mentions any of them — not behind a cfg, not behind a feature, never.
+  Since `std` is on in the default set, every consumer resolved, downloaded and compiled all
+  seven, and `argon2`, a password hash, sat in the direct dependency list of a transport
+  library, which is the first thing an auditor asks about. `env_logger` has one real caller,
+  an example, and is a dev-dependency now.
+
+  **Two of the seven are still in the graph, and the entry above says "declared" for that
+  reason.** `once_cell` is a dependency of `dashmap`, `borsh-derive` and `uniffi`, and
+  `bitflags` of `rustix` under `uniffi`'s `tempfile`, so both are still compiled for a
+  default build and always were. What went away for those two is this crate's own
+  *declaration* of them, and with it the feature selection it unified into the graph — the
+  same mechanism the entry below and the one under **Removed** are about. The other five
+  leave outright.
+
+  `time` is an eighth and is recorded separately, under **Removed**, because it is the one
+  the crate does read: the `mimicry` feature names it now, which is where its only reader is
+  — the validity window on the synthetic certificate the TLS-mimicry theater presents — and
+  `std` no longer names it, so it leaves a default build. That change takes `time/std` away
+  from a consumer who had been inheriting it, which is a thing a reader has to act on rather
+  than merely note, so it is not filed here.
+
+  A default consumer build goes from **163 crates to 134**: twenty-nine leave, among them
+  `regex`, `jiff`, `blake2`, `password-hash` and the whole `anstream`/`anstyle` colour stack,
+  and nothing is added. Twenty-three of the twenty-nine follow from the seven declarations
+  above; the other six follow from the trim under **Removed** — `time` with `deranged`,
+  `num-conv`, `powerfmt` and `time-core`, plus `signal-hook-registry`, which `tokio` pulls in
+  for `signal` alone. Re-derive the pair rather than trusting it — each figure is the node
+  count of the default normal dependency graph, the crate itself included:
+
+  ```bash
+  cargo tree --manifest-path core/Cargo.toml -e normal --prefix none \
+    | sed 's/ (\*)$//' | sort -u | wc -l
+  ```
+
+  Run at the `v0.3.0` tag it prints 163; run here, 134.
+
+- **The seven removed crates reach a consumer by the same route as a feature would, and
+  much more narrowly.** Rust will not let code name a crate its own manifest does not
+  declare, so nobody was using them *through* this one; what a consumer could be relying on
+  is Cargo's feature unification again. This crate asked for `tokio-util` with default
+  features plus `codec`, for
+  `argon2`, `once_cell`, `bitflags` and `env_logger` with their default features, for
+  `base64` with `alloc` only, and for `async-trait`, which has no features — so a consumer
+  that declares one of those itself with fewer features was being handed ours and now gets
+  only its own. The remedy is one line in the same place — name
+  the crate and the features you use in your own manifest — and it is worth applying
+  deliberately rather than waiting to find out, because the missing item can be one an
+  `#[cfg(feature)]` in that crate hides rather than one it names.
+
+### Removed
+
+- **Four `tokio` features and `time`'s place in `std` are gone, and a consumer who was
+  inheriting either has to name it in their own manifest.** On native targets this crate
+  asked `tokio` for `signal`, `process`, `fs` and `io-std`; `std` asked for `dep:time`.
+  None of the five has a call site anywhere in the crate, its tests, its benches or its
+  examples — nothing here spawns a process, reads a file, listens for a signal or reads a
+  clock outside the `mimicry` leg, which names `time` itself. By this library's own needs
+  all five were dead weight every default consumer compiled.
+
+  **They are still a consumer-visible removal, because Cargo unifies features across the
+  whole dependency graph.** What this crate asks of a shared dependency is added to what the
+  consumer asked of the same dependency, and the consumer's own code compiles against the
+  union. So a program that declares `tokio = { features = ["rt-multi-thread", "macros"] }`
+  and `time = { default-features = false }`, calls `tokio::signal::ctrl_c()`,
+  `tokio::io::stdin()`, `tokio::fs`, `tokio::process` and `OffsetDateTime::now_utc()`, and
+  never touches this crate's API at all, builds against 0.3.0 and gives five errors against
+  this release — none of which names this crate or a feature. That was reproduced against
+  unchanged consumer source rather than reasoned about, which is how it came to be withdrawn
+  from 0.3.1 and moved here: the same change in a patch release is a consumer's build broken
+  on `cargo update`, and in a minor release it is a line in the release notes they read
+  first. The remedy is in the header above, and it is safe to apply before upgrading — asking
+  tokio and `time` for what your own code uses is correct against every version of this
+  crate.
+
+  Six crates leave with the five features: `time` and its `deranged`, `num-conv`, `powerfmt`
+  and `time-core`, plus `signal-hook-registry` behind tokio's `signal`. They are six of the
+  twenty-nine in the count under **Changed**. `time` itself is still built by a `mimicry`
+  build, which is the only configuration that reads it.
+
+  **Nothing in the tool chain reports this, which is why it is written here at length.** The
+  public API is byte-identical across the change, so `cargo-semver-checks` finds nothing: a
+  dependency's feature set is not part of the surface it compares. There is no lint for it
+  either. A consumer's first notice is a compiler error in their own file about a method
+  they did not know they were borrowing.
+
+### Added
+
+- **A gate over the release path, because a release cannot be its own regression test.**
+  Every artifact defect above shipped in 0.3.0, was green in CI, and was found by downloading
+  the published tarball: `build-artifacts` runs on a tag, once, and what it produced was read
+  by nobody until a consumer tried to use it. `scripts/check_release_artifacts.py` reads the
+  files that decide what is shipped and fails when any of the four properties is back to its
+  0.3.0 state — a stripping profile, a macOS install name left as rustc wrote it, a digest
+  line carrying a directory, an unpinned WASI runtime. It strips comment lines before
+  matching, because each fix has prose beside it describing the defect and a scan that
+  matched the prose would pass the tree it exists to fail.
+  `scripts/check_release_artifacts_test.py` is what says it reads them correctly: **26**
+  cases, each putting one property back and requiring a failure that names it, plus the
+  unmutated tree passing and the case count asserted. It held sixteen when this release's
+  first draft cut, and three of the four properties could still be restored without any of
+  them firing — see **Fixed**, "The release-artifact gate asserted the vocabulary of its four
+  properties rather than their shape". The new CI job `release artifact shape`
+  runs both, then does the half a text scan cannot: it builds the shipped profile and hands
+  the library to the bindings generator, checking what was written rather than the exit code,
+  since `uniffi-bindgen` succeeds while finding nothing.
+
+- **A shape check over the Swift XCFramework, and a build-and-import check over the Python
+  wheel.** `tests/bindings/swift/check_xcframework.sh` asserts the per-slice header names,
+  that no framework was copied inside the framework, and that there is one slice per
+  platform `Package.swift` declares; `check_xcframework_test.sh` breaks it eight ways to
+  prove it fires, and asserts its own case count, so an early exit in it cannot read as a
+  clean sweep. `python/verify_wheel.sh` builds a wheel, installs it into a throwaway
+  virtualenv and imports and exercises it, which is the only thing that catches an import
+  the build itself reports as a success.
+
+  **Where each of those actually runs, since a check nothing invokes is a script.** The
+  mutation cases need nothing but a temporary directory, so they are a pre-commit hook now,
+  firing on the four Swift packaging files. The other two need an artifact to look at — a
+  built framework, a built wheel — and only one of them has one to look at here.
+  `python/verify_wheel.sh` runs in `release.yml`'s `build-python-wheel` job, on the wheel
+  that job has just built, replacing the inline `import phantom_protocol` that was the whole
+  of that job's smoke test and that a wheel with no bindings in it passes. The XCFramework
+  check belongs in `bindings.yml`'s `swift` job after `build-xcframework.sh`, and nothing in
+  the repository builds a framework, so it is run by hand from the flow in
+  `tests/bindings/PACKAGING.md` and is carried as a named exception in
+  `scripts/check_gate_wiring.py` — an exception that is refused as stale the moment anything
+  does run it. Making that job's step, and the branch-protection contexts that make either of
+  them count, is a maintainer action this release does not take. The release-artifact gate
+  above is the only new CI job here.
+
+- **Typed EOF on `PhantomStream::recv` is now documented where a reader looks for it.**
+  `docs/protocol/PROTOCOL.md` § 4.5 names `Ok(None)` (clean in-order `FIN`, half-closed)
+  against `Err(CoreError::ConnectionClosed)` (abnormal end), marked as this implementation's
+  surfacing of the release rule rather than a wire requirement — what the wire requires is
+  that a second implementation be able to surface the two separately at all.
+  `docs/architecture/ARCHITECTURE.md` § 9 records the same distinction beside the
+  typed-`CoreError` contract, with the pre-0.3.0 signature and the two caller shapes the
+  change turns into compile errors.
+
+- **The types a caller has to name to use the API are re-exported at the crate root.**
+  `CoreError` and `PhantomConfig` were there and nothing else was, so
+  `use phantom_protocol::ConnectionState;` failed to compile on the line below a
+  `use phantom_protocol::CoreError;` that worked, and the type a mandatory builder argument
+  takes — `HybridVerifyingKey`, for `.pinned_key()` — lived two modules in from anywhere the
+  builder is documented. `ConnectionState`, `PhantomSession`, `PhantomStream`,
+  `ResumptionHint`, `TrafficShapingConfig`, `PaddingPolicy`, `MetricsSnapshotFfi`,
+  `HybridVerifyingKey` and, on native targets, `PhantomListener`, `PhantomUdpListener` and
+  `AcceptOutcome` are all reachable as `phantom_protocol::<Name>` now; `api` itself gained the
+  five it was missing. These are additions and re-exports of the same types, so every path
+  that resolved before still resolves, and no UniFFI-exported item is added — which is what
+  keeps the checksum count above the whole of the binding difference. They are also the
+  reason this release is a minor one rather than a patch: SemVer counts an addition as a
+  minor change even when nothing that compiled stops compiling.
+
+- **The `ServerReject` frame's other two reject codes have names and constructors.**
+  `REJECT_PROTOCOL_VARIANT` (2) and `REJECT_RETRY_LIMIT` (3) join
+  `REJECT_UNSUPPORTED_VERSION` (1) in `transport::handshake`, with
+  `ServerReject::protocol_variant_mismatch()` and `ServerReject::retry_limit()` beside
+  `ServerReject::unsupported_version()`. Both codes are new on the wire here: 0.3.0 assigned
+  only code 1, answered a build-variant mismatch by closing with no reply at all, and
+  abandoned a handshake over the retry bound the same way. Neither is a format change —
+  `ServerReject` keeps its three fields and its byte layout, and the frozen wire vectors pass
+  unregenerated — so a 0.3.0 peer that receives one reads it through its own unknown-code
+  fallback. The two **Fixed** entries that put them on the wire are "A fips peer meeting a
+  non-fips one is now told so" and "A pinned TCP handshake failed about one attempt in twenty
+  under concurrency from a single address"; what a receiver should do with a code it does not
+  recognise is in `docs/protocol/PROTOCOL.md` § 6.10.
+
+- **Two methods on published transport types**, each the smallest surface a fix in this
+  release needed. `StreamDemultiplexer::close_all_streams()` releases every delivery route in
+  one pass, which is what lets a `PhantomStream::recv()` parked on an ended session return
+  instead of waiting for ever (**Fixed**, "`PhantomStream::recv()` now returns when the
+  session ends"). `SessionCache::is_disabled()` reports a cache configured to hold nothing,
+  which is what the zero-capacity 0-RTT path now consults before it looks for a ticket
+  (**Fixed**, "`PhantomConfig::session_cache_capacity = 0` now turns 0-RTT off").
+
+- **`interop with the published release`**, a CI job that builds one peer source twice — once
+  against the published `=0.3.0`, once against this tree — and has them exchange data in both
+  directions over PhantomUDP and over TCP, with each version as server and as client. Wire
+  compatibility with 0.3.0 is this release's lead claim and had no automated proof, and it is
+  the claim that fails most quietly: a packet whose header version does not match is dropped
+  with no reply and before any flag is read, so two incompatible peers complete a handshake,
+  agree keys, and then never deliver a byte, with nothing at either end to say why.
+
+- **`scripts/check_reject_codes.py`**, which holds the reject codes
+  `docs/protocol/PROTOCOL.md` lists to the ones
+  `core/src/transport/handshake.rs` assigns, and requires the specification to say what a
+  receiver does with a code it does not recognise. Nothing else could notice the drift it
+  exists for: a code is a `pub const` and a match arm, no wire format moves, no frozen vector
+  changes, and the frame is never sent on the success path, so the two codes this release adds
+  reached a green tree with the specification still naming one. Each of the specification's two
+  normative sites — the byte-level field table and the struct listing — is read on its own, so
+  restoring either one to its 0.3.0 content fails even while the rest of the document is
+  current; see **Fixed**, "The reject-code gate read the whole specification where only two
+  sites are normative". Eleven mutation cases, each putting one thing wrong and requiring a
+  failure that names it, including the case where the constants are renamed out from under the
+  script's own pattern — a gate that matches nothing reports the same success as a tree that
+  agrees. It runs in the `panic-site inventory` job
+  and as a pre-commit hook, and `scripts/check_gate_wiring.py` now vouches for both.
+
+- **Two of this file's own claims about itself are held to the code in `cargo test --lib`.**
+  `claims_this_crate_makes_about_itself` in `core/src/lib.rs` asserts that the comment
+  counting the build-time feature gates agrees with the number of `compile_error!`s below it —
+  it said "the only remaining build-time gate" while the file held four, and had been wrong
+  since 0.2.0 — and that no comment in the two files that carried it re-asserts the withdrawn
+  "1.8 s on a 600 ms path" figure. Both are prose, which nothing compiles; the second is the
+  only kind of gate that keeps a retracted number retracted.
+
+- **`scripts/required_status_checks.py`**, which derives from the workflow files the
+  branch-protection contexts that ought to be required, names the ones that are missing, and
+  prints the single command that closes the gap. Nine pull-request jobs currently cannot block
+  a merge: `cargo check (MSRV 1.93)`, `cargo package`, `cargo test + clippy (--features
+  mimicry)`, `testbed compiles + tests`, the `interop with the published release` job above,
+  and the four gates whose whole purpose is to fail — `changelog structure`, `panic-site
+  inventory`, `published memory arithmetic` and `release artifact shape`. It reports and
+  changes nothing unless run with `--apply`; the derivation is gated in CI, the comparison
+  against the live setting is not, because that needs rights over the repository's settings
+  which `GITHUB_TOKEN` does not have. Making the nine required is a maintainer action this
+  release does not take, and `python3 scripts/required_status_checks.py` re-derives the list
+  and prints the `gh api` call that applies it.
+
+### Documented
+
+- **The 0.3.0 breaking list did not name `PhantomStream::recv`'s changed signature, and it
+  is the one break a read loop meets at runtime rather than at compile time.** 0.2.2's
+  `recv` returned `Result<Vec<u8>, CoreError>`; 0.3.0's returns
+  `Result<Option<Vec<u8>>, CoreError>`, where `Ok(None)` is the peer's clean `FIN` —
+  half-closed, so this side may still send — and `Err(CoreError::ConnectionClosed)` is an
+  abnormal end. Before 0.3.0 both arrived as the same error, so a read loop could not tell a
+  peer that had finished from a session that had broken. Two caller shapes break, and both
+  break at the `match`: one that handled only `Err` now loops forever on `Ok(None)`, and one
+  that treated the old error as EOF now swallows a real failure. Across the FFI the method's
+  return type moves with it, so every binding must be regenerated rather than relinked —
+  Python `recv()` yields `None`, Swift and Kotlin an optional. The 0.3.0 section's
+  "Every Rust API break in this window, in one list" is left as it was written, which is the
+  rule this project applies to shipped release notes; this entry is where the omission is
+  recorded. `scripts/check_changelog_breaking.py` passed over it because the symbol *is*
+  named in that section — as a trailing sentence inside a bullet about an unrelated removal
+  — which is the floor that gate sets and not a review.
+
+- **`docs/security/invariants.md` describes the two invariants this release moved.**
+  Invariant 10 said a variant mismatch ends the attempt without a session, which is still
+  true and no longer the whole of it: the server answers on the wire first, under a new
+  reject code, and a new unauthenticated payload sent to an unauthenticated peer belongs in
+  the security record rather than only in these notes. The entry now states it, with why it
+  is not an amplification primitive (a seven-byte reply behind the stateless-cookie round,
+  which runs first) and why it discloses nothing a probe did not have (0.3.0 already sent
+  the same body for a version mismatch). Invariant 1's caller obligation said the
+  `connect_pinned*` functions return before the handshake has run, which stopped being true
+  of the three UDP ones on a multi-address name; it now says which functions return when,
+  and adds the rule a candidate walk has to keep — that a pinned-identity mismatch is an
+  answer about this attempt and not a reason to try the next address, because a walk that
+  carries on past it replaces a typed `ServerIdentityMismatch` with whatever the last
+  candidate reports.
+
+- **The stream cap is documented as the peer's count, and as a mixed-version limit.**
+  `docs/protocol/PROTOCOL.md` § 4.4 and the DoS-bound table in
+  `docs/security/threat-model.md` said `MAX_STREAMS` bounds concurrent receive streams
+  without saying which streams are counted, which is the whole of the difference between
+  the two versions; both now say it, and the protocol section states the 255 a sender
+  should keep to against a peer whose build it does not know, together with what a second
+  implementation should count.
+
+- **The address walk's documentation no longer says an abandoned attempt asks its background
+  task to close.** It does not. Dropping the session raises the close request, but that
+  request is read inside `run_data_pump`, which a session abandoned during its handshake
+  never reaches — so each abandoned candidate keeps its socket, its background task and its
+  handshake retransmissions until its own 10 s deadline expires, leaving up to `n − 1` of
+  them alive at once for an `n`-address name. Cutting a running handshake short is not
+  available here: the same background task serves
+  `PhantomSession::connect_with_transport`, whose documented contract is that a close
+  arriving during the handshake still pushes the writes queued ahead of it, and that needs
+  the handshake to finish. So the documentation states what happens, what it costs — one
+  socket, one task, and the flight repeats of the handshake retransmit budget sent to an
+  address that is not answering — and why it is deliberate rather than pending.
+
+- **`docs/policy/versioning.md` § 2 says how the semver report decides what to check.** The
+  release type is derived from the version step rather than fixed, and the section that
+  presents `cargo-semver-checks` as the guardrail for the record is where a reader finds out
+  that a narrower type skips lints rather than relabelling findings.
+
+- **`PhantomConfig::write_stall_timeout`'s one-second floor is documented as belonging to
+  the field rather than to the deadline.** The field said the deadline must be at least a
+  second and that the entry points refuse a shorter one; both are true of the field and
+  neither is true of the deadline, because a caller who builds a transport and calls
+  `with_write_stall_timeout` hands over any duration and gets the transport back, not a
+  `Result`. Refusing it there would change a signature, and clamping would contradict the
+  config path, which refuses rather than corrects. So the asymmetry stays and the field now
+  states it, along with the reason it is one: a value in the record is one an operator
+  supplied for connections the library builds out of their sight, while a duration handed
+  straight to a transport is a choice its author made about that transport.
+
+- **Each PhantomUDP transport now says which migration entry point its `supports_migration()`
+  answer is about.** Both halves of a session are address-aware and rebind without a
+  re-handshake, so both answer `true` — and the rustdoc says which method that `true` is
+  about, and on the server half what it costs a caller who reads it through
+  `PhantomSession::supports_migration()`. See **Fixed**, "An accepted session reported a
+  migration it could not perform", for the behaviour that changed with it.
+
+- **The draining window of `docs/protocol/PROTOCOL.md` § 4.11 is a datagram-transport
+  property, and the section said it without qualification.** The window exists because a
+  `CLOSE` is not `RELIABLE` and carries no `stream_offset`, so on a path that reorders it
+  overtakes data nothing will re-send; the 200 ms floor is sized against the displacement a
+  queue produces rather than against the path's length. Over a byte pipe — TCP, a
+  WebSocket, a WASI socket, a UART — there is no such displacement: the transport delivers
+  in order, so by the time the close is parsed everything written before it has been handed
+  over, and the peer's own end-of-stream arrives immediately behind the frame. This
+  implementation therefore publishes `Draining` and tears down on that end-of-stream, tens
+  of microseconds later, which reads as a violated floor for a case the floor was never
+  about. The section now says so, along with the two things that follow: holding the full
+  window on a byte pipe is conformant too, and `ConnectionState::Draining` is **not** a
+  state an application can poll for there — a consumer sampling `connection_state()` even
+  every millisecond sees `Connected` and then `Closed`, and should read the error from
+  `recv()` instead.
+
+- **A resume spends its ticket whether or not early data rides along, and the entry points
+  now say so.** The one-shot rule is decided when the resumption binder verifies, before the
+  server looks for a sealed blob, so resuming with an empty `early_data` buys only the
+  cookie / proof-of-work bypass and leaves nothing for the connect that does have a payload
+  — while `early_data_accepted()` answers `None`, which is correct ("no early-data on this
+  connect") and reads as "nothing was spent". Making the consumption conditional on a
+  payload is not the fix, because a ticket that bought the bypass without being spent would
+  buy it as often as its holder liked. So `connect_pinned_with_resumption`,
+  `connect_pinned_udp_with_resumption` and `SessionBuilder::resumption` state the cost and
+  say to keep the hint until there is something to send, and a `--lib` test drives a hello
+  that names a ticket and carries no blob and then shows the next resume off the same hint
+  falling back to 1-RTT. The same change drops a sentence the address-walk fix left behind:
+  `connect_pinned_udp_with_resumption` still said the first resolved address is used with no
+  fallback.
+
+- **`docs/known-deviations.md` is new, and it is the one place a surprised reader should
+  look first.** This release documents several behaviours that are deliberate, specified and
+  have still caught a consumer out — the draining window a byte-pipe session does not wait
+  out, the resumption ticket a payload-free resume spends, the stream cap a mixed pair
+  counts two ways, the half mebibyte `disconnect()` discards because it does not wait for an
+  acknowledgement — and each of them was written down correctly several hundred lines into a
+  release section or a rustdoc. A reader who has just been surprised cannot guess which
+  document to open. The new file is an index of eleven such entries, each in the same three
+  parts: what a consumer observed, what the rule actually is, and what to write instead. It
+  is linked from `README.md`'s pre-1.0 notice and from its documentation list, and it is
+  explicitly not a defect list (those are here, under the release that fixed them) and not a
+  limitations list (those are `docs/DEFERRED_WORK.md`).
+
+- **What is built, what ships and what is tested are three different things, and
+  `README.md` now separates them.** It presented Windows as a "hard gate" and Kotlin/Android
+  as "Production-shape", and its cross-platform highlight read as though every platform named
+  was exercised. A matrix row is `cargo check --lib`, and there are thirteen of them over
+  twelve targets. Prebuilt release artifacts exist for
+  exactly four targets — `x86_64` and `aarch64` × `unknown-linux-gnu` and `apple-darwin`.
+  Test code executes in three places and no more: every suite on x86_64 Linux, one pinned
+  loopback handshake through the Swift binding on `macos-latest`, and the WASI guest
+  fixture under `wasmtime` on a Linux host. So **no unit test and no loopback integration
+  test has ever run on Windows**, although both MSVC rows do compile on a real
+  `windows-latest` runner, and there is no Windows artifact either; the same holds for iOS,
+  musl, browser wasm and bare metal. **Android is in no workflow at all** — a grep for it
+  across all eight returns nothing — while `tests/bindings/kotlin/build-jnilibs.sh`
+  cross-builds three ABIs against an unpinned NDK and `examples/mobile/android/` is a
+  complete Compose application, both run by hand. The new "Platform support" section states
+  all of that in one table, because the risk an adopter takes is not "not packaged" but
+  "never executed": on a target outside the four they stand up their own cross-build, run
+  the suite there themselves, and own every platform failure it turns up.
+  `docs/DEFERRED_WORK.md` § 5 records it as a deliberate deferral, with the cost per
+  platform and the order that buys the most.
+
+- **The threat model had no row for either of the last two wire revisions.** `WIRE_VERSION`
+  6 → 7 and 7 → 8 shipped, and `docs/security/threat-model.md` mentioned neither the
+  `CONTROL` frame, nor the `CLOSE` subtype, nor the draining window — this protocol's newest
+  attack surface, being an in-session control frame a peer can send and a receiver commitment
+  to keep reading. Three § 5 rows now cover it, each naming the receiver rule of
+  `docs/protocol/PROTOCOL.md` § 4.11 that answers it: a forged `CLOSE` from an off-path
+  attacker who guesses a connection id (answered by dispatching **after** the AEAD open and
+  **after** the replay window — rule 4, and the reason the frame could ship at all), an
+  unknown subtype reaching the application as one byte of stream data (rule 3 — every arm
+  consumes the packet, the unknown one included), and a replayed `CLOSE` (refused by the
+  window that already runs ahead of the branch). The draining window is recorded as a
+  **resource bound** rather than as a timeout, because its duration is three round trips
+  clamped to `[200 ms, 600 ms]` and `min_rtt` rises with the delay a peer adds to its own
+  acknowledgements — so the ceiling is what keeps a local commitment from being a number a
+  remote party writes, and the floor is there for the opposite reason. § 7's cross-reference
+  map and § 9's revision history carry the same, and § 8 gains the two limitations these
+  rows imply.
+
+- **The peer-steerable congestion levers are in the threat model rather than only in an
+  engineering brief.** Every round-trip and delivery-rate figure this sender acts on is
+  derived from when acknowledgements arrive, and an authenticated peer chooses that. A § 5
+  DoS row and a § 8 limitation now state what is bounded — the peer-declared
+  `Sack::ack_delay_us` is honoured only while the sample stays at or above the smallest round
+  trip this endpoint has itself timed and is otherwise dropped whole (RFC 9002 § 5.3), a
+  bandwidth sample is bounded by the acknowledgement interval, and no peer figure moves a
+  threshold — and the one thing that is not: `bdp = btl_bw × min_rtt` sets the level the loss
+  response settles at, both factors come from arrival times, and no clamp is available because
+  there is no local lower bound on a path's length. The residual is accepted on the record,
+  including the part that is not about the peer: on a shared bottleneck an inflated `bdp`
+  makes this sender crowd out other flows, not only the one telling the lie.
+
+- **§ 4.11's byte-pipe paragraph was wrong about a UART, and disagreed with its own transport
+  count.** It listed a UART among the transports where "the peer's own end-of-stream arrives
+  immediately behind the data". A UART has no end-of-stream at all: a serial line carries no
+  close and no EOF, its reader simply never completes another frame, which is exactly why
+  `EmbeddedLeg` has no clock and leaves the write deadline to its writer. The ordering
+  argument holds there — an ordered transport has no displacement to absorb — but what *ends*
+  the session does not: on the four transports that are stream connections it is the peer's
+  end-of-stream, and on a UART it is the draining deadline itself, run off the send loop's
+  own tick. The paragraph also spoke of "five transports" while listing four byte pipes;
+  there are six, five of them ordered. Both are corrected, and § 13's stamp — which still
+  read 2026-08-22 against a commit from that pass — now records the four sections this
+  release re-derived (§ 4.4, § 4.5, § 4.11, § 6.10) and carries a date and a release rather
+  than a hash, per `docs/policy/versioning.md` § 10.
+
+- **The `ServerReject` frame carries three reject codes now and the spec documented one.**
+  `docs/protocol/PROTOCOL.md`'s § 2 table and its § 6.10 struct listing both named
+  `1 = REJECT_UNSUPPORTED_VERSION` and nothing else, and went on naming only that while
+  `2 = REJECT_PROTOCOL_VARIANT` and `3 = REJECT_RETRY_LIMIT` were both added to the frame in
+  this same release — the specification lagged the code inside one window rather than across
+  two. A second implementation reading that spec would have rendered either of the new codes
+  as a version refusal — which is exactly the mistake this release fixes in its own client. Both sites now list all three, § 6.10 says what each means and what a receiver
+  does with a code it does not recognise (treat it as fatal and non-retryable, and do not
+  read it as a version refusal — `supported_version` is present whatever the reason was),
+  and the section heading no longer calls the frame an unsupported-version signal, since
+  two of its three reasons are not that.
+
+- **Figures in these notes that did not follow from anything are corrected or gone, each
+  with the recipe that re-derives it.** Four of them: "a handshake on a 600 ms path takes
+  about 1.8 s", offered as the reason the per-candidate share has a 2 s floor, when two
+  flights on a 600 ms path is 1.2 s and the floor is
+  `UDP_HANDSHAKE_FLIGHTS × NO_SAMPLE_FLIGHT_RTO`, derived from no path length at all; "164
+  crates to 135", neither of which is a figure `cargo tree` prints — the measured pair is
+  163 at the `v0.3.0` tag and 134 here, and the entry under **Changed** that gives it now
+  carries the command that prints both — and which was the only figure in its section with
+  no re-derivation recipe beside it; the address roster described as the answer
+  a caller gets when no address answered, when it is reachable only where no candidate's
+  socket could be created; and "every hex token still in `docs/` is a decimal sysctl value",
+  which holds for none of the three classes the scan actually matches. A figure with no way
+  to re-derive it is a claim, and these notes are long enough that a claim in them is
+  load-bearing.
+
+- **The 0.3.0 section undercounted this crate's UniFFI checksums.** It said "fifty-nine" in
+  one place and "59" in another, where the generated bindings of both 0.3.0 and this release
+  assert **62** — eight constructors, eight free functions and forty-six methods. The figure
+  is the whole content of that entry, which asks a consumer to regenerate the bindings
+  rather than relink them, so it now carries the command that prints it. The eleven
+  checksums that move in *this* release, listed at the head of this section, were counted
+  the same way: by diffing that file against the one at the `v0.3.0` tag.
+
+- **Two documents still described the address walk this release replaced, and a security
+  invariant cited a test that does not exist.** `docs/known-deviations.md` § 7 and
+  `docs/security/invariants.md` both still set out the serial walk, including a tail of
+  addresses that a name with six or more of them never reached — a limitation the overlapped
+  walk does not have, because the per-candidate shares run concurrently instead of end to
+  end: the tenth address of a ten-address name is contacted 2.25 s into a ten-second
+  deadline, and all ten are reached. Both now describe what ships, with the two ordering
+  rules the overlap needed to keep Invariant 1's pin refusal and the one property it
+  narrows against the serial walk — and, since the overlap can hold a refusal and a success
+  at once, which of the two answers and where the losing refusal goes, which is the log and
+  nowhere else. Separately, Invariant 10's "Pinned by" line named
+  `the_reject_codes_are_distinct_and_the_version_one_is_unchanged`, a test this tree does
+  not contain — the name is `…_and_the_shipped_ones_are_unchanged`. A citation that names
+  nothing reads as covered, which is worse than citing nothing, so that file's header now
+  carries the `comm` that holds every name in every "Pinned by" line against the `fn`s in
+  `core/src` and `core/tests`. It prints nine lines, all of them modules or fields; a tenth
+  is a citation that has gone stale, and a run of it before this change printed one.
+
+- **`docs/compliance/cc-pp-mapping.md`'s ATE_FUN.1 row counted 73 negative-security tests,
+  twice, where the suite has 77** — evidence offered to a lab that would run the suite and
+  count. Corrected in both places, with the `grep` that re-derives it beside the figure. The
+  file's other counts were checked against the tree in the same pass and all hold: 5 CAVP
+  vectors, 7 fuzz targets, 23 audited panic sites, four direct `getrandom::fill` call sites,
+  and the three former `thread_rng()` fallbacks, of which the tree now has none.
+
+- **The repository's review posture is stated where a reader weighing the library will meet
+  it.** `CONTRIBUTING.md` said changes under the six security-sensitive paths "require
+  codeowner review before merge"; `.github/CODEOWNERS` says in its own header that codeowner
+  review is advisory unless branch protection enables it; and `main`'s protection has
+  `required_pull_request_reviews` unset with `enforce_admins` false. Of 229 pull requests,
+  none carries a review. `CONTRIBUTING.md` now says what is actually enforced — 35 required
+  status checks, and an auto-requested review that is a request — and `README.md`'s pre-1.0
+  notice and "Status & limitations" state plainly that no release has been reviewed by a
+  second person, alongside the absence of an external audit, with what would change it. The
+  branch-protection settings themselves are a maintainer action and are not touched here.
 ## [0.3.0] - 2026-09-26
 
 **Peers of this release and of 0.2.2 will not talk to each other, and the refusal is
@@ -22,7 +1307,7 @@ before any session exists. Upgrade both ends; there is no negotiation and no fal
 design, pre-1.0.
 
 **Every language binding must be regenerated, not just relinked.** `uniffi` 0.32 changed
-the metadata each exported item hashes into its checksum, so all fifty-nine of this crate's
+the metadata each exported item hashes into its checksum, so all sixty-two of this crate's
 checksums moved while `UNIFFI_CONTRACT_VERSION` stayed at 30 — the coarse gate passes and
 the mismatch lands at import time in the consumer's process. `ResumptionHint` also changed
 from a record to an object in the same release, which changes the C parameter type and
@@ -703,8 +1988,11 @@ Pointers only: each item is set out in full in the entry named.
 
   **`uniffi` 0.32 is a binding-ABI break even though no Rust source changed.** The macro
   now writes an `orig_name` field into every function's metadata buffer, and the per-item
-  checksum is an FNV hash *of that buffer* — so all 59 checksums this crate exports moved,
-  and none of them landed on its old value. `UNIFFI_CONTRACT_VERSION` did **not** move: it
+  checksum is an FNV hash *of that buffer* — so all 62 checksums this crate exports moved,
+  and none of them landed on its old value. That count is what the generated bindings
+  assert, and it re-derives from any of them — `grep -cE
+  'uniffi_phantom_protocol_checksum_[a-z_0-9]+\(\) != '
+  tests/bindings/phantom_protocol.py`. `UNIFFI_CONTRACT_VERSION` did **not** move: it
   is 30 in both releases. That combination is the part worth writing down, because the
   coarse gate stays green through it — a consumer who updates the native library and keeps
   the binding files generated against 0.31 gets `UniFFI API checksum mismatch` at import
@@ -4108,7 +5396,8 @@ dependency changes** — binary- and wire-compatible with 0.2.0
   stalled all further sends. Send accounting now uses the payload length, so
   inflight balances exactly against the ACK and loss paths.
 
-[Unreleased]: https://github.com/snaart/phantom_protocol/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/snaart/phantom_protocol/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/snaart/phantom_protocol/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/snaart/phantom_protocol/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/snaart/phantom_protocol/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/snaart/phantom_protocol/compare/v0.2.0...v0.2.1

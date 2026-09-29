@@ -309,20 +309,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // 4. Client — `connect_with_transport` spawns the handshake task in the
-    //    background; poll `connection_state` until it reaches `Connected`.
+    //    background and returns before it has run, so nothing about the peer's
+    //    identity is settled on the line below.
     let session = PhantomSession::connect_with_transport("embedded-demo:0", client_leg, pinned_key);
 
-    let mut ok = false;
-    for _ in 0..250 {
-        if session.connection_state() == ConnectionState::Connected {
-            ok = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    if !ok {
-        return Err("client failed to reach Connected within 5s".into());
-    }
+    // `await_ready()` is what settles it (Invariant 1), and it is what an embedder
+    // should copy from here. Polling `connection_state()` in a sleep loop — which is
+    // what this example used to do — waits for the same handshake but throws the
+    // answer away: a wrong pinned key reaches `Failed`, not `Connected`, so the loop
+    // spins out its whole budget and then reports a timeout for a key mismatch that
+    // was known on the first round trip. `await_ready()` returns the typed cause,
+    // `CoreError::ServerIdentityMismatch`, as soon as the handshake has one.
+    timeout(IO_TIMEOUT, session.await_ready())
+        .await
+        .expect("client handshake timed out")?;
+    assert_eq!(session.connection_state(), ConnectionState::Connected);
     let hs_c_out = c_out.load(Ordering::Relaxed);
     let hs_s_out = s_out.load(Ordering::Relaxed);
     println!(

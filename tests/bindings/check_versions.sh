@@ -19,8 +19,9 @@ set -euo pipefail
 # a core that had moved on is a result attributed to the wrong release, and
 # that misattribution outlives the run.
 #
-# NOTE: tests/bindings/c/package.sh hardcodes its own `VERSION=` (it names
-# the released C tarball) and is NOT covered here — bump it by hand.
+# NOTE: tests/bindings/c/package.sh needs no entry here — it reads the version
+# straight out of core/Cargo.toml when it names the released C tarball, so there
+# is nothing in it to drift.
 #
 # Wired into .github/workflows/bindings.yml's `drift` job. Its own tests are in
 # check_versions_test.sh, which runs alongside it there. Run locally:

@@ -66,6 +66,29 @@ repos:
         files: ^(core/src/.*\.rs|docs/security/panic-sites\.md)$
         pass_filenames: false
 
+      # ── ServerReject codes vs the protocol specification ──────────────
+      - id: check-reject-codes
+        name: documented ServerReject codes match the ones assigned
+        # A reject code is a `pub const` and a match arm: no wire format
+        # moves, no frozen vector changes, and the frame is never sent on the
+        # success path, so adding one leaves every test green while the
+        # specification describes a smaller protocol than the one that ships.
+        # Code 2 travelled a whole release that way.
+        entry: scripts/check_reject_codes.py
+        language: system
+        files: ^(core/src/transport/handshake\.rs|docs/protocol/PROTOCOL\.md)$
+        pass_filenames: false
+
+      - id: check-reject-codes-cases
+        name: the ServerReject code gate still fails when it should
+        # The gate's own mutation cases. They need nothing but a temporary
+        # directory, so they run here rather than only in CI; a pattern that
+        # has stopped matching reports the same success as a tree that agrees.
+        entry: scripts/check_reject_codes_test.py
+        language: system
+        files: ^scripts/check_reject_codes(_test)?\.py$
+        pass_filenames: false
+
       # ── Published memory arithmetic ───────────────────────────────────
       - id: check-memory-arithmetic
         name: published memory arithmetic matches its constants
@@ -87,6 +110,55 @@ repos:
         entry: python3 scripts/check_changelog_breaking.py --structure-only
         language: system
         files: ^CHANGELOG\.md$
+        pass_filenames: false
+
+      # ── The release-path gates' own cases ─────────────────────────────
+      - id: semver-report-script
+        name: semver_report.sh reads a report the way it claims to
+        # The script decides a CI job by reading text: which release type the
+        # version step calls for, whether the run reached a verdict at all, and
+        # whether the type it used matches the step the tool says it compared.
+        # Each of those is a text-reading rule that can stop working while the
+        # job stays green, so the cases run whenever the script or they change.
+        # cargo is stubbed, so this costs a couple of seconds and no build.
+        entry: scripts/semver_report_test.sh
+        language: system
+        files: ^scripts/semver_report(_test)?\.sh$
+        pass_filenames: false
+
+      - id: check-xcframework-shape
+        name: the XCFramework shape gate rejects every broken shape
+        # `check_xcframework.sh` needs a built framework and so cannot run here;
+        # its mutation cases need nothing but a temp directory and fabricate the
+        # eight broken trees themselves, which is the half that can. They also
+        # assert their own case count, so an early exit is not a clean sweep.
+        entry: tests/bindings/swift/check_xcframework_test.sh
+        language: system
+        files: ^tests/bindings/swift/(check_xcframework\.sh|check_xcframework_test\.sh|Package\.swift|build-xcframework\.sh)$
+        pass_filenames: false
+
+      - id: check-gate-wiring
+        name: every check under scripts/ and tests/ is invoked by something
+        # A check nobody runs is indistinguishable from one that always passes,
+        # and the diff that adds it looks complete. `run_c_pinning_test.sh` — the
+        # regression test for a pinned-identity defect in the blocking C helpers
+        # — was in no workflow and no hook, so reverting the fix would have been
+        # green. Pure text over the workflows, the hooks and the runners
+        # themselves, so it belongs here as well as in CI. The C test it caught
+        # does NOT run here: it needs a release build of the cdylib, which is
+        # minutes, and heavy checks stay in CI.
+        entry: scripts/check_gate_wiring.py
+        language: system
+        files: ^(\.github/workflows/.*\.yml|\.pre-commit-config\.yaml|scripts/.*|tests/.*)$
+        pass_filenames: false
+
+      - id: check-gate-wiring-cases
+        name: the gate-wiring check reports each way the wiring can go missing
+        # Fabricates its own trees in a temp directory and needs nothing built,
+        # so the cases can run beside the check they are for.
+        entry: scripts/check_gate_wiring_test.py
+        language: system
+        files: ^scripts/check_gate_wiring(_test)?\.py$
         pass_filenames: false
 
       # ── Landing page and license text that ship inside the crate ──────
