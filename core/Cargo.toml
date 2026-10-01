@@ -355,7 +355,7 @@ crossbeam-utils = { version = "0.8", optional = true }  # CachePadded for observ
 # wires" boundary used for HTTP metrics today.
 opentelemetry = { version = "0.32", optional = true, default-features = false, features = ["metrics", "trace"] }
 opentelemetry_sdk = { version = "0.32", optional = true, default-features = false, features = ["metrics", "trace", "rt-tokio"] }
-tracing-opentelemetry = { version = "0.33", optional = true, default-features = false, features = ["tracing-log"] }
+tracing-opentelemetry = { version = "0.34", optional = true, default-features = false, features = ["tracing-log"] }
 hmac = { version = "0.13", optional = true }
 dashmap = { version = "6.1.0", optional = true }
 

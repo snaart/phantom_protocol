@@ -22,4 +22,4 @@ opentelemetry_sdk = { version = "0.32", features = ["metrics", "trace", "rt-toki
 opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "grpc-tonic", "metrics", "trace",
 ] }
-tracing-opentelemetry = "0.33"
+tracing-opentelemetry = "0.34"
