@@ -320,7 +320,7 @@ hkdf = { version = "0.13", optional = true }
 sha2 = { version = "0.11", optional = true }
 blake3 = { version = "1.5", optional = true }
 getrandom = { version = "0.4", optional = true }
-parking_lot = { version = "0.12", optional = true }  # Fast mutex for buffer pool
+parking_lot = { version = "0.13", optional = true }  # Fast mutex for buffer pool
 arc-swap = { version = "1", optional = true }        # Lock-free atomic swap for the CryptoState rekey path (Phase 1.5)
 lz4_flex = { version = "0.14", optional = true }   # Fastest pure-Rust LZ4 (safe, no C bindings); >=0.13.1 floor avoids yanked 0.11.5 (RUSTSEC-2026-0041)
 # zstd pinned to a release version. Optional (gated by `compression-zstd`
